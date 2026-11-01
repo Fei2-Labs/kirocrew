@@ -28,6 +28,7 @@ import kiro_crew
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
+from kiro_crew import fork_version
 from kiro_crew.dashboard.state import (
     DashboardState,
 )
@@ -294,6 +295,16 @@ async def api_status(request: web.Request) -> web.Response:
             "mem_total_gb": static_info.get("mem_total_gb"),
         }
     )
+    # Fork build identity — peek_revision is non-blocking (returns None if not
+    # warmed yet; warm() runs off-loop in the update check). The frontend
+    # renders fork attribution and the upgrade button from these fields.
+    _fork_peek = fork_version.peek_revision()
+    if _fork_peek is not None:
+        _fork_rev, _fork_dirty = _fork_peek
+        if _fork_rev:
+            data["fork_revision"] = _fork_rev
+            data["fork_dirty"] = _fork_dirty
+            data["update_fork_suppressed"] = True
     # Frontend RUM config blob (PlatformContext telemetry).  The Default
     # TelemetryProvider returns None (RUM off), so the standalone status payload
     # is byte-for-byte unchanged and the SPA's RUM shim stays a no-op.  The

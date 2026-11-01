@@ -7575,6 +7575,11 @@
         "based_on_upstream": "based on upstream {{version}} · fork {{revision}}",
         "fork_uncommitted_changes": "uncommitted changes",
         "fork_update_withheld": "Upstream {{version}} is available. It is not offered here, because installing it would replace this fork.",
+        "fork_check_update": "Check for fork update",
+        "fork_up_to_date": "This fork is up to date.",
+        "fork_upgrading": "Upgrading…",
+        "fork_upgrade_to": "Upgrade to {{version}}",
+        "fork_upgrade_success": "Installed. Gateway is restarting — the page will reload shortly.",
         "automatic_updates_unavailable_fork": "Automatic updates are unavailable because this build was packaged from a fork. The update feed publishes upstream releases, which would replace this build rather than update it."
       },
       "crewmatesSection": {

@@ -296,6 +296,74 @@ export function GatewayAutoUpdateSwitch({ anchor = true, readOnMount = false, on
   )
 }
 
+/** Fork upgrade: check GitHub Releases and offer one-click install. */
+function ForkUpgradeButton() {
+  const [checking, setChecking] = useState(false)
+  const [applying, setApplying] = useState(false)
+  const [info, setInfo] = useState<{
+    available?: boolean; remote_version?: string; remote_sha?: string;
+    remote_tag?: string; error?: string; release_url?: string;
+  } | null>(null)
+  const [applyResult, setApplyResult] = useState<{ ok?: boolean; message?: string; error?: string } | null>(null)
+
+  const handleCheck = async () => {
+    setChecking(true); setApplyResult(null)
+    try {
+      const res = await api.lifecycle.checkForkUpdate()
+      setInfo(res)
+    } catch (e: any) {
+      setInfo({ error: e?.message || 'check failed' })
+    } finally { setChecking(false) }
+  }
+
+  const handleApply = async () => {
+    setApplying(true); setApplyResult(null)
+    try {
+      const res = await api.lifecycle.applyForkUpdate()
+      setApplyResult(res)
+      if (res.ok) {
+        // Gateway will restart — poll until it comes back.
+        setTimeout(() => { window.location.reload() }, 8000)
+      }
+    } catch (e: any) {
+      setApplyResult({ ok: false, error: e?.message || 'apply failed' })
+    } finally { setApplying(false) }
+  }
+
+  return (
+    <div className="mt-2 flex flex-col gap-1.5" data-testid="about-fork-upgrade">
+      <div className="flex items-center gap-2 flex-wrap">
+        <Btn size="sm" variant="outline" onClick={handleCheck} disabled={checking || applying}>
+          <RefreshCw size={12} className={checking ? 'animate-spin' : ''} />
+          {i18nT('pages.settings.aboutPanel.fork_check_update')}
+        </Btn>
+        {info?.available && !applyResult?.ok && (
+          <Btn size="sm" variant="default" onClick={handleApply} disabled={applying}>
+            <Download size={12} className={applying ? 'animate-pulse' : ''} />
+            {applying
+              ? i18nT('pages.settings.aboutPanel.fork_upgrading')
+              : i18nT('pages.settings.aboutPanel.fork_upgrade_to', { version: info.remote_version || info.remote_tag || '' })}
+          </Btn>
+        )}
+      </div>
+      {info && !info.available && !info.error && (
+        <span className="text-[11px] text-muted">{i18nT('pages.settings.aboutPanel.fork_up_to_date')}</span>
+      )}
+      {info?.error && (
+        <span className="text-[11px]" style={{ color: 'var(--destructive)' }}>{info.error}</span>
+      )}
+      {applyResult?.ok && (
+        <span className="text-[11px]" style={{ color: 'var(--success)' }}>
+          {i18nT('pages.settings.aboutPanel.fork_upgrade_success')}
+        </span>
+      )}
+      {applyResult && !applyResult.ok && applyResult.error && (
+        <span className="text-[11px]" style={{ color: 'var(--destructive)' }}>{applyResult.error}</span>
+      )}
+    </div>
+  )
+}
+
 export function AboutPanel() {
   const { botName, avatar } = useBranding()
   const gatewayVersion = useAppSelector(s => s.dashboard.status?.version) || ''
@@ -1083,6 +1151,10 @@ export function AboutPanel() {
                 })}
               </div>
             )}
+            {/* Fork upgrade: check the fork's own GitHub Releases feed and
+                offer a one-click upgrade. This replaces the upstream update
+                path, which is permanently disabled for fork builds. */}
+            {forkRevision && <ForkUpgradeButton />}
             {/* The gateway's own line, only when it is not the build the shell
                 badge above names. The branch and commit chips live here in that
                 case — they are gateway stamps, so beside the shell badge they

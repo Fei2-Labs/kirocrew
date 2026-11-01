@@ -66,6 +66,15 @@ def register(app: web.Application) -> None:
     # not be the harder one to reach.
     app.router.add_delete("/api/update/arm", handlers.api_update_disarm)
     app.router.add_post("/api/update/approve", handlers.api_update_approve)
+    # Fork update: check for and apply updates from the fork's GitHub Releases.
+    # Separate from the upstream update path which is permanently disabled for
+    # fork builds.
+    from kiro_crew.dashboard.handlers.updates_fork import (
+        api_update_fork_check,
+        api_update_fork_apply,
+    )
+    app.router.add_get("/api/update/fork", api_update_fork_check)
+    app.router.add_post("/api/update/fork", api_update_fork_apply)
     # Restart with no update. Sibling of /api/update rather than a mode of it:
     # /api/update refuses every layout that is not a git checkout, while a
     # restart is valid everywhere and is how a wheel install picks up code a

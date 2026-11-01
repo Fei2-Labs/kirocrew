@@ -41,6 +41,15 @@ export function createUpdatesEndpoints({ post, del, j, jfetch: fetch }: ClientTr
     dismissUpdateArm: (requestId: string) => del(`/api/update/arm?request_id=${encodeURIComponent(requestId)}`).then(j) as Promise<{ ok?: boolean; armed?: boolean; dismissed?: boolean }>,
     cancelUpdate: () => post('/api/update/cancel').then(j),
     simulateUpdate: (opts?: { delay?: number; fail_at?: string }) => post('/api/update/simulate', opts || {}).then(j),
+    // Fork update: check and apply from the fork's GitHub Releases feed.
+    checkForkUpdate: () => fetch('/api/update/fork').then(j) as Promise<{
+      available: boolean; current_version?: string; current_sha?: string;
+      remote_version?: string; remote_sha?: string; remote_tag?: string;
+      release_url?: string; error?: string;
+    }>,
+    applyForkUpdate: () => post('/api/update/fork').then(j) as Promise<{
+      ok: boolean; installed_tag?: string; message?: string; error?: string;
+    }>,
   }
 
   return { lifecycle }
