@@ -296,9 +296,14 @@ async def api_status(request: web.Request) -> web.Response:
         }
     )
     # Fork build identity — peek_revision is non-blocking (returns None if not
-    # warmed yet; warm() runs off-loop in the update check). The frontend
-    # renders fork attribution and the upgrade button from these fields.
+    # warmed yet). For fork builds the upstream update check never runs, so
+    # warm() is never called there; we warm it ourselves off the event loop on
+    # the first status request.
     _fork_peek = fork_version.peek_revision()
+    if _fork_peek is None:
+        # First call — warm off-loop, then peek again.
+        await asyncio.to_thread(fork_version.warm)
+        _fork_peek = fork_version.peek_revision()
     if _fork_peek is not None:
         _fork_rev, _fork_dirty = _fork_peek
         if _fork_rev:
