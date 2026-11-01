@@ -309,7 +309,7 @@ function ForkUpgradeButton() {
   const handleCheck = async () => {
     setChecking(true); setApplyResult(null)
     try {
-      const res = await api.lifecycle.checkForkUpdate()
+      const res = await api.checkForkUpdate()
       setInfo(res)
     } catch (e: any) {
       setInfo({ error: e?.message || 'check failed' })
@@ -319,10 +319,9 @@ function ForkUpgradeButton() {
   const handleApply = async () => {
     setApplying(true); setApplyResult(null)
     try {
-      const res = await api.lifecycle.applyForkUpdate()
+      const res = await api.applyForkUpdate()
       setApplyResult(res)
       if (res.ok) {
-        // Gateway will restart — poll until it comes back.
         setTimeout(() => { window.location.reload() }, 8000)
       }
     } catch (e: any) {
@@ -333,12 +332,12 @@ function ForkUpgradeButton() {
   return (
     <div className="mt-2 flex flex-col gap-1.5" data-testid="about-fork-upgrade">
       <div className="flex items-center gap-2 flex-wrap">
-        <Btn size="sm" variant="outline" onClick={handleCheck} disabled={checking || applying}>
+        <Btn onClick={handleCheck} disabled={checking || applying}>
           <RefreshCw size={12} className={checking ? 'animate-spin' : ''} />
           {i18nT('pages.settings.aboutPanel.fork_check_update')}
         </Btn>
         {info?.available && !applyResult?.ok && (
-          <Btn size="sm" variant="default" onClick={handleApply} disabled={applying}>
+          <Btn primary onClick={handleApply} disabled={applying}>
             <Download size={12} className={applying ? 'animate-pulse' : ''} />
             {applying
               ? i18nT('pages.settings.aboutPanel.fork_upgrading')
