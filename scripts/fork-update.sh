@@ -54,7 +54,38 @@ echo "⬇️  Downloading $wheel_name..."
 curl -fSL -o "${tmpdir}/${wheel_name}" "$wheel_url"
 
 echo "📦 Installing..."
-pip install --force-reinstall --no-deps "${tmpdir}/${wheel_name}"
+
+# Find the pip that owns the current kirocrew install.
+KIROCREW_BIN=$(command -v kirocrew 2>/dev/null || true)
+CREW_PIP=""
+
+if [ -n "$KIROCREW_BIN" ]; then
+  # Resolve symlinks to find the real launcher directory.
+  real="$KIROCREW_BIN"
+  while [ -L "$real" ]; do real=$(readlink "$real"); done
+  bindir=$(cd "$(dirname "$real")" && pwd)
+
+  # cli.sh installs: wrapper calls $DIR/python3.12 -m kiro_crew
+  if [ -x "$bindir/python3.12" ]; then
+    CREW_PIP="$bindir/python3.12 -m pip"
+  elif [ -x "$bindir/python3" ]; then
+    CREW_PIP="$bindir/python3 -m pip"
+  fi
+fi
+
+# crew-venv installs (source build)
+if [ -z "$CREW_PIP" ] && [ -x "$HOME/.kiro/crew-venv/bin/pip" ]; then
+  CREW_PIP="$HOME/.kiro/crew-venv/bin/pip"
+fi
+
+# Fallback to whatever pip is on PATH
+if [ -z "$CREW_PIP" ]; then
+  CREW_PIP="pip"
+fi
+
+# --break-system-packages handles uv/PEP 668 managed environments safely
+$CREW_PIP install --break-system-packages --force-reinstall --no-deps "${tmpdir}/${wheel_name}" 2>/dev/null \
+  || $CREW_PIP install --force-reinstall --no-deps "${tmpdir}/${wheel_name}"
 
 echo ""
 echo "✅ Upgraded:"
