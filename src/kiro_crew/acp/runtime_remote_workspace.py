@@ -48,6 +48,19 @@ def _restricts_replaced_builtins(permissions: Any) -> bool:
     return False
 
 
+def _carries_spec_allowlist(agent: Any) -> bool:
+    """Whether a projected entry records a shell or write allowlist its spec set.
+
+    The gate enforces those on built-in calls only, and a remote workspace turns
+    the built-ins into MCP tools, so such an agent cannot keep its restriction there.
+    """
+    from kiro_crew.acp.kas_permissions import CREW_SHELL_ALLOWLIST_KEY, CREW_WRITE_ALLOWLIST_KEY
+
+    return isinstance(agent, dict) and any(
+        key in agent for key in (CREW_SHELL_ALLOWLIST_KEY, CREW_WRITE_ALLOWLIST_KEY)
+    )
+
+
 def _without_local_only_grants(grants: list[str]) -> list[str]:
     """MCP grants for a remote session, minus every tool that acts on this machine.
 
@@ -169,15 +182,10 @@ def set_remote_workspace(self: AcpRuntime, workspace: Any) -> None:
 
 def check_remote_workspace_supported(self: AcpRuntime) -> None:
     """Raise before any guest compute is touched when this runtime cannot fence it."""
-    from kiro_crew import session_environment
     from kiro_crew.session_environment import REMOTE_NEEDS_KAS
 
     if self._process is not None:
         raise AcpRuntimeError("a remote workspace must be set before the runtime spawns")
-    # Fail closed: on a Windows gateway a filesystem deny could not bind the
-    # workspace tools' POSIX targets, so no workspace is attached at all.
-    if not session_environment.gateway_matches_posix_paths():
-        raise AcpRuntimeError(session_environment.REMOTE_NEEDS_POSIX_GATEWAY)
     if self.acp_backend == ACP_BACKEND_KAS:
         return
     raise AcpRuntimeError(REMOTE_NEEDS_KAS)
@@ -228,13 +236,24 @@ def _remote_workspace_agents(self: AcpRuntime, agents: Any, servers: list[Any]) 
     notice = (
         f"\n\nThis session's files and shell live in a remote workspace at {workdir}. "
         f"Use the @{name} tools for every file and command; local file and shell "
-        "tools are not available."
+        "tools are not available. Git over HTTPS or SSH to GitHub, GitLab, Bitbucket "
+        "and Azure DevOps (dev.azure.com) works from those commands as usual. For a "
+        "host the gateway has a git login for and is allowed to lend, git goes "
+        "through the gateway, which adds that login; any other host uses the "
+        "workspace's own git login, if it has one. Under the strict agent sandbox "
+        "the gateway lends none, so only the workspace's own login applies. A push "
+        "through the gateway that updates or deletes a protected branch such as main "
+        "is refused whole, as it is for a local session; push a feature branch "
+        "instead. Do not go looking for keys or tokens, and do not unset git's url "
+        "rewrites."
     )
     out = []
     for agent in agents:
         # KAS judges workspace tools as `mcp`, so the agent's own shell and
         # file restrictions would stop matching: refuse instead of dropping them.
-        if _restricts_replaced_builtins(agent.get("permissions")):
+        # The spec's deny-all-but allowlists (shell `denyByDefault`, write
+        # `fallbackAction: "deny"`) bind built-ins only, so they are refused too.
+        if _restricts_replaced_builtins(agent.get("permissions")) or _carries_spec_allowlist(agent):
             from kiro_crew.session_environment import REMOTE_AGENT_RESTRICTED
 
             raise AcpRuntimeError(REMOTE_AGENT_RESTRICTED)

@@ -11,6 +11,19 @@ and every primary restore re-applies the slot's reasoning effort to the newly
 selected model (`reapply_live_effort`); an effort re-apply that fails is logged as a
 warning and does not fail the model change.
 
+A harness that takes its model at launch (`ACP_BACKENDS_MODEL_AT_LAUNCH`, Strands)
+has the same seam: its `set_model` relaunches the process on the candidate and
+reloads the session (`acp/launch_tuning.py`). It advertises no model list, so no
+candidate is skipped as unadvertised; a chain entry another harness's catalog owns
+is refused by that `set_model` instead, and the walk skips it. `auto` relaunches on
+the model the harness's own settings name. The restore probe relaunches on the
+primary the same way.
+
+On such a harness only, an `auto` candidate is recorded as the model the session
+serves after the swap (the marker, the walk's active entry and the returned candidate),
+so the restore probe compares the marker against what the session runs. Every other
+harness records `auto` as before.
+
 ## Configuration
 
 `AgentConfig.fallback_model` is normalized by
@@ -171,7 +184,11 @@ families — a different model routinely accepts what another's filter declined
   `TURN_FALLBACK_ATTR`, whose start-of-turn probe would restore the primary
   before the retry ran), snapshots `_model_pick_gen` so a later explicit pick
   is detectable at restore, and refuses a candidate equal to the refusing
-  model. When the session is unpinned (the automatic-routing sentinel, so the
+  model; when a fallback IS configured but resolves to that same model
+  (`_refusal_fallback_is_same_model`), a separate `notice` row carrying the
+  `refusal_fallback_same_model` gateway-notice token says the retry was skipped
+  because the fallback is the same model and to pick a different one, rather
+  than the `fallback_off` sentence that reads as no fallback set. When the session is unpinned (the automatic-routing sentinel, so the
   active model reads as unknown), the swap runs only when the sentinel is
   advertised as a switch target: the restore leg would have to
   `set_model("auto")`, and a partition that does not serve the sentinel

@@ -31,6 +31,7 @@ def _render(
     *,
     slot: str | None = None,
     last_user_at: str = "",
+    state: Any = None,
 ) -> str | None:
     """The live page with its values filled in -- the frame's half of contract v3 part 5.
 
@@ -50,8 +51,8 @@ def _render(
     handler ETags the WHOLE serialized response so an unchanged page skips the download
     -- there is no compose cache here, because the compose itself is cheap (the field
     read is memoized by the fold layer) and the download is the cost worth skipping.
-    ``None`` on any failure, so the raw page still renders under the frame's own stale
-    band rather than the tab erroring.
+    ``None`` on any failure, so the raw page still renders rather than the tab
+    erroring.
     """
     try:
         from kiro_crew import dashboard_frame
@@ -59,6 +60,7 @@ def _render(
             _page_safe,
             _template_text_safe,
             _trusted_page,
+            page_safe_for,
             read_fields,
         )
         from kiro_crew.dashboard_templates.manifest import parse_manifest
@@ -86,10 +88,10 @@ def _render(
             # MASKED AND REDACTED on the way out, at the one step that hands fold
             # values to a page's own script. A snapshot is taken from what the page
             # holds, so it inherits this rather than needing its own pass.
-            {name: _page_safe(value) for name, value in read.fields.items()},
+            # *state* stamps each work item's worker facts before the key is masked.
+            {name: page_safe_for(state)(value) for name, value in read.fields.items()},
             agentic=[name for name, spec in manifest.fields.items() if spec.agentic],
             seq=read.seq,
-            stale=read.stale,
             missing=read.missing,
             # Masked like the values beside them: a stamp is not a secret, but this is
             # the one chokepoint and a field added here later would otherwise skip it.

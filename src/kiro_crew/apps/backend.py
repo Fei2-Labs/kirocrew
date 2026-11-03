@@ -150,7 +150,6 @@ _BACKEND_LOG_MAX_BYTES = 1_048_576  # 1 MiB
 # Node.js binary resolution
 # ---------------------------------------------------------------------------
 
-
 def _resolve_nvm_path(binary_name: str) -> str | None:
     """Resolve a binary via nvm, returning its full path or None.
 
@@ -293,6 +292,16 @@ def _shebang_argv(entry: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _starting_reservation(app_name: str) -> AppProcess:
+    """A STARTING record that holds *app_name*'s slot while a spawn is in flight.
+
+    It names no process and carries no provenance. The single-flight spawn below and the
+    restart's drain both publish one, so a concurrent start waits on it instead of
+    reading the slot as free.
+    """
+    return AppProcess(app_name=app_name, starting=True, started_at=time.time())
+
+
 def start_app_backend(app_name: str) -> AppProcess | None:
     """Start an app's backend process if it declares one.
 
@@ -338,7 +347,7 @@ def _start_app_backend(app_name: str) -> AppProcess | None:
                 await_inflight = True
         if not await_inflight:
             # Reserve a STARTING placeholder so a concurrent call sees this spawn in flight.
-            spawn_placeholder = AppProcess(app_name=app_name, starting=True, started_at=time.time())
+            spawn_placeholder = _starting_reservation(app_name)
             _processes[app_name] = spawn_placeholder
     if await_inflight:
         logger.info("App %s backend is already starting — awaiting the in-flight spawn", app_name)
@@ -433,7 +442,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     root = app_dir(app_name)
     entry_point = manifest.backend.entryPoint
     # Module-style entry point (e.g. "kiro_crew.apps.builtins.<name>"):
-    # used by built-in apps that live inside the Kiro Crew package itself.
+    # used by built-in apps that live inside the KiroCrew package itself.
     # The shape test is the shared `is_module_style_entry_point` -- the same
     # predicate `bridges_mcp.py` and the install-time desktop gate answer from,
     # so what this spawn provisions and what those sites assume it provisions
@@ -503,10 +512,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
             if not (_MIN_PORT <= port <= _MAX_PORT):
                 logger.error(
                     "App %s: port %d outside allowed range %d-%d",
-                    app_name,
-                    port,
-                    _MIN_PORT,
-                    _MAX_PORT,
+                    app_name, port, _MIN_PORT, _MAX_PORT,
                 )
                 return None
             # Claim it immediately so a concurrently-starting auto-port app cannot
@@ -544,10 +550,8 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
             if healthy:
                 try:
                     sel().log_api_access(
-                        caller="gateway",
-                        operation="app_backend_adopt",
-                        outcome="adopted",
-                        resources=f"{app_name} port={port}",
+                        caller="gateway", operation="app_backend_adopt",
+                        outcome="adopted", resources=f"{app_name} port={port}",
                     )
                 except Exception as exc:
                     logger.debug("SEL audit failed for app %s backend adopt: %s", app_name, exc)
@@ -566,20 +570,10 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                 if adopted is None:
                     return None
                 adopted_pids, adopted_start_times = adopted
-                logger.info(
-                    "App %s: healthy instance already on port %d — adopting (pids=%s)",
-                    app_name,
-                    port,
-                    adopted_pids,
-                )
+                logger.info("App %s: healthy instance already on port %d — adopting (pids=%s)", app_name, port, adopted_pids)
                 ap = AppProcess(
-                    app_name=app_name,
-                    port=port,
-                    pid=0,
-                    proc=None,
-                    healthy=True,
-                    started_at=time.time(),
-                    log_path=str(log_path),
+                    app_name=app_name, port=port, pid=0, proc=None,
+                    healthy=True, started_at=time.time(), log_path=str(log_path),
                     adopted_pids=adopted_pids,
                     adopted_start_times=adopted_start_times,
                     gateway_started=True,
@@ -606,7 +600,10 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                 # would kill a healthy service we would immediately re-adopt. stop's
                 # adopted path kills only the re-validated PIDs for this reason.
                 with _lock:
-                    if _spawn_owner is not None and _processes.get(app_name) is not _spawn_owner:
+                    if (
+                        _spawn_owner is not None
+                        and _processes.get(app_name) is not _spawn_owner
+                    ):
                         return None
                     _processes[app_name] = ap
                     _allocated_ports[app_name] = port
@@ -622,8 +619,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
             else:
                 try:
                     sel().log_api_access(
-                        caller="gateway",
-                        operation="app_backend_spawn",
+                        caller="gateway", operation="app_backend_spawn",
                         outcome="rejected_port_unhealthy",
                         resources=f"{app_name} port={port}",
                     )
@@ -631,9 +627,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                     logger.debug("SEL audit failed for app %s port rejection: %s", app_name, exc)
                 logger.warning(
                     "App %s: port %d occupied by unhealthy process — "
-                    "kill it manually then retry",
-                    app_name,
-                    port,
+                    "kill it manually then retry", app_name, port,
                 )
                 return None
         except OSError:
@@ -746,6 +740,12 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     # start an app on a host that is running perfectly well.
     if central_ceiling_installed():
         _platform_extra[POLICY_CACHE_ONLY_ENV] = "1"
+        # An enterprise child adopts only the cache for the profile this gateway is
+        # pinned to; minimal_env() would otherwise drop the pin it inherits.
+        from kiro_crew.platform.enterprise_policy_fetch import PROFILE_PIN_ENV
+
+        if os.environ.get(PROFILE_PIN_ENV):
+            _platform_extra[PROFILE_PIN_ENV] = os.environ[PROFILE_PIN_ENV]
         # The EFFECTIVE bound, not the env var: a fleet is just as likely to declare
         # max_cache_age_secs in the published document, and reading only the environment
         # would leave this child with no bound at all — accepting an arbitrarily stale
@@ -812,7 +812,11 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     bound_port = os.environ.get("KIROCREW_BOUND_PORT", "").strip()
     bound_host_env = os.environ.get("KIROCREW_BOUND_HOST", "").strip()
     gateway_origin = ""
-    if bound_port.isdigit() and 1 <= int(bound_port) <= 65535 and bound_host_env in ("", "::1"):
+    if (
+        bound_port.isdigit()
+        and 1 <= int(bound_port) <= 65535
+        and bound_host_env in ("", "::1")
+    ):
         # Host evidence: absent means loopback (the default bind shapes —
         # loopback itself, or a wildcard bind loopback reaches); "::1" is the
         # v6-loopback family marker. Only these two shapes are injected: a
@@ -932,10 +936,8 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                 logger.info("Installing npm deps for app %s", app_name)
                 try:
                     sel().log_api_access(
-                        caller="gateway",
-                        operation="app_backend_npm_install",
-                        outcome="started",
-                        resources=f"{app_name}",
+                        caller="gateway", operation="app_backend_npm_install",
+                        outcome="started", resources=f"{app_name}",
                     )
                 except Exception as exc:
                     logger.debug("SEL audit failed for npm install %s: %s", app_name, exc)
@@ -947,10 +949,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
                     sandboxed_npm = cgroup_scope_argv(sandboxed_npm)  # cgroup DoS ceiling
                     run_limited(
                         sandboxed_npm,
-                        cwd=str(root),
-                        env=env,
-                        capture_output=True,
-                        timeout=120,
+                        cwd=str(root), env=env, capture_output=True, timeout=120,
                     )
                 except Exception as exc:
                     logger.warning("Failed to install npm deps for app %s: %s", app_name, exc)
@@ -979,7 +978,6 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         if _shipped_md_notebook:
             cmd = platform_compat.isolated_python_argv(
                 "-I",
-                "-B",
                 "-c",
                 (
                     "import runpy, sys; "
@@ -1028,7 +1026,9 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         cwd = str(root)
 
     # --- ASGI (Python) backend ---
-    elif backend_type == "asgi" or (not backend_type and _is_asgi_entry(entry)):
+    elif backend_type == "asgi" or (
+        not backend_type and _is_asgi_entry(entry)
+    ):
         # Prefer the app's venv interpreter, else the gateway's own (sys.executable) —
         # never a bare "python3": a bare name relies on PATH, which isn't guaranteed
         # (e.g. some build environments ship only a versioned interpreter, so
@@ -1254,16 +1254,12 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
     sandboxed_cmd = cgroup_scope_argv(sandboxed_cmd)  # cgroup DoS ceiling
 
     logger.info(
-        "Spawning app %s backend: %s",
-        app_name,
-        " ".join(sandboxed_cmd),
+        "Spawning app %s backend: %s", app_name, " ".join(sandboxed_cmd),
     )
     try:
         sel().log_api_access(
-            caller="gateway",
-            operation="app_backend_spawn",
-            outcome="started",
-            resources=f"{app_name} port={port}",
+            caller="gateway", operation="app_backend_spawn",
+            outcome="started", resources=f"{app_name} port={port}",
         )
     except Exception as exc:
         logger.debug("SEL audit failed for app %s backend spawn: %s", app_name, exc)
@@ -1372,9 +1368,7 @@ def _start_app_backend_body(app_name: str, manifest: Any) -> AppProcess | None:
         collided = "address already in use" in tail.lower() or "errno 98" in tail.lower()
         logger.error(
             "App %s backend exited immediately (rc=%s) on port %d%s — %s",
-            app_name,
-            proc.returncode,
-            port,
+            app_name, proc.returncode, port,
             " [PORT COLLISION]" if collided else "",
             tail or "(no output)",
         )

@@ -125,6 +125,7 @@ from kiro_crew.cron_service.model import (  # noqa: F401 -- re-exported
 from kiro_crew.cron_service.readers import (  # noqa: F401 -- re-exported
     _SKILL_TOKEN_RE,
     _captured_template_id,
+    bound_script_runs_from_disk,
     dispatched_agents_from_disk,
     enabled_count_from_disk,
     job_agent_names_from_disk,
@@ -151,6 +152,7 @@ from kiro_crew.cron_service.schedule import (  # noqa: F401 -- re-exported
     is_due,
     is_valid_skip_date,
     is_valid_timezone,
+    never_fires_warning,
     next_wake_secs,
     parse_time_string,
     validate_cron_expr,
@@ -492,8 +494,10 @@ class CronPauseNotSaved(RuntimeError):
     """Raised by :meth:`CronService.cancel` when a cancelled one-shot's pause did not reach the store.
 
     The run is cancelled and its history entry written; only the park failed to
-    land, and nothing retries the save later. The message describes the job as the
-    cancel last saw it, after the merge (see :func:`_cancelled_park_report`).
+    land. A scheduled run keeps its terminal record for the next store tick, but
+    this error still reports that no durable write has returned yet. The message
+    describes the job as the cancel last saw it, after the merge (see
+    :func:`_cancelled_park_report`).
     """
 
 
@@ -501,10 +505,15 @@ class CronPauseNotSaved(RuntimeError):
 _PARK_JOB_REMOVED = "the job is no longer in the cron store"
 _PARK_NEWER_RUN = "the cron store already holds a newer run of the job"
 _PARK_NOT_ONE_SHOT = "the job is no longer a one-shot in the cron store"
+_PARK_NEWER_CHOICE = "the job was paused or resumed after the cancel"
 _PARK_NOT_SAVED = "The run was cancelled, but its pause could not be saved"
 _ON_SCHEDULE_MESSAGE = (
     f"{_PARK_NOT_SAVED}: a newer run of the job was recorded meanwhile, so the job is back"
     " on its schedule now. Pause or delete it if it must not run again."
+)
+_RESUMED_MESSAGE = (
+    "The run was cancelled, but the job was resumed meanwhile, so it is back on its"
+    " schedule now. Pause or delete it if it must not run again."
 )
 _RECURRING_MESSAGE = (
     f"{_PARK_NOT_SAVED}: the job was changed to a recurring schedule meanwhile and runs on"
@@ -513,7 +522,11 @@ _RECURRING_MESSAGE = (
 
 
 def _cancelled_park_report(
-    job: CronJob | None, reason: str | None, saved: str | None = None
+    job: CronJob | None,
+    reason: str | None,
+    saved: str | None = None,
+    *,
+    held: bool = False,
 ) -> tuple[str, str | None]:
     """The history note and the message for a cancelled one-shot's park.
 
@@ -523,10 +536,20 @@ def _cancelled_park_report(
     is true whatever wrote the store meanwhile. A message of None means nothing
     is left to pause, and ``cancel`` returns True: a failed park answers that
     only on ``saved``, what the store as saved shows when it shows the job
-    cannot run again (``CronService._saved_job_state``).
+    cannot run again (``CronService._saved_job_state``). ``held`` says this
+    process still holds the cancel's terminal record for a later store write
+    (a scheduled run): a reload re-applies it, so only a restart before that
+    write lands can run the job again.
     """
     if reason is None:
         return "", None
+    if reason == _PARK_NEWER_CHOICE and job is not None:
+        # The store saved the user's later choice, so it is the job's state.
+        if job.enabled:
+            return "; the job was resumed meanwhile, so it is back on its schedule now", (
+                _RESUMED_MESSAGE
+            )
+        return "; the job was paused meanwhile", None
     if saved == "absent":
         return "; the job was removed from the cron store meanwhile", None
     note = f"; the pause could not be saved ({reason})"
@@ -540,6 +563,12 @@ def _cancelled_park_report(
     # shown paused or absent by the saved store: a reload or a restart can bring
     # it back enabled, so it may run again.
     subject = "this one-shot" if job is None or job.schedule.kind == "at" else "the job"
+    if held:
+        return f"{note}, so {subject} may run again after a restart", (
+            f"{_PARK_NOT_SAVED}. It is held off the schedule until a later cron store"
+            f" write saves the pause, so {subject} may run again only if the gateway"
+            " restarts first. Delete it if it must not run again."
+        )
     return f"{note}, so {subject} may run again", (
         f"{_PARK_NOT_SAVED}, so {subject} may run again once the cron store is reloaded or"
         " the gateway restarts. Delete it if it must not run again."
@@ -639,6 +668,11 @@ class CronService:
         # every apply of a held record: the loop holds, worker threads re-apply
         # and release, and a hold and a re-apply never interleave on one job.
         self._held_run_records: dict[str, CronJob] = {}
+        # The held records that are a scheduled cancel or reap's terminal
+        # settlement, by job id (the same object as in _held_run_records). Their
+        # park is not on disk until a save lands it, so they leave the listed
+        # job's ``user_paused`` as persisted (_apply_held_run_record).
+        self._held_settlements: dict[str, CronJob] = {}
         self._held_run_records_guard = threading.Lock()
         # True while a critical-posture episode is deferring scheduled
         # firings (see _on_timer). Log-throttle state only: the INFO line
@@ -663,9 +697,19 @@ class CronService:
         # the entire exact key, not one caller's reference to it.
         self._active_session_lock = threading.Lock()
         self._active_session_keys: dict[str, dict[str, _RunClaim | None]] = {}
+        # (job id, key) pairs whose registering run ended its turn on the key
+        # (``finish_session_key``): retired by the last sub-agent's cleanup even
+        # while that run's claim is live.
+        self._finished_session_keys: set[tuple[str, str]] = set()
         self._sessions: SessionManager | None = None
         self._reaper_task: asyncio.Task[None] | None = None
         self._push_refresh: Callable[[str], None] | None = None  # set externally
+        # Creates a missing Schedule-page folder by name and returns
+        # ``(folder_id, error)``. Set by the dashboard once its socket is bound
+        # (``wire_app_cron_folder_creator``), so the app cron bridge can file a
+        # job in the folder its manifest names on install. None during gateway
+        # startup and in processes that do not own ``cron_folders.json``.
+        self.folder_creator: Callable[[str], Awaitable[tuple[str, str | None]]] | None = None
         # The gateway's failure alert for a run its deadline ended (set_timeout_alert),
         # and the alerts in flight: the loop keeps only weak references to tasks.
         self._timeout_alert: Callable[[CronJob, str], Coroutine[Any, Any, None]] | None = None
@@ -794,6 +838,8 @@ class CronService:
     # The runs in flight: ``kiro_crew.cron_service.service.run_registry``.
     register_active_session_key = _run_registry.register_active_session_key
     clear_active_session_key = _run_registry.clear_active_session_key
+    retire_finished_session_key = _run_registry.retire_finished_session_key
+    finish_session_key = _run_registry.finish_session_key
     _run_session_keys = _run_registry._run_session_keys
     active_session_keys = _run_registry.active_session_keys
     get_history = _run_registry.get_history
@@ -826,6 +872,7 @@ class CronService:
     _save_held_run_records_locked = _run_merge._save_held_run_records_locked
     _flush_held_run_records = _run_merge._flush_held_run_records
     _merge_job_result = _run_merge._merge_job_result
+    _merge_terminal_state_with_retry = _run_merge._merge_terminal_state_with_retry
     _merge_terminal_state_locked = _run_merge._merge_terminal_state_locked
     _saved_job_state = _run_merge._saved_job_state
     # The loop-stall breaker: ``kiro_crew.cron_service.service.stall_breaker``.
@@ -1090,6 +1137,20 @@ class CronService:
                 if job.id == job_id:
                     if expected_owner is not None and job.created_by != expected_owner:
                         raise PermissionError("Cron job ownership violation")
+                    # A request that moves the job's pause state is ordered after
+                    # every terminal record frozen before it, so a pending record
+                    # keeps this choice (``_apply_held_run_record``). So is a
+                    # resume of a one-shot: another process can hold a cancelled
+                    # run's park for it that this store never received, and the
+                    # resume is the user's answer to it. Any other request that
+                    # changes nothing records nothing, and its save leaves the
+                    # store's bytes as they were.
+                    if (
+                        (job.enabled, job.user_paused) != (enabled, not enabled)
+                        or (enabled and job.auto_paused)
+                        or (enabled and job.schedule.kind == "at")
+                    ):
+                        job.user_pause_generation += 1
                     job.user_paused = not enabled
                     job.enabled = enabled
                     # Re-enabling clears an execution auto-pause; without this a

@@ -40,6 +40,7 @@ from kiro_crew.apps.manager import (
     get_app,
 )
 from kiro_crew.apps.manifest import Dependencies, PlatformConfig
+from kiro_crew.apps.point_grants import point_grant_families
 from kiro_crew.apps.registry import minimal_env
 from kiro_crew.apps.routes_lifecycle import (
     _deregister_app_off_loop,
@@ -281,7 +282,7 @@ async def handle_enable_app(request: web.Request) -> web.Response:
         return denied
 
     name = request.match_info["name"]
-    info = get_app(name)
+    info = await asyncio.to_thread(get_app, name)
     if not info:
         return web.json_response({"error": f"app {name!r} not installed"}, status=404)
 
@@ -297,14 +298,14 @@ async def handle_enable_app(request: web.Request) -> web.Response:
             # same "no body" path as malformed JSON, not a 500.
             pass
     session_approval_consent = body.get("sessionApprovalConsent") is True
-    # The entries the owner was shown, as {"api": [...], "events": [...]}.
+    # The entries the owner was shown, as {"api": [...], "events": [...], ...}.
     # Anything else approves nothing: a bare flag cannot say what was seen.
     raw_grants = body.get("grantsConsent")
     grants_consent: dict[str, list[str]] | None = None
     if isinstance(raw_grants, dict):
         grants_consent = {
             family: [e for e in raw_grants.get(family) or [] if isinstance(e, str)]
-            for family in ("api", "events")
+            for family in ("api", "events", *point_grant_families())
             if isinstance(raw_grants.get(family) or [], list)
         }
     if session_approval_consent or grants_consent is not None:
@@ -320,7 +321,17 @@ async def handle_enable_app(request: web.Request) -> web.Response:
     resources = info.get("resources", "gateway")
     manifest = info.get("manifest", {})
     on_enable = (manifest.get("setup") or {}).get("onEnable", "")
-    enable_timeout = int((manifest.get("setup") or {}).get("onEnableTimeout", 30))
+    # The record carries the timeout as `int()` read it, the form the signature
+    # covers; the 1..300 bound is applied (and a clamp logged) here, where the script
+    # runs under the app lifecycle lock. A local import keeps this helper out of the
+    # names the routes facade serves from this module.
+    from kiro_crew.apps.manifest import lifecycle_timeout_seconds
+
+    enable_timeout = lifecycle_timeout_seconds(
+        (manifest.get("setup") or {}).get("onEnableTimeout"),
+        app_name=name,
+        field_name="onEnableTimeout",
+    )
 
     # Per-app lifecycle lock: enable mutates metadata, registers resources,
     # and starts the backend — must not interleave with a concurrent
@@ -329,7 +340,7 @@ async def handle_enable_app(request: web.Request) -> web.Response:
     async with app_lifecycle_lock(name):
         # A re-enable repeats every step but the Python hooks: the flag does not prove
         # onEnable ran (a file-only CLI enable skips it), while hook_reconcile loads hooks.
-        was_enabled = app_enabled_state(name) is True
+        was_enabled = await asyncio.to_thread(app_enabled_state, name) is True
         result = await asyncio.to_thread(
             enable_app,
             name,
@@ -542,7 +553,7 @@ async def handle_disable_app(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     name = request.match_info["name"]
-    info = get_app(name)
+    info = await asyncio.to_thread(get_app, name)
     if not info:
         return web.json_response({"error": f"app {name!r} not installed"}, status=404)
 
@@ -556,7 +567,7 @@ async def handle_disable_app(request: web.Request) -> web.Response:
         if startup_refusal is not None:
             return startup_refusal
         # Teardown decides whether app code may run from `enabled`; read it under the lock.
-        if (enabled := app_enabled_state(name)) is not None:
+        if (enabled := await asyncio.to_thread(app_enabled_state, name)) is not None:
             info = {**info, "enabled": enabled}
 
         # `onDisable` is NOT run here: it runs inside `teardown_app_runtime`
@@ -669,7 +680,7 @@ async def handle_open_app(request: web.Request) -> web.Response:
     if owner_denied is not None:
         return owner_denied
     name = request.match_info["name"]
-    info = get_app(name)
+    info = await asyncio.to_thread(get_app, name)
     if not info:
         return web.json_response({"error": f"app {name!r} not found"}, status=404)
 

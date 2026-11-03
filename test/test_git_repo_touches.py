@@ -22,6 +22,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
+from git_maintenance_helpers import git_maintenance_off_entries
 
 from kiro_crew.dashboard import git_repo_touches as touches
 from kiro_crew.dashboard.chat_runner import _flush_file_changes
@@ -60,12 +61,14 @@ def mock_sel():
 
 def _init_repo(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+    env.update(git_maintenance_off_entries(env))
     subprocess.run(
         ["git", "init", "-q", "-b", "trunk"],
         cwd=root,
         check=True,
         capture_output=True,
-        env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull},
+        env=env,
     )
     return root
 

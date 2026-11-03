@@ -144,6 +144,7 @@ class SubagentManager:
         completion_keep_chars: int = COMPLETION_KEEP_DEFAULT_CHARS,
         memory_mode_for_session: Callable[[str], str] | None = None,
         defer_queue_dispatch: bool = False,
+        hold_orphan_notices: bool = False,
     ):
         self._sessions = sessions
         # Run ids a parent-end teardown stopped. Keyed by ID rather than carried
@@ -177,6 +178,10 @@ class SubagentManager:
         self._teardown_sweeps_owed: list[tuple[str, AbstractSet[str], str]] = []
         self._teardown_fence_lock = threading.Lock()
         self._memory_mode_for_session = memory_mode_for_session
+        #: Parent session key -> the folder steering directories that parent
+        #: receives. Wired by the gateway (``DashboardState``); unset in a
+        #: process with no chat folders, where children get no folder steering.
+        self._parent_steering_dirs: Callable[[str], Awaitable[tuple[str, ...]]] | None = None
         self._ctx_builder = ctx_builder
         self._on_done = on_done
         #: While True the staggered pump admits nothing: the durable rows that
@@ -189,6 +194,16 @@ class SubagentManager:
         #: a hold that is never released leaves one debug line behind instead
         #: of the silent "accepted, never claimed" queue this fix diagnoses.
         self._queue_dispatch_hold_logged = False
+        #: Set while the boot orphan sweep may not send its notices yet. The sweep
+        #: starts with the reaper, before the gateway has restored the dashboard
+        #: tabs those notices are injected into, so a notice sent then finds no tab
+        #: and falls back to the owner DM. The sweep still ends the orphans'
+        #: processes at once; only the notices wait for
+        #: :meth:`release_orphan_notices`, bounded by ``_ORPHAN_NOTICE_HOLD_SECS``.
+        #: ``None`` (the default: tests, tools) sends them as soon as it finds them.
+        self._orphan_notice_gate: asyncio.Event | None = (
+            asyncio.Event() if hold_orphan_notices else None
+        )
         # ``_max_concurrent`` is the EFFECTIVE cap every admission read site
         # consults: ``min(user cap, adaptive cap)``. The user's resolved cap
         # (``agent.max_subagents`` / the auto ceiling) is the ceiling in
@@ -410,6 +425,13 @@ class SubagentManager:
         # cannot see it, so the gate bounds it from this clock
         # (``agent.subagent_queue_max_wait_secs``) at each re-park.
         self._floor_waits: dict[str, tuple[int, int, int]] = {}
+        # Member id -> the parent turn attempt that spawned a member the gate
+        # queued (``api_spawn``), handed to the real record when the pump starts
+        # it (``_spawned_under``). In memory only: the token holds an asyncio
+        # task, so it never enters a queue row or the durable store. Bounded to
+        # ``_QUEUED_SPAWN_ATTEMPT_LIMIT``, oldest first (``carry_spawn_attempt``);
+        # a restart forgets it and that member holds nothing.
+        self._queued_spawn_attempts: dict[str, tuple[str, Any, int]] = {}
         self._pressure_recheck_handle: asyncio.TimerHandle | None = None
         # agent_id -> the ``approval_mode`` a durable row was accepted with, for
         # as long as it waits: the store never carries it, so a window refill
@@ -867,6 +889,7 @@ class SubagentManager:
     reconfigure = _config_surface.reconfigure
     apply_limits = _config_surface.apply_limits
     release_queue_dispatch = _config_surface.release_queue_dispatch
+    release_orphan_notices = _config_surface.release_orphan_notices
     _clamp_effective_cap = _config_surface._clamp_effective_cap
     set_cap_raise_listener = _config_surface.set_cap_raise_listener
     _notify_cap_raised = _config_surface._notify_cap_raised
@@ -897,6 +920,8 @@ class SubagentManager:
     _pressure_lane_started = _admission_surface._pressure_lane_started
     _forget_pressure_clock = _admission_surface._forget_pressure_clock
     _forget_pending_start = _admission_surface._forget_pending_start
+    carry_spawn_attempt = _admission_surface.carry_spawn_attempt
+    _take_spawn_attempt = _admission_surface._take_spawn_attempt
     _drain_queue = _admission_surface._drain_queue
     _admit_released_start = _admission_surface._admit_released_start
     _release_admitted_start = _admission_surface._release_admitted_start
@@ -982,6 +1007,7 @@ class SubagentManager:
     _sessions_under = _terminal_surface._sessions_under
     _retain_process_handles = _terminal_surface._retain_process_handles
     notify_injection_failed = _terminal_surface.notify_injection_failed
+    suppress_retired_delivery = _terminal_surface.suppress_retired_delivery
     batch_members_pending = _terminal_surface.batch_members_pending
     batch_reports_in_flight = _terminal_surface.batch_reports_in_flight
     arm_report_in_flight = _terminal_surface.arm_report_in_flight
@@ -1026,6 +1052,7 @@ class SubagentManager:
     _hold_for_detached_writer = _run_surface._hold_for_detached_writer
     _cap_unclaimed_result = _run_surface._cap_unclaimed_result
     _record_reap_ending = _run_surface._record_reap_ending
+    _leave_for_next_start = _run_surface._leave_for_next_start
     _run_inner = _run_surface._run_inner
     _stop_recovery_wanted = _run_surface._stop_recovery_wanted
     _yield_for_stop_recovery = _run_surface._yield_for_stop_recovery

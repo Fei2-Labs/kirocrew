@@ -356,7 +356,8 @@ class TestApprovalPolicy:
 
     def test_set_approval_policy_missing_session(self, cfg):
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        mgr.set_approval_policy("nonexistent", "auto")  # should not raise
+        assert mgr.set_approval_policy("nonexistent", "auto") is None
+        assert not mgr.has_session("nonexistent")
 
     @pytest.mark.asyncio
     async def test_approval_policy_propagated_on_create(self, cfg):
@@ -1153,7 +1154,6 @@ class TestGetOrCreatePoolClaim:
     async def test_cold_start_with_resume_sid(self, cfg):
         """get_or_create with a stored session_map entry attempts resume."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        # Mock session_map to return a resume SID
         with (
             patch.object(mgr._session_map, "get", return_value="sid-resume-test"),
             patch.object(mgr._session_map, "get_cwd", return_value=None),
@@ -1182,6 +1182,41 @@ class TestGetOrCreateDeadProvider:
         mgr.release("k1")
         assert new_provider is not provider
         await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_dead_provider_evicted_mid_turn_cannot_unlock_the_successors_turn(self, cfg):
+        """Turn T still holds the permit of a session whose provider died. The
+        next claim evicts it and starts a successor, whose turn B is running when
+        T finally releases by key: that late release must not free B's permit."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        t_done = asyncio.Event()
+        t_holds = asyncio.Event()
+
+        async def _turn() -> None:
+            await mgr.get_or_create("k1")
+            t_holds.set()
+            await asyncio.wait_for(t_done.wait(), timeout=30)
+            mgr.release("k1")
+
+        t_task = asyncio.ensure_future(_turn())
+        try:
+            await await_until(t_holds, what="T holds the first session")
+            dead = mgr._sessions["k1"].provider
+            dead.is_alive = lambda: False
+            dead.is_process_alive = lambda: False
+
+            successor_provider, is_new, _ = await mgr.get_or_create("k1")  # B's turn
+            assert is_new and successor_provider is not dead
+            successor = mgr._sessions["k1"]
+            t_done.set()
+            await await_until(t_task, what="T's late release")
+            assert successor.semaphore.locked(), "T's release unlocked B's turn on the successor"
+            mgr.release("k1")
+            assert not successor.semaphore.locked()
+        finally:
+            t_done.set()
+            await await_until(asyncio.gather(t_task, return_exceptions=True), what="T")
+            await mgr.close_all()
 
 
 class TestConcurrentAccess:
@@ -1237,4 +1272,131 @@ class TestSessionState:
         # last_used should be recent (within last second)
         # flake-ok: pre-existing real-clock check that release stamped last_used within 1 s; a worker stall over 1 s reds it; moved verbatim; tracked for a de-flake pass
         assert time.monotonic() - sess.last_used < 1.0
+        await mgr.close_all()
+
+
+class TestRealClaimJoinsAnInFlightEagerStart:
+    """A real claim that arrives while the key's eager (speculative) start is
+    still starting waits for that start and claims its session, instead of
+    cold-starting a second process for the same key. When the eager start
+    fails, the claim cold-starts as before."""
+
+    @staticmethod
+    def _gated_factory(gate: asyncio.Event, providers: list, fail_first: bool = False):
+        base = _mock_provider_factory()
+
+        def factory(session_key=None, agent=None, channel_id=None, **kwargs):
+            m = base(session_key, agent, channel_id, **kwargs)
+            failing = fail_first and not providers
+
+            async def _start():
+                await gate.wait()
+                if failing:
+                    raise RuntimeError("eager start failed")
+
+            m.start = _start
+            providers.append(m)
+            return m
+
+        return factory
+
+    @staticmethod
+    def _real_claim_parked(mgr: SessionManager, key: str, providers: list) -> bool:
+        # On the old path the real claim spawns its own provider (a second
+        # factory call). On the joined path it waits on the eager start's
+        # announcement. Either way it has stopped moving.
+        if len(providers) >= 2:
+            return True
+        entry = getattr(mgr._allocation_state, "speculative_starts", {}).get(key)
+        return bool(entry is not None and getattr(entry[0], "_waiters", None))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("priority", ["fg", "bg"])
+    async def test_a_send_during_an_eager_start_spawns_one_process(self, cfg, priority):
+        from kiro_crew.start_priority import StartPriority
+
+        start_priority = StartPriority(priority)
+        gate = asyncio.Event()
+        providers: list = []
+        mgr = SessionManager(cfg, provider_factory=self._gated_factory(gate, providers))
+        key = "dashboard:join-eager"
+
+        eager = asyncio.create_task(
+            mgr.get_or_create(key, speculative=True, start_priority=start_priority)
+        )
+        await async_wait_until(lambda: len(providers) == 1, describe=lambda: len(providers))
+        real = asyncio.create_task(mgr.get_or_create(key, start_priority=start_priority))
+        await async_wait_until(
+            lambda: self._real_claim_parked(mgr, key, providers),
+            describe=lambda: len(providers),
+        )
+
+        gate.set()
+        eager_provider, eager_new, _ = await await_until(eager, what="eager start")
+        assert eager_new is True
+        mgr.release(key)
+        real_provider, real_new, _ = await await_until(real, what="real claim")
+
+        assert len(providers) == 1, "the send spawned a second process"
+        assert real_provider is eager_provider
+        # The eager start left the first-turn flag armed for the real message.
+        assert real_new is True
+        assert mgr.count == 1
+        assert mgr._allocation_state.speculative_starts == {}
+        mgr.release(key)
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_foreground_send_does_not_wait_on_a_background_eager_start(self, cfg):
+        """A BACKGROUND eager start waits in every start queue at BACKGROUND: a
+        person's FOREGROUND claim must not inherit that position, so it
+        cold-starts at its own priority as before."""
+        from kiro_crew.start_priority import StartPriority
+
+        providers: list = []
+        gate = asyncio.Event()
+        gate.set()
+        mgr = SessionManager(cfg, provider_factory=self._gated_factory(gate, providers))
+        key = "dashboard:join-eager-background"
+        queued = asyncio.Event()  # never set: the eager start is still waiting
+        mgr._allocation_state.speculative_starts[key] = (queued, StartPriority.BACKGROUND)
+
+        real = asyncio.create_task(mgr.get_or_create(key, start_priority=StartPriority.FOREGROUND))
+        provider, is_new, _ = await await_until(real, what="real claim", timeout=10.0)
+
+        assert not queued.is_set()
+        assert providers == [provider]
+        assert is_new is True
+        mgr.release(key)
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_send_cold_starts_when_the_eager_start_fails(self, cfg):
+        gate = asyncio.Event()
+        providers: list = []
+        mgr = SessionManager(
+            cfg, provider_factory=self._gated_factory(gate, providers, fail_first=True)
+        )
+        key = "dashboard:join-eager-fails"
+
+        with patch.object(SessionManager, "_dispatch_hard_kill"):
+            eager = asyncio.create_task(mgr.get_or_create(key, speculative=True))
+            await async_wait_until(lambda: len(providers) == 1, describe=lambda: len(providers))
+            real = asyncio.create_task(mgr.get_or_create(key))
+            await async_wait_until(
+                lambda: self._real_claim_parked(mgr, key, providers),
+                describe=lambda: len(providers),
+            )
+
+            gate.set()
+            with pytest.raises(RuntimeError, match="eager start failed"):
+                await await_until(eager, what="eager start")
+            real_provider, real_new, _ = await await_until(real, what="real claim")
+
+        assert len(providers) == 2
+        assert real_provider is providers[1]
+        assert real_new is True
+        assert mgr.count == 1
+        assert mgr._allocation_state.speculative_starts == {}
+        mgr.release(key)
         await mgr.close_all()

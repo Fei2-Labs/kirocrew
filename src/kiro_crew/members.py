@@ -25,7 +25,7 @@ import sys as _sys
 from typing import TYPE_CHECKING
 
 import kiro_crew._facade_mirror as _facade_mirror
-from kiro_crew import context_omissions, platform_compat  # noqa: F401
+from kiro_crew import context_omissions, member_records, platform_compat  # noqa: F401
 from kiro_crew.artifacts import slugify  # noqa: F401
 from kiro_crew.atomic_write import atomic_write, fsync_dir, read_bytes_with_retry  # noqa: F401
 from kiro_crew.config.paths import data_home  # noqa: F401
@@ -49,7 +49,9 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
     from kiro_crew.members_parts.dm_bindings import (  # noqa: F401
+        _read_canonical_binding,
         attributable_session_key,
+        dm_binding_depends_on_config,
         dm_binding_path,
         member_identity_for_session,
         read_dm_binding,
@@ -64,6 +66,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         record_activity,
     )
     from kiro_crew.members_parts.member_sessions import (  # noqa: F401
+        _CREWMATE_WORKER_MEMBERS,
+        _CREWMATE_WORKER_PROMPT_IN_CONTEXT,
         _CREWMATE_WORKER_SLOTS,
         MEMBER_DISPATCH_SERVER,
         MEMBER_PANEL_SERVER,
@@ -72,6 +76,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _member_session_element,
         _slot_part,
         crew_panel_enabled,
+        crewmate_worker_member_id,
+        crewmate_worker_prompt_in_context,
+        forget_crewmate_worker_session,
         is_crewmate_worker_session,
         is_member_session_key,
         member_dispatch_session_server,
@@ -80,6 +87,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         member_slot_key,
         member_thread_session_alias,
         member_turn_context,
+        note_crewmate_worker_prompt_channel,
         note_crewmate_worker_session,
         select_provider_backend,
     )
@@ -109,11 +117,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _stable_member_slug,
         canonical_member_key,
         check_crew_label,
+        count_person_created_crewmates,
         crew_id_for_display_name,
         crew_showing,
         is_configured_dispatchable_member,
         is_crew_id,
         is_dispatchable_member_name,
+        is_person_created_crewmate,
         is_readable_member_name,
         is_valid_member_name,
         key_new_crew,
@@ -129,9 +139,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         welcome_owed,
     )
     from kiro_crew.members_parts.prompt_layers import (  # noqa: F401
+        _RULES_WRITE_LOCK,
         MEMBER_BRIEFING_TRUNCATION_MARKER,
+        MemberRulesChanged,
         MemberRulesUnreadable,
         _briefing_pinned_target,
+        _write_member_rules,
         cap_member_briefing,
         member_briefing_path,
         member_briefing_supported,
@@ -164,6 +177,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     import os  # noqa: F401
     import re  # noqa: F401
     import stat  # noqa: F401
+    import threading  # noqa: F401
     from collections.abc import Container, Mapping  # noqa: F401
     from dataclasses import dataclass  # noqa: F401
     from datetime import datetime, timezone  # noqa: F401

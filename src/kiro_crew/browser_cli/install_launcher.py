@@ -26,7 +26,13 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from kiro_crew import github_runner, platform_compat
-from kiro_crew.browser_cli.install_runner import _PROBE_TIMEOUT_S, _run, redact_install_output
+from kiro_crew.browser_cli.install_runner import (
+    _PROBE_TIMEOUT_S,
+    INTERRUPTED_RC,
+    TIMEOUT_RC,
+    _run,
+    redact_install_output,
+)
 from kiro_crew.config.paths import config_dir
 from kiro_crew.env import find_node_tool
 
@@ -95,6 +101,15 @@ def _managed_node_path() -> Path:
 def _staged_node_runs(candidate: Path) -> str | None:
     """Reason the staged Node copy cannot run standalone, or ``None`` if it can.
 
+    :func:`_probe_staged_node` without the exit code.
+    """
+    failure = _probe_staged_node(candidate)
+    return None if failure is None else failure[1]
+
+
+def _probe_staged_node(candidate: Path) -> tuple[int, str] | None:
+    """``(returncode, reason)`` when the staged Node copy cannot run standalone.
+
     Runs the copy exactly as the gateway will run it -- by absolute path, from
     the managed leaf, under :func:`cli_env` -- and asks for its version. One
     probe covers every way a copy can be dead: a launcher script whose relative
@@ -111,10 +126,78 @@ def _staged_node_runs(candidate: Path) -> str | None:
     )
     if code != 0:
         detail = (err or out).strip().splitlines()
-        return f"exit {code}" + (f": {detail[-1]}" if detail else "")
+        # A loader names the missing library on its first line and follows it
+        # with the paths it tried, so the last line alone drops the cause.
+        line = next((d for d in detail if _MISSING_LIBRARY_RE.search(d)), None)
+        if line is None and detail:
+            line = detail[-1]
+        return code, f"exit {code}" + (f": {line.strip()}" if line else "")
     if _first_version(out) is None:
-        return f"did not report a version (stdout: {out.strip()[:80]!r})"
+        return 1, f"did not report a version (stdout: {out.strip()[:80]!r})"
     return None
+
+
+#: How the macOS (dyld) and Linux (ld.so) loaders name a shared library they
+#: could not load. Homebrew's ``node`` links ``@rpath/libnode.<N>.dylib`` from its
+#: Cellar, so a copy in the managed leaf fails with the first form.
+_MISSING_LIBRARY_RE = re.compile(
+    r"Library not loaded: (?P<dyld>\S+)|error while loading shared libraries: (?P<ld>[^:\s]+)"
+)
+
+
+def _unrunnable_node_remedy(reason: str) -> str:
+    """What the user does about a Node copy that :func:`_staged_node_runs` refused.
+
+    A missing shared library is the Homebrew split-``libnode`` build (or any
+    Node that is not one self-contained file): no copy of that binary can run
+    from the leaf, so the remedy names a Node that can and the override that
+    selects it. ``node_bin_dirs`` is cached for the gateway's lifetime, hence
+    the restart.
+    """
+    match = _MISSING_LIBRARY_RE.search(reason)
+    if match is None:
+        return "Install Node as a self-contained binary."
+    library = match.group("dyld") or match.group("ld")
+    return (
+        f"This Node build loads {library} from its own install tree, so a copy of it "
+        "cannot run (Homebrew's node ships libnode this way). Install a self-contained "
+        "Node 20 or newer, such as the official build from nodejs.org, set "
+        "KIROCREW_NODE_BIN_DIR to its bin directory, restart the gateway, and install "
+        "the browser CLI again."
+    )
+
+
+def staged_node_failure(command: list[str]) -> tuple[int, str] | None:
+    """``(returncode, reason)`` when the staged ``gateway-node`` *command* runs cannot start.
+
+    :func:`_stage_managed_node` runs a copy before it becomes ``gateway-node``,
+    but a copy staged before that check existed is still on disk, and
+    :func:`cli_command` vets it by location only. Running it here lets
+    ``install_browser`` report it before the browser download instead of
+    failing inside it with a loader crash. A fixed system Node is not probed:
+    the gateway did not stage it, and reinstalling the CLI would not change it.
+
+    The probe's own returncode is kept, so a probe that timed out
+    (``TIMEOUT_RC``) or was interrupted (``INTERRUPTED_RC``) reads as that, not
+    as a Node that cannot run, and gets no Node remedy.
+    """
+    if not command:
+        return None
+    managed = _managed_node_path()
+    try:
+        if Path(command[0]).resolve(strict=True) != managed.resolve(strict=True):
+            return None
+    except OSError:
+        return None
+    failure = _probe_staged_node(managed)
+    if failure is None:
+        return None
+    code, reason = failure
+    if code in (TIMEOUT_RC, INTERRUPTED_RC):
+        return code, f"the staged Node {managed} check did not finish ({reason})"
+    return code, (
+        f"the staged Node {managed} does not run ({reason}). {_unrunnable_node_remedy(reason)}"
+    )
 
 
 def _stage_managed_node(source: str) -> Path:
@@ -146,6 +229,7 @@ def _stage_managed_node(source: str) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     if root.is_symlink():
         raise OSError(f"managed CLI root is a symlink: {root}")
+    _clear_retired_managed_nodes(root)
     destination = _managed_node_path()
     fd, incoming = tempfile.mkstemp(
         dir=root,
@@ -156,18 +240,85 @@ def _stage_managed_node(source: str) -> Path:
     try:
         shutil.copyfile(source_path, incoming)
         if not platform_compat.IS_WINDOWS:
-            os.chmod(incoming, 0o500)
+            # The copy is a public Node executable with no secret payload; the
+            # mode just makes it read+exec only before it is probed and renamed.
+            os.chmod(incoming, 0o500)  # lockdown-ok: public Node binary, carries no secret
         reason = _staged_node_runs(Path(incoming))
         if reason is not None:
             raise OSError(
                 f"Node copied from {source_path} does not run from the managed leaf "
-                f"({reason}). Install Node as a self-contained binary."
+                f"({reason}). {_unrunnable_node_remedy(reason)}"
             )
-        os.replace(incoming, destination)
+        _swap_in_managed_node(Path(incoming), destination)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(incoming)
     return destination
+
+
+def _swap_in_managed_node(incoming: Path, destination: Path) -> None:
+    """Move the staged copy over ``destination``, surviving a running Node on Windows.
+
+    On POSIX this is a plain ``os.replace``: the OS renames over an executable
+    that a process has open, and the running image keeps its own copy.
+
+    Windows refuses to rename over a file that is open for execution, so a
+    reinstall or upgrade run while a managed ``node.exe`` is still serving an
+    agent fails here with a bare ``PermissionError`` ("Access is denied").
+    Windows does, however, allow renaming the running image to a different
+    name -- the open handle follows the file. So the running copy is moved
+    aside first, which frees the name, and the staged copy is renamed into
+    place. The moved-aside image is deleted best-effort: the still-running
+    process may hold it, and that is harmless -- the next install clears any
+    leftover ``.old-*`` sidecars before it stages. If even moving it aside
+    fails, the destination is genuinely pinned, and the error names the running
+    ``node.exe`` and the remedy instead of propagating a bare "Access is denied".
+    """
+    if not platform_compat.IS_WINDOWS:
+        os.replace(incoming, destination)
+        return
+    try:
+        os.replace(incoming, destination)
+        return
+    except PermissionError:
+        pass
+    # A unique token, not just the pid: two swaps in one gateway process would
+    # otherwise reuse the same retired name, and a retired node.exe the first
+    # swap left running (its best-effort delete failed) would make the second
+    # swap's move-aside try to overwrite a running executable and fail.
+    token = os.urandom(8).hex()
+    retired = destination.with_name(f".{destination.name}.{token}.old")
+    try:
+        os.replace(destination, retired)
+    except OSError as exc:
+        raise OSError(
+            f"the managed Node at {destination} is in use and could not be replaced "
+            "(Windows locks a running executable). Close every running browser CLI "
+            "session and any process using that node.exe, then install the browser "
+            "CLI again."
+        ) from exc
+    try:
+        os.replace(incoming, destination)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.replace(retired, destination)
+        raise
+    with contextlib.suppress(OSError):
+        os.unlink(retired)
+
+
+def _clear_retired_managed_nodes(root: Path) -> None:
+    """Delete any ``.node.exe.<token>.old`` sidecars a prior running-image swap left.
+
+    The swap on Windows renames a locked running ``node.exe`` aside and deletes
+    it best-effort; a copy the process still held stays on disk. Clearing them
+    here, before the next stage, keeps the leaf from accumulating dead images
+    without ever touching the live ``node.exe``.
+    """
+    name = _managed_node_path().name
+    for stale in root.glob(f".{name}.*.old"):
+        with contextlib.suppress(OSError):
+            os.unlink(stale)
 
 
 def _managed_cli_candidates() -> tuple[Path, ...]:

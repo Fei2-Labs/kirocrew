@@ -158,6 +158,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _darwin_libproc_fd_bound _darwin_libproc_fd_handle _darwin_peer_is_loopback
         darwin_established_tcp_count _darwin_libc_sysctl _darwin_libc_sysctl_loaded
         _darwin_libc_sysctl_lock _darwin_sysctl_handle darwin_process_argv
+        _darwin_tb_frequency
         darwin_process_environ DarwinKinfoProc _darwin_kinfo_proc_parse
         _darwin_kinfo_size_mismatch_logged _darwin_kinfo_query darwin_kinfo_proc
         darwin_pid_is_zombie darwin_pgroup_members _DARWIN_BSDINFO_SIZE _DARWIN_OFF_START_TVSEC
@@ -172,7 +173,8 @@ _MOVED: dict[str, tuple[str, ...]] = {
     "kiro_crew.platform_compat_runtime": tuple("""
         _UTF8_PROCESS_ENV _ensure_utf8_process_environment _KEPT_FOR_REEXEC keep_for_reexec
         kept_for_reexec _WHEEL_APPLY_MODULE cancel_wheel_applies_in_flight hard_exit
-        _disarm_process_alarm_before_exec reexec_launcher reexec_python_module
+        _disarm_process_alarm_before_exec _rearm_process_alarm_after_failed_exec
+        reexec_launcher reexec_python_module
         execv_target_available _POST_DRAIN_EXEC_FAILURE_EXIT _EXIT_FLUSH_DEADLINE_SECS
         exit_after_failed_restart_exec _drain_event_log_for_exit _WINDOWS_ARM_MACHINES
         is_windows_on_arm BUNDLED_BACKEND_DIST_DIRNAME is_bundled_interpreter
@@ -192,13 +194,14 @@ _MOVED: dict[str, tuple[str, ...]] = {
         pinned_dir_flags PINNED_TREE_MAX_DEPTH PinnedDirectory pinned_directory
         _win_open_without_following open_file_no_reparse _WIN_FILE_LIST_DIRECTORY
         _WIN_OPEN_ALWAYS _WIN_FILE_ATTRIBUTE_TAG_INFO win_fd_is_link _win_reparse_refused
-        win_open_no_reparse open_create_no_reparse
+        win_open_no_reparse open_create_no_reparse names_a_verbatim_only_file
         """.split()),
     "kiro_crew.platform_compat_files": tuple("""
         _RENAME_NOREPLACE_FN _RENAME_NOREPLACE_FLAG _SYS_RENAMEAT2_BY_MACHINE
         _build_renameat2_via_syscall RENAME_NOREPLACE_AVAILABLE TCC_PROTECTED_HOME_DIRS
         TCC_LIBRARY_WALKABLE_CHILDREN _LIBRARY_DIR rename_noreplace publish_dir_noreplace
         tcc_protected_dirs_for_walk tcc_prune_walk_dirs fchmod_safe chmod_safe
+        claude_code_managed_settings_dir
         _clear_readonly_and_retry rmtree_force _WIN_FILE_SHARE_READ_WRITE_DELETE
         open_log_file_for_tail open_lock_file_for_sweep path_volume_is_remote
         _WINDOWS_RUNNABLE_HOOK_SUFFIXES is_executable_file is_readonly_filesystem
@@ -216,8 +219,8 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _ACL_WRITE _NO_ACL_ERRNOS _acl_admits_another_account group_write_admits_another_account
         _is_root_owned_path _local_aws_bin_candidate _is_native_program
         _local_aws_bin_is_trusted trusted_aws_bin aws_bin_declined_on_ownership
-        trusted_system_path reveal_in_file_manager open_with_default_app _reveal_env
-        tool_outside_trusted_dirs short_path_name
+        trusted_system_path desktop_launcher_available reveal_in_file_manager
+        open_with_default_app _reveal_env tool_outside_trusted_dirs short_path_name
         """.split()),
     "kiro_crew.platform_compat_liveness": tuple("""
         PID_DEAD PID_ALIVE PID_UNSIGNALABLE live_thread_group_leaders is_thread_group_leader
@@ -262,7 +265,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _open_process_termination_handle open_process_termination_handle
         duplicate_asyncio_process_handle _windows_lineage_matches_lifetimes
         _windows_process_query_diagnostic _windows_descendant_failure_details
-        _windows_process_query_creation _windows_foreign_descendant_pids
+        _windows_process_query_creation _windows_foreign_descendant_pids _windows_is_older_orphan
         descendant_termination_handles close_process_handle descendant_termination_handles_async
         _JOB_OBJECT_LIMIT_ACTIVE_PROCESS _JOB_OBJECT_LIMIT_JOB_MEMORY
         _JOBOBJECT_EXTENDED_LIMIT_INFORMATION_CLASS apply_job_limits _TH32CS_SNAPTHREAD
@@ -283,7 +286,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         windows_tree_cleanup_pending _create_windows_subprocess_owned
         """.split()),
     "kiro_crew.platform_compat_kill": tuple("""
-        pgroup_exists _raise_taskkill_error kill_pid kill_process_group kill_process_tree
+        pgroup_exists _raise_taskkill_error kill_pid kill_process_group _killpg kill_process_tree
         kill_process_tree_pinned kill_pid_pinned kill_pid_async kill_process_tree_async
         REAP_TIMEOUT_SECS _shares_own_process_group kill_popen_tree kill_and_reap
         _run_cleanup_shielded _isolated_group_of_live_child _discard_output_until_exit
@@ -306,6 +309,9 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _linux_available_mib host_total_mib host_available_mib MEMORY_PRESSURE_NORMAL
         MEMORY_PRESSURE_WARN MEMORY_PRESSURE_CRITICAL _MEMORY_PRESSURE_NAMES
         _MEMORY_PRESSURE_SYSCTL memory_pressure_level memory_pressure_name
+        POWER_AC POWER_BATTERY POWER_UNKNOWN _LINUX_POWER_SUPPLY_ROOT _WIN_AC_OFFLINE
+        _WIN_AC_ONLINE _linux_supply_attr _linux_power_source _SystemPowerStatus
+        _windows_ac_line_status _windows_power_source power_source
         """.split()),
 }
 
@@ -387,6 +393,9 @@ _CARVED_IMPORTS: dict[str, frozenset[str]] = {
             "kiro_crew.platform_compat_identity",
             "kiro_crew.platform_compat_liveness",
             "kiro_crew.platform_compat_native",
+            # darwin_pgroup_members settles macOS's EPERM for pgroup_exists and for an
+            # all-zombie group's killpg.
+            "kiro_crew.platform_compat_proctable",
             "kiro_crew.platform_compat_trust",
             "kiro_crew.platform_compat_winproc",
             "kiro_crew.platform_compat_wintree",

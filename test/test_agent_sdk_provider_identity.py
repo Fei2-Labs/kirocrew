@@ -45,6 +45,7 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
 #: Files whose provider-identity branches were converted. Each must ask the
 #: predicate and must not compare the literal.
 CONVERTED = (
+    "context.py",
     "cli_doctor.py",
     "cli_doctor_parts/model_section.py",
     "knowledge/llm_pool.py",
@@ -212,19 +213,7 @@ def _literal_comparisons(path: Path) -> list[int]:
     return hits
 
 
-#: Files on axis (2) -- the session-map / live-client provider LABEL, whose
-#: constant is ``acp.types.PROVIDER_LABEL_CLAUDE``. They must not spell the raw
-#: literal either, but the constant they reach for is the label's, not this
-#: module's: ``provider_identity`` documents (1) and (2) as equal in value and
-#: deliberately uncoupled, so asking ``is_claude_code`` about a label is the
-#: silent coupling that note exists to prevent. In this fork it is also just
-#: wrong: ``agent.provider`` is declared ``enum=["acp"]``, so axis (1) never
-#: carries the Claude id, while every ``build_message`` caller threads
-#: ``provider_label(client)``.
-LABEL_AXIS = ("context.py",)
-
-
-@pytest.mark.parametrize("rel", CONVERTED + LABEL_AXIS)
+@pytest.mark.parametrize("rel", CONVERTED)
 def test_no_converted_file_compares_the_literal(rel: str) -> None:
     """The converted branches must keep asking the predicate.
 
@@ -251,56 +240,39 @@ def test_converted_files_ask_the_predicate(rel: str) -> None:
     Without this, deleting the branch (or renaming the file) would make the
     ratchet pass while the provider-specific logic went somewhere unwatched.
     """
-    body = (SRC / rel).read_text(encoding="utf-8")
+    # A composed file asks it in its own text or in an owner it composes.
+    body = "\n".join(
+        path.read_text(encoding="utf-8") for path in [SRC / rel, *_composed_owner_paths(rel)]
+    )
     assert "is_claude_code" in body, f"{rel} no longer asks is_claude_code()"
 
 
-@pytest.mark.parametrize("rel", LABEL_AXIS)
-def test_the_label_axis_uses_the_label_constant_not_the_predicate(rel: str) -> None:
-    """Axis (2) asks the label's own constant, on purpose.
-
-    ``context.py``'s ``provider_type`` is not ``agent.provider``: every
-    ``build_message`` caller passes ``provider_label(client)``, the live
-    client's served label. ``provider_identity`` names (1) and (2) as equal in
-    value but deliberately uncoupled "so a future divergence fails loudly
-    instead of silently coupling config vocabulary to session-map vocabulary" --
-    and routing a label through ``is_claude_code`` is that coupling. The raw
-    literal stays banned here by the ratchet above; only the constant differs.
-    """
-    body = (SRC / rel).read_text(encoding="utf-8")
-    assert "PROVIDER_LABEL_CLAUDE" in body, (
-        f"{rel} no longer reaches the label constant; a live-client provider "
-        "label must compare against acp.types.PROVIDER_LABEL_CLAUDE"
-    )
-    assert "is_claude_code(" not in body, (
-        f"{rel} asks is_claude_code() about a provider LABEL. That is axis (2), "
-        'not the agent.provider axis -- and agent.provider is enum=["acp"], so '
-        "the predicate can only ever answer False here."
-    )
-
-
-def test_onboarding_import_source_id_is_left_alone() -> None:
-    """``onboarding_import`` keeps its own ``"claude_code"``, on purpose.
-
-    There it identifies the Claude Code desktop app whose settings are being
-    imported (``~/.claude``, ``CLAUDE_CONFIG_DIR``) -- a foreign config tree on
-    disk, not the provider this process runs on. Routing it through the
-    predicate would assert a provider identity that has nothing to do with the
-    question being asked.
-    """
-    body = (SRC / "onboarding_import.py").read_text(encoding="utf-8")
-    assert '"claude_code"' in body
-    assert "is_claude_code" not in body
-
-
-def test_model_registry_keeps_its_index_key() -> None:
-    """``model_registry`` keeps the string as a namespace key, on purpose.
-
-    The module states the reason where the constant is defined: *"Named for the
-    registry key, NOT because windows are claude_code-only."* A model's context
-    window belongs to the model, not to the provider serving it, so these are
-    not provider checks and must not become any.
-    """
-    body = (SRC / "model_registry.py").read_text(encoding="utf-8")
-    assert '_WINDOW_INDEX = "claude_code"' in body
+@pytest.mark.parametrize(
+    ("module", "literal"),
+    [
+        # There ``"claude_code"`` identifies the Claude Code desktop app whose
+        # settings are being imported (``~/.claude``, ``CLAUDE_CONFIG_DIR``) -- a
+        # foreign config tree on disk, not the provider this process runs on.
+        # Routing it through the predicate would assert a provider identity that
+        # has nothing to do with the question being asked.
+        pytest.param(
+            "onboarding_import.py",
+            '"claude_code"',
+            id="test_onboarding_import_source_id_is_left_alone",
+        ),
+        # The module states the reason where the constant is defined: *"Named for
+        # the registry key, NOT because windows are claude_code-only."* A model's
+        # context window belongs to the model, not to the provider serving it, so
+        # these are not provider checks and must not become any.
+        pytest.param(
+            "model_registry.py",
+            '_WINDOW_INDEX = "claude_code"',
+            id="test_model_registry_keeps_its_index_key",
+        ),
+    ],
+)
+def test_a_non_provider_claude_code_string_is_left_alone(module: str, literal: str) -> None:
+    """These modules keep their own ``"claude_code"`` string, on purpose."""
+    body = (SRC / module).read_text(encoding="utf-8")
+    assert literal in body
     assert "is_claude_code" not in body

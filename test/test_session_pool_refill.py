@@ -39,7 +39,6 @@ class TestReloadProviderFactoryRefillsPool:
     async def test_reload_resets_pool_started_and_refills(self):
         """After reload_provider_factory, warm pool is replenished with new provider type."""
         mgr, factory = _make_manager(pool_size=1)
-        # Simulate initial start_pool having run
         mgr._pool_started = True
         old_provider = _make_provider()
         mgr._warm_pool.put_nowait((old_provider, time.monotonic()))
@@ -80,6 +79,7 @@ class TestReloadProviderFactoryRefillsPool:
             await mgr.reload_provider_factory()
 
         fake_task.cancel.assert_called_once()
+        assert mgr._pool_health_task is not fake_task, "a fresh health loop replaced it"
         await mgr.close_all()
 
 
@@ -242,21 +242,22 @@ class TestDefaultProjectDir:
 
 
 class TestPoolCwd:
-    def test_pool_cwd_set_from_default_project_dir(self):
+    @pytest.mark.parametrize(
+        "project_dir, expected",
+        [
+            pytest.param(
+                "/custom/workspace", "/custom/workspace", id="pool_cwd_set_from_default_project_dir"
+            ),
+            pytest.param("", "", id="pool_cwd_empty_when_no_workspace"),
+        ],
+    )
+    def test_pool_cwd_follows_default_project_dir(self, project_dir, expected):
         from kiro_crew.session import SessionManager
 
         cfg = _make_cfg()
-        with patch("kiro_crew.session.default_project_dir", return_value="/custom/workspace"):
+        with patch("kiro_crew.session.default_project_dir", return_value=project_dir):
             mgr = SessionManager(cfg)
-        assert mgr._pool_cwd == "/custom/workspace"
-
-    def test_pool_cwd_empty_when_no_workspace(self):
-        from kiro_crew.session import SessionManager
-
-        cfg = _make_cfg()
-        with patch("kiro_crew.session.default_project_dir", return_value=""):
-            mgr = SessionManager(cfg)
-        assert mgr._pool_cwd == ""
+        assert mgr._pool_cwd == expected
 
     @pytest.mark.asyncio
     async def test_pool_claimed_when_cwd_matches_pool_cwd(self):
@@ -306,6 +307,8 @@ class TestPoolCwd:
 
         mgr._drain_and_claim.assert_not_awaited()
         factory.assert_called_once()
+        assert provider is not pooled
+        assert mgr._warm_pool.qsize() == 1
 
     @pytest.mark.asyncio
     async def test_fill_warm_pool_passes_pool_cwd(self):
@@ -361,8 +364,7 @@ class TestFillLockReleasedAcrossStart:
             started += 1
             if started == 1:
                 first_started.set()
-            # flake-ok: pre-existing gated start stub, moved verbatim; the finally block sets the event and every outer await is bounded
-            await release_start.wait()
+            await await_until(release_start, what="the test releases the gated start")
 
         def _factory(*a, **kw):
             p = _make_provider()
@@ -424,8 +426,7 @@ class TestFillLockReleasedAcrossStart:
             nonlocal started
             started += 1
             in_start.set()
-            # flake-ok: pre-existing gated start stub, moved verbatim; the finally block sets the event and every outer await is bounded
-            await release_start.wait()
+            await await_until(release_start, what="the test releases the gated start")
 
         def _factory(*a, **kw):
             p = _make_provider()
@@ -475,8 +476,7 @@ class TestFillLockReleasedAcrossStart:
 
         async def _slow_start() -> None:
             in_start.set()
-            # flake-ok: pre-existing gated start stub, moved verbatim; the finally block sets the event and every outer await is bounded
-            await release_start.wait()
+            await await_until(release_start, what="the test releases the gated start")
 
         def _stale_factory(*a, **kw):
             p = _make_provider()
@@ -530,8 +530,7 @@ class TestFillLockReleasedAcrossStart:
 
         async def _slow_start() -> None:
             in_start.set()
-            # flake-ok: pre-existing gated start stub, moved verbatim; the finally block sets the event and every outer await is bounded
-            await release_start.wait()
+            await await_until(release_start, what="the test releases the gated start")
 
         def _factory(*a, **kw):
             p = _make_provider()
@@ -566,3 +565,97 @@ class TestFillLockReleasedAcrossStart:
         # second provider against the retired identity.
         assert len(providers) == 1
         providers[0].shutdown.assert_awaited_once()
+
+
+class TestMcpConfigFence:
+    """An MCP write during the released-lock window of a fill is handed to the
+    provider that fill holds. The dashboard's live-apply gate marks the providers
+    it can see (registered sessions, the queued pool); a provider between its
+    ``start()`` and its enqueue is in neither snapshot, so without this fence it
+    joins the pool projected from the spec as it stood before the write."""
+
+    @staticmethod
+    def _gated_factory(providers: list, in_start: asyncio.Event, release: asyncio.Event):
+        async def _slow_start() -> None:
+            in_start.set()
+            await await_until(release, what="the test releases the gated start")
+
+        def _factory(*a, **kw):
+            p = _make_provider()
+            p.start = AsyncMock(side_effect=_slow_start)
+            p.mark_mcp_config_changed = MagicMock()
+            providers.append(p)
+            return p
+
+        return _factory
+
+    @pytest.mark.asyncio
+    async def test_a_write_during_the_start_marks_the_provider_at_enqueue(self):
+        mgr, _ = _make_manager(pool_size=1)
+        mgr._start_sem = PrioritySemaphore(1)
+        in_start = asyncio.Event()
+        release_start = asyncio.Event()
+        providers: list = []
+        mgr._provider_factory = MagicMock(
+            side_effect=self._gated_factory(providers, in_start, release_start)
+        )
+
+        fill = asyncio.create_task(mgr._fill_warm_pool())
+        try:
+            await await_until(in_start, what="the refill enters start()")
+            # The write lands while the provider is parked inside start(): the
+            # gate's snapshots cannot include it, so the manager-level fence is
+            # the only thing that can reach it.
+            mgr.mark_mcp_config_changed()
+        finally:
+            release_start.set()
+            await await_until(fill, what="the refill finishes")
+
+        assert len(providers) == 1
+        assert mgr._warm_pool.qsize() == 1
+        providers[0].mark_mcp_config_changed.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_no_write_leaves_the_provider_unmarked(self):
+        mgr, _ = _make_manager(pool_size=1)
+        mgr._start_sem = PrioritySemaphore(1)
+        in_start = asyncio.Event()
+        release_start = asyncio.Event()
+        providers: list = []
+        mgr._provider_factory = MagicMock(
+            side_effect=self._gated_factory(providers, in_start, release_start)
+        )
+
+        fill = asyncio.create_task(mgr._fill_warm_pool())
+        try:
+            await await_until(in_start, what="the refill enters start()")
+        finally:
+            release_start.set()
+            await await_until(fill, what="the refill finishes")
+
+        assert mgr._warm_pool.qsize() == 1
+        providers[0].mark_mcp_config_changed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_write_before_the_start_is_not_a_fence_crossing(self):
+        """The provider built after the write already projects from the new
+        spec; marking it would cost a needless close and reload at its first turn."""
+        mgr, _ = _make_manager(pool_size=1)
+        mgr._start_sem = PrioritySemaphore(1)
+        in_start = asyncio.Event()
+        release_start = asyncio.Event()
+        providers: list = []
+        mgr._provider_factory = MagicMock(
+            side_effect=self._gated_factory(providers, in_start, release_start)
+        )
+        mgr.mark_mcp_config_changed()
+
+        fill = asyncio.create_task(mgr._fill_warm_pool())
+        try:
+            await await_until(in_start, what="the refill enters start()")
+        finally:
+            release_start.set()
+            await await_until(fill, what="the refill finishes")
+
+        assert mgr._warm_pool.qsize() == 1
+        providers[0].mark_mcp_config_changed.assert_not_called()

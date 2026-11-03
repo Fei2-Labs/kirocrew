@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncContextManager
 
 from kiro_crew import _facade_mirror, model_scope  # noqa: F401
+from kiro_crew.acp import relaunch_reload as _relaunch_reload
 from kiro_crew.acp.client import (  # noqa: F401
     DEFAULT_MODEL,
     AcpAuthRequired,
@@ -53,6 +54,7 @@ from kiro_crew.acp.types import (  # noqa: F401
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
@@ -68,8 +70,11 @@ from kiro_crew.acp.types import (  # noqa: F401
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_MATE_WORKER_KIT,
+    ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
+    ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_TOOL_LIMITS,
+    ACP_BACKENDS_REPORT_USAGE,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
     EVENT_COMPACTION_STATUS,
@@ -85,6 +90,10 @@ from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND  # noqa: F401
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import model_registry_namespace  # noqa: F401
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKENDS_EFFORT_AT_LAUNCH,
+    ACP_BACKENDS_MODEL_AT_LAUNCH,
+)
 from kiro_crew.agent_sdk.capabilities import SessionCapabilities, capabilities_for
 from kiro_crew.agent_sdk.tool_search import (  # noqa: F401
     TOOL_SEARCH_DEFAULT_MIN_PCT,
@@ -207,6 +216,10 @@ class AcpProvider(LLMProvider):
         # copy, ``apps.agent_launch``), set by session allocation; ``agent``
         # stays the session's identity. Read by the Kiro runtime start only.
         self.app_launch_agent = ""
+        # The app that owns this session, set by session allocation from the chat
+        # slot's own app (never from transcript metadata). The remote git proxy's
+        # egress check passes it to governance so an app-bound profile applies.
+        self.owning_app = ""
         # Kept on the provider, not only on the placeholder client: on the kiro
         # path ``_start_kiro_runtime_impl`` replaces that client with an
         # ``AcpRuntime`` it constructs itself, and a dedicated subagent's
@@ -241,6 +254,8 @@ class AcpProvider(LLMProvider):
         # consumers (dashboard chat) BEFORE startup; re-applied when
         # _start_kiro_runtime_impl swaps in the real AcpSessionProvider.
         self._child_fidelity_aware: bool = False
+        # Same shape for the MCP elicitation opt-in (see accepts_elicitation).
+        self._accepts_elicitation: bool = False
         # Canonical Kiro Crew identity (a cfg.agents key), resolved by the
         # factory at provider-creation time — ``agent`` above is the bound kiro
         # template, a different namespace. Threaded into the kiro-shared
@@ -355,6 +370,32 @@ class AcpProvider(LLMProvider):
                 pass
 
     @property
+    def accepts_elicitation(self) -> bool:
+        """See AcpSessionHandle.accepts_elicitation.
+
+        Stored here and forwarded to the live inner client for the same reason
+        ``child_fidelity_aware`` is: the kiro backend's placeholder client is
+        replaced at runtime startup, and the stored value is re-applied then.
+        """
+        return self._accepts_elicitation
+
+    @accepts_elicitation.setter
+    def accepts_elicitation(self, value: bool) -> None:
+        self._accepts_elicitation = bool(value)
+        inner = getattr(self, "_client", None)
+        if inner is not None and hasattr(inner, "accepts_elicitation"):
+            try:
+                inner.accepts_elicitation = bool(value)
+            except Exception:  # pragma: no cover - read-only shapes
+                pass
+
+    async def answer_elicitation(
+        self, request_id: str | int, action: str, content: dict[str, Any] | None = None
+    ) -> bool:
+        """Answer a pending MCP elicitation on the inner client."""
+        return await self._client.answer_elicitation(request_id, action, content)
+
+    @property
     def model_pin_refused(self) -> str:
         """The pinned model the adapter refused at startup, or ``""``.
 
@@ -441,16 +482,38 @@ class AcpProvider(LLMProvider):
 
     @property
     def steer_upgrade_notice(self) -> str:
-        """The upgrade notice when this session's adapter is too old to steer, else ``""``.
+        """The notice when this session's adapter cannot steer, else ``""``.
 
-        Read off :attr:`agent_version`, so ``""`` before the handshake and for an
-        adapter that reported no readable version.
+        Too old (:attr:`agent_version` below the steer floor), or its handshake left
+        out the field the steer is gated on (the session card, ``card_for`` with the
+        ``initialize`` result, withdraws ``mid_turn_steer``). ``""`` before the
+        handshake and for an adapter that reported no readable version.
         """
-        from kiro_crew.acp.client_turn_control import steer_version_issue
-
-        return steer_version_issue(
-            str(getattr(self._client, "backend", "") or ""), self.agent_version
+        from kiro_crew.acp.client_turn_control import (
+            steer_unadvertised_issue,
+            steer_version_issue,
         )
+
+        backend = str(getattr(self._client, "backend", "") or "")
+        return steer_version_issue(backend, self.agent_version) or steer_unadvertised_issue(
+            backend, getattr(self._client, "initialize_result", None)
+        )
+
+    @property
+    def tested_version_notice(self) -> str:
+        """The notice when this session's harness reports a release outside the one
+        Crew tested it on (goose and codex today), else ``""``. A warning, never a refusal."""
+        from kiro_crew.acp.client_turn_control import untested_version_issue
+
+        backend = str(getattr(self._client, "backend", "") or "")
+        return untested_version_issue(backend, self.agent_version)
+
+    @property
+    def agent_prompt_upgrade_notice(self) -> str:
+        """The upgrade notice when the KAS this session runs drops its agent's prompt,
+        else ``""``. Recorded when the session registered its ``customAgents``."""
+        notice = getattr(self._client, "kas_agent_prompt_notice", "")
+        return notice if isinstance(notice, str) else ""
 
     @property
     def cwd(self) -> str:
@@ -518,6 +581,18 @@ class AcpProvider(LLMProvider):
         return value if isinstance(value, str) else ""
 
     @property
+    def kas_registered_agents(self) -> list[dict[str, Any]] | None:
+        """The agent batch this session registered with KAS, or ``None`` with no batch."""
+        value = getattr(self._client, "kas_registered_agents", None)
+        return value if isinstance(value, list) else None
+
+    @property
+    def kas_active_mode_id(self) -> str:
+        """The last mode id KAS reported for this session, or ``""``."""
+        value = getattr(self._client, "kas_active_mode_id", "")
+        return value if isinstance(value, str) else ""
+
+    @property
     def is_codex_backend(self) -> bool:
         """True when this ACP provider talks to codex-acp (vs kiro-cli)."""
         return self._client.backend == ACP_BACKEND_CODEX
@@ -541,6 +616,16 @@ class AcpProvider(LLMProvider):
     def is_deepseek_backend(self) -> bool:
         """True when this ACP provider talks to DeepSeek Harness (vs kiro-cli)."""
         return self._client.backend == ACP_BACKEND_DEEPSEEK
+
+    @property
+    def is_copilot_backend(self) -> bool:
+        """True when this ACP provider talks to GitHub Copilot CLI (vs kiro-cli)."""
+        return self._client.backend == ACP_BACKEND_COPILOT
+
+    @property
+    def is_strands_backend(self) -> bool:
+        """True when this ACP provider talks to the Strands CLI (vs kiro-cli)."""
+        return self._client.backend == ACP_BACKEND_STRANDS
 
     @property
     def is_kas_backend(self) -> bool:
@@ -704,6 +789,16 @@ class AcpProvider(LLMProvider):
         return self._client.backend in ACP_BACKENDS_MATE_WORKER_KIT
 
     @property
+    def mate_worker_prompt_in_context(self) -> bool:
+        """A crewmate worker reads its prompt from the context block by opt-in (H6)."""
+        return self._client.backend in ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT
+
+    @property
+    def mate_worker_tool_limits_supported(self) -> bool:
+        """A crewmate worker's single-tool limits are honoured by opt-in (H6)."""
+        return self._client.backend in ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS
+
+    @property
     def loaded_capability_template(self) -> str:
         return self._client.loaded_capability_template
 
@@ -726,6 +821,40 @@ class AcpProvider(LLMProvider):
         return mcp_hot_reload_supported(
             self._client.backend, parse_kiro_cli_version(self.agent_version)
         )
+
+    @property
+    def mcp_config_wire_reinject(self) -> bool:
+        """True when this provider's LIVE session takes a re-sent MCP projection.
+
+        Answered by the inner session provider (``AcpSessionProvider``, from
+        ``ACP_BACKENDS_MCP_WIRE_REINJECT`` membership -- harness-parity H6/H14).
+        Before startup ``self._client`` is the placeholder ``AcpClient``, which
+        has no session to re-load and no such attribute, so this reads False
+        and a session still starting is reset like one that cannot apply the
+        change. Only a literal ``True`` passes, so a mock never reads as a skip.
+        """
+        return getattr(self._client, "mcp_config_wire_reinject", False) is True
+
+    @property
+    def mcp_config_relaunch_reload(self) -> bool:
+        """True when an MCP write reaches this session by relaunch + ``session/load``.
+
+        Answered for the direct ``AcpClient`` from ``ACP_BACKENDS_MCP_RELAUNCH_RELOAD``
+        membership (harness-parity H6/H14); a runtime-backed provider's inner
+        session provider is not an ``AcpClient`` and answers False.
+        """
+        client = self._client
+        return isinstance(client, AcpClient) and _relaunch_reload.mcp_config_relaunch_reload(client)
+
+    def mark_mcp_config_changed(self) -> None:
+        """Hand the mark to the inner session provider, or set it on the direct client."""
+        client = self._client
+        if isinstance(client, AcpClient):
+            _relaunch_reload.mark_mcp_config_changed(client)
+            return
+        mark = getattr(client, "mark_mcp_config_changed", None)
+        if callable(mark):
+            mark()
 
     def available_models(self) -> list[dict[str, str]]:
         """Models the backend advertised at session init (may be empty).
@@ -789,6 +918,12 @@ class AcpProvider(LLMProvider):
         if isinstance(self._client, AcpSessionProvider):
             return self._client.native_context_documents
         return {}
+
+    def note_user_message(self, text: str) -> None:
+        # Only the shared runtime's session starts a KAS sign-in; the direct
+        # client gets the engine's own OAuth requests and has no trigger.
+        if isinstance(self._client, AcpSessionProvider):
+            self._sign_in_ask: str = text
 
     @property
     def member_dispatch_mounted(self) -> bool | None:
@@ -863,6 +998,15 @@ class AcpProvider(LLMProvider):
         return resolve_billing_stats(getattr(self, "_client", None))
 
     @property
+    def reports_turn_usage(self) -> bool:
+        """Membership in ``ACP_BACKENDS_REPORT_USAGE`` (harness-parity H6).
+
+        Read per call off the inner client's backend, which the runtime's session
+        provider reports once it replaces the placeholder client at startup.
+        """
+        return self._client.backend in ACP_BACKENDS_REPORT_USAGE
+
+    @property
     def steer_needs_loss_recovery(self) -> bool:
         """True when the inner session can lose a steer it reported delivered."""
         return self._client.steer_needs_loss_recovery is True
@@ -912,6 +1056,15 @@ class AcpProvider(LLMProvider):
         """
         await self._client.new_conversation()  # type: ignore[attr-defined]
 
+    def set_delete_delay(self, seconds: float) -> None:
+        """Keep the session's record for ``seconds`` after it ends, then delete it.
+
+        Only a session on the shared runtime can be released and deleted later,
+        so the per-session client ends its sessions as before.
+        """
+        if isinstance(self._client, AcpSessionProvider):
+            self._client.set_delete_delay(seconds)
+
     def is_alive(self) -> bool:
         """Whether the shared client is responsive.
 
@@ -944,6 +1097,18 @@ class AcpProvider(LLMProvider):
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight (and not yet cancelled) on the client."""
         return bool(self._client) and self._client.has_active_turn()
+
+    @property
+    def switches_by_relaunch(self) -> bool:
+        """Whether a model or effort change relaunches this session's process (Strands).
+
+        Such a switch either lands on the same chat or raises with the prior values
+        back in force, so a caller answers the raise as a refusal: it keeps the old
+        setting and does not reset the session, which would cold-start on the refused
+        value and fail the same way.
+        """
+        backend = getattr(self._client, "backend", "")
+        return backend in ACP_BACKENDS_MODEL_AT_LAUNCH or backend in ACP_BACKENDS_EFFORT_AT_LAUNCH
 
     def background_launch(self) -> tuple[float, str] | None:
         """The client's newest background launch, or ``None`` (see base)."""
@@ -1078,6 +1243,57 @@ def is_claude_backend(provider: Any) -> bool:
     return isinstance(provider, AcpProvider) and provider.is_claude_backend
 
 
+def _provider_backend(provider: Any) -> Any:
+    """The backend id *provider* talks to, or ``None`` for a shape that carries none.
+
+    Private on purpose: ``llm_helpers.provider_backend`` is the public reader
+    and answers ``""`` for a miss, while this one must keep a miss (``None``)
+    apart from kiro-cli's ``""``. Its only caller is the ``harness`` metric
+    attribute, through the driver delegate.
+
+    For the two provider shapes this is the check :func:`provider_label`
+    resolves through, so a caller that needs the raw id (the ``harness`` metric
+    attribute) reads the same answer the session map persists. It also reads a
+    bare ``AcpSessionHandle`` and an ``AcpRuntime``, which the background
+    one-liner path passes in place of a provider. ``None`` keeps "not a provider" apart from
+    kiro-cli, whose own id is the empty string (see
+    ``agent_sdk.backend_identity`` for why a blind ``getattr`` default of
+    ``""`` would conflate them). The value is returned as found, so a caller
+    decides what a non-string means.
+    """
+    backend = _provider_shape_backend(provider)
+    if backend is not None:
+        return backend
+    # The two shapes a background one-liner hands out as its turn's
+    # ``model_source``: a runtime-owned session handle, and the runtime itself.
+    # Neither is a provider, so ``provider_label`` (which keys the session map)
+    # deliberately does not read them; only this attribution read does.
+    if isinstance(provider, AcpSessionHandle):
+        runtime = getattr(provider, "_runtime", None)
+        return None if runtime is None else getattr(runtime, "acp_backend", None)
+    if isinstance(provider, AcpRuntime):
+        return provider.acp_backend
+    return None
+
+
+def _provider_shape_backend(provider: Any) -> Any:
+    """The backend of the two PROVIDER shapes, or ``None``.
+
+    The shape check :func:`provider_label` resolves through. An ``AcpProvider``
+    with no client yet carries no backend, so it is ``None`` here rather than
+    kiro-cli's ``""``; the label maps both to the default, so its answer is
+    unchanged.
+    """
+    if isinstance(provider, AcpSessionProvider):
+        return provider.backend
+    if isinstance(provider, AcpProvider):
+        client = getattr(provider, "client", None)
+        if client is None:
+            return None
+        return getattr(client, "backend", "")
+    return None
+
+
 def provider_label(provider: Any) -> str:
     """Backend identity key for *provider*.
 
@@ -1097,11 +1313,8 @@ def provider_label(provider: Any) -> str:
     the kiro label, and the map then prunes its id for want of a kiro
     transcript.
     """
-    if isinstance(provider, AcpSessionProvider):
-        backend = provider.backend
-    elif isinstance(provider, AcpProvider):
-        backend = getattr(getattr(provider, "client", None), "backend", "")
-    else:
+    backend = _provider_shape_backend(provider)
+    if backend is None:
         return PROVIDER_LABEL_DEFAULT
     # The claude test stays a NAME check ahead of the mapping rather than folding
     # into it: ``is_claude_backend_name`` accepts every spelling this build treats

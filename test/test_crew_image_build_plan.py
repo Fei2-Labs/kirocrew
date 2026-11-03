@@ -37,7 +37,7 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "crew_image_build_plan.py"
+SCRIPT = ROOT / "src/kiro_crew/apps/builtins/aws_control/crew/scripts/crew_image_build_plan.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "crew-image-build.yml"
 
 #: Windows reports success from ``os.access(path, os.X_OK)`` for any file that
@@ -60,9 +60,12 @@ _SPEC.loader.exec_module(plan_mod)
 
 
 def _fake_tree(root: Path, recipe_text: str, *, producer: str = "scripts/p.sh") -> Path:
-    """A throwaway repo root with one recipe and one executable producer."""
+    """A throwaway repo root with one recipe and one executable producer.
+
+    *producer* is spelled as a recipe cites it, relative to the crew tree.
+    """
     (root / plan_mod.RUNTIME_SUBPATH).mkdir(parents=True, exist_ok=True)
-    script = root / producer
+    script = root / plan_mod.CREW_SUBPATH / producer
     script.parent.mkdir(parents=True, exist_ok=True)
     script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     script.chmod(0o755)
@@ -74,32 +77,55 @@ def _fake_tree(root: Path, recipe_text: str, *, producer: str = "scripts/p.sh") 
 # ── the derivation ───────────────────────────────────────────────────────────
 
 
-def test_a_concrete_from_is_a_base(tmp_path: Path) -> None:
-    recipe = _fake_tree(tmp_path, "# built by scripts/p.sh\nFROM python:3.12-slim\n")
-    assert plan_mod.classify(recipe, tmp_path).role == "base"
+@pytest.mark.parametrize(
+    "text, role",
+    [
+        pytest.param(
+            "# built by scripts/p.sh\nFROM python:3.12-slim\n",
+            "base",
+            id="test_a_concrete_from_is_a_base",
+        ),
+        pytest.param(
+            "# built by scripts/p.sh\nARG BASE\nFROM \\\n  ${BASE}\n",
+            "layer",
+            id="test_a_continuation_joined_from_is_read",
+        ),
+    ],
+)
+def test_the_first_from_decides_the_role(tmp_path: Path, text: str, role: str) -> None:
+    recipe = _fake_tree(tmp_path, text)
+    assert plan_mod.classify(recipe, tmp_path).role == role
 
 
-def test_a_pre_from_arg_is_a_digest_pinned_layer(tmp_path: Path) -> None:
-    recipe = _fake_tree(tmp_path, "# built by scripts/p.sh\nARG BASE\nFROM ${BASE}\n")
+@pytest.mark.parametrize(
+    "text, base_arg",
+    [
+        pytest.param(
+            "# built by scripts/p.sh\nARG BASE\nFROM ${BASE}\n",
+            "BASE",
+            id="test_a_pre_from_arg_is_a_digest_pinned_layer",
+        ),
+        # The rule is "the first FROM interpolates an ARG declared above it", not
+        # "the ARG is called BASE": a lane keyed on the literal name would
+        # silently stop recognising a renamed one.
+        pytest.param(
+            "# built by scripts/p.sh\nARG PARENT_IMAGE\nFROM $PARENT_IMAGE\n",
+            "PARENT_IMAGE",
+            id="test_the_base_arg_name_is_not_hard_coded",
+        ),
+        # A ``--platform`` option is dropped, so the ARG behind it is still the
+        # pinned base.
+        pytest.param(
+            "# built by scripts/p.sh\nARG BASE\nFROM --platform=$BUILDPLATFORM ${BASE}\n",
+            "BASE",
+            id="test_a_from_option_does_not_hide_a_layer",
+        ),
+    ],
+)
+def test_a_pre_from_arg_makes_a_layer(tmp_path: Path, text: str, base_arg: str) -> None:
+    recipe = _fake_tree(tmp_path, text)
     got = plan_mod.classify(recipe, tmp_path)
-    assert (got.role, got.base_arg) == ("layer", "BASE")
-
-
-def test_the_base_arg_name_is_not_hard_coded(tmp_path: Path) -> None:
-    """A recipe pinning through some other ARG name is still a layer.
-
-    The rule is "the first FROM interpolates an ARG declared above it", not "the
-    ARG is called BASE" -- a lane keyed on the literal name would silently stop
-    recognising a renamed one.
-    """
-    recipe = _fake_tree(tmp_path, "# built by scripts/p.sh\nARG PARENT_IMAGE\nFROM $PARENT_IMAGE\n")
-    got = plan_mod.classify(recipe, tmp_path)
-    assert (got.role, got.base_arg) == ("layer", "PARENT_IMAGE")
-
-
-def test_a_continuation_joined_from_is_read(tmp_path: Path) -> None:
-    recipe = _fake_tree(tmp_path, "# built by scripts/p.sh\nARG BASE\nFROM \\\n  ${BASE}\n")
-    assert plan_mod.classify(recipe, tmp_path).role == "layer"
+    assert (got.role, got.base_arg) == ("layer", base_arg)
 
 
 @pytest.mark.parametrize(
@@ -123,16 +149,6 @@ def test_a_from_option_is_not_mistaken_for_the_image(tmp_path: Path, flag: str) 
     assert operand == "python:3.12-slim", f"read {operand!r} as the image of `FROM {flag} ...`"
     recipe = _fake_tree(tmp_path, text)
     assert plan_mod.classify(recipe, tmp_path).role == "base"
-
-
-def test_a_from_option_does_not_hide_a_layer(tmp_path: Path) -> None:
-    """The option is dropped, so the ARG behind it is still the pinned base."""
-    recipe = _fake_tree(
-        tmp_path,
-        "# built by scripts/p.sh\nARG BASE\nFROM --platform=$BUILDPLATFORM ${BASE}\n",
-    )
-    got = plan_mod.classify(recipe, tmp_path)
-    assert (got.role, got.base_arg) == ("layer", "BASE")
 
 
 def test_a_stage_alias_is_not_mistaken_for_the_image(tmp_path: Path) -> None:
@@ -171,35 +187,45 @@ def test_an_arg_declared_after_from_is_refused(tmp_path: Path) -> None:
         plan_mod.classify(recipe, tmp_path)
 
 
-def test_a_recipe_naming_no_producer_is_refused(tmp_path: Path) -> None:
-    recipe = _fake_tree(tmp_path, "FROM python:3.12-slim\n")
-    with pytest.raises(plan_mod.PlanError, match="names no scripts"):
-        plan_mod.classify(recipe, tmp_path)
-
-
-def test_a_recipe_mentioning_two_scripts_is_refused(tmp_path: Path) -> None:
-    """Which of two mentioned scripts builds the recipe is not guessable.
-
-    The refusal carries the remedy, because the alternative -- a declaration
-    syntax -- would be a second way to say the same thing with no recipe using
-    it. The first genuinely ambiguous recipe is what should buy that.
-    """
-    recipe = _fake_tree(tmp_path, "# scripts/p.sh and scripts/q.sh\nFROM python:3.12-slim\n")
-    with pytest.raises(plan_mod.PlanError, match="mentions several scripts"):
-        plan_mod.classify(recipe, tmp_path)
-
-
-def test_an_absent_producer_is_refused(tmp_path: Path) -> None:
-    """The defect this lane exists for: a recipe citing a script nobody wrote."""
-    recipe = _fake_tree(tmp_path, "# built by scripts/gone.sh\nFROM python:3.12-slim\n")
-    with pytest.raises(plan_mod.PlanError, match="does not exist"):
+@pytest.mark.parametrize(
+    "text, match",
+    [
+        pytest.param(
+            "FROM python:3.12-slim\n",
+            "names no scripts",
+            id="test_a_recipe_naming_no_producer_is_refused",
+        ),
+        # Which of two mentioned scripts builds the recipe is not guessable. The
+        # refusal carries the remedy instead of a declaration syntax that no
+        # recipe would use yet.
+        pytest.param(
+            "# scripts/p.sh and scripts/q.sh\nFROM python:3.12-slim\n",
+            "mentions several scripts",
+            id="test_a_recipe_mentioning_two_scripts_is_refused",
+        ),
+        # The defect this lane exists for: a recipe citing a script nobody wrote.
+        pytest.param(
+            "# built by scripts/gone.sh\nFROM python:3.12-slim\n",
+            "does not exist",
+            id="test_an_absent_producer_is_refused",
+        ),
+        pytest.param(
+            "# built by scripts/p.sh\nRUN true\n",
+            "no FROM",
+            id="test_a_recipe_without_a_from_is_refused",
+        ),
+    ],
+)
+def test_an_unbuildable_recipe_is_refused(tmp_path: Path, text: str, match: str) -> None:
+    recipe = _fake_tree(tmp_path, text)
+    with pytest.raises(plan_mod.PlanError, match=match):
         plan_mod.classify(recipe, tmp_path)
 
 
 @_POSIX_ONLY
 def test_a_non_executable_producer_is_refused(tmp_path: Path) -> None:
     recipe = _fake_tree(tmp_path, "# built by scripts/p.sh\nFROM python:3.12-slim\n")
-    (tmp_path / "scripts" / "p.sh").chmod(0o644)
+    (tmp_path / plan_mod.CREW_SUBPATH / "scripts" / "p.sh").chmod(0o644)
     with pytest.raises(plan_mod.PlanError, match="not executable"):
         plan_mod.classify(recipe, tmp_path)
 
@@ -217,9 +243,9 @@ def test_the_executability_check_stands_down_on_windows(
     branch is executed rather than argued about.
     """
     recipe = _fake_tree(tmp_path, "# built by scripts/p.sh\nFROM python:3.12-slim\n")
-    (tmp_path / "scripts" / "p.sh").chmod(0o644)
+    (tmp_path / plan_mod.CREW_SUBPATH / "scripts" / "p.sh").chmod(0o644)
     monkeypatch.setattr(plan_mod.os, "name", "nt")
-    assert plan_mod.classify(recipe, tmp_path).producer == "scripts/p.sh"
+    assert plan_mod.classify(recipe, tmp_path).producer == f"{plan_mod.CREW_SUBPATH}/scripts/p.sh"
 
 
 def test_an_absent_producer_is_still_refused_on_windows(
@@ -234,12 +260,6 @@ def test_an_absent_producer_is_still_refused_on_windows(
     recipe = _fake_tree(tmp_path, "# built by scripts/gone.sh\nFROM python:3.12-slim\n")
     monkeypatch.setattr(plan_mod.os, "name", "nt")
     with pytest.raises(plan_mod.PlanError, match="does not exist"):
-        plan_mod.classify(recipe, tmp_path)
-
-
-def test_a_recipe_without_a_from_is_refused(tmp_path: Path) -> None:
-    recipe = _fake_tree(tmp_path, "# built by scripts/p.sh\nRUN true\n")
-    with pytest.raises(plan_mod.PlanError, match="no FROM"):
         plan_mod.classify(recipe, tmp_path)
 
 
@@ -267,7 +287,7 @@ def test_a_layer_with_several_candidate_bases_is_refused(tmp_path: Path) -> None
     """
     runtime = tmp_path / plan_mod.RUNTIME_SUBPATH
     runtime.mkdir(parents=True)
-    script = tmp_path / "scripts" / "p.sh"
+    script = tmp_path / plan_mod.CREW_SUBPATH / "scripts" / "p.sh"
     script.parent.mkdir(parents=True)
     script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     script.chmod(0o755)
@@ -288,7 +308,7 @@ def test_several_bases_alone_are_fine(tmp_path: Path) -> None:
     """
     runtime = tmp_path / plan_mod.RUNTIME_SUBPATH
     runtime.mkdir(parents=True)
-    script = tmp_path / "scripts" / "p.sh"
+    script = tmp_path / plan_mod.CREW_SUBPATH / "scripts" / "p.sh"
     script.parent.mkdir(parents=True)
     script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     script.chmod(0o755)
@@ -300,7 +320,7 @@ def test_several_bases_alone_are_fine(tmp_path: Path) -> None:
 def test_bases_are_planned_before_layers(tmp_path: Path) -> None:
     runtime = tmp_path / plan_mod.RUNTIME_SUBPATH
     runtime.mkdir(parents=True)
-    script = tmp_path / "scripts" / "p.sh"
+    script = tmp_path / plan_mod.CREW_SUBPATH / "scripts" / "p.sh"
     script.parent.mkdir(parents=True)
     script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     script.chmod(0o755)
@@ -322,7 +342,7 @@ def test_the_real_tree_holds_recipes() -> None:
     """Guard the guard, against the real tree this time."""
     assert plan_mod.discover_recipes(ROOT), (
         f"no Dockerfile* under {plan_mod.RUNTIME_SUBPATH}; if the recipes moved, move "
-        "scripts/crew_image_build_plan.py and crew-image-build.yml with them"
+        "crew/scripts/crew_image_build_plan.py and crew-image-build.yml with them"
     )
 
 
@@ -369,7 +389,7 @@ def test_the_script_does_not_restate_the_digest_algorithm() -> None:
     )
     for restated in ("hashlib", 'separators=(",", ":")'):
         assert restated not in source, (
-            f"scripts/crew_image_build_plan.py restates the digest algorithm ({restated!r}); "
+            f"crew_image_build_plan.py restates the digest algorithm ({restated!r}); "
             "import it instead -- a fifth spelling is what the container's own "
             "_independent_digest already covers"
         )
@@ -475,7 +495,10 @@ def test_the_workflow_triggers_on_the_recipe_subtree() -> None:
 
 def test_the_workflow_triggers_on_the_plan_script_and_itself() -> None:
     patterns = _workflow_paths()
-    for rel in ("scripts/crew_image_build_plan.py", ".github/workflows/crew-image-build.yml"):
+    for rel in (
+        f"{plan_mod.CREW_SUBPATH}/scripts/crew_image_build_plan.py",
+        ".github/workflows/crew-image-build.yml",
+    ):
         assert _covered(rel, patterns), f"{rel} is outside crew-image-build.yml's paths filter"
 
 
@@ -513,6 +536,8 @@ def test_the_paths_filter_stops_short_of_every_script() -> None:
         "scripts/local-gate.py",
         "scripts/check_comment_history.py",
         "scripts/build_something_else.sh",
+        f"{plan_mod.CREW_SUBPATH}/scripts/build_something_else.sh",
+        f"{plan_mod.CREW_SUBPATH}/packaging/build.py",
     ):
         assert not _covered(unrelated, patterns), (
             f"crew-image-build.yml's paths filter matches {unrelated}, which this lane does "
@@ -700,7 +725,7 @@ def test_every_registry_this_lane_writes_to_is_loopback() -> None:
         "docker tag local-only:ci registry.example.com/kirocrew-crew-base:ci",
         "docker build -t registry.example.com/kirocrew-crew-base:ci .",
         "docker buildx build --push --tag registry.example.com/kirocrew-crew-base:ci .",
-        "./scripts/build_crew_base_image.sh --tag registry.example.com/base:ci",
+        "./src/kiro_crew/apps/builtins/aws_control/crew/scripts/build_crew_base_image.sh --tag registry.example.com/base:ci",
     ],
 )
 def test_an_off_machine_write_site_is_caught(site: str) -> None:
@@ -775,7 +800,7 @@ def test_the_plan_script_is_recorded_executable() -> None:
     platform, and it is the one that decides what a Linux runner checks out.
     """
     listed = subprocess.run(
-        ["git", "ls-files", "--stage", "--", "scripts/crew_image_build_plan.py"],
+        ["git", "ls-files", "--stage", "--", SCRIPT.relative_to(ROOT).as_posix()],
         cwd=ROOT,
         capture_output=True,
         encoding="utf-8",
@@ -784,9 +809,9 @@ def test_the_plan_script_is_recorded_executable() -> None:
     assert listed.strip(), "the plan script is not tracked, so git records no mode for it"
     mode = listed.split()[0]
     assert mode == "100755", (
-        f"git records mode {mode} for scripts/crew_image_build_plan.py; it carries a shebang "
+        f"git records mode {mode} for {SCRIPT.relative_to(ROOT).as_posix()}; it carries a shebang "
         "and the lane invokes it, so the committed mode must be 100755. Fix with "
-        "`git update-index --chmod=+x scripts/crew_image_build_plan.py`"
+        f"`git update-index --chmod=+x {SCRIPT.relative_to(ROOT).as_posix()}`"
     )
 
 

@@ -7,7 +7,7 @@ Each function here whose first parameter is ``self`` is an ``AcpProvider`` metho
 class binds it by name, so it reads and writes the session's own state on the instance,
 and a patch of the method on the class or on an instance reaches every caller.
 
-Instance fields written: ``_compact_result``.
+Instance fields written: ``_compact_result``, ``_sign_in_ask``.
 
 Instance fields read: ``_client``, ``essential_delivery``.
 """
@@ -21,7 +21,9 @@ from collections.abc import AsyncIterator
 from contextlib import aclosing
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.acp import relaunch_reload
 from kiro_crew.acp.client import AcpClient, AcpError
+from kiro_crew.acp.launch_tuning import switch_barrier
 from kiro_crew.acp.types import (
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     EVENT_COMPACTION_STATUS,
@@ -89,11 +91,26 @@ def _to_llm_event(e: Any) -> LLMEvent:
         mcp_identity_trusted=e.mcp_identity_trusted,
         mcp_identity_unreadable=e.mcp_identity_unreadable,
         kas_builtin_ids=e.kas_builtin_ids,
+        # Dropping this would leave every spec-granted KAS built-in prompting on
+        # this surface: the gate's spec-builtin-grant row reads it.
+        spec_granted_builtins=e.spec_granted_builtins,
+        # Same row: dropping this would leave every allowedCommands match prompting.
+        spec_granted_commands=e.spec_granted_commands,
+        # Dropping this would let a `denyByDefault` spec's unlisted command run on
+        # this surface: the gate's spec-shell-allowlist row reads it.
+        spec_shell_allowlist=e.spec_shell_allowlist,
+        # Same for a `fallbackAction: "deny"` spec's unlisted write: the gate's
+        # spec-write-allowlist row reads this.
+        spec_write_allowlist=e.spec_write_allowlist,
+        spec_write_cwd=e.spec_write_cwd,
         # Dropping this would refuse every deepseek read on a side turn.
         deepseek_tool_name=e.deepseek_tool_name,
         # Dropping this would let a READ_ONLY turn on an unproved dsh
         # composition reach the gate's other read-only proofs.
         deepseek_read_only_issue=e.deepseek_read_only_issue,
+        # Dropping this would let a Strands side turn's read-only shell command
+        # reach the gate's shell classifier and run.
+        side_read_only_refusal=e.side_read_only_refusal,
         server_name=e.server_name,
         oauth_url=e.oauth_url,
         subagents=e.subagents,
@@ -132,6 +149,11 @@ def _to_llm_event(e: Any) -> LLMEvent:
         # it before the evidence text, and the sub-agent run loop yields
         # its lane slot (``waiting_input`` WaitRecord) on it.
         status=e.status,
+        # The MCP server's ask itself (mode, message, fields or URL). Dropping
+        # it hands the dashboard runner an EVENT_ELICITATION_REQUEST with
+        # nothing to render: an empty card the person cannot answer, while
+        # the engine holds the tool call open for the whole window.
+        elicitation=e.elicitation,
     )
 
 
@@ -148,17 +170,31 @@ async def _ready_confirmed_session(self: AcpProvider) -> None:
     ``AcpClient``, so their paths gain no call or await (harness-parity H13).
     """
     if isinstance(self._client, AcpClient):
-        await self._client.ensure_ready()
+        # A model or effort switch on a launch-time harness holds this lock across
+        # its relaunch (``acp.launch_tuning``): a send waits for it to land rather
+        # than starting a second process inside it, and a switch waits for this start.
+        async with switch_barrier(self._client):
+            await self._client.ensure_ready()
+            # A pending MCP change on a relaunch-reload harness is applied here,
+            # before the prompt and before the confirmation, so the relaunched
+            # session is the one confirmed and prompted. A no-op with no mark set.
+            await relaunch_reload.apply_pending_mcp_relaunch(self._client)
         await self._client.confirm_member_projection()
 
 
 async def stream(
     self: AcpProvider, message: str, timeout: float | None = None, *, allow_image: bool = True
 ) -> AsyncIterator[LLMEvent]:
+    ask, self._sign_in_ask = getattr(self, "_sign_in_ask", ""), ""
     # The direct client can respawn in ensure_ready; resolve that BEFORE
     # comparing receipts so a recycled conversation receives the full text.
     await self._ready_confirmed_session()
     send = self._client.stream_events
+    if ask:
+        from kiro_crew.acp.session_provider import AcpSessionProvider
+
+        if isinstance(self._client, AcpSessionProvider):
+            send = functools.partial(self._client.stream, sign_in_ask=ask)
     if not allow_image:
         send = functools.partial(send, allow_image=False)
     if timeout is not None:
@@ -171,6 +207,7 @@ async def stream(
 
 
 async def stream_command(self: AcpProvider, command: str) -> AsyncIterator[LLMEvent]:
+    _, self._sign_in_ask = getattr(self, "_sign_in_ask", ""), ""
     # _kiro.dev/commands/execute is a kiro extension, so only
     # ACP_BACKENDS_KIRO_SLASH_COMMANDS members can be sent it. Everyone else
     # routes through session/prompt, which an adapter interprets natively for

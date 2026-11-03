@@ -29,6 +29,7 @@ from kiro_crew.acp.client import (
     advertised_model_ids,
     catalog_row_would_drop,
 )
+from kiro_crew.acp.launch_tuning import switch_launch_model, switch_launch_tuning
 from kiro_crew.acp.session_handle import (
     _READ_PATH_PROBE_DEADLINE_SECS,
     _READ_PATH_REPROBE_MIN_INTERVAL_SECS,
@@ -38,10 +39,12 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_OVERLAY,
     ACP_BACKENDS_KIRO_FAMILY,
+    ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     effort_config_option_id,
     effort_config_option_value,
 )
 from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_EFFORT_AT_LAUNCH, launch_effort_supported
 from kiro_crew.effort import EFFORT_LEVELS, model_supports_effort, resolve_effort_for_model
 from kiro_crew.providers.acp_cli_overlay import _clear_cli_overlay_effort
 from kiro_crew.providers.base import LLMProvider
@@ -157,6 +160,15 @@ async def _bind_unbound_effort(self: AcpProvider) -> None:
     pinned = self._client._model
     if pinned and pinned != DEFAULT_MODEL:
         return
+    # Positive membership first: only a launch-effort client carries ``_launch_effort``,
+    # so no other harness's start reads it (harness-parity H14).
+    if (
+        self._client.backend in ACP_BACKENDS_EFFORT_AT_LAUNCH
+        and self._client._launch_effort == level
+    ):
+        # A launch-effort harness (Strands) already started on it (``--effort``):
+        # applied, whatever model the CLI picked, so there is nothing to bind or drop.
+        return
     model = self.served_model
     if model:
         stored = self._effort_per_model.get(model)
@@ -232,7 +244,7 @@ def accepts_effort_level(self: AcpProvider, level: str) -> bool:
     advertised = self._advertised_effort_levels()
     if not advertised:
         return True
-    return effort_config_option_value(self._client.backend, level) in advertised
+    return effort_config_option_value(self._client.backend, level, advertised) in advertised
 
 
 def supports_effort(self: AcpProvider) -> bool:
@@ -255,11 +267,21 @@ def supports_effort(self: AcpProvider) -> bool:
     harness is saying the current model takes no level (goose does this per
     model), and every write there reads back as ``off``.
     """
+    if self._client.backend in ACP_BACKENDS_EFFORT_AT_LAUNCH:
+        # The CLI takes a level for every model and maps it onto what the model
+        # offers itself; Crew's registry knows none of these operator-named ids.
+        return True
     if self._client.backend in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION:
         if not self._client.supports_config_option(effort_config_option_id(self._client.backend)):
             return False
         advertised = self._client.get_valid_effort_levels()
         return not advertised or any(level != "off" for level in advertised)
+    # A pair-id harness takes a level only through its effort option, so a build
+    # that advertises none drops every pick (change_effort skips it).
+    if self._client.backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS and not (
+        self._client.supports_config_option(effort_config_option_id(self._client.backend))
+    ):
+        return False
     return model_supports_effort(self._effort_model)
 
 
@@ -278,15 +300,18 @@ def _resolve_effort(self: AcpProvider) -> str | None:
     """
     # The fold the WRITE path takes, handed in so it runs BEFORE the
     # advertised-list check rather than after it. ``change_effort`` admits any
-    # level the dynamic validation set knows, so a stored ``max`` on a harness
-    # whose ceiling is ``xhigh`` is this harness's ``xhigh`` -- and a filter
-    # that ran first would drop the very level the live push applied.
+    # level the dynamic validation set knows, so a stored level a harness spells
+    # differently must be checked in that harness's spelling -- a filter that
+    # ran first would drop the very level the live push applied.
+    advertised = self._advertised_effort_levels()
     return resolve_effort_for_model(
         self._effort_model,
         slot_overrides=self._effort_per_model,
         defaults=self._effort_defaults,
-        levels=self._advertised_effort_levels(),
-        normalize=functools.partial(effort_config_option_value, self._client.backend),
+        levels=advertised,
+        normalize=functools.partial(
+            effort_config_option_value, self._client.backend, advertised=advertised
+        ),
     )
 
 
@@ -339,7 +364,8 @@ async def _set_effort_config_option(self: AcpProvider, level: str) -> None:
     # the reason ``effort_config_option_value`` gives: a vocabulary that omits
     # one of Crew's levels is a declared fact, and the descent below can only
     # recover from it when the refusal shape is one this tree recognises.
-    target = effort_config_option_value(self._client.backend, level)
+    advertised = self._advertised_effort_levels()
+    target = effort_config_option_value(self._client.backend, level, advertised)
     if target != level:
         logger.info(
             "effort %r spelled %r on backend %s",
@@ -355,7 +381,6 @@ async def _set_effort_config_option(self: AcpProvider, level: str) -> None:
     # advertised is not written at all: such a level is hidden there, not
     # stepped onto a neighbour, and every value this sends is one the harness
     # offered -- so no refusal shape has to be recognised for it.
-    advertised = self._advertised_effort_levels()
     if advertised and target not in advertised:
         logger.info(
             "effort %r is not advertised by backend %s; skipping effort push",
@@ -417,6 +442,8 @@ async def change_effort(self: AcpProvider, level: str) -> bool:
             model,
         )
         return False
+    if self._client.backend in ACP_BACKENDS_EFFORT_AT_LAUNCH:
+        return await _change_launch_effort(self, level)
     # The capability answers, not raw set membership: the capability layer is the
     # one place that names a harness's effort channel.
     via_config_option = self.capabilities.effort_via_config_option
@@ -564,6 +591,13 @@ async def set_model(self: AcpProvider, model: str) -> None:
     """
     overrides = self._effort_per_model
     carried = overrides.get(self._effort_model, "")
+    if self._client.backend in ACP_BACKENDS_EFFORT_AT_LAUNCH:
+        # Model and level are both launch arguments: one relaunch carries both, the
+        # target's own level when it has one, else the level of the model left.
+        await switch_launch_model(
+            self._client, model, effort=overrides.get(model) or carried or None
+        )
+        return
     await self._client.set_model(model)
     try:
         own = overrides.get(self._client._model) or overrides.get(model, "")
@@ -602,6 +636,9 @@ async def clear_effort(self: AcpProvider) -> bool | None:
     resets nothing.
     """
     model = self._effort_model
+    if self._client.backend in ACP_BACKENDS_EFFORT_AT_LAUNCH:
+        # Clears the unbound level itself, and puts it back if the relaunch fails.
+        return await _clear_launch_effort(self, model)
     # Cleared to the default: a level held for an unpinned start must not
     # be bound again by the next restart.
     self._unbound_effort = ""
@@ -669,6 +706,64 @@ async def clear_effort(self: AcpProvider) -> bool | None:
         return None
     logger.info("ACP effort cleared (kiro); session reset needed for built-in default")
     return False
+
+
+def launch_effort_level(provider: AcpProvider) -> str:
+    """The level a launch-time-effort harness starts with, or ``""`` for the CLI's own.
+
+    The level stored for the model the session runs, else one requested with nothing
+    pinned. Only a level picked for the session; an inherited default never reaches
+    the argv. The registry's per-model gate in :meth:`_resolve_effort` is not asked:
+    it knows none of the operator-named ids such a harness runs, and the CLI maps a
+    level onto the model itself.
+    """
+    return provider._effort_per_model.get(provider._effort_model) or provider._unbound_effort or ""
+
+
+async def _change_launch_effort(provider: AcpProvider, level: str) -> bool:
+    """``change_effort`` for ``ACP_BACKENDS_EFFORT_AT_LAUNCH``: relaunch on *level*."""
+    # The cold-start factory judges a level by the same vocabulary, so a level
+    # accepted here is the level the next start launches with.
+    if not launch_effort_supported(provider._client.backend, level):
+        raise ValueError(f"invalid effort level {level!r}")
+    model = provider._effort_model
+    prev = provider._effort_per_model.get(model)
+    provider._effort_per_model[model] = level
+    try:
+        await switch_launch_tuning(provider._client, effort=level)
+    except BaseException:
+        if prev is None:
+            provider._effort_per_model.pop(model, None)
+        else:
+            provider._effort_per_model[model] = prev
+        raise
+    if provider._unbound_effort:
+        provider._unbound_effort = level
+    return True
+
+
+async def _clear_launch_effort(provider: AcpProvider, model: str) -> bool:
+    """``clear_effort`` for ``ACP_BACKENDS_EFFORT_AT_LAUNCH``: relaunch on the CLI's default.
+
+    A cold start with no slot level passes no ``--effort`` either, so a clear and
+    the next cold start run the same level.
+
+    Every model's entry goes, not only *model*'s: the slot holds one level, and a
+    model this session left (whose level a switch carried here) must not bring the
+    cleared level back when it is picked again, since a cold start would not.
+    """
+    del model  # every entry is cleared, see above
+    cleared = dict(provider._effort_per_model)
+    unbound = provider._unbound_effort
+    provider._effort_per_model.clear()
+    provider._unbound_effort = ""
+    try:
+        await switch_launch_tuning(provider._client, effort="")
+    except BaseException:
+        provider._effort_per_model.update(cleared)
+        provider._unbound_effort = unbound
+        raise
+    return True
 
 
 async def _apply_initial_effort(self: AcpProvider) -> None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
+import inspect
 import json
 import re
 import sys
@@ -36,8 +37,6 @@ from kiro_crew import platform_compat
 from kiro_crew.artifact_store.dashboard_package import DASHBOARD_KIND, parse_package
 from kiro_crew.dashboard.handlers import agent_panel as routes
 from kiro_crew.testing.wait import async_wait_until, await_until
-
-pytestmark = pytest.mark.asyncio
 
 CREW = "fleet-crew"
 SLUG = "fleet-crew"
@@ -1844,10 +1843,12 @@ async def test_a_save_whose_limit_has_passed_starts_no_browser_and_says_timed_ou
 
 def test_only_a_save_of_a_written_page_can_start_a_check():
     """The browser is for ``dashboard_save`` of a page written as ``view.html`` and for
-    nothing else: not a ``dashboard_write``, a preview, an apply, or the load of a page.
+    the crewmate's own ``dashboard_snapshot`` of one, and for nothing else: not a
+    ``dashboard_write``, a preview, an apply, or the load of a page.
 
-    Every module that names the runner or the glue is listed, and within the route module
-    the one function that starts a check is the save.
+    Every module that names the runner or the glue is listed; within the route module the
+    one function that starts a check is the save, and within the snapshot's module it is
+    the snapshot route, through the glue's picture-taking entry.
     """
     from source_corpus import iter_candidate_sources, src_root
 
@@ -1859,7 +1860,9 @@ def test_only_a_save_of_a_written_page_can_start_a_check():
     )
     assert users == [
         "dashboard/handlers/agent_panel_dashboard.py",
+        "dashboard/handlers/agent_panel_snapshot.py",
         "dashboard/handlers/member_dashboard_fields.py",
+        "dashboard_page_image.py",
         "dashboard_verify.py",
     ]
     # a mirror facade: its code is in the owners it lists
@@ -1878,6 +1881,15 @@ def test_only_a_save_of_a_written_page_can_start_a_check():
         if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "_page_check"
     }
     assert starters == {"api_dashboard_save"}
+    snapshot = importlib.import_module("kiro_crew.dashboard.handlers.agent_panel_snapshot")
+    picture_takers = {
+        fn.name
+        for fn in ast.walk(ast.parse(Path(snapshot.__file__).read_text(encoding="utf-8")))
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Attribute) and node.attr == "snapshot_package_page"
+    }
+    assert picture_takers == {"api_dashboard_snapshot"}
 
 
 async def test_a_skipped_run_says_so_and_the_gateway_checks_shapes_and_schemes(monkeypatch, store):
@@ -1955,3 +1967,11 @@ def test_the_tool_sends_the_empty_theme_when_the_client_dropped_it(monkeypatch):
     monkeypatch.setattr(mcp_panel, "_post", _post)
     mcp_panel._call_tool_inner("dashboard_save", {"model": {"types": {}}, "view": {"html": "x"}})
     assert sent and sent[0]["theme"] == {"tokens": {}}
+
+
+# Mark only the async tests: a module-wide ``pytestmark`` also lands on the sync
+# ones and warns. One loop, because a decorator per test would push this file
+# past the 2,000-line cap.
+for _name, _test in list(globals().items()):
+    if _name.startswith("test_") and inspect.iscoroutinefunction(_test):
+        globals()[_name] = pytest.mark.asyncio(_test)

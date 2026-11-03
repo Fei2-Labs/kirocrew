@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { SettingsSection, SettingsCard, SettingsToggle, SettingsSelect, SettingsInput } from '../../components/settings'
 import { Btn, FormSkeleton } from '../../components/ui'
@@ -11,10 +11,15 @@ import { Info } from 'lucide-react'
 import ErrorNotice from '../../components/ErrorNotice'
 import SpeechProviderNotice from '../../components/SpeechProviderNotice'
 import { parseSpeechProviders, speechProviderNotice, speechProviderOptions } from '../../lib/speechProviders'
+import { languageOptionLabel } from '../../lib/sttProviders'
 type VoiceConfig = {
   enabled: boolean; provider: string; voice: string; engine: string; rate: string
   autoSpeak: boolean; aws_profile: string; region: string
   system_voice: string
+  /** BCP-47 tag for spoken replies; `''` is the provider's own default. Absent on an older gateway. */
+  language_code?: string
+  /** The Language picker's codes, `''` first; absent on an older gateway. */
+  language_codes?: string[]
   /** Served provider entries (see lib/speechProviders); absent on an older gateway. */
   providers?: unknown
 }
@@ -42,6 +47,9 @@ const PROVIDER_LABEL_KEY: Record<string, string> = {
 
 /** Sentinel for "let the OS pick", which is what an empty `system_voice` means. */
 const SYSTEM_VOICE_DEFAULT = ''
+
+/** Sentinel for "the provider's own default language", what an empty `language_code` means. */
+const LANGUAGE_PROVIDER_DEFAULT = ''
 
 /**
  * Offline stand-in for `aws polly describe-voices` (non-Polly users have no AWS
@@ -86,14 +94,19 @@ export function VoicePanel() {
   // follows above.
   const systemVoicesQ = useQuery<{ available: boolean; voices: SystemVoice[] }>({ queryKey: ['voiceSystemVoices'], queryFn: () => api.voiceSystemVoices(), staleTime: 3600_000, enabled: voiceQ.data?.provider === 'system' })
 
-  const initializedRef = useRef(false)
-  useEffect(() => {
-    if (voiceQ.data && !initializedRef.current) {
-      initializedRef.current = true
-      setLocalProfile(voiceQ.data.aws_profile || '')
-      setLocalRegion(voiceQ.data.region || '')
-    }
-  }, [voiceQ.data])
+  // The served config seeds the editable rows ONCE, in the render that first has
+  // it. Setting state during render is React's shape for state derived from a
+  // value that just arrived: the in-progress output is discarded and the
+  // component re-renders before anything commits, so the commit that first shows
+  // the Polly rows already shows the stored profile and region in them. Seeding
+  // from an effect instead commits one frame where the rows are on screen and
+  // empty, which a user can see and a test can land on.
+  const [seeded, setSeeded] = useState(false)
+  if (voiceQ.data && !seeded) {
+    setSeeded(true)
+    setLocalProfile(voiceQ.data.aws_profile || '')
+    setLocalRegion(voiceQ.data.region || '')
+  }
 
   // `voice` takes the first fallback entry rather than respelling the VoiceId:
   // one source for the same value, and the id is provider-supplied data that no
@@ -124,6 +137,12 @@ export function VoicePanel() {
     ? voicesQ.data.voices.map(v => ({ value: v.id, label: `${v.name} (${v.languageCode} ${v.gender[0]})`, engines: v.engines }))
     : VOICE_OPTIONS_FALLBACK.map(v => ({ ...v, engines: ENGINE_OPTIONS }))
   const selectedVoiceEngines = voiceOptions.find(v => v.value === voiceCfg.voice)?.engines ?? ENGINE_OPTIONS
+  // An older gateway serves no list; offering only the default keeps the select
+  // from naming a language it cannot save.
+  const languageCodes = voiceCfg.language_codes?.length ? voiceCfg.language_codes : [LANGUAGE_PROVIDER_DEFAULT]
+  const languageLabels = languageCodes.map(code => code === LANGUAGE_PROVIDER_DEFAULT
+    ? i18nT('pages.settings.voicePanel.language_provider_default')
+    : languageOptionLabel(code))
 
   const voiceMut = useMutation({
     mutationFn: (patch: Partial<VoiceConfig>) => api.updateVoiceConfig(patch),
@@ -242,7 +261,12 @@ export function VoicePanel() {
                   <SettingsInput label={i18nT('pages.settings.voicePanel.aws_profile_polly')} hint={i18nT('pages.settings.voicePanel.aws_credentials_profile_for_polly')} value={localProfile} onChange={setLocalProfile} onBlur={() => setVoice({ aws_profile: localProfile.trim() })} placeholder={i18nT('pages.settings.voicePanel.default')} disabled={voiceDisabled} />
                   <SettingsInput label={i18nT('pages.settings.voicePanel.aws_region_polly')} hint={i18nT('pages.settings.voicePanel.aws_region_for_polly_api')} value={localRegion} onChange={setLocalRegion} onBlur={() => setVoice({ region: localRegion.trim() })} placeholder={i18nT('pages.settings.voicePanel.us_east_1')} disabled={voiceDisabled} />
                 </>
-              ) : null}
+              ) : (
+                /* Edition providers only: Polly and the built-in engine speak
+                   the language of the voice picked above, so a Language select
+                   on their branches would be a control that changes nothing. */
+                <SettingsSelect settingId="voice.language-2" label={i18nT('pages.settings.voicePanel.language')} hint={i18nT('pages.settings.voicePanel.language_for_spoken_replies')} value={voiceCfg.language_code ?? LANGUAGE_PROVIDER_DEFAULT} options={languageCodes} optionLabels={languageLabels} onChange={v => setVoice({ language_code: v })} disabled={voiceDisabled} />
+              )}
             </>
           )}
         </SettingsCard>

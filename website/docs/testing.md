@@ -161,6 +161,26 @@ the harness gateway runs with `KIROCREW_SKIP_APP_STORE_FETCH=1`, so Discover
 renders the bundled seed, not the live catalog, and a spec's verdict never waits
 on the CDN. A gateway you start by hand for a local run does not set it.
 
+## Render benchmark
+
+`npm run bench:render` builds the SPA with react-dom/profiling into
+`node_modules/.cache/kc-perf/dist` and runs `scripts/bench-render.mjs` against it,
+gateway-free. Four scenarios replay seeded websocket traffic into a 222-session
+sidebar for 30 s each: `idle`, `s1x1` and `s1x5` (1 or 5 background slots running
+agentic turns) and `s2` (the open chat streams a long answer). For each one it
+reports React commits, component renders, store dispatches and `useAppSelector`
+calls, the median of 3 runs, and fails when a median is more than 15% over its
+budget in `perf-budgets.json`.
+
+Counts, not milliseconds, are gated: a scenario sends the same frames every run,
+so a count moves when render behaviour does. A PR that adds renders on purpose
+raises the budget and says why; a PR that removes them lowers it. To see why a
+component renders, pass `--why Name,Other`: the JSON report then lists each
+render's cause (mount, a changed hook or selector, a context, which props
+changed and whether only their identity did, or a parent re-render). Run one
+scenario with `node scripts/bench-render.mjs --scenario s2 --runs 1` after the
+first build; `--viewport mobile --cpu 4` approximates a phone.
+
 ## CI gates
 
 - **jscpd** duplication check: copy-pasted code fails the build.
@@ -171,7 +191,9 @@ on the CDN. A gateway you start by hand for a local run does not set it.
   coordinator, coverage maps, happy-dom state, and the operating system on a
   standard hosted runner; without it one fork per core exceeds host RAM and the
   kernel OOM-kills a worker, which surfaces as "Worker exited unexpectedly"
-  even though every test passed.
+  even though every test passed. CI's `frontend-test` job overrides the cap
+  with `--maxWorkers`, sized to its runner: cores minus one, and at most one
+  fork per 1.5 GiB of RAM (3 on a hosted runner, 7 on the 8-core fleet).
 
 Backend-side test determinism and suite-speed rules (they apply to the same CI run)
 are in

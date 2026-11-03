@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from git_maintenance_helpers import git_maintenance_off_entries
 from skill_script_helpers import load_skill_script
 
 from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
@@ -50,6 +51,9 @@ def _env() -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1",
         }
     )
+    # Dropping every GIT_* drops the suite's maintenance entries too, and the
+    # global file is pointed away, so they go back on the env this helper built.
+    env.update(git_maintenance_off_entries(env))
     return env
 
 

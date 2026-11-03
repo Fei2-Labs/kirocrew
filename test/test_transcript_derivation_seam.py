@@ -29,6 +29,7 @@ import pathlib
 from collections import Counter
 
 import pytest
+from source_corpus import parsed_candidates
 
 from kiro_crew import history as history_mod
 from kiro_crew.history import (
@@ -70,6 +71,9 @@ PLUMBING: frozenset[tuple[str, str]] = frozenset(
         ("kiro_crew/channel_transcript_migration.py", "read_messages"),
         # SEL audit log `recent`, not a transcript.
         ("kiro_crew/cli_commands_security.py", "recent"),
+        # `kirocrew consolidate`: a yes/no sensitive-session check on a tail
+        # consolidate_now left, to report the skip; no rows leave.
+        ("kiro_crew/cli_knowledge.py", "_read_messages"),
         # The live session's OWN rows into its OWN prompt / compaction.
         ("kiro_crew/context.py", "read_messages"),
         ("kiro_crew/context.py", "read_messages_chained"),
@@ -150,8 +154,11 @@ PLUMBING: frozenset[tuple[str, str]] = frozenset(
 
 def _plain_read_sites() -> set[tuple[str, str]]:
     found: set[tuple[str, str]] = set()
-    for path in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    # A site is an attribute spelled as one of the read names, so only the files whose
+    # text holds one are parsed.
+    for path, _text, tree in parsed_candidates(
+        require_any=sorted(PLAIN_READS), skip_syntax_errors=False
+    ):
         rel = path.relative_to(SRC).as_posix()
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in PLAIN_READS:

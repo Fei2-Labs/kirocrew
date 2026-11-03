@@ -434,7 +434,7 @@ class TestResolveKirocrewBin:
     def test_finds_bin_in_parent_hierarchy(self, tmp_path: Path):
         """Walks up from package dir to find bin/kirocrew."""
         import kiro_crew.agent as agent_mod
-        from kiro_crew.agent import _resolve_kirocrew_bin
+        from kiro_crew.agent import _kirocrew_bin_subpath, _resolve_kirocrew_bin
 
         # Create structure: venv/lib/python3.x/site-packages/kiro_crew
         #                   venv/bin/kirocrew
@@ -443,17 +443,14 @@ class TestResolveKirocrewBin:
         pkg_dir.mkdir(parents=True)
         (pkg_dir / "__init__.py").write_text("")
 
-        bin_dir = venv / "bin"
-        bin_dir.mkdir()
-        kirocrew_bin = bin_dir / "kirocrew"
+        kirocrew_bin = _kirocrew_bin_subpath(venv)
+        kirocrew_bin.parent.mkdir()
         kirocrew_bin.write_text("#!/bin/bash\necho kirocrew")
         kirocrew_bin.chmod(0o755)
 
-        # Mock kiro_crew.__file__ to point to our fake package
         mock_mc = unittest.mock.MagicMock()
         mock_mc.__file__ = str(pkg_dir / "__init__.py")
 
-        # Reset global and mock the import
         old_val = agent_mod._KIROCREW_BIN
         try:
             agent_mod._KIROCREW_BIN = None
@@ -702,16 +699,15 @@ class TestResolveKirocrewBin:
         readable ``bin/kirocrew`` discovered by the walk is used as-is.
         """
         import kiro_crew.agent as agent_mod
-        from kiro_crew.agent import _resolve_kirocrew_bin
+        from kiro_crew.agent import _kirocrew_bin_subpath, _resolve_kirocrew_bin
 
         venv = tmp_path / "venv"
         pkg_dir = venv / "lib" / "python3.10" / "site-packages" / "kiro_crew"
         pkg_dir.mkdir(parents=True)
         (pkg_dir / "__init__.py").write_text("")
 
-        bin_dir = venv / "bin"
-        bin_dir.mkdir()
-        kirocrew_bin = bin_dir / "kirocrew"
+        kirocrew_bin = _kirocrew_bin_subpath(venv)
+        kirocrew_bin.parent.mkdir()
         kirocrew_bin.write_text('#!/bin/sh\nexec kirocrew "$@"\n')
         kirocrew_bin.chmod(0o755)
 
@@ -741,7 +737,7 @@ class TestResolveKirocrewBin:
     def test_accepts_apollo_binary_with_envroot(self, tmp_path: Path):
         """Accepts Apollo binary when .envroot exists in a parent directory."""
         import kiro_crew.agent as agent_mod
-        from kiro_crew.agent import _resolve_kirocrew_bin
+        from kiro_crew.agent import _kirocrew_bin_subpath, _resolve_kirocrew_bin
 
         # Create env/runtime/.envroot + env/runtime/bin/kirocrew (Apollo)
         runtime = tmp_path / "env" / "runtime"
@@ -751,9 +747,8 @@ class TestResolveKirocrewBin:
         )
         (runtime / ".envroot").write_text("")
 
-        bin_dir = runtime / "bin"
-        bin_dir.mkdir()
-        kirocrew_bin = bin_dir / "kirocrew"
+        kirocrew_bin = _kirocrew_bin_subpath(runtime)
+        kirocrew_bin.parent.mkdir()
         kirocrew_bin.write_bytes(
             b"#!/apollo/sbin/envroot $ENVROOT/python3.10/bin/python3.10\nimport sys\n"
         )
@@ -769,7 +764,6 @@ class TestResolveKirocrewBin:
             agent_mod._KIROCREW_BIN = None
             with patch.dict("sys.modules", {"kiro_crew": mock_mc}):
                 result = _resolve_kirocrew_bin()
-            # Should accept — .envroot exists in parent of bin/
             assert result == str(kirocrew_bin)
         finally:
             agent_mod._KIROCREW_BIN = old_val
@@ -781,16 +775,15 @@ class TestResolveKirocrewBin:
         check is a no-op), so the walk-discovered bin wins over PATH.
         """
         import kiro_crew.agent as agent_mod
-        from kiro_crew.agent import _resolve_kirocrew_bin
+        from kiro_crew.agent import _kirocrew_bin_subpath, _resolve_kirocrew_bin
 
         project = tmp_path / "project"
         pkg_dir = project / "src" / "kiro_crew"
         pkg_dir.mkdir(parents=True)
         (pkg_dir / "__init__.py").write_text("")
 
-        bin_dir = project / "bin"
-        bin_dir.mkdir()
-        wrapper = bin_dir / "kirocrew"
+        wrapper = _kirocrew_bin_subpath(project)
+        wrapper.parent.mkdir()
         wrapper.write_text('#!/bin/sh\nexec kirocrew "$@"\n')
         wrapper.chmod(0o755)
 
@@ -836,7 +829,7 @@ class TestResolveKirocrewBin:
     def test_prefers_venv_bin_over_project_bin(self, tmp_path: Path):
         """Resolves .venv/bin/kirocrew before bin/kirocrew in the same tree."""
         import kiro_crew.agent as agent_mod
-        from kiro_crew.agent import _resolve_kirocrew_bin
+        from kiro_crew.agent import _kirocrew_bin_subpath, _resolve_kirocrew_bin
 
         # Create structure: project/src/kiro_crew + project/.venv/bin/kirocrew
         # + project/bin/kirocrew (Brazil wrapper)
@@ -846,15 +839,14 @@ class TestResolveKirocrewBin:
         (pkg_dir / "__init__.py").write_text("")
 
         # .venv/bin/kirocrew — the preferred candidate
-        venv_bin = project / ".venv" / "bin" / "kirocrew"
+        venv_bin = _kirocrew_bin_subpath(project / ".venv")
         venv_bin.parent.mkdir(parents=True)
         venv_bin.write_text('#!/bin/sh\nexec python -m kiro_crew "$@"\n')
         venv_bin.chmod(0o755)
 
         # bin/kirocrew — Brazil wrapper (should be skipped)
-        bin_dir = project / "bin"
-        bin_dir.mkdir()
-        brazil_wrapper = bin_dir / "kirocrew"
+        brazil_wrapper = _kirocrew_bin_subpath(project)
+        brazil_wrapper.parent.mkdir()
         brazil_wrapper.write_text('#!/bin/sh\nexec brazil-runtime-exec kirocrew "$@"\n')
         brazil_wrapper.chmod(0o755)
 
@@ -866,7 +858,6 @@ class TestResolveKirocrewBin:
             agent_mod._KIROCREW_BIN = None
             with patch.dict("sys.modules", {"kiro_crew": mock_mc}):
                 result = _resolve_kirocrew_bin()
-            # Should prefer .venv/bin/kirocrew over bin/kirocrew
             assert result == str(venv_bin)
         finally:
             agent_mod._KIROCREW_BIN = old_val
@@ -874,7 +865,7 @@ class TestResolveKirocrewBin:
     def test_venv_install_falls_through_to_step1(self, tmp_path: Path):
         """When pkg_dir is inside .venv/, pyvenv.cfg breaks step 0."""
         import kiro_crew.agent as agent_mod
-        from kiro_crew.agent import _resolve_kirocrew_bin
+        from kiro_crew.agent import _kirocrew_bin_subpath, _resolve_kirocrew_bin
 
         # Simulate pip-into-venv: .venv/lib/python3.x/site-packages/kiro_crew/
         venv_root = tmp_path / ".venv"
@@ -884,7 +875,7 @@ class TestResolveKirocrewBin:
         (venv_root / "pyvenv.cfg").write_text("home = /usr/bin\n")
 
         # .venv/bin/kirocrew exists (step 1 should find it)
-        venv_bin = venv_root / "bin" / "kirocrew"
+        venv_bin = _kirocrew_bin_subpath(venv_root)
         venv_bin.parent.mkdir(parents=True)
         venv_bin.write_text('#!/bin/sh\nexec python -m kiro_crew "$@"\n')
         venv_bin.chmod(0o755)

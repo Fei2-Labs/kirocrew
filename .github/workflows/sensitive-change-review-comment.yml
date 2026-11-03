@@ -27,14 +27,20 @@ jobs:
   rerun:
     name: Re-run Sensitive Change Review
     # Only the PR author's comment can count, so nobody else's comment spends
-    # a run. The checker re-checks the author, the head SHA and the template.
+    # a run. An EDIT counts only when the author made it (the event sender is
+    # the comment's author), so someone else changing the author's words
+    # does not. The checker re-checks the author, the head SHA and the template.
     if: >-
       github.event.issue.pull_request != null
       && github.event.comment.user.login == github.event.issue.user.login
+      && github.event.sender.login == github.event.comment.user.login
       && contains(github.event.comment.body, '## Sensitive change review')
-    # Hosted, not the fleet: any commenter can fire issue_comment, and a
-    # non-allowlisted actor's fleet dispatch would queue forever.
-    runs-on: ubuntu-latest
+    # Off the fleet: any commenter can fire issue_comment, and a
+    # non-allowlisted actor's fleet dispatch would queue forever. The group is
+    # a GitHub-hosted Ubuntu VM dispatched by GitHub rather than the AWS
+    # webhook, so no actor allowlist applies and that reason is untouched; it
+    # buys queue position on the lane that re-runs a gate blocking a merge.
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     timeout-minutes: 5
     # Job-level, so only a run that passed the `if` joins the group: anyone
     # else's comment is skipped before it can cancel the author's re-run.

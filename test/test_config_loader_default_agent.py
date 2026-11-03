@@ -273,7 +273,19 @@ class TestDanglingDefaultAgentReset(unittest.TestCase):
     not evidence of a removal."""
 
     def setUp(self):
+        import gc
+
         import kiro_crew.config.loader as loader
+
+        # Drain cyclic garbage left by any earlier test before this one starts.
+        # The workspace-aware tests in this class can leave a PosixPath reference
+        # cycle; without an explicit pass the finalizer fires inside the next
+        # test here and attributes the unraisable exception to the wrong test.
+        # Running in setUp also clears cycles left by earlier modules on the
+        # same worker before the first test of this class.
+        # Two passes cover chains of two-level cycles.
+        gc.collect()
+        gc.collect()
 
         loader._MATERIALIZED_AGENTS = frozenset()
         loader._MATERIALIZED_STEMS = {}
@@ -341,6 +353,48 @@ class TestDanglingDefaultAgentReset(unittest.TestCase):
         assert event.event_type == "default_agent_reset"
         assert event.resources == "agent:pkg"
         assert event.metadata == {"template": "captain", "reset_to": "default"}
+
+    def test_the_edition_lookup_with_no_context_does_not_re_enter_itself(self):
+        # With no installed context, the edition lookup builds one, which loads
+        # config, which can reach the lookup again. Unguarded, that runs to the
+        # recursion limit, where a GC finalizer fails whichever test is running.
+        import kiro_crew.config.loader as loader
+        import kiro_crew.platform.context as context
+
+        real = context.current_context
+        depth = [0]
+        peak = [0]
+
+        def counting():
+            depth[0] += 1
+            peak[0] = max(peak[0], depth[0])
+            try:
+                return real()
+            finally:
+                depth[0] -= 1
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(
+                Path(td),
+                {"default": {"kiro_agent": "kirocrew"}, "pkg": {"kiro_agent": "captain"}},
+                "pkg",
+                {"kirocrew.json": {"name": "kirocrew"}, "captain.json": {"name": "captain"}},
+            )
+            p1, p2 = self._patched(config, d)
+            with (
+                p1,
+                p2,
+                unittest.mock.patch("kiro_crew.sel.sel"),
+                unittest.mock.patch.object(context, "_ACTIVE", None),
+                unittest.mock.patch.object(context, "current_context", counting),
+            ):
+                loader.refresh_materialized_agents(heal_default=True)
+                (d / "captain.json").unlink()
+                with self.assertLogs("kiro_crew.config.loader", level="WARNING"):
+                    loader.refresh_materialized_agents(heal_default=True)
+            on_disk = self._on_disk(config)
+        assert on_disk["default_agent"] == "default"
+        assert peak[0] == 1
 
     def test_an_unreadable_crewmate_file_is_not_removal_evidence(self):
         # The default is a crewmate whose own file sits in the crewmate folder.
@@ -714,10 +768,33 @@ class TestDanglingDefaultAgentReset(unittest.TestCase):
                 ]
                 assert len(reported) == 1
 
+    def test_kept_file_name_mappings_stay_within_the_bound(self):
+        # An incomplete scan keeps the mappings of the specs it skipped on top
+        # of the fresh ones it built, so the merged map is bounded where it is
+        # retained: specs that stop parsing while new ones appear never push
+        # it past the count bound.
+        import kiro_crew.config.loader as loader
+
+        with tempfile.TemporaryDirectory() as td:
+            config, d = self._home(Path(td), {"default": {"kiro_agent": "kirocrew"}}, "default", {})
+            p1, p2 = self._patched(config, d)
+            with p1, p2, unittest.mock.patch.object(loader, "_MATERIALIZED_SEEN_MAX", 8):
+                for batch in range(3):
+                    for spec in d.glob("Pkg-*.json"):
+                        spec.write_text("{torn", encoding="utf-8")
+                    for n in range(8):
+                        (d / f"Pkg-{batch}-{n}.json").write_text(
+                            json.dumps({"name": f"agent-{batch}-{n}"}), encoding="utf-8"
+                        )
+                    loader.refresh_materialized_agents()
+                    assert len(loader._MATERIALIZED_STEMS) <= 8
+                # The fresh mappings win over the kept ones.
+                assert all(stem.startswith("Pkg-2-") for stem in loader._MATERIALIZED_STEMS)
+
     def test_a_scan_that_could_not_read_every_spec_is_not_evidence_of_a_removal(self):
         # The default's spec is caught mid-write (or briefly unreadable) during
-        # the owner's fetch. The scan skips it, so its name is missing, but the
-        # file is still there: the default must not be reset on that scan, and
+        # the owner's fetch. The scan skips it and keeps the name it declared
+        # last, since the file is still there: the default must not be reset on that scan, and
         # once the file reads again nothing has changed. A real removal still
         # resets on the next complete scan.
         import kiro_crew.config.loader as loader
@@ -736,7 +813,10 @@ class TestDanglingDefaultAgentReset(unittest.TestCase):
                 good = spec.read_text(encoding="utf-8")
                 spec.write_text('{"name": "capt', encoding="utf-8")  # torn
                 loader.refresh_materialized_agents(heal_default=True)
-                assert "captain" not in loader._MATERIALIZED_AGENTS
+                # The incomplete scan keeps the name the last snapshot had
+                # and still never heals.
+                assert "captain" in loader._MATERIALIZED_AGENTS
+                assert loader._MATERIALIZED_COMPLETE is False
                 assert self._on_disk(config)["default_agent"] == "pkg"
                 spec.write_text(good, encoding="utf-8")
                 loader.refresh_materialized_agents(heal_default=True)

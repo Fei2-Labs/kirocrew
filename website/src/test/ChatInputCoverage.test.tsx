@@ -1,7 +1,8 @@
 import React from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
+import { namedCeiling } from './namedCeiling'
 import ChatInput from '../components/ChatInput'
 import { ComposerVoiceSliceOverride } from '../chat-core/composer/Composer'
 import { api } from '../api/client'
@@ -45,11 +46,16 @@ function PasteHarness({
 
 /** Resolve after one animation frame — the handlers schedule their caret
  *  restore there. Frame-driven, not a timed sleep, so it cannot flake. */
-const nextFrame = () => new Promise<void>(resolve => { requestAnimationFrame(() => resolve()) })
+const nextFrame = () => act(async () => {
+  await new Promise<void>(resolve => { requestAnimationFrame(() => resolve()) })
+})
 
 const mountTokens = (initial: string, blocks: PasteBlock[] = [block], onBlocks?: (b: PasteBlock[]) => void) => {
   renderWithProviders(<PasteHarness initial={initial} initialBlocks={blocks} onBlocks={onBlocks} />)
-  return screen.getByLabelText('Message input') as HTMLTextAreaElement
+  const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+  // fireEvent.select and the paste tests focus the box; the focus handler sets state.
+  act(() => { ta.focus() })
+  return ta
 }
 
 beforeEach(() => {
@@ -531,21 +537,21 @@ describe('ChatInput + menu trigger shortcuts', () => {
     const onChange = vi.fn()
     renderWithProviders(<ChatInput {...base} value="look at" onChange={onChange} onFileSelect={vi.fn()} />)
     openPlusMenu()
-    fireEvent.click(screen.getByTitle('Reference a file'))
+    fireEvent.click(screen.getByText('Reference a file'))
     expect(onChange).toHaveBeenCalledWith('look at @')
   })
 
   it('the File item is withheld when the host provides no file-select handler', () => {
     renderWithProviders(<ChatInput {...base} />)
     openPlusMenu()
-    expect(screen.queryByTitle('Reference a file')).toBeNull()
+    expect(screen.queryByText('Reference a file')).toBeNull()
   })
 
   it('the Skill item appends the $ sigil without doubling an existing space', () => {
     const onChange = vi.fn()
     renderWithProviders(<ChatInput {...base} value="run " onChange={onChange} />)
     openPlusMenu()
-    fireEvent.click(screen.getByTitle('Use a skill'))
+    fireEvent.click(screen.getByText('Use a skill'))
     expect(onChange).toHaveBeenCalledWith('run $')
   })
 
@@ -553,7 +559,7 @@ describe('ChatInput + menu trigger shortcuts', () => {
     const onChange = vi.fn()
     renderWithProviders(<ChatInput {...base} onChange={onChange} />)
     openPlusMenu()
-    fireEvent.click(screen.getByTitle('Use a skill'))
+    fireEvent.click(screen.getByText('Use a skill'))
     expect(onChange).toHaveBeenCalledWith('$')
     await nextFrame()
     // The composer is refocused with the caret parked at the end, so the user
@@ -564,9 +570,9 @@ describe('ChatInput + menu trigger shortcuts', () => {
   it('picking a trigger closes the + menu', () => {
     renderWithProviders(<ChatInput {...base} onChange={vi.fn()} />)
     openPlusMenu()
-    expect(screen.getByTitle('Use a skill')).toBeInTheDocument()
-    fireEvent.click(screen.getByTitle('Use a skill'))
-    expect(screen.queryByTitle('Use a skill')).toBeNull()
+    expect(screen.getByText('Use a skill')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Use a skill'))
+    expect(screen.queryByText('Use a skill')).toBeNull()
   })
 
   it('a mousedown outside the portaled menu closes it', () => {
@@ -656,6 +662,7 @@ const AGENT_SOURCE = 'Set per agent in config.json (agents.orchestrator.autocomp
 describe('ChatInput context-usage popover', () => {
   // The context chip lives on the shelf row, which only mounts when the host
   // supplies at least one shelf control — onProjectClick is the cheapest.
+  // The popover has no heading; its "Remaining" row is the open/closed signal.
   const base = { value: '', onChange: vi.fn(), onSend: vi.fn(), onProjectClick: vi.fn() }
 
   it('opens a breakdown with used and remaining token counts', () => {
@@ -663,10 +670,25 @@ describe('ChatInput context-usage popover', () => {
       <ChatInput {...base} contextPct={42} contextWindowTokens={200_000} contextUsedTokens={84_000} />,
     )
     fireEvent.click(screen.getByLabelText('Context usage'))
-    expect(screen.getByText('Context window')).toBeInTheDocument()
+    expect(screen.getByText('Remaining')).toBeInTheDocument()
     expect(screen.getByText('42%')).toBeInTheDocument()
     expect(screen.getByText('84K')).toBeInTheDocument()
     expect(screen.getByText('116K')).toBeInTheDocument()
+  })
+
+  it('threads derivePctFromUsed through so a switch derives the percentage from used', () => {
+    // The switch shape: the stored pct was dropped and only used=120k kept, so
+    // the host sets derivePctFromUsed and the window resolves to the new 200k.
+    // Through ChatInput (not the control alone): if the flag is not a
+    // ChatInputProps field passed on to ContextUsageControl, the popover shows
+    // the raw 12% and ~24K, which is the gap that broke the build.
+    renderWithProviders(
+      <ChatInput {...base} contextPct={12} contextWindowTokens={200_000} contextUsedTokens={120_000} derivePctFromUsed />,
+    )
+    fireEvent.click(screen.getByLabelText('Context usage'))
+    expect(screen.getByText('60%')).toBeInTheDocument()
+    expect(screen.getByText('120K')).toBeInTheDocument()
+    expect(screen.queryByText('12%')).toBeNull()
   })
 
   it('derives an approximate used count when the host reports only a percentage', () => {
@@ -683,16 +705,16 @@ describe('ChatInput context-usage popover', () => {
     renderWithProviders(<ChatInput {...base} contextPct={10} contextWindowTokens={100_000} />)
     const chip = screen.getByLabelText('Context usage')
     fireEvent.click(chip)
-    expect(screen.getByText('Context window')).toBeInTheDocument()
+    expect(screen.getByText('Remaining')).toBeInTheDocument()
     fireEvent.click(chip)
-    expect(screen.queryByText('Context window')).toBeNull()
+    expect(screen.queryByText('Remaining')).toBeNull()
   })
 
   it('a mousedown outside the popover closes it', () => {
     renderWithProviders(<ChatInput {...base} contextPct={10} contextWindowTokens={100_000} />)
     fireEvent.click(screen.getByLabelText('Context usage'))
     fireEvent.mouseDown(document.body)
-    expect(screen.queryByText('Context window')).toBeNull()
+    expect(screen.queryByText('Remaining')).toBeNull()
   })
 
   it('renders no context chip at all when the host reports no percentage', () => {
@@ -766,7 +788,7 @@ describe('ChatInput context-usage popover', () => {
     vi.spyOn(api, 'chatSlotAutocompact').mockRejectedValue(new Error('offline'))
     renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
     fireEvent.click(screen.getByLabelText('Context usage'))
-    expect(await screen.findByText('Context window')).toBeInTheDocument()
+    expect(await screen.findByText('Remaining')).toBeInTheDocument()
     await waitFor(() => expect(api.chatSlotAutocompact).toHaveBeenCalled())
     expect(screen.queryByText('Auto-compact at')).toBeNull()
     // The learned control must not vanish unexplained: a muted one-liner
@@ -864,7 +886,7 @@ describe('ChatInput context-usage popover', () => {
     const post = vi.spyOn(api, 'setChatSlotAutocompact')
     post.mockClear()
     post.mockReturnValueOnce(firstPost).mockResolvedValue({ ok: true, pct: 71, global_pct: 70 })
-    renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
+    const { queryClient } = renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
     fireEvent.click(screen.getByLabelText('Context usage'))
     expect(await screen.findByText('85%')).toBeInTheDocument()
     // First write: reset to global. Its POST stays in flight (deferred).
@@ -875,7 +897,8 @@ describe('ChatInput context-usage popover', () => {
     fireEvent.keyDown(screen.getByRole('slider'), { key: 'ArrowRight' })
     // Let the 400ms debounce elapse — WITHOUT serialization the second POST
     // fires here while the first is unresolved (post count hits 2).
-    await new Promise(r => setTimeout(r, 600))
+    // The debounced second write is issued (two mutations in flight) yet queued behind the first.
+    await waitFor(() => expect(queryClient.isMutating()).toBe(2), namedCeiling('AUTOCOMPACT_SECOND_WRITE_QUEUED', 1500))
     expect(post).toHaveBeenCalledTimes(1)
     // Settle the first write; only then may the second be issued.
     resolveFirst({ ok: true, pct: null, global_pct: 70 })

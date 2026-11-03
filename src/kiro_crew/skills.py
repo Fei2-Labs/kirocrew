@@ -431,6 +431,11 @@ class SkillsLoader:
         self._catalog_drop_lock = threading.Lock()
         self._closed = False
         self._disabled_apps_cache: tuple[float, frozenset[str]] | None = None
+        #: ``id(catalog list) -> (that list, disabled apps, visible rows)``; see
+        #: ``skill_runtime.catalog._iter_visible``.
+        self._visible_memo: dict[
+            int, tuple[list[tuple[str, Path, str | None]], frozenset[str], list]
+        ] = {}
         # (canonical key, allowed) pairs already audited, so the enforcement
         # record is written on first use rather than once per message.
         self._audited_projects: set[tuple[str, bool]] = set()
@@ -665,6 +670,7 @@ class SkillsLoader:
     preview_pending_update = _review.preview_pending_update
     approve_pending_update_checked = _review.approve_pending_update_checked
     approve_pending_skill_checked = _review.approve_pending_skill_checked
+    approve_pending_as_read = _review.approve_pending_as_read
 
     def _iter_uncached(self, project_key: str | None = None) -> list[tuple[str, Path, str | None]]:
         """Walk the skills dir, extra paths, and an already-canonical project root."""
@@ -1033,6 +1039,8 @@ class SkillsLoader:
         target: str | None = None,
         base_version: int | None = None,
         refusal: ClaimRefusal | None = None,
+        missing_scripts: list[str] | None = None,
+        rejected_scripts: dict[str, list[str]] | None = None,
     ) -> str | None:
         """Write a skill candidate to the pending queue (not live).
 
@@ -1053,6 +1061,8 @@ class SkillsLoader:
             target=target,
             base_version=base_version,
             refusal=refusal,
+            missing_scripts=missing_scripts,
+            rejected_scripts=rejected_scripts,
         )
 
     # ── Pending candidate trees: ``kiro_crew.skills_candidate_tree`` ──

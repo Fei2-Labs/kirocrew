@@ -242,7 +242,6 @@ class TestSetupTimezone:
 
         _setup_timezone()
 
-        # File should be unchanged
         assert cfg_file.read_text(encoding="utf-8") == "not json {{{"
         output = capsys.readouterr().out
         assert "Could not read" in output
@@ -369,6 +368,24 @@ class TestManifest:
             _manifest(alias="carol", output=str(out_file))
         assert out_file.exists()
 
+    @pytest.mark.parametrize("target", ["a-directory", "a-file/out.yaml"])
+    def test_unwritable_output_is_one_error_line(self, tmp_path, capsys, target):
+        (tmp_path / "a-directory").mkdir()
+        (tmp_path / "a-file").write_text("", encoding="utf-8")
+        out_file = tmp_path / target
+        with self._patch_template("name: KiroCrew-{{ALIAS}}\n"):  # brand-ok
+            from kiro_crew.cli_setup import _manifest
+
+            try:
+                with pytest.raises(SystemExit) as exc_info:
+                    _manifest(alias="erin", output=str(out_file))
+            except OSError as exc:
+                pytest.fail(f"a raw {type(exc).__name__} escaped instead of an error line: {exc}")
+        assert exc_info.value.code == 1
+        err_lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+        assert len(err_lines) == 1
+        assert err_lines[0].startswith(f"❌ Could not write {out_file}: ")
+
     def test_exits_when_template_missing(self):
         mock_resource = MagicMock()
         mock_resource.joinpath.return_value.read_text.side_effect = FileNotFoundError
@@ -488,7 +505,7 @@ class TestConfigDirOverride:
 
         assert _detect_project_dir() == str(proj.resolve())
 
-    def test_logout_reads_secret_for_listener_port(self, monkeypatch):
+    def test_logout_reads_secret_for_listener_port(self, monkeypatch, capsys):
         """_logout resolves the secret paired with the requested listener."""
         read_secret = MagicMock(return_value="test-secret")
         monkeypatch.setattr("kiro_crew.cli_server.platform_compat.IS_POSIX", True)
@@ -507,9 +524,12 @@ class TestConfigDirOverride:
                 "kiro_crew.cli_server", fromlist=["loopback_urlopen"]
             ).loopback_urlopen(req, timeout=timeout),
         )
-        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp):
+        with patch("kiro_crew.cli_server.loopback_urlopen", return_value=mock_resp) as opener:
             _logout(5476)
         read_secret.assert_called_once_with(5476, dial_host="127.0.0.1")
+        # The secret read for that listener is the one the request carries.
+        assert opener.call_args.args[0].get_header("X-local-secret") == "test-secret"
+        assert "All dashboard sessions revoked" in capsys.readouterr().out
 
     def test_setup_slack_tokens_writes_to_config_dir(self, tmp_path, monkeypatch):
         """_setup_slack_tokens writes .env to config_dir(), not ~/.kirocrew."""
@@ -517,7 +537,6 @@ class TestConfigDirOverride:
 
         from kiro_crew.cli_setup import _setup_slack_tokens
 
-        # Simulate user providing all tokens
         inputs = iter(["y", "xapp-test", "xoxb-test", "U12345"])
         monkeypatch.setattr("builtins.input", lambda _: next(inputs))
 
@@ -626,7 +645,7 @@ class TestSetupChannelGating:
     into the guided Slack credential + slash-command steps.
     """
 
-    def _run_setup(self, monkeypatch, tmp_path, **kwargs):
+    def _run_setup(self, monkeypatch, tmp_path, argv=None, **kwargs):
         import kiro_crew.cli_setup as cs
 
         calls: list[str] = []
@@ -662,7 +681,13 @@ class TestSetupChannelGating:
         # Keep the macOS-only desktop-app input() prompt off the path.
         monkeypatch.setattr(cs.platform, "system", lambda: "Linux")
 
-        cs._setup_impl(**kwargs)
+        if argv is None:
+            cs._setup_impl(**kwargs)
+        else:
+            from kiro_crew.cli import main
+
+            monkeypatch.setattr("sys.argv", argv)
+            main()
         return calls
 
     def test_default_setup_skips_slack_steps(self, tmp_path, monkeypatch, capsys):
@@ -714,18 +739,12 @@ class TestSetupChannelGating:
         calls = self._run_setup(monkeypatch, tmp_path, slack=True, whatsapp=True)
         assert calls == ["slack_tokens", "slash_command", "whatsapp"]
 
-    def test_the_whatsapp_flag_reaches_setup_from_the_command_line(self):
+    def test_the_whatsapp_flag_reaches_setup_from_the_command_line(self, tmp_path, monkeypatch):
         """The wizard-level tests call ``_setup_impl`` directly, so the argparse
         flag and its plumbing need their own guard: without them
         ``kirocrew setup --whatsapp`` exits 2 instead of running anything."""
-        import sys
-
-        argv = ["kirocrew", "setup", "--whatsapp"]
-        with patch.object(sys, "argv", argv), patch("kiro_crew.cli._setup") as mock_setup:
-            from kiro_crew.cli import main
-
-            main()
-            assert mock_setup.call_args.kwargs["whatsapp"] is True
+        calls = self._run_setup(monkeypatch, tmp_path, argv=["kirocrew", "setup", "--whatsapp"])
+        assert calls == ["whatsapp"]
 
     def test_agent_only_with_whatsapp_warns_and_skips_the_step(self, tmp_path, monkeypatch, capsys):
         """--agent-only --whatsapp: the step is skipped, and the notice names the

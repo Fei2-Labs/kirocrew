@@ -37,6 +37,14 @@ export interface AcpBackendProbe {
   missing_components: string[]
   install_command: string
   /**
+   * Set only on a `'missing'` row whose binary DOES resolve but runs a release
+   * other than the one the gateway verified (GitHub Copilot CLI's pin): the
+   * release it found. The row then reads "Wrong version" rather than "Not
+   * installed", and `install_command` installs the verified release. OPTIONAL
+   * because a gateway that predates this field sends none.
+   */
+  found_version?: string
+  /**
    * Installed on disk, but the RUNNING gateway already resolved its absence and
    * cached that for the process's life — so a session started now would still
    * fail. Disables the option and says restart, rather than offering a control
@@ -203,6 +211,8 @@ export function createConfigEndpoints({ post, put, j, jfetch: fetch }: ClientTra
     // Owner-only, and absent (404) on an older gateway. Both of those reach the
     // caller as a rejection, which is the intended signal: "no probe information",
     // to be treated as fail-open rather than as a verdict.
+    // `kiro_selection_runs_on_kas`: `agent.acp_backend` is stored as Kiro CLI and
+    // sessions run it on KAS, so the Agent Harness panel offers to save KAS.
     acpBackends: (options: boolean | { probe?: boolean } = false) => {
       const probe = typeof options === 'boolean' ? options : options.probe === true
       return fetch('/api/acp-backends' + (probe ? '?probe=1' : '')).then(j) as Promise<AcpBackendsResponse>

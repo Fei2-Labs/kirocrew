@@ -94,8 +94,8 @@ tool. All stores share one model and inference worker. The interactive
 process may run on -- which a CPU-set restriction (`--cpuset-cpus`, `taskset`)
 narrows below the host's core count -- and never below one thread, so the event
 loop keeps a core wherever
-there is one to spare; `memory.embedding_bulk_threads` remains 1. The value 4 means that default policy, so pinning threads
-where the process may use 4 or fewer CPUs takes a different number; any other explicit setting is
+there is one to spare; where the process may use 12 or more CPUs the default is 6; `memory.embedding_bulk_threads` remains 1. The value 4 means that default policy, so 4 cannot be pinned
+where the process may use 4 or fewer, or 12 or more CPUs (there a 4 runs 6; set 3 or 5 to stay low); any other explicit setting is
 honored up to that same count. Bulk threads may be 0 to inherit the normal
 setting. Background jobs share the configured bulk
 duty cycle, while waiting interactive queries take priority. A full inference
@@ -105,13 +105,14 @@ members do not create unbounded native work.
 Private V2 execution requires `agent.sandbox=auto` and working Linux/WSL namespaces
 or macOS outer Seatbelt. Native Windows, unconfined execution, unsupported MCP
 backends and Kiro internal delegation refuse private member turns with a reason.
-The owner can still manage memory in the dashboard. Existing members, including
-the default assistant selection, keep their declared V1 memory after upgrading.
-To opt in, open Crew Manager, select the member, open **Workspace · Memory**, and
-choose **Create private memory**. The new V2 store starts empty; previous V1
-stores remain available for an explicit copy of selected starting knowledge.
-Check the execution requirements above before choosing V2. New members receive
-V2 automatically, and an existing V2 member never falls back to V1 on failure.
+The owner can still manage memory in the dashboard. A member's memory store is
+chosen when the member is created and cannot be rebound afterwards. Existing
+members, including the default assistant selection, keep their declared V1
+memory after upgrading. To give a crewmate private V2 memory, create a new crew
+member: new members receive V2 automatically, starting empty, and V1 stores
+remain available for an explicit copy of selected starting knowledge. Check the
+execution requirements above first. A V2 member never falls back to V1 on
+failure.
 
 ## Install paths
 
@@ -146,6 +147,7 @@ that path binding. Prefer a package where you can.
 | A desktop app on Fedora / RHEL / CentOS Stream / Amazon Linux 2023 | **`.rpm`** (d) |
 | A desktop app with no root and no package manager | **AppImage** (d) |
 | A container host | **Docker** ([guide](docker.md)) |
+| To work on Kiro Crew itself (follows a branch; `main` is Nightly) | **From source** (b) |
 
 ### a. One-line install (fastest)
 
@@ -154,6 +156,16 @@ npm, no local build:
 
 ```bash
 curl -fsSL https://download.crew.kiro.dev/cli.sh | sh
+```
+
+Once the wheel is in, the installer runs the new `kirocrew kas install` to
+download the [built-in KAS engine](#first-run) this release pins (about 55-70 MB
+for your platform). If that download fails, for example on a host with no
+access to the CDN, the install still succeeds and the installer prints the
+command to retry. Pass `--no-kas` (or set `KIROCREW_INSTALL_KAS=0`) to skip it:
+
+```bash
+curl -fsSL https://download.crew.kiro.dev/cli.sh | sh -s -- --no-kas
 ```
 
 `stable` is the default channel. Track a faster one, or pin an exact version:
@@ -276,6 +288,25 @@ make build                                   # npm build + editable backend inst
 PYTHONPATH=src python -m kiro_crew gateway   # -> http://localhost:5476
 ```
 
+**This is the contributor layout, not an end-user install.** `make build` and
+`install.sh` both build the clone they run in, so the install follows the
+clone's checked-out branch rather than a release lane. On `main` that is the
+Nightly lane: the version reads `0.X.0.devYYYYMMDD`, ahead of the Stable
+release the desktop app and the [one-line install](#a-one-line-install-fastest)
+follow. `install.sh` says which lane it is building, at its start and at its
+end.
+
+Updating follows the same branch. `kirocrew update` (and the dashboard
+**Update** button) fetches `origin/<branch>` and hard-resets the clone to it
+when the clone is only behind. A clone that is both ahead and behind — local
+commits `origin/<branch>` lacks, plus new ones from it — is refused, because the
+reset would discard the local commits; `kirocrew update --force` discards them
+deliberately. A clone that is only ahead is reported up to date. A detached
+checkout, such as a release tag, is on no branch, and `kirocrew update` cannot
+update it. To follow a release lane on a laptop or server, use the one-line
+install: it updates from the channel's signed release feed and has no git
+history to diverge.
+
 On Windows the same targets run through `make.ps1`, because `make` is not part
 of a Windows install and the Makefile's recipes are POSIX-shaped
 (`.venv/bin/pip`, `rm -rf`, `bash ensure-*.sh`):
@@ -320,7 +351,10 @@ Both targets bootstrap their toolchain first (`ensure-node.sh`,
 `ensure-python.sh`) and fall back to whatever is on `PATH` if that fails. The
 backend target refuses to build a venv from an interpreter older than 3.12,
 matching `pyproject.toml`'s `requires-python`, rather than letting dependency
-resolution backtrack or the package fail at import.
+resolution backtrack or the package fail at import. `ensure-python.sh` also
+skips any interpreter whose throwaway `--without-pip` venv cannot run python,
+such as a shared-libpython build behind a launcher wrapper (Toolbox's kirocrew
+Python), and moves on to the next candidate or mise.
 
 `make.ps1` resolves the same toolchain but installs none of it: the bootstrap
 scripts' install paths are `curl … | sh`, so on Windows it searches (`py`
@@ -469,8 +503,9 @@ and the three Linux formats come from one backend tree packaged three times.
 The published, signed apps ([prebuilt downloads](../../README.md#app-downloads))
 update themselves, and the gateway bundled inside them, through the
 app's own updater. By default a new release downloads in the background and
-installs the next time you quit the app (closing the window only hides it to
-the tray; quit from the tray or the menu bar). To be asked first, turn off
+installs the next time you quit the app (by default closing the window only hides
+it to the tray; quit from the tray or the menu bar, or turn off **Keep running in the background
+after closing the window** in Settings → Display → View → Desktop app so the close button quits). To be asked first, turn off
 **Install app updates automatically** on the About page (an **Update the gateway
 automatically** switch beside it sets only an attached gateway's `auto_update`); the app then offers each release and
 downloads it when you click Download, in the update popup or on the About page.
@@ -551,7 +586,11 @@ Linux, `.\make.ps1 <target>` on Windows.
 | `make clean` | Remove build artifacts, dists, and caches |
 
 Override the Python interpreter with `make PY=python3.12 build`, or
-`.\make.ps1 build -Py C:\path\to\python.exe`.
+`.\make.ps1 build -Py C:\path\to\python.exe`. Either one takes precedence over
+the `<data-home>/python-bin` marker `ensure-python.sh` records; a `PY` exported
+in the environment does not, so the marker still wins over it.
+
+`make wheel`, `make backend-bin` and `make desktop` take `EDITION=oss` or `EDITION=enterprise`, stamped into the built package's `kiro_crew/edition.py`. Only `EDITION=` on the `make` command line counts; an exported shell `EDITION` is ignored, even under `make -e`. Without it, the value comes from the `KIROCREW_BUILD_EDITION` environment variable, and then defaults to `oss`. Both set to different values, or any other value (wildcards such as `%` included), fails the build before it starts. On Windows, set `KIROCREW_BUILD_EDITION` before `.\make.ps1`. See [platform-context](../system-specs/modules/platform-context.md#build-time-edition-constant).
 
 Both desktop targets run `packaging/build-desktop.sh` on every platform,
 including Windows, where `make.ps1` invokes it through the Git for Windows bash:
@@ -581,9 +620,11 @@ same account store.
 
 The built-in KAS engine is an alternative that needs no Kiro CLI. It is in
 shadow testing: the switch is off by default on every platform and nothing turns
-it on for you. From a source install, `bash install.sh --kas` downloads the
-engine version this release pins; after any other install, `kirocrew kas
-install` does the same. The desktop app ships that engine inside the app
+it on for you. The one-line install (`cli.sh`) and `bash install.sh` download
+the engine version this release pins by default, by running `kirocrew kas
+install` once Kiro Crew is installed; `--no-kas` skips that, and a failed
+download only warns. After any other install, or to retry, run `kirocrew kas
+install` yourself. The desktop app ships that engine inside the app
 (`BUNDLE_KAS=1` at build time), so there is nothing to download. To try the
 route, turn on **Run KAS on Kiro Crew's own engine** under Settings → Developer →
 Feature Previews (or `kirocrew config set agent.kas_bundle true`) and restart; you

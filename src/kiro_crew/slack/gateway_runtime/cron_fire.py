@@ -12,7 +12,8 @@ unreadable cron store aside.
 Orchestrator fields read: ``_cfg``, ``_no_crons``, ``_running_script_ids``,
 ``ctx_builder``, ``dashboard_state``, ``sessions``.
 Orchestrator fields written: ``_cron_armed``, ``_cron_quarantine``,
-``_cron_reconciled``, ``cron_svc``.
+``_cron_reconciled``, ``_cron_runs_holding`` (a message run's task, from before its
+first acquire to its end), ``cron_svc``.
 
 Composed by :mod:`kiro_crew.slack.gateway`, whose globals its functions run on;
 see :mod:`kiro_crew.slack.gateway_runtime`.
@@ -20,7 +21,7 @@ see :mod:`kiro_crew.slack.gateway_runtime`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     import asyncio
@@ -59,6 +60,9 @@ class _CronCapture(NamedTuple):
     cron_memory_store: str
     cron_agent: str
     default_substituted: bool
+    # The previous run's result framed as untrusted data, for build_message's
+    # request_prefix_context (``cron_prior_result_context``); "" when none.
+    prior_result: str = ""
 
 
 def _cron_extra_env(job: CronJob) -> dict[str, str] | None:
@@ -137,7 +141,12 @@ async def _init_cron(self: GatewayOrchestrator, *, arm: bool = True) -> None:
                     )
                 await self._alert_cron_failure(job, gate_reason, denied=True)
                 return None
-            return await goal_reminder.fire(self.dashboard_state, job)
+            outcome = await goal_reminder.fire(self.dashboard_state, job)
+            # The run's summary in the job's history: a check-in delivers
+            # nothing itself, so without it a skip ("the mate is busy") would
+            # read as a success that said nothing, silent job or not.
+            job.set_run_result(redact(outcome))
+            return outcome
 
         cap = await self._cron_capture(job)
 
@@ -152,7 +161,14 @@ async def _init_cron(self: GatewayOrchestrator, *, arm: bool = True) -> None:
 
         # ── Code-based script execution (deterministic, no LLM) ──
         if job.script:
-            return await self._cron_run_script(job)
+            result = await self._cron_run_script(job)
+            if job.last_status == "error" and not getattr(job, "run_never_started", False):
+                # A failed run writes no record, so the crewmate's page would keep the
+                # last good one as current: the gateway records the failure there. A
+                # run that never started (overlap guard, admission closed, pool
+                # starved) is not a failure of the job, as the scheduler counts it.
+                await self._record_bound_script_failure(job)
+            return result
 
         # ── Fire-time governance gate: message (LLM) jobs ──
         # Command and script jobs are gated inside their blocks above; a job
@@ -216,11 +232,33 @@ async def _init_cron(self: GatewayOrchestrator, *, arm: bool = True) -> None:
         # When agent_sequence has multiple agents, run them sequentially
         # with per-agent session keys and per-job env vars.
         if agent_sequence_dispatches(cap.cron_agents):
-            return await self._cron_run_sequence(job, cap)
+            dispatch = self._cron_run_sequence(job, cap)
+        else:
+            # ── Single-agent path (existing behavior) ──
+            # Per-job env vars (single-agent path) travel via extra_env passthrough
+            dispatch = self._cron_run_single(job, cap, retry=_cron_callback)
+        from kiro_crew.shared_crew.admission_entry import admitted_cron_dispatch
 
-        # ── Single-agent path (existing behavior) ──
-        # Per-job env vars (single-agent path) travel via extra_env passthrough
-        return await self._cron_run_single(job, cap, retry=_cron_callback)
+        return await admitted_cron_dispatch(job, _held(dispatch))
+
+    async def _held(dispatch: Any) -> Any:
+        # ── The run's own holding ──
+        # The task awaiting this is the cron run from before its first acquire
+        # to its end, so a permit it holds is the run's own from the moment the
+        # claim sets the session's turn_owner. The idle cleanup after a last
+        # sub-agent (_reset_cron_parent_when_idle) reads that holder and leaves
+        # a session this task holds to the run's finalizer. The outermost frame
+        # owns the entry: a retry re-enters _cron_callback in the same task and
+        # must not drop it when its own frame returns.
+        run_task = asyncio.current_task()
+        owned = run_task if run_task not in self._cron_runs_holding else None
+        if owned is not None:
+            self._cron_runs_holding.add(owned)
+        try:
+            return await dispatch
+        finally:
+            if owned is not None:
+                self._cron_runs_holding.discard(owned)
 
     self._cron_reconciled = False
     self._cron_armed = False
@@ -236,7 +274,7 @@ async def _init_cron(self: GatewayOrchestrator, *, arm: bool = True) -> None:
         self.cron_svc.set_refresh_callback(self.dashboard_state.push_refresh)
     # A run its deadline ends never returns to _cron_callback, whose failure
     # paths are the only ones that alert; the service hands it back here.
-    self.cron_svc.set_timeout_alert(self._alert_cron_failure)
+    self.cron_svc.set_timeout_alert(self._alert_cron_timeout)
     if self._no_crons:
         logger.info("Cron scheduler disabled (--no-crons)")
     else:
@@ -258,6 +296,41 @@ async def _init_cron(self: GatewayOrchestrator, *, arm: bool = True) -> None:
             await self._start_cron_after_memory_ready()
 
 
+async def _record_bound_script_failure(self: GatewayOrchestrator, job: CronJob) -> None:
+    """Record *job*'s failed run in the crew log of the crewmate it is bound to.
+
+    Only for a job bound to a crewmate (``member_id``). The identity is the
+    scheduler's own record of the job, never anything the script said. BEST-EFFORT and
+    off the loop: the recorder never raises, and a failure that cannot be recorded
+    (no crew log yet, the crew panel off) changes nothing about the run.
+    """
+    import asyncio as _asyncio
+
+    from kiro_crew.dashboard.handlers.agent_panel_record import record_cron_failure
+
+    member_id = str(getattr(job, "member_id", "") or "")
+    if not member_id:
+        return
+    try:
+        await _asyncio.to_thread(
+            record_cron_failure, str(job.id), member_id, str(job.last_error or "")
+        )
+    except Exception:
+        logger.debug("Cron '%s': failure record skipped", job.name, exc_info=True)
+
+
+async def _alert_cron_timeout(self: GatewayOrchestrator, job: CronJob, detail: str) -> None:
+    """The service's timeout alert: record a bound script's failure, then alert.
+
+    A run its deadline ends is cancelled inside ``_cron_run_script``, so the failure
+    record after it in ``_cron_callback`` never runs; this is where that run is
+    recorded instead. A run that never started is skipped, as there.
+    """
+    if getattr(job, "script", None) and not getattr(job, "run_never_started", False):
+        await self._record_bound_script_failure(job)
+    await self._alert_cron_failure(job, detail)
+
+
 async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture:
     """What one cron fire captures before it dispatches anything.
 
@@ -266,9 +339,12 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
     the agent it dispatches: the configured default stands in for the bare floor
     only where that is safe. Every kind of job captures, before the overlap guard.
     """
-    # helper picks stable vs ephemeral session key and
-    # decides whether to prepend last_result, based on job.persistent_session.
+    # helper picks stable vs ephemeral session key; a persistent job's previous
+    # result is carried separately, framed as data, ahead of the request.
     session_key, msg = build_cron_session_context(job)
+    from kiro_crew.cron_service.identity import cron_prior_result_context
+
+    prior_result = cron_prior_result_context(job)
 
     from kiro_crew.cron import resolve_cron_memory
     from kiro_crew.execution_context import (
@@ -278,6 +354,20 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
 
     # Snapshot the job before yielding; reloading a cron cannot rebind it.
     cron_agents = list(job.agent_sequence)
+    # Only an agent run writes a transcript under this key; tagging a script or
+    # command job would create an empty transcript on every fire.
+    if (
+        not job.persistent_session
+        and not (job.script or job.command)
+        and not agent_sequence_dispatches(cron_agents)
+    ):
+
+        def tag_run_transcript() -> None:
+            from kiro_crew.history import ConversationLog
+
+            ConversationLog().update_metadata(session_key, {"cron_run": "ephemeral"})
+
+        await asyncio.to_thread(tag_run_transcript)
     # ── Default-agent fallback (LLM jobs) ──
     # A job with no explicit agent_id must run the configured default
     # agent (config.agent.default_agent), matching the chat transports'
@@ -294,8 +384,7 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
     #   * Above the branch, because every record created since the
     #     execution-context migration carries `execution_context` and so
     #     takes the other arm. Resolving inside `else:` reaches only
-    #     pre-migration jobs and leaves the reported symptom in place for
-    #     everything created since.
+    #     pre-migration jobs and leaves every newer job on the floor.
     #   * Not into the capture, because `cron_execution` is what
     #     `bind_session_execution` publishes under the session key, and a
     #     persistent_session job (the default) reuses the stable key
@@ -400,7 +489,7 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
     # of which any durable record compares.
     #
     # Gated on the resolved agent still being the bare "kirocrew" floor,
-    # which is the whole of what this change replaces. A record whose
+    # the only value the default may replace. A record whose
     # captured template_id names a REAL template keeps it: a schedule
     # created from a template chat with no `agent` argument names its
     # template ONLY there, `agent_id` staying empty: bind_cron_memory
@@ -411,11 +500,11 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
     # captured execution and memory store stayed the original template's,
     # and dispatched_agents_from_disk -- the delete guard's ONE walk of
     # the dispatch-mirroring rule -- still reported the old agent: guard
-    # and dispatch would drift, which is the same silent wrong-agent class
-    # this change removes, reintroduced on the other arm. Compared after
+    # and dispatch would drift into a silent wrong-agent dispatch.
+    # Compared after
     # .strip() so a whitespace-only capture counts as the floor, which is
-    # where whitespace agent_id handling lives now that the capture itself
-    # is left byte-for-byte alone.
+    # where whitespace agent_id handling lives: the capture itself is
+    # left byte-for-byte alone.
     # Also gated on the capture carrying no member_id. A cron created
     # from a crew member's chat is captured by resolve_member_execution
     # as a MEMBER execution whose template_id is
@@ -438,7 +527,7 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
     # the namespace is the authoritative answer to "did this capture
     # select a member?" and member_id is only its persisted form.
     # Requiring BOTH keeps a legacy member on an unmigrated store out of
-    # the override, which a member_id-only gate admitted.
+    # the override; a member_id-only gate would admit it.
     #
     # And BOTH capture gates together are still not enough, because on
     # the `job.execution_context is None` arm cron_execution is
@@ -455,7 +544,7 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
     # with nothing backfilling execution_context on load. So the JOB is
     # asked as well: on that arm it is the only surviving evidence of the
     # selection. A truthy non-str also declines, which is the safe
-    # direction -- declining leaves the pre-change floor behaviour.
+    # direction -- declining keeps the floor agent.
     if (
         _default_agent
         and (cron_agent or "").strip() in ("", "kirocrew")
@@ -477,21 +566,17 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
         # the substituted template is never consulted and a child it
         # forbids starts.
         #
-        # Honouring it properly means a NON-DURABLE parent execution the
-        # spawn gate reads, in two files this change does not touch and
-        # whose reviewers are scoped to spawn admission, not cron. So
-        # this change narrows itself instead: a default that declares an
-        # allowlist is not substituted, and the job keeps the floor it
-        # already had before this change. Nothing an operator has today
-        # regresses; the capability simply waits for that CR.
+        # Honouring it would need a NON-DURABLE parent execution the
+        # spawn gate reads. Until that exists, a default that declares an
+        # allowlist is not substituted, and the job keeps the floor.
         #
         # DENY BY DEFAULT. A non-empty tuple declines, and so does the
         # reader's `None`. Only `()` -- "no readable spec declares this
         # name, and every spec file parsed" -- permits the substitution.
         #
-        # An earlier revision substituted on `None`, arguing the spawn
-        # gate would refuse anyway because it asks about the CAPTURE's
-        # floor spelling. That premise is false: `agent.py` generates and
+        # `None` must not substitute on the theory that the spawn gate
+        # refuses anyway because it asks about the CAPTURE's floor
+        # spelling. That premise is false: `agent.py` generates and
         # installs `kirocrew.json` into the agents directory and
         # `config/defaults.json` declares `"name": "kirocrew"`, so a
         # readable spec DOES declare the floor name -- and
@@ -533,6 +618,7 @@ async def _cron_capture(self: GatewayOrchestrator, job: CronJob) -> _CronCapture
         cron_memory_store,
         cron_agent,
         _default_substituted,
+        prior_result,
     )
 
 

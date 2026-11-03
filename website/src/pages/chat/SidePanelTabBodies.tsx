@@ -20,6 +20,7 @@ import FileBrowserRail from './FileBrowserRail'
 import WebPreviewPanel from '../../components/WebPreviewPanel'
 import CliPanel from '../../components/CliPanel'
 import { countLines } from '../../components/FileChangeChips'
+import { pathBasename } from '../../utils/pathBasename'
 import { useQueryClient } from '@tanstack/react-query'
 import type { PanelTab } from '../../hooks/usePanelTabs'
 import { usePanelTerminalsPending } from '../../hooks/usePanelTabs'
@@ -147,7 +148,7 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
   onDiskContent: (c: string, binary?: boolean, partial?: boolean) => void
   onDiffModeChange: (diffMode: boolean) => void
   onFileSave: (fp: string, c: string) => Promise<void>
-  onFileOpen?: (p: string, opts?: { diffMode?: boolean; line?: number; replaceId?: string; canReplace?: () => boolean }) => void
+  onFileOpen?: (p: string, opts?: { diffMode?: boolean; line?: number; endLine?: number; replaceId?: string; canReplace?: () => boolean }) => void
   /** The header path menu's "Show folder in side panel" target. */
   onFolderOpen?: (p: string) => void
   /** Right-click "Add to context" on a rail row. */
@@ -186,11 +187,13 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
       revealLine={tab.revealLine}
       onRevealConsumed={onRevealConsumed}
       onFolderOpen={onFolderOpen}
+      onFileOpen={onFileOpen ? (p, opts) => onFileOpen(p, opts?.line != null ? { line: opts.line, endLine: opts.endLine } : undefined) : undefined}
       railOpen={railUsable && railOpen}
       onRailToggle={railUsable ? () => setRailOpen(v => !v) : undefined}
       browserRail={railUsable ? (
         <FileBrowserRail
           projectDir={projectDir}
+          active={active}
           onAddToContext={onAddToContext}
           onOpenFolder={onFolderOpen}
           selectedPath={tab.path || null}
@@ -312,7 +315,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
    *  so the strip label tracks where the user actually is. */
   onPathChange: (p: string) => void
   onFileSave: (fp: string, c: string) => Promise<void>
-  onFileOpen?: (p: string, opts?: { diffMode?: boolean; line?: number; replaceId?: string; canReplace?: () => boolean }) => void
+  onFileOpen?: (p: string, opts?: { diffMode?: boolean; line?: number; endLine?: number; replaceId?: string; canReplace?: () => boolean }) => void
   /** Open a directory as a folder tab: the file tab header's "Show folder in
    *  side panel" row. */
   onFolderOpen?: (p: string) => void
@@ -329,7 +332,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
   // switch cannot remount its `AppHost`. The tab loop in `SidePanel.tsx` returns null for both.
   const terminalsPending = usePanelTerminalsPending()
   // A restored shell may be gone: connecting before the ruling would spawn a new one.
-  if (tab.kind === 'terminal') return terminalsPending ? null : <CliPanel sessionId={tab.sessionId ?? ''} cwd={tab.cwd} visible={active} onSendToChat={onTerminalSendToChat} />
+  if (tab.kind === 'terminal') return terminalsPending ? null : <CliPanel sessionId={tab.sessionId ?? ''} cwd={tab.cwd} remoteSlot={tab.remoteSlot} chatSlot={slot || undefined} visible={active} onSendToChat={onTerminalSendToChat} />
   if (tab.kind === 'browser') return <WebPreviewPanel sessionKey={slot} active={active} />
   if (tab.kind === 'app') return <McpAppTabBody tab={tab} slot={slot} />
   // Cross-remount scroll identity for document bodies. Same slot+id key shape
@@ -414,7 +417,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
             <button className="text-[12px] text-text-strong truncate hover:text-accent cursor-pointer transition-colors bg-transparent border-none p-0" onClick={() => { onFileOpen?.(tab.path || '') }} title={i18nT('pages.chat.sidePanel.open_in_editor_2', { path: tab.path || '' })}>
               {/* Bare filename: the tab title carries '- Diff', which would
                   read redundantly next to the Turn Diff badge here. */}
-              {(tab.path || '').split('/').pop() || tab.title}
+              {pathBasename(tab.path || '') || tab.title}
             </button>
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-accent/15 text-accent font-medium shrink-0">{i18nT('pages.chat.sidePanel.turn_diff')}</span>
             {(added > 0 || removed > 0) && <span className="text-[11px] font-mono font-semibold shrink-0">{added > 0 && <span className="text-ok">+{added}</span>}{removed > 0 && <span className="text-danger ml-1.5">-{removed}</span>}</span>}

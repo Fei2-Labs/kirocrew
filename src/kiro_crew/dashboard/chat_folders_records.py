@@ -33,6 +33,7 @@ from kiro_crew.dashboard.token_auth import (
     refuse_unattributable_caller,
     request_origin,
 )
+from kiro_crew.instances.crew_ref import clean_crew_ref
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.sel import sel
 
@@ -51,6 +52,12 @@ logger = logging.getLogger("kiro_crew.dashboard.chat_folders")
 #: authoritative while the lock is held, which is the same reason the parent is
 #: re-checked and ``order`` recounted there.
 MAX_CHAT_FOLDERS = 500
+
+#: PATCH fields that change how the sidebar draws a folder rather than what the
+#: folder is. A person changing only these has not claimed the folder:
+#: collapsing it to look past it, or a drag that renumbers its siblings. They are
+#: also the only fields a mate's home folder takes from anyone.
+LAYOUT_ONLY_FIELDS = frozenset({"collapsed", "order"})
 
 
 def _validate_folder_tags(state: DashboardState, raw: Any) -> tuple[list[str] | None, str | None]:
@@ -461,12 +468,27 @@ class FolderCapError(FolderCreateError):
         )
 
 
+class FolderMateHomeLockedError(FolderOwnershipError):
+    """Refused because the parent sits in a mate's home and the caller is not that mate.
+
+    A subclass of :class:`FolderOwnershipError` so a caller that already treats
+    an ownership refusal as a denied security decision (the scaffold audits it
+    as one) does the same here; the folder API answers it with its own code.
+    """
+
+    def __init__(self) -> None:
+        FolderCreateError.__init__(
+            self, "this folder belongs to a mate and is managed for you", "mate_home_locked"
+        )
+
+
 # Named by the path callers import them from: a traceback or a log line renders a raised
 # class as ``module.qualname``, so the owner module must not leak into it.
 FolderCreateError.__module__ = "kiro_crew.dashboard.chat_folders"
 FolderOwnershipError.__module__ = "kiro_crew.dashboard.chat_folders"
 FolderNameExistsError.__module__ = "kiro_crew.dashboard.chat_folders"
 FolderCapError.__module__ = "kiro_crew.dashboard.chat_folders"
+FolderMateHomeLockedError.__module__ = "kiro_crew.dashboard.chat_folders"
 
 
 async def create_folder_record(
@@ -476,6 +498,7 @@ async def create_folder_record(
     parent_id: str = "",
     project_dir: str = "",
     default_agent: str = "",
+    default_destination_crew: str = "",
     color: str = "",
     icon: str = "",
     request_app: str = "",
@@ -574,9 +597,14 @@ async def create_folder_record(
             ``icon``, or a ``unique_project_dir`` collision).
         FolderOwnershipError: if an app tried to nest under a folder it does
             not own.
+        FolderMateHomeLockedError: if the parent is a mate's home folder, or
+            inside one, and ``request_app`` is not that mate.
         FolderNameExistsError: if ``refuse_duplicate_name`` is set and the
             parent already holds a folder of this name.
     """
+
+    # Function-local: ``mate_folders`` imports this module for the folder cap.
+    from kiro_crew.dashboard.mate_folders import refuses_write_into
 
     name = name.strip()[:100]
     if not name:
@@ -632,6 +660,7 @@ async def create_folder_record(
         "parent_id": parent_id,
         "project_dir": project_dir,
         "default_agent": default_agent,
+        "default_destination_crew": clean_crew_ref(default_destination_crew),
         # Epoch seconds, a JSON number, so the sidebar and the MCP tree read it
         # with the same rule they read ``order`` by. It is what the sidebar's
         # ``created`` folder sort orders on; a row from before this key existed
@@ -661,6 +690,10 @@ async def create_folder_record(
         parent = next((f for f in folders if f["id"] == parent_id), None) if parent_id else None
         if parent_id and parent is None:
             return False, "parent_not_found"
+        # A mate's home and its subtree take folders from that mate only. Decided
+        # under the lock, where the parent's place in the tree is current.
+        if parent is not None and refuses_write_into(folders, parent_id, request_app):
+            return False, "mate_home_locked"
         # The ceiling is tested here, under the lock, for the same reason the parent
         # is re-checked here: `len(folders)` is only authoritative while the lock is
         # held, so a pre-lock test lets concurrent creators each pass a cap that is
@@ -723,6 +756,8 @@ async def create_folder_record(
     if create_err == "parent_not_found":
         # The parent was deleted while this request waited for the lock.
         raise FolderCreateError("parent folder not found", "folder_parent_not_found")
+    if create_err == "mate_home_locked":
+        raise FolderMateHomeLockedError()
     if create_err == "forbidden_parent":
         raise FolderOwnershipError()
     if create_err == "project_dir_exists":

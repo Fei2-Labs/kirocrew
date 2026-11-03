@@ -49,6 +49,8 @@ from kiro_crew.secrets.migrate import _env_lock_path
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
 from kiro_crew.skills import remove_retired_conductor_skill
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.terminal_safe import safe_terminal_line
 from kiro_crew.validation import USER_ID_RE
 
 
@@ -72,8 +74,22 @@ def _get_alias() -> str:
     return alias
 
 
+def _manifest_features() -> frozenset[str]:
+    """The Slack Code switches the saved config turns on (none if it cannot load).
+
+    The CLI renders the SAME manifest the dashboard serves for this install, so an
+    existing app updated from either one asks Slack for the same scopes.
+    """
+    from kiro_crew.slack.features import manifest_features
+
+    try:
+        return manifest_features(KiroCrewConfig.load())
+    except Exception:
+        return frozenset()
+
+
 def _manifest(alias: str | None = None, output: str | None = None, url: bool = False) -> None:
-    """Render slack-manifest.yaml with the user's alias substituted."""
+    """Render slack-manifest.yaml with the user's alias and Slack Code switches."""
 
     alias = alias or _get_alias()
     if not slack_manifest.valid_alias(alias):
@@ -83,24 +99,35 @@ def _manifest(alias: str | None = None, output: str | None = None, url: bool = F
             file=sys.stderr,
         )
         sys.exit(1)
+    features = _manifest_features()
     try:
-        rendered = slack_manifest.render(alias)
+        rendered = slack_manifest.render(alias, features=features)
     except FileNotFoundError:
         print("❌ Cannot find slack-manifest.yaml", file=sys.stderr)
         sys.exit(1)
     command = slack_manifest.slash_command(alias)
+    switches = ", ".join(f"slack.{f}" for f in slack_manifest.FEATURES if f in features)
     hint = (
         f"   Slash command: /{command} — the gateway answers it once slack.command matches:\n"
         f"   kirocrew config set slack.command {command}\n"
+        f"   Slack Code switches rendered: {switches or 'none'}\n"
     )
     if url:
         print("\n🔗 Click to create your Slack app:\n")
-        print(f"{slack_manifest.deep_link(alias)}\n")
+        print(f"{slack_manifest.deep_link(alias, features)}\n")
         print(hint)
     elif output:
         out = Path(output)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(rendered, encoding="utf-8")
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(rendered, encoding="utf-8")
+        except OSError as exc:
+            # A directory at the path, a file where a folder should be or a
+            # read-only target: one line, not a traceback.
+            shown = safe_terminal_line(str(output))
+            reason = safe_terminal_line(str(exc.strerror or exc))
+            print(f"❌ Could not write {shown}: {reason}", file=sys.stderr)
+            sys.exit(1)
         print(f"✅ Manifest written to {output} (name: KiroCrew-{alias})")
         print(hint)
     else:
@@ -212,46 +239,69 @@ def _print_no_desktop_sources() -> None:
     )
 
 
-def _setup_electron() -> None:
-    """Build and install the KiroCrew desktop app (macOS only)."""
+def _run_desktop_build_step(label: str, cmd: list[str], cwd: Path, timeout: int) -> bool:
+    """Run one desktop-app build command; print why it failed and return False."""
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd),
+            capture_output=True,
+            # npm and electron-builder are node programs: their pipes carry
+            # UTF-8, not the locale's code page.
+            **UTF8_TEXT,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"  ❌ {label} timed out after {timeout}s.")
+        print("     Check your network and re-run: kirocrew setup --electron-only")
+        return False
+    except OSError as exc:
+        print(f"  ❌ {label} could not start: {exc}")
+        return False
+    if result.returncode != 0:
+        # npm / electron-builder print the failing error LAST: redact the whole
+        # stream (it can echo registry URLs with tokens), then keep the tail.
+        print(f"  ❌ {label} failed: {redact(result.stderr.strip())[-200:]}")
+        return False
+    return True
+
+
+def _setup_electron() -> bool:
+    """Build and install the Kiro Crew desktop app (macOS only).
+
+    Returns False when the install was attempted and failed, so
+    ``setup --electron-only`` can exit non-zero. A platform without the app and
+    a packaged install with no sources to build are not failures.
+    """
     if platform.system() != "Darwin":
         print("  ⚠️  Kiro Crew desktop app is only available on macOS.")
-        return
+        return True
 
     electron_dir = _find_electron_dir()
     if electron_dir is None:
         _print_no_desktop_sources()
-        return
+        return True
 
     if not shutil.which("node"):
         print("  ❌ Node.js not found — required to build the desktop app.")
         print("     Install Node.js and re-run: kirocrew setup --electron-only")
-        return
+        return False
 
     print("  🔨 Building Kiro Crew desktop app…")
-    npm_install = subprocess.run(
+    if not _run_desktop_build_step(
+        "npm install",
         ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error"],
-        cwd=str(electron_dir),
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if npm_install.returncode != 0:
-        # npm / electron-builder print the failing error LAST: redact the whole
-        # stream (it can echo registry URLs with tokens), then keep the tail.
-        print(f"  ❌ npm install failed: {redact(npm_install.stderr.strip())[-200:]}")
-        return
-
-    build = subprocess.run(
+        electron_dir,
+        120,
+    ):
+        return False
+    if not _run_desktop_build_step(
+        "Electron build",
         ["npx", "electron-builder", "--mac", "--dir"],
-        cwd=str(electron_dir),
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    if build.returncode != 0:
-        print(f"  ❌ Electron build failed: {redact(build.stderr.strip())[-200:]}")
-        return
+        electron_dir,
+        300,
+    ):
+        return False
 
     arch = "mac-arm64" if platform.machine() == "arm64" else "mac"
     app_src = electron_dir / "dist" / arch / "KiroCrew.app"
@@ -262,7 +312,7 @@ def _setup_electron() -> None:
                 break
     if not app_src.is_dir():
         print("  ❌ Build succeeded but KiroCrew.app not found in dist/")
-        return
+        return False
 
     app_dest = Path.home() / "Applications" / "KiroCrew.app"
     app_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -271,6 +321,7 @@ def _setup_electron() -> None:
     shutil.copytree(str(app_src), str(app_dest))
     print("  ✅ KiroCrew.app installed to ~/Applications")
     print("     Launch via Spotlight (⌘+Space → KiroCrew) or Finder → ~/Applications")
+    return True
 
 
 def _setup(
@@ -310,7 +361,9 @@ def _setup_impl(
 
     if electron_only:
         print("── Desktop App ──\n")
-        _setup_electron()
+        if not _setup_electron():
+            # The desktop app was the whole ask: a failed build is a failed run.
+            sys.exit(1)
         return
 
     print("Kiro Crew Setup 👻\n")
@@ -820,7 +873,7 @@ def _setup_slack_tokens() -> None:
     # the possibly-stale snapshot read before the prompts.
     cred_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = _env_lock_path(cred_path)
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    lock_fd = platform_compat.open_create_or_existing(lock_path, os.O_RDWR, 0o600)
     if not platform_compat.try_acquire_lock(lock_fd, exclusive=True):
         os.close(lock_fd)
         print(

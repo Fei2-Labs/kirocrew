@@ -13,7 +13,7 @@
  * hand-off reaches that stamp.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { screen, waitFor } from '@testing-library/react'
+import { act, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { createTestStore, renderWithProviders } from './helpers'
@@ -62,7 +62,18 @@ async function setup(n: Notification) {
   await store.dispatch(switchSlot('origin'))
   expect(store.getState().chat.activeSlot).toBe('origin')
   renderWithProviders(<NotificationDetailPanel n={n} onClose={() => {}} />, { store })
+  // ThemeProvider settles through promise callbacks after mount; drain them
+  // before the test acts, so its update lands inside act().
+  await settle()
   return store
+}
+
+// Drains pending promise callbacks and the React updates they schedule, with
+// no wall-clock wait. Every mock here settles through microtasks.
+async function settle(): Promise<void> {
+  await act(async () => {
+    for (let i = 0; i < 10; i += 1) await Promise.resolve()
+  })
 }
 const keys = (store: Awaited<ReturnType<typeof setup>>) => store.getState().dashboard.slots.map(s => s.key)
 

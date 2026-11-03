@@ -18,6 +18,7 @@ import argparse
 from typing import TYPE_CHECKING
 
 from kiro_crew import cli_help
+from kiro_crew.cli_arg_types import non_negative_int
 
 if TYPE_CHECKING:
     _Commands = argparse._SubParsersAction[argparse.ArgumentParser]
@@ -257,9 +258,14 @@ Examples:
   kirocrew kas install --from ./bundle   # offline: manifest.json + artifacts in a directory
   kirocrew kas status
   kirocrew kas remove
+  kirocrew kas login                     # sign Kiro Crew's vault in with a device code (Builder ID)
+  kirocrew kas login --provider idc --start-url https://my-org.awsapps.com/start --region us-east-1
+  kirocrew kas whoami --format json      # who the vault is signed in as; exit 1 when signed out
+  kirocrew kas logout
+  kirocrew kas route                     # kas-bundle | kiro-cli: which program owns the sign-in here
 
 Then: kirocrew config set agent.kas_bundle true && kirocrew restart
-The engine signs in through Kiro Crew's own login (dashboard → Sign in).
+The engine signs in through Kiro Crew's own login (dashboard → Sign in, or `kas login`).
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -277,7 +283,11 @@ def register_logs_parser(sub: _Commands) -> None:
         "-f", "--follow", action="store_true", help="Follow log output (live tail)"
     )
     logs_parser.add_argument(
-        "-n", "--lines", type=int, default=100, help="Number of lines to show (default: 100)"
+        "-n",
+        "--lines",
+        type=non_negative_int,
+        default=100,
+        help="Number of lines to show (default: 100; 0 shows none, useful with -f)",
     )
 
 
@@ -311,6 +321,31 @@ def register_logout_parser(sub: _Commands) -> None:
         type=int,
         default=None,
         help="Dashboard port (default: resolved from KIROCREW_PORT env or dashboard.url config)",
+    )
+
+
+def register_open_parser(sub: _Commands) -> None:
+    open_parser = cli_help.add_command(
+        sub,
+        "open",
+        description=(
+            "Open the Kiro Crew desktop app on a session through its kirocrew:// URL scheme. "
+            "With no session the app is brought forward. "
+            "Requires the desktop app (the scheme is registered by its installer); "
+            "--print writes the URL instead of opening it, for scripts and other apps."
+        ),
+    )
+    open_parser.add_argument(
+        "session",
+        nargs="?",
+        default=None,
+        help="Session key: the ?sid= value in the dashboard's URL when that session is open",
+    )
+    open_parser.add_argument(
+        "--print",
+        dest="print_url",
+        action="store_true",
+        help="Print the kirocrew:// URL and exit without opening anything",
     )
 
 

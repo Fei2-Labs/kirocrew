@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react'
 import { useDictationPanelUsable } from '../VoiceDictationPanel'
 import { useTouchPushToTalk } from '../../hooks/useTouchPushToTalk'
+import { bindingAriaKeyshortcuts, bindingLabel, type PttBinding } from '../../lib/pushToTalk'
 import { useAppSelector } from '../../store'
 import { safeSetItem } from '../../utils/safeStorage'
 import { isTouchDevice } from '../../utils/isTouchDevice'
@@ -8,6 +9,8 @@ import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 import { i18nT } from '../../i18n/t'
 import type { ComposerVoiceInputProps } from '../../chat-core/composer/Composer'
 import type { ComposerControl } from '../composerControl'
+import { anotherEscapeOwnerIsOpen } from './escapeOwners'
+import { slotRowByKey } from '../../store/slotIndex'
 
 /* Dictation as the composer sees it. The Composer root's Voice atom
    (`chat-core/composer/useComposerVoice.ts`) owns capture, the one-mic mutex
@@ -165,13 +168,15 @@ export function useDictationControls({ composerControl, value, autoFocusKey, any
   // hand-rolled pickers that close on Escape WITHOUT preventing default, so
   // they cannot be detected that way.
   //
-  // The `[role="dialog"]` probe is the precedence rule: Escape belongs to the
-  // TOPMOST dismissible surface, and the composer is not it while a dialog is
-  // up. Modal, CommandPalette and SnipOverlay all bind Escape on `window` and
-  // all carry role="dialog", so one presence check defers to every one of them
-  // rather than enumerating them. Without it this handler would steal Escape
-  // from each — those surfaces own Escape, so intercepting it here would be a
-  // regression, not a trade.
+  // The `anotherEscapeOwnerIsOpen()` probe is the precedence rule: Escape
+  // belongs to the TOPMOST dismissible surface, and the composer is not it
+  // while another surface owns Escape. Shared with the stop-key gate
+  // (escapeOwners.ts) so the two cannot drift: it covers role="dialog"
+  // surfaces (Modal, CommandPalette, SnipOverlay — minus the read-only
+  // live-desktop opt-out) AND the non-dialog document-level owners (the
+  // embedded file preview, the message-search bar). Without it this handler
+  // would steal Escape from each — those surfaces own Escape, so intercepting
+  // it here would be a regression, not a trade.
   //
   // stopPropagation() only once we have decided the key is OURS. document
   // bubbles on to `window`, and those window handlers do not check
@@ -185,7 +190,7 @@ export function useDictationControls({ composerControl, value, autoFocusKey, any
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.isComposing || e.defaultPrevented) return
       if (anyPickerOpenRef.current) return
-      if (document.querySelector('[role="dialog"]')) return
+      if (anotherEscapeOwnerIsOpen()) return
       e.preventDefault()
       e.stopPropagation()
       cancel()
@@ -200,7 +205,7 @@ export function useDictationControls({ composerControl, value, autoFocusKey, any
 /** Hold-to-talk: on a touch device the mic switches the composer between the
  *  keyboard and a press-and-hold target, and every label on those controls
  *  says what the next press actually does. */
-export function useHoldToTalk({ onVoiceStart, onVoiceStop, onVoiceCancel, voiceCaptureActive, voiceRecording, voiceTranscribeActive, voiceTranscribing, voiceDownload, voiceSubmitOnRelease = false, voiceBusyElsewhere, voiceBusyElsewhereSession, composerHasDraft, disabled, optimizing, placeholder, showDictation }: {
+export function useHoldToTalk({ onVoiceStart, onVoiceStop, onVoiceCancel, voiceCaptureActive, voiceRecording, voiceTranscribeActive, voiceTranscribing, voiceDownload, voiceSubmitOnRelease = false, voicePttBinding = null, voiceBusyElsewhere, voiceBusyElsewhereSession, composerHasDraft, disabled, optimizing, placeholder, showDictation }: {
   onVoiceStart: VoiceInput['onVoiceStart']
   onVoiceStop: VoiceInput['onVoiceStop']
   onVoiceCancel: VoiceInput['onVoiceCancel']
@@ -212,6 +217,9 @@ export function useHoldToTalk({ onVoiceStart, onVoiceStop, onVoiceCancel, voiceC
   /** `stt.submit_on_release`: a deliberate finish sends, so the labels say so
    *  and the hold bar offers its sideways keep-as-draft zone. */
   voiceSubmitOnRelease?: boolean
+  /** The push-to-talk key the mic names, or null where pressing it would not
+   *  record into this composer (see `pttBinding` in `useComposerVoice`). */
+  voicePttBinding?: PttBinding | null
   voiceBusyElsewhere: boolean
   voiceBusyElsewhereSession: VoiceInput['voiceBusyElsewhereSession']
   /** The composer holds text or files a send would carry (session refs excluded). */
@@ -275,7 +283,7 @@ export function useHoldToTalk({ onVoiceStart, onVoiceStop, onVoiceCancel, voiceC
   // An untitled chat (its stored title can be the raw slot key) is named
   // "Untitled session", so the label and the jump action never show the key.
   const micOwnerTitle = useAppSelector(s => {
-    const owner = voiceBusyElsewhereSession ? s.dashboard.slots.find(x => x.key === voiceBusyElsewhereSession) : undefined
+    const owner = voiceBusyElsewhereSession ? slotRowByKey(s.dashboard.slots, voiceBusyElsewhereSession) : undefined
     return owner ? sessionDisplayTitle(owner) : null
   })
   const micHeldElsewhereLabel = micOwnerTitle
@@ -399,6 +407,10 @@ export function useHoldToTalk({ onVoiceStart, onVoiceStop, onVoiceCancel, voiceC
   // job the click actually performs. Reading `voiceHoldMode` first was what let the
   // two diverge — and a transcription elsewhere must not relabel a control whose
   // only job here is handing the keyboard back.
+  // Named at render, so a language switch renames it like every other label.
+  const pttKey = voicePttBinding
+    ? { name: bindingLabel(voicePttBinding), ariaKeyshortcuts: bindingAriaKeyshortcuts(voicePttBinding) }
+    : null
   const micLabel = micIsModeSwitch
     ? voiceHoldMode
       ? i18nT('components.chatInput.switch_to_keyboard')
@@ -416,7 +428,14 @@ export function useHoldToTalk({ onVoiceStart, onVoiceStop, onVoiceCancel, voiceC
         ? voiceSubmitOnRelease
           ? i18nT('components.chatInput.stop_and_send')
           : i18nT('components.chatInput.stop_recording')
-        : i18nT('components.chatInput.voice_input')
+        // Idle, it names the push-to-talk key too: the key does the same job,
+        // and nothing else in the composer says so.
+        : pttKey
+          ? i18nT('components.chatInput.voice_input_with_key', { name: pttKey.name })
+          : i18nT('components.chatInput.voice_input')
+  // The key starts and stops the same recording, so it is announced whenever
+  // the mic records. As a mode switch the mic records nothing, so it is not.
+  const micKeyShortcuts = !micIsModeSwitch && pttKey ? pttKey.ariaKeyshortcuts : undefined
   /**
    * What the hold bar says, which must describe what the NEXT press or release
    * ACTUALLY does. Two of these were wrong for the same reason — the WeChat
@@ -478,7 +497,7 @@ export function useHoldToTalk({ onVoiceStart, onVoiceStop, onVoiceCancel, voiceC
 
   return {
     transcribeInFlight, transcribingIsHonest, micHeldElsewhere, micBlocked, micOwnerTitle, micHeldElsewhereLabel,
-    setHoldTarget, touchPtt, voiceHoldMode, micIsModeSwitch, voiceSettling, textareaParked, toggleVoiceMode, micLabel, holdBarLabel,
+    setHoldTarget, touchPtt, voiceHoldMode, micIsModeSwitch, voiceSettling, textareaParked, toggleVoiceMode, micLabel, micKeyShortcuts, holdBarLabel,
     voiceModePlaceholder,
   }
 }

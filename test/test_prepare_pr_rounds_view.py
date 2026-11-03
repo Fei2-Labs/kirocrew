@@ -9,48 +9,38 @@ load-bearing:
 - the two optional plain lines (`self-added:`, `mechanism:`) are read from the
   comment body OUTSIDE the `> ` block, and a span disposed twice in one round
   counts that round once;
-- the retrospective trigger is an EXIT CODE (30): a span at three rounds, or the
-  next round being the 3rd/6th/9th.
+- the retrospective trigger is an EXIT CODE (30): a span FIXED in two earlier
+  rounds (SEAM REPEAT; SEAM LIMIT after four), or the next round being the
+  3rd/6th/9th. A rebuttal or a deferral answered again is not a fix and never
+  triggers it, and no step of the view asks a person.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from types import ModuleType
 
+import pytest
+from prepare_pr_rounds_helpers import (
+    CLASS_A,
+    HEADS,
+    SCRIPT,
+    SCRIPTS_DIR,
+    _contract,
+    _disp,
+    _load,
+    _wire,
+)
 from skill_script_helpers import load_skill_script
 
-ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = (
-    ROOT
-    / "src"
-    / "kiro_crew"
-    / "builtin_skills"
-    / "kirocrew-dev"
-    / "kirocrew-prepare-pr"
-    / "scripts"
-    / "pr_findings.py"
-)
 
-
-def _load() -> ModuleType:
-    return load_skill_script("prepare_pr_findings_rounds", SCRIPT)
-
-
-def _disp(cid: int, target: str, head: str, span: str | None, extra: str = "") -> dict:
-    marker = "<!-- ai-review-disposition target={} head={} -->\n".format(target, head)
-    claim = "**fixed** — span={}\n".format(span) if span else "**fixed** — a watch item\n"
-    body = marker + claim + extra + "\n> rationale line naming span=deadbeef0000 as evidence only\n"
-    return {"id": cid, "body": body, "user": {"login": "writer"}}
-
-
-def _wire(module: ModuleType, monkeypatch, comments: list[dict]) -> None:
-    monkeypatch.setattr(module, "fetch_disposition_comments", lambda repo, number: comments)
-    monkeypatch.setattr(
-        module,
-        "writer_disposition_records",
-        lambda repo, cs: [module.parse_disposition_record(c) for c in cs],
-    )
+def _fix_counts(module: ModuleType) -> dict:
+    """{span: distinct judged heads that fixed it}, from the same counter `--rounds` prints."""
+    by_head, order, _, _ = module._collect_rounds("o/r", 7)
+    fixes = module._review_contract.fix_rounds(order, by_head)
+    return {sp: len(rs) for sp, rs in fixes.items()}
 
 
 def test_rounds_are_grouped_by_judged_head_in_order(monkeypatch, capsys):
@@ -199,3 +189,948 @@ def test_the_goal_line_is_redacted_before_printing(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "goal (frozen): leak" in out
     assert secret not in out
+
+
+CLASS_A2 = "class: a git hook can come from a source other than core hooksPath\n"
+CLASS_B = "class: the export path drops the trailing newline\n"
+
+
+def test_a_span_fixed_in_two_heads_prints_seam_repeat_and_exits_30(monkeypatch, capsys):
+    mod = _load()
+    # four rounds disposed, so the cadence alone (the 5th round) would not fire
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1", CLASS_A),
+        _disp(2, "gpt", HEADS[1], "aaaaaaaaaaa1", CLASS_A2),
+        _disp(3, "gpt", HEADS[2], "cccccccccc21"),
+        _disp(4, "gpt", HEADS[3], "cccccccccc22"),
+    ]
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    assert "SEAM REPEAT span=aaaaaaaaaaa1 fixed in rounds 0, 1." in out
+    assert "SEAM LIMIT" not in out
+    assert "remove the second writer" in out and "defer with an issue" in out
+    assert "No one needs to approve" in out
+
+
+def test_a_span_fixed_in_one_head_is_not_a_seam(monkeypatch, capsys):
+    mod = _load()
+    comments = [_disp(i + 1, "gpt", HEADS[i], "{:011d}{}".format(i, "c")) for i in range(4)]
+    comments[1] = _disp(2, "gpt", HEADS[1], "aaaaaaaaaaa1", CLASS_A)
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    assert "SEAM" not in capsys.readouterr().out
+
+
+def test_two_fixed_records_of_one_head_count_that_head_once_and_keep_every_span(
+    monkeypatch, capsys
+):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1"),
+        _disp(2, "opus", HEADS[0], "aaaaaaaaaaa1"),
+        _disp(3, "gpt", HEADS[0], "bbbbbbbbbbb1"),
+        _disp(4, "gpt", HEADS[1], "aaaaaaaaaaa1"),
+        _disp(5, "gpt", HEADS[1], "bbbbbbbbbbb1", word="rebutted"),
+    ]
+    _wire(mod, monkeypatch, comments)
+    assert _fix_counts(mod) == {"aaaaaaaaaaa1": 2, "bbbbbbbbbbb1": 1}
+
+
+def test_a_span_with_no_class_sentence_still_counts(monkeypatch, capsys):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1"),
+        _disp(2, "gpt", HEADS[1], "aaaaaaaaaaa1", CLASS_A),
+        _disp(3, "gpt", HEADS[2], "cccccccccc21"),
+        _disp(4, "gpt", HEADS[3], "cccccccccc22"),
+    ]
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    assert "SEAM REPEAT span=aaaaaaaaaaa1" in capsys.readouterr().out
+
+
+def test_a_span_fixed_in_four_heads_prints_seam_limit_with_only_narrow_or_defer(
+    monkeypatch, capsys
+):
+    mod = _load()
+    comments = [_disp(i + 1, "gpt", HEADS[i], "aaaaaaaaaaa1", CLASS_A) for i in range(4)]
+    comments.append(_disp(9, "gpt", HEADS[4], "cccccccccc21"))
+    comments.append(_disp(10, "gpt", HEADS[5], "cccccccccc22"))
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    assert "SEAM LIMIT span=aaaaaaaaaaa1 fixed in rounds 0, 1, 2, 3." in out
+    assert "SEAM REPEAT" not in out
+    assert "narrow the scope, or defer with an issue" in out
+    assert "remove the second writer" not in out
+
+
+def test_answering_a_rebuttal_again_is_not_a_fix(monkeypatch, capsys):
+    mod = _load()
+    comments = [_disp(i + 1, "gpt", HEADS[i], "aaaaaaaaaaa1", word="rebutted") for i in range(4)]
+    _wire(mod, monkeypatch, comments)
+    # four rounds, the same span in all four, no fix: mentions alone do not count
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    assert "SEAM" not in capsys.readouterr().out
+
+
+def test_the_fix_count_is_of_distinct_heads_whatever_the_class_lines_say(monkeypatch):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1", CLASS_A),
+        _disp(2, "gpt", HEADS[1], "aaaaaaaaaaa1", CLASS_A2),
+        _disp(3, "gpt", HEADS[2], "aaaaaaaaaaa1", CLASS_A),
+        _disp(4, "gpt", HEADS[0], "bbbbbbbbbbb1", CLASS_A),
+        _disp(5, "gpt", HEADS[1], "bbbbbbbbbbb1", CLASS_B),
+    ]
+    _wire(mod, monkeypatch, comments)
+    assert _fix_counts(mod) == {"aaaaaaaaaaa1": 3, "bbbbbbbbbbb1": 2}
+
+
+def test_the_findings_view_prints_a_class_sweep_line_per_span(capsys):
+    mod = _load()
+    mod.sweep_prompt([])
+    assert capsys.readouterr().out == ""
+    mod.sweep_prompt(["aaaaaaaaaaa1", "bbbbbbbbbbb1"])
+    out = capsys.readouterr().out
+    assert "CLASS SWEEP span=aaaaaaaaaaa1:" in out and "CLASS SWEEP span=bbbbbbbbbbb1:" in out
+    assert "prepare-pr-sweep.md" in out and "references/seam-protocol.md" in out
+
+
+def test_the_seam_protocol_reference_carries_the_pick_order_and_the_sweep_format():
+    ref = (SCRIPT.parent.parent / "references" / "seam-protocol.md").read_text(encoding="utf-8")
+    for needle in (
+        "SEAM REPEAT",
+        "SEAM LIMIT",
+        "prepare-pr-sweep.md",
+        "search: none --",
+        "resolution: deferred #<issue> pinned-by <test id>",
+        "Nothing here asks a person",
+    ):
+        assert needle in ref
+    skill = (SCRIPT.parent.parent / "SKILL.md").read_text(encoding="utf-8")
+    assert "references/seam-protocol.md" in skill and "`SEAM LIMIT`" in skill
+
+
+def test_unlike_class_lines_never_hide_a_seam(monkeypatch, capsys):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1", CLASS_A),
+        _disp(2, "gpt", HEADS[1], "aaaaaaaaaaa1", CLASS_B),
+        _disp(3, "gpt", HEADS[2], "aaaaaaaaaaa1", CLASS_B),
+        _disp(4, "gpt", HEADS[3], "aaaaaaaaaaa1", CLASS_B),
+    ]
+    _wire(mod, monkeypatch, comments)
+    # A, B, B, B: four heads fixed the span, so the next fix is its 5th
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    assert "SEAM LIMIT span=aaaaaaaaaaa1 fixed in rounds 0, 1, 2, 3." in capsys.readouterr().out
+    assert _fix_counts(mod) == {"aaaaaaaaaaa1": 4}
+
+
+def test_the_counter_has_no_class_similarity():
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "difflib" not in src and "alike" not in src.lower() and "CLASS_ALIKE" not in src
+    assert "CLASS_RE" not in src and "declared_class" not in src and "labels" not in src
+
+
+def test_a_class_line_in_a_disposition_is_never_printed_or_counted(monkeypatch, capsys):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1", CLASS_A),
+        _disp(2, "gpt", HEADS[1], "aaaaaaaaaaa1", CLASS_B),
+        _disp(3, "gpt", HEADS[2], "cccccccccc21"),
+        _disp(4, "gpt", HEADS[3], "cccccccccc22"),
+    ]
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    assert "SEAM REPEAT span=aaaaaaaaaaa1 fixed in rounds 0, 1." in out
+    assert "class (label" not in out and "trailing newline" not in out
+
+
+def test_a_rebuttal_that_quotes_a_fixed_bullet_is_not_a_fix(monkeypatch, capsys):
+    mod = _load()
+    quote = "> - **fixed** in head 1: the earlier patch\n> Outcome: fixed in abc123\n"
+    comments = []
+    for i in range(4):
+        body = (
+            "<!-- ai-review-disposition target=gpt head={} -->\n"
+            "**rebutted** — span=aaaaaaaaaaa1\n{}"
+        ).format(HEADS[i], quote)
+        comments.append({"id": i + 1, "body": body, "user": {"login": "writer"}})
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0, "four rebuttals are not four fixes"
+    assert "SEAM" not in capsys.readouterr().out
+    assert _fix_counts(mod) == {}
+
+
+def test_a_fenced_block_never_declares_an_outcome():
+    mod = _load()
+    body = "<!-- m -->\n**rebutted** — x\n```\n**fixed** — y\nclass: inside a fence\n```\n"
+    assert mod.declared_outcome(body) == "rebutted"
+    assert mod.declared_outcome("```\n**fixed**\n```\n") == ""
+
+
+@pytest.mark.parametrize(
+    ("body", "word"),
+    [
+        ("<!-- m -->\n**fixed** — span=aaaaaaaaaaa1\n", "fixed"),
+        ("<!-- m -->\n- **fixed** — span=aaaaaaaaaaa1\n", "fixed"),
+        ("<!-- m -->\ntitle\n\n> Outcome: fixed in 7ff6176c3d. Detail\n", "fixed"),
+        ("<!-- m -->\ntitle\n\n> Outcome: checked, no change needed.\n", "checked"),
+        ("<!-- m -->\n**rebutted** -- span=aaaaaaaaaaa1\n> - **fixed** quoted\n", "rebutted"),
+        ("<!-- m -->\n**fixed** -- span=aaaaaaaaaaa1\n> rationale\n", "fixed"),
+        ("<!-- m -->\n- **deferred** span=aaaaaaaaaaa1\n> #4711\n", "deferred"),
+        ("<!-- m -->\nOutcome: rebutted\n", "rebutted"),
+        (
+            "<!-- m -->\n- **Title** span=aaaaaaaaaaa1\nDisposition: fixed, in the next push.\n",
+            "fixed",
+        ),
+        ("<!-- m -->\n**Disposition: rebutted (no change needed)** -- x\n", "rebutted"),
+        ("<!-- m -->\n> a quoted line that says fixed\n", ""),
+        ("<!-- m -->\nfixed without any marker form\n", ""),
+        ("<!-- m -->\n**Refused activation puts a message in the origin chat**\n", ""),
+        ("<!-- m -->\n**Fixed point iteration is slow**\n> detail\n", ""),
+        ("<!-- m -->\n- **span=aaaaaaaaaaa1** Retry guard fails\n", ""),
+        # the bold token must be exactly an outcome word and start the record
+        ("<!-- m -->\n- **fixed: the guard** span=aaaaaaaaaaa1\n> detail\n", ""),
+        ("<!-- m -->\n- **Title** span=aaaaaaaaaaa1\n**fixed** -- later line\n", ""),
+        ("<!-- m -->\n- **span=aaaaaaaaaaa1** fixed in head 1083c00c5\n", ""),
+    ],
+)
+def test_the_declared_outcome_is_read_from_the_forms_dispositions_use(body, word):
+    assert _load().declared_outcome(body) == word
+
+
+def test_a_quoted_outcome_line_is_a_fix_in_the_rounds_view(monkeypatch, capsys):
+    mod = _load()
+    comments = []
+    for i in range(2):
+        body = (
+            "<!-- ai-review-disposition target=gpt head={} -->\n"
+            "title of the finding span=aaaaaaaaaaa1\n\n> Outcome: fixed in 7ff6176c3d. Detail.\n"
+        ).format(HEADS[i])
+        comments.append({"id": i + 1, "body": body, "user": {"login": "writer"}})
+    comments.append(_disp(8, "gpt", HEADS[2], "cccccccccc21"))
+    comments.append(_disp(9, "gpt", HEADS[3], "cccccccccc22"))
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    assert "SEAM REPEAT span=aaaaaaaaaaa1 fixed in rounds 0, 1." in capsys.readouterr().out
+
+
+def test_a_bold_title_with_no_outcome_line_counts_nothing(monkeypatch, capsys):
+    mod = _load()
+    comments = []
+    for i in range(4):
+        body = (
+            "<!-- ai-review-disposition target=gpt head={} -->\n"
+            "**Fixed point iteration is slow** span=aaaaaaaaaaa1\n\n> some rationale\n"
+        ).format(HEADS[i])
+        comments.append({"id": i + 1, "body": body, "user": {"login": "writer"}})
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    assert _fix_counts(mod) == {}
+
+
+def test_evidence_inside_a_blockquoted_fence_declares_no_outcome(monkeypatch, capsys):
+    mod = _load()
+    body = (
+        "<!-- m -->\n- **span=aaaaaaaaaaa1** rebutted\n> ```\n> Outcome: fixed in abc\n> ```\n"
+        "> Outcome: rebutted, by design.\n"
+    )
+    assert mod.declared_outcome(body) == "rebutted"
+    assert mod.declared_outcome("<!-- m -->\ntitle\n> ```\n> Outcome: fixed in abc\n> ```\n") == ""
+    comments = []
+    for i in range(4):
+        text = (
+            "<!-- ai-review-disposition target=gpt head={} -->\n"
+            "**rebutted** span=aaaaaaaaaaa1\n> ```\n> Outcome: fixed in abc\n> ```\n"
+            "> Outcome: rebutted, by design.\n"
+        ).format(HEADS[i])
+        comments.append({"id": i + 1, "body": text, "user": {"login": "writer"}})
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    assert "SEAM" not in capsys.readouterr().out
+    assert _fix_counts(mod) == {}
+
+
+def test_a_short_and_a_full_spelling_of_one_head_are_one_round(monkeypatch, capsys):
+    mod = _load()
+    full = "abcdef0123456789abcdef0123456789abcdef01"
+    comments = [
+        _disp(1, "gpt", full, "aaaaaaaaaaa1"),
+        _disp(2, "gpt", full[:7], "aaaaaaaaaaa1"),
+        _disp(3, "opus", full[:10], "bbbbbbbbbbb1"),
+        _disp(4, "gpt", HEADS[1], "cccccccccc21"),
+        _disp(5, "gpt", HEADS[2], "cccccccccc22"),
+        _disp(6, "gpt", HEADS[3], "cccccccccc23"),
+    ]
+    _wire(mod, monkeypatch, comments)
+    # four judged heads, none repeating a span: no seam, and the 5th round is not a cadence round
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    out = capsys.readouterr().out
+    assert "- round 0 — head abcdef012345 — 3 disposition(s)" in out
+    assert "next round: 4" in out and "SEAM" not in out
+    assert _fix_counts(mod) == {
+        "aaaaaaaaaaa1": 1,
+        "bbbbbbbbbbb1": 1,
+        "cccccccccc21": 1,
+        "cccccccccc22": 1,
+        "cccccccccc23": 1,
+    }
+
+
+def test_two_different_heads_with_a_shared_short_prefix_stay_two_rounds(monkeypatch):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", "abcdef0" + "1" * 33, "aaaaaaaaaaa1"),
+        _disp(2, "gpt", "abcdef1" + "1" * 33, "aaaaaaaaaaa1"),
+    ]
+    _wire(mod, monkeypatch, comments)
+    assert _fix_counts(mod) == {"aaaaaaaaaaa1": 2}
+
+
+# Fence tracking: the opening character and length are remembered, and only a
+# matching fence closes the block.
+def _outcome(*lines: str) -> str:
+    return _load().declared_outcome("<!-- m -->\n" + "\n".join(lines) + "\n")
+
+
+def test_a_backtick_fence_inside_a_tilde_block_does_not_close_it():
+    # the evidence block is ~~~markdown; the ``` inside it is content, so the quoted
+    # fixed line stays evidence and the declared outcome is the later rebuttal
+    assert (
+        _outcome(
+            "~~~markdown", "```", "> Outcome: fixed in abc", "```", "~~~", "> Outcome: rebutted."
+        )
+        == "rebutted"
+    )
+    assert _outcome("~~~markdown", "```", "> Outcome: fixed in abc", "```", "~~~") == ""
+
+
+def test_a_tilde_fence_inside_a_backtick_block_does_not_close_it():
+    assert _outcome(
+        "```", "~~~", "> Outcome: fixed in abc", "~~~", "```", "> Outcome: rebutted."
+    ) == ("rebutted")
+
+
+def test_a_shorter_fence_does_not_close_a_longer_one():
+    assert (
+        _outcome("````", "```", "> Outcome: fixed in abc", "```", "````", "> Outcome: rebutted.")
+        == "rebutted"
+    )
+    assert (
+        _outcome("~~~~~", "~~~", "> Outcome: fixed in abc", "~~~", "~~~~~", "> Outcome: x.") == "x"
+    )
+
+
+def test_a_longer_closing_fence_closes_and_text_after_it_is_read():
+    assert _outcome("```", "> Outcome: fixed in abc", "`````", "> Outcome: rebutted.") == "rebutted"
+
+
+def test_a_closing_fence_carries_no_info_string_and_at_most_three_spaces_of_indent():
+    # "```text" does not close a ``` block; four spaces of indent do not either
+    assert _outcome("```", "```text", "> Outcome: fixed in abc", "```", "> Outcome: rebutted.") == (
+        "rebutted"
+    )
+    assert _outcome("```", "    ```", "> Outcome: fixed in abc", "   ```", "> Outcome: x.") == "x"
+
+
+def test_inline_code_with_backticks_and_deep_indent_are_not_fence_openers():
+    assert _outcome("```inline``` text", "> Outcome: fixed in abc") == "fixed"
+    assert _outcome("    ```", "> Outcome: fixed in abc") == "fixed"
+    assert _outcome("   ```", "> Outcome: fixed in abc") == ""
+
+
+def test_fences_are_tracked_through_blockquote_markers():
+    assert (
+        _outcome(
+            "> ~~~markdown",
+            "> ```",
+            "> Outcome: fixed in abc",
+            "> ```",
+            "> ~~~",
+            "> Outcome: rebutted.",
+        )
+        == "rebutted"
+    )
+    assert _outcome(">> ```", ">> Outcome: fixed in abc", ">> ```", "> Outcome: rebutted.") == (
+        "rebutted"
+    )
+
+
+def test_a_block_that_never_closes_hides_what_follows_so_it_counts_nothing():
+    assert _outcome("```", "> Outcome: fixed in abc") == ""
+
+
+def test_a_nested_fence_in_evidence_is_not_a_false_fix_in_the_rounds_view(monkeypatch, capsys):
+    mod = _load()
+    comments = []
+    for i in range(4):
+        text = (
+            "<!-- ai-review-disposition target=gpt head={} -->\n"
+            "**rebutted** span=aaaaaaaaaaa1\n~~~markdown\n```\n- **fixed** quoted\n"
+            "> Outcome: fixed in abc\n```\n~~~\n> Outcome: rebutted, by design.\n"
+        ).format(HEADS[i])
+        comments.append({"id": i + 1, "body": text, "user": {"login": "writer"}})
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    assert "SEAM" not in capsys.readouterr().out
+    assert _fix_counts(mod) == {}
+
+
+# Line ends: only CR, LF and CRLF end a line.
+def test_a_separator_inside_a_title_does_not_start_an_outcome_line():
+    body = "<!-- m -->\ntitle with a break\u2028> Outcome: fixed in abc\n> Outcome: rebutted.\n"
+    assert _load().declared_outcome(body) == "rebutted"
+    assert _load().declared_outcome("<!-- m -->\r\ntitle\r\n> Outcome: fixed in abc\r\n") == "fixed"
+
+
+def test_the_outcome_label_may_be_bold():
+    for line in ("> **Outcome:** fixed in abc", "> **Outcome**: fixed in abc", ">Outcome:\tfixed"):
+        assert _outcome("title", line) == "fixed"
+
+
+# The same fence class in diff_signals.py (the `## What changed` word limit).
+def _signals() -> ModuleType:
+    return load_skill_script("prepare_pr_diff_signals_fences", SCRIPT.parent / "diff_signals.py")
+
+
+def _what_changed(*lines: str) -> str:
+    body = "## What changed\n" + "\n".join(lines) + "\n## Tests\n\nx\n"
+    return _signals()._what_changed_unfenced(body)
+
+
+def test_what_changed_drops_a_tilde_block_with_a_backtick_fence_inside():
+    text = _what_changed("keep one", "~~~", "```", "drop me", "```", "~~~", "keep two")
+    assert "keep one" in text and "keep two" in text
+    assert "drop me" not in text and "~~~" not in text
+
+
+def test_what_changed_drops_a_four_backtick_block_holding_a_three_backtick_line():
+    text = _what_changed(
+        "keep one", "````", "```", "drop me", "```", "still dropped", "````", "keep two"
+    )
+    assert "drop me" not in text and "still dropped" not in text
+    assert "keep one" in text and "keep two" in text
+
+
+def test_what_changed_keeps_text_after_a_fence_that_never_closes_as_prose():
+    text = _what_changed("keep one", "```", "counted as prose", "also counted")
+    assert "counted as prose" in text and "also counted" in text
+
+
+def test_what_changed_ignores_inline_code_and_deep_indent_as_openers():
+    text = _what_changed("```inline``` words", "kept", "    ```", "also kept")
+    assert "kept" in text and "also kept" in text
+
+
+def test_what_changed_closing_fence_needs_the_same_character_and_no_info():
+    text = _what_changed("```", "~~~", "dropped", "```lang", "dropped too", "```", "kept")
+    assert "dropped" not in text and "kept" in text
+
+
+# Printed labels and counts are computed from the predicate they name.
+def test_recurring_spans_lists_every_span_answered_in_three_rounds_whatever_the_answers(
+    monkeypatch, capsys
+):
+    mod = _load()
+    comments = [_disp(i + 1, "gpt", HEADS[i], "aaaaaaaaaaa1", word="rebutted") for i in range(4)]
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0, "rebuttals alone never make it due"
+    out = capsys.readouterr().out
+    assert "recurring spans (≥3 rounds):\n  aaaaaaaaaaa1 ×4\n" in out
+    assert "only fixes make a retrospective due" in out
+    assert "recurring spans (≥3 rounds): none" not in out
+
+
+def test_recurring_spans_counts_rounds_not_records_and_skips_a_span_below_the_threshold(
+    monkeypatch, capsys
+):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1", word="rebutted"),
+        _disp(2, "opus", HEADS[0], "aaaaaaaaaaa1", word="deferred"),
+        _disp(3, "gpt", HEADS[1], "aaaaaaaaaaa1", word="fixed"),
+        _disp(4, "gpt", HEADS[2], "aaaaaaaaaaa1", word="rebutted"),
+        _disp(5, "gpt", HEADS[0], "bbbbbbbbbbb1", word="rebutted"),
+        _disp(6, "gpt", HEADS[1], "bbbbbbbbbbb1", word="rebutted"),
+        _disp(7, "gpt", HEADS[3], "cccccccccc21", word="rebutted"),
+    ]
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    out = capsys.readouterr().out
+    assert "  aaaaaaaaaaa1 ×3\n" in out, "three rounds, four records"
+    assert "bbbbbbbbbbb1 ×" not in out, "two rounds is below the threshold"
+
+
+def test_recurring_spans_says_none_only_when_no_span_reaches_the_threshold(monkeypatch, capsys):
+    mod = _load()
+    comments = [_disp(i + 1, "gpt", HEADS[i], "aaaaaaaaaaa1", word="rebutted") for i in range(2)]
+    comments.append(_disp(9, "gpt", HEADS[2], "bbbbbbbbbbb1", word="rebutted"))
+    _wire(mod, monkeypatch, comments)
+    mod.rounds_view("o/r", 7, "f" * 40, {})
+    out = capsys.readouterr().out
+    assert "recurring spans (≥3 rounds): none" in out and "only fixes" not in out
+
+
+def test_the_threshold_in_the_label_is_the_constant_the_list_uses(monkeypatch, capsys):
+    mod = _load()
+    monkeypatch.setattr(mod, "RETRO_EVERY", 2)
+    comments = [_disp(i + 1, "gpt", HEADS[i], "aaaaaaaaaaa1", word="rebutted") for i in range(2)]
+    _wire(mod, monkeypatch, comments)
+    mod.rounds_view("o/r", 7, "f" * 40, {})
+    assert "recurring spans (≥2 rounds):\n  aaaaaaaaaaa1 ×2\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("fixes", "kind", "ordinal"),
+    [(2, "REPEAT", "3rd"), (3, "REPEAT", "4th"), (4, "LIMIT", "5th"), (5, "LIMIT", "6th")],
+)
+def test_the_seam_line_states_the_ordinal_of_the_next_fix_it_counted(
+    monkeypatch, capsys, fixes, kind, ordinal
+):
+    mod = _load()
+    comments = [_disp(i + 1, "gpt", HEADS[i], "aaaaaaaaaaa1") for i in range(fixes)]
+    _wire(mod, monkeypatch, comments)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    rounds = ", ".join(str(i) for i in range(fixes))
+    assert (
+        f"SEAM {kind} span=aaaaaaaaaaa1 fixed in rounds {rounds}. The next fix would be its {ordinal}"
+        in out
+    )
+    assert out.count("SEAM ") == 1
+
+
+def test_nth_covers_the_teens_and_larger_numbers():
+    nth = _load()._nth
+    assert [nth(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 101)] == [
+        "1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "23rd", "101st",
+    ]  # fmt: skip
+
+
+# One fence reader: pr_status_issue_links.py. _review_contract.py loads it and builds the
+# line readers on it; no other script keeps a copy.
+FENCE_OWNER = "pr_status_issue_links.py"
+
+
+def test_exactly_one_prepare_pr_script_defines_the_fence_rules():
+    holders = [
+        path.name
+        for path in sorted(SCRIPTS_DIR.glob("*.py"))
+        if "FENCE_OPEN_RE = re.compile" in path.read_text(encoding="utf-8")
+        or "`{3,}" in path.read_text(encoding="utf-8")
+    ]
+    assert holders == [FENCE_OWNER]
+    assert "_review_contract" in (SCRIPTS_DIR / "diff_signals.py").read_text(encoding="utf-8")
+
+
+def test_the_contracts_fence_functions_are_the_owners_code():
+    c = _contract()
+    owner = str(SCRIPTS_DIR / FENCE_OWNER)
+    assert c.fence_opening.__code__.co_filename == owner
+    assert c.is_closing_fence.__code__.co_filename == owner
+    assert not hasattr(c, "FENCE_OPEN_RE")
+
+
+def test_the_shared_helpers_pin_character_length_indent_and_info_string():
+    c = _contract()
+    assert c.fence_opening("```") == ("`", 3) and c.fence_opening("~~~~ md") == ("~", 4)
+    assert c.fence_opening("   ```py") == ("`", 3)
+    assert c.fence_opening("    ```") is None and c.fence_opening("```a`b") is None
+    assert c.fence_opening("``") is None and c.fence_opening("text ```") is None
+    assert c.is_closing_fence("```", "`", 3) and c.is_closing_fence("`````", "`", 3)
+    assert c.is_closing_fence("   ```  ", "`", 3) and c.is_closing_fence("```\r", "`", 3)
+    assert not c.is_closing_fence("``", "`", 3) and not c.is_closing_fence("~~~", "`", 3)
+    assert not c.is_closing_fence("```x", "`", 3) and not c.is_closing_fence("    ```", "`", 3)
+
+
+def test_the_shared_line_readers_agree_with_the_scripts_that_use_them():
+    c = _contract()
+    text = "a\r\n~~~\n```\nb\n```\n~~~\n> ```\n> c\n> ```\nd\u2028e\rf"
+    assert list(c.unfenced_lines(text)) == ["a", "> ```", "> c", "> ```", "d\u2028e", "f"]
+    assert list(c.unfenced_lines(text, quoted=True)) == ["a", "d\u2028e", "f"]
+    assert c.split_lines("x\r\ny\nz\rw\u2028v") == ["x", "y", "z", "w\u2028v"]
+    assert c.drop_fenced_blocks("k1\n```\ndrop\n```\nk2") == "k1\nk2"
+    assert c.drop_fenced_blocks("k1\n```\nnever closed") == "k1\n```\nnever closed"
+    assert (
+        _signals()._what_changed_unfenced("## What changed\nk1\n~~~\n```\nx\n```\n~~~\nk2\n## T\n")
+        == "k1\nk2\n"
+    )
+
+
+# --- Outcome formats the repository really emits (code-quality/impl/D5-FORMAT-SURVEY.md) -----
+SAMPLES = json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "prepare_pr_dispositions.json").read_text(
+        encoding="utf-8"
+    )
+)
+
+
+def _sample_id(sample: dict) -> str:
+    return "{}-{}".format(sample["pr"], sample["comment"])
+
+
+@pytest.mark.parametrize("sample", SAMPLES, ids=_sample_id)
+def test_every_real_disposition_declares_the_outcome_the_survey_read_from_it(sample):
+    assert _load().declared_outcome(sample["body"]) == sample["expected"], sample["form"]
+
+
+def test_the_samples_cover_every_form_and_fix_and_non_fix_words():
+    words = {s["expected"] for s in SAMPLES}
+    assert {
+        "fixed",
+        "rebutted",
+        "agreed",
+        "acknowledged",
+        "checked",
+        "accepted",
+        "kept",
+        "",
+    } <= words
+    forms = " ".join(s["form"] for s in SAMPLES)
+    for needle in (
+        "quoted lead",
+        "quoted bold",
+        "Outcome",
+        "Disposition",
+        "bold title",
+        "suffix",
+        "colon",
+        "sentence",
+    ):
+        assert needle in forms
+
+
+def _as_round(sample: dict, comment_id: int, head: str) -> dict:
+    """The sample as a comment on another judged head (its marker names `head`)."""
+    body = re.sub(r"head=[0-9a-f]{7,40}", "head=" + head, sample["body"], count=1)
+    return {"id": comment_id, "body": body, "user": {"login": "writer"}}
+
+
+FIXED_WITH_SPAN = [
+    s
+    for s in SAMPLES
+    if s["expected"] == "fixed"
+    and re.match(r"<!-- ai-review-disposition target=\S+ head=[0-9a-f]+ -->\n", s["body"])
+    and re.search(r"span=[0-9a-f]{12}", s["body"].split("\n", 1)[1])
+]
+
+
+@pytest.mark.parametrize("sample", FIXED_WITH_SPAN, ids=_sample_id)
+def test_three_real_fixes_of_one_span_make_a_seam_in_every_real_format(sample, monkeypatch, capsys):
+    mod = _load()
+    span = re.search(r"span=([0-9a-f]{12})", sample["body"]).group(1)
+    comments = [_as_round(sample, i + 1, HEADS[i]) for i in range(3)]
+    _wire(mod, monkeypatch, comments, on_head={span})
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    assert f"SEAM REPEAT span={span} fixed in rounds 0, 1, 2." in out
+    assert "outcomes: fixed×1" in out and "undeclared" not in out
+
+
+def test_the_fixed_samples_with_a_span_include_the_common_quoted_forms():
+    forms = " ".join(s["form"] for s in FIXED_WITH_SPAN)
+    assert "quoted lead" in forms and "bold title" in forms and "suffix" in forms
+
+
+def test_a_record_with_no_recognised_outcome_prints_as_undeclared_and_counts_as_no_fix(
+    monkeypatch, capsys
+):
+    mod = _load()
+    sample = next(s for s in SAMPLES if s["expected"] == "" and s["pr"] == 22866)
+    comments = [_as_round(sample, i + 1, HEADS[i]) for i in range(2)]
+    _wire(mod, monkeypatch, comments, on_head=None)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30, "cadence: the next round is the 3rd"
+    out = capsys.readouterr().out
+    assert out.count("outcomes: undeclared×1") == 2
+    assert "undeclared outcome: comment 1 spans -" in out
+    assert "SEAM" not in out
+    assert _fix_counts(mod) == {}
+
+
+def test_a_marker_that_names_no_target_and_head_is_reported_as_skipped(monkeypatch, capsys):
+    mod = _load()
+    odd = next(s for s in SAMPLES if s["pr"] == 23074)
+    spanned = [s for s in SAMPLES if s["pr"] == 22989 and s["expected"] == "fixed"][0]
+    marker_with_span = spanned["body"].replace(" -->", " span=767a9edfdd2e -->", 1)
+    comments = [
+        {"id": 5, "body": odd["body"], "user": {"login": "writer"}},
+        {"id": 6, "body": marker_with_span, "user": {"login": "writer"}},
+        _disp(7, "gpt", HEADS[0], "aaaaaaaaaaa1"),
+    ]
+    _wire(mod, monkeypatch, comments)
+    mod.rounds_view("o/r", 7, "f" * 40, {})
+    out = capsys.readouterr().out
+    assert "skipped 2 disposition record(s) whose marker is not" in out and "(comment 5, 6)" in out
+    assert "- round 0 — head 111111111111 — 1 disposition(s)" in out
+
+
+def test_an_outcome_word_is_a_fix_only_from_the_fix_vocabulary():
+    c = _load()._review_contract
+    assert c.FIX_OUTCOMES == {"fixed", "removed", "reverted"}
+    for word in ("rebutted", "deferred", "acknowledged", "accepted", "agreed", "kept"):
+        assert word in c.OUTCOME_WORDS and word not in c.FIX_OUTCOMES
+    assert (
+        _load().declared_outcome("<!-- m -->\n> removed in 3f04fb2f04e6: the parameter\n")
+        == "removed"
+    )
+    assert _load().declared_outcome("<!-- m -->\n> Fixed point iteration is slow\n") == ""
+    assert _load().declared_outcome("<!-- m -->\n**Fixed point iteration is slow**\n") == ""
+
+
+# --- When a seam triggers, and what a recorded resolution does -------------------------------
+def _fixes(span: str, heads: list[int]) -> list[dict]:
+    return [_disp(i + 1, "gpt", HEADS[h], span, CLASS_A) for i, h in enumerate(heads)]
+
+
+def test_a_seam_whose_span_is_gone_and_was_not_just_reached_does_not_trigger_again(
+    monkeypatch, capsys
+):
+    mod = _load()
+    comments = _fixes("aaaaaaaaaaa1", [0, 1])
+    comments += [
+        _disp(10, "gpt", HEADS[2], "cccccccccc21"),
+        _disp(11, "gpt", HEADS[3], "cccccccccc22"),
+    ]
+    _wire(mod, monkeypatch, comments, on_head={"cccccccccc23"})
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    out = capsys.readouterr().out
+    assert "SEAM REPEAT" not in out and "RETROSPECTIVE DUE" not in out
+    assert "seam history: span=aaaaaaaaaaa1 fixed in rounds 0, 1 (gone from the current head" in out
+
+
+def test_the_same_seam_triggers_when_its_span_is_on_the_current_head(monkeypatch, capsys):
+    mod = _load()
+    comments = _fixes("aaaaaaaaaaa1", [0, 1])
+    comments += [
+        _disp(10, "gpt", HEADS[2], "cccccccccc21"),
+        _disp(11, "gpt", HEADS[3], "cccccccccc22"),
+    ]
+    _wire(mod, monkeypatch, comments, on_head={"aaaaaaaaaaa1"})
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    assert "SEAM REPEAT span=aaaaaaaaaaa1 fixed in rounds 0, 1." in out
+    assert "seam history" not in out
+
+
+def test_a_seam_triggers_once_when_the_latest_round_reaches_the_threshold(monkeypatch, capsys):
+    mod = _load()
+    comments = _fixes("aaaaaaaaaaa1", [0, 1])
+    _wire(mod, monkeypatch, comments, on_head=set())
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30, "the 2nd fix is the latest round"
+    assert "SEAM REPEAT span=aaaaaaaaaaa1" in capsys.readouterr().out
+    # one more round on another span: the seam is not new and the span is gone
+    comments.append(_disp(10, "gpt", HEADS[2], "cccccccccc21"))
+    comments.append(_disp(11, "gpt", HEADS[3], "cccccccccc22"))
+    _wire(mod, monkeypatch, comments, on_head=set())
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+
+
+def test_a_third_fix_that_is_not_the_latest_round_and_is_gone_does_not_trigger(monkeypatch, capsys):
+    mod = _load()
+    comments = _fixes("aaaaaaaaaaa1", [0, 1, 2])
+    comments.append(_disp(10, "gpt", HEADS[3], "cccccccccc21"))
+    _wire(mod, monkeypatch, comments, on_head=set())
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    assert "seam history: span=aaaaaaaaaaa1 fixed in rounds 0, 1, 2" in capsys.readouterr().out
+
+
+def test_the_limit_threshold_triggers_when_its_fix_is_the_latest_round(monkeypatch, capsys):
+    mod = _load()
+    comments = _fixes("aaaaaaaaaaa1", [0, 1, 2, 3])
+    _wire(mod, monkeypatch, comments, on_head=set())
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    assert "SEAM LIMIT span=aaaaaaaaaaa1 fixed in rounds 0, 1, 2, 3." in capsys.readouterr().out
+
+
+def test_unreadable_current_head_findings_treat_every_seam_as_present_and_say_so(
+    monkeypatch, capsys
+):
+    mod = _load()
+    comments = _fixes("aaaaaaaaaaa1", [0, 1])
+    comments += [
+        _disp(10, "gpt", HEADS[2], "cccccccccc21"),
+        _disp(11, "gpt", HEADS[3], "cccccccccc22"),
+    ]
+    _wire(mod, monkeypatch, comments, on_head=None)
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    assert "the current head's findings could not be read: every seam is treated as present" in out
+
+
+def _resolved(cid: int, head: str, span: str, resolution: str) -> dict:
+    return _disp(cid, "gpt", head, span, "{}\n".format(resolution))
+
+
+def test_a_recorded_resolution_restarts_the_span_so_it_does_not_trigger(monkeypatch, capsys):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1"),
+        _resolved(2, HEADS[1], "aaaaaaaaaaa1", "resolution: narrowed -- only the key is read now"),
+    ]
+    _wire(mod, monkeypatch, comments, on_head={"aaaaaaaaaaa1"})
+    # two rounds are disposed, so the next is the 3rd: the cadence is due, a seam is not
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    assert "SEAM" not in out
+    assert "resolution: span aaaaaaaaaaa1 narrowed" in out
+    assert _fix_counts(mod) == {}
+
+
+def test_a_span_that_is_fixed_again_after_its_resolution_counts_from_the_resolution(
+    monkeypatch, capsys
+):
+    mod = _load()
+    comments = [
+        _disp(1, "gpt", HEADS[0], "aaaaaaaaaaa1"),
+        _resolved(2, HEADS[1], "aaaaaaaaaaa1", "resolution: deferred #4711 pinned-by test/a.py::t"),
+        _disp(3, "gpt", HEADS[2], "aaaaaaaaaaa1"),
+        _disp(4, "gpt", HEADS[3], "aaaaaaaaaaa1"),
+    ]
+    _wire(mod, monkeypatch, comments, on_head={"aaaaaaaaaaa1"})
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 30
+    out = capsys.readouterr().out
+    assert "SEAM REPEAT span=aaaaaaaaaaa1 fixed in rounds 2, 3." in out
+    assert _fix_counts(mod) == {"aaaaaaaaaaa1": 2}
+
+
+@pytest.mark.parametrize("word", ["removed", "narrowed", "deferred"])
+def test_the_resolution_line_is_read_from_plain_text_only(word):
+    read = _load().declared_resolution
+    assert (
+        read(f"<!-- m -->\n**fixed**\nresolution: {word} -- reason of twenty characters\n") == word
+    )
+    assert read(f"<!-- m -->\n**fixed**\n> resolution: {word} -- quoted evidence\n") == ""
+    assert read(f"<!-- m -->\n```\nresolution: {word} -- fenced\n```\n") == ""
+    assert read("<!-- m -->\n**fixed**\nresolution: whatever\n") == ""
+
+
+def test_the_reference_describes_the_formats_the_trigger_and_the_resolution_line():
+    ref = (SCRIPTS_DIR.parent / "references" / "seam-protocol.md").read_text(encoding="utf-8")
+    for needle in (
+        "D5-FORMAT-SURVEY.md",
+        "`undeclared`",
+        "seam history",
+        "on the current head",
+        "plain `resolution:` line",
+        "> fixed in <sha>",
+    ):
+        assert needle in ref, needle
+    skill = (SCRIPTS_DIR.parent / "SKILL.md").read_text(encoding="utf-8")
+    assert "just reached" in skill and "`resolution: removed|narrowed|deferred" in skill
+
+
+@pytest.mark.parametrize(
+    ("line", "word"),
+    [
+        ("> Fixed in 7ff6176c3d. detail", "fixed"),
+        ("> fixed in 2d49e39956c1: detail", "fixed"),
+        ("> fixed: the code is gone", "fixed"),
+        ("> Fixed. detail", "fixed"),
+        ("> **fixed** in debee13b98.", "fixed"),
+        ("> **Fixed**", "fixed"),
+        ("> removed in 3f04fb2f04e6: the parameter", "removed"),
+        ("> accepted: the PR stays", "accepted"),
+        ("> Agreed, no change.", "agreed"),
+        ("> Kept as two maps", "kept"),
+        ("> Fixed in the next push", ""),
+        ("> Fixed point iteration", ""),
+        ("> fixedness", ""),
+        ("> Legitimate. detail", ""),
+        ("> - **fixed** quoted bullet", ""),
+        ("", ""),
+    ],
+)
+def test_the_quoted_lead_reads_a_word_only_at_a_real_boundary(line, word):
+    assert _load().declared_outcome("<!-- m -->\n" + line + "\n") == word
+
+
+# --- The outcome is never read from a finding's title or from metadata lines ----------------
+HOSTILE_TITLES = [
+    "Deleted slot -- removed sessions still listed",
+    "Deleted slot \u2014 removed sessions still listed",
+    "Retry: removed entries are re-added",
+    "Fixed point iteration is slow",
+    "Guard reverted in abc1234 leaves a second writer",
+    "Removed in abc1234: the stale row stays",
+    "issue (blocking): the cache was fixed in abc1234 but never read",
+]
+HOSTILE_METADATA = [
+    "class: a guard removed in abc1234 leaves a second writer",
+    "mechanism: a retry guard fixed in abc1234",
+    "self-added: yes -- removed in abc1234",
+    "resolution: removed -- the writer was removed in abc1234",
+    "[operator: bolichen97] fixed in abc1234",
+]
+
+
+@pytest.mark.parametrize("title", HOSTILE_TITLES)
+def test_a_finding_title_never_declares_the_outcome(title):
+    body = f"<!-- m -->\n- **{title}** (span=aaaaaaaaaaa1)\n> Rebutted: by design, no change.\n"
+    assert _load().declared_outcome(body) == "rebutted"
+    undeclared = f"<!-- m -->\n- **{title}** (span=aaaaaaaaaaa1)\n> thought: by design.\n"
+    assert _load().declared_outcome(undeclared) == ""
+    assert _load().declared_outcome(f"<!-- m -->\n{title}\n> Rebutted: no.\n") == "rebutted"
+
+
+@pytest.mark.parametrize("meta", HOSTILE_METADATA)
+def test_a_metadata_line_never_declares_the_outcome(meta):
+    body = f"<!-- m -->\n{meta}\n- **Title** (span=aaaaaaaaaaa1)\n> Rebutted: by design.\n"
+    assert _load().declared_outcome(body) == "rebutted"
+    assert _load().declared_outcome(f"<!-- m -->\n{meta}\n- **Title**\n> thought: x\n") == ""
+
+
+@pytest.mark.parametrize("title", HOSTILE_TITLES)
+def test_four_rebuttals_under_a_hostile_title_raise_no_seam(title, monkeypatch, capsys):
+    mod = _load()
+    comments = []
+    for i in range(4):
+        body = (
+            f"<!-- ai-review-disposition target=gpt head={HEADS[i]} -->\n"
+            f"- **{title}** (span=aaaaaaaaaaa1)\n> Rebutted: by design, no change.\n"
+        )
+        comments.append({"id": i + 1, "body": body, "user": {"login": "writer"}})
+    _wire(mod, monkeypatch, comments, on_head={"aaaaaaaaaaa1"})
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    out = capsys.readouterr().out
+    assert "SEAM" not in out and "outcomes: rebutted×1" in out
+    assert _fix_counts(mod) == {}
+
+
+@pytest.mark.parametrize("meta", HOSTILE_METADATA)
+def test_four_rebuttals_with_a_hostile_metadata_line_raise_no_seam(meta, monkeypatch, capsys):
+    mod = _load()
+    comments = []
+    for i in range(4):
+        body = (
+            f"<!-- ai-review-disposition target=gpt head={HEADS[i]} -->\n{meta}\n"
+            "- **Title** (span=aaaaaaaaaaa1)\n> Rebutted: by design, no change.\n"
+        )
+        comments.append({"id": i + 1, "body": body, "user": {"login": "writer"}})
+    _wire(mod, monkeypatch, comments, on_head={"aaaaaaaaaaa1"})
+    assert mod.rounds_view("o/r", 7, "f" * 40, {}) == 0
+    assert "SEAM" not in capsys.readouterr().out
+    assert _fix_counts(mod) == {}
+
+
+def test_unquoted_prose_and_later_quoted_lines_declare_nothing():
+    read = _load().declared_outcome
+    assert read("<!-- m -->\nThe guard was removed in abc1234.\n") == ""
+    assert read("<!-- m -->\nFixed in abc1234.\n") == ""
+    assert read("<!-- m -->\n> Legitimate. detail\n> fixed in abc1234\n") == ""
+    assert read("<!-- m -->\n> Legitimate. detail\n> Outcome: fixed in abc1234\n") == ""
+
+
+def test_the_two_read_places_and_nothing_else():
+    read = _load().declared_outcome
+    # (a) the first quoted lead
+    assert read("<!-- m -->\n- **Title**\n> fixed in abc1234: detail\n") == "fixed"
+    assert read("<!-- m -->\n- **Title**\n> Rebutted: by design\n") == "rebutted"
+    assert read("<!-- m -->\n- **Title**\n> deferred #4711 pinned by a test\n") == "deferred"
+    # (b) an explicit label line, or a bold outcome token that starts the record
+    assert read("<!-- m -->\nOutcome: fixed\n") == "fixed"
+    assert read("<!-- m -->\nself-added: yes\n- **fixed** span=aaaaaaaaaaa1\n") == "fixed"
+    assert read("<!-- m -->\n[operator: x]\n**rebutted** -- span=aaaaaaaaaaa1\n") == "rebutted"

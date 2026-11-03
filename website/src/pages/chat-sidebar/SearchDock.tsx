@@ -7,7 +7,7 @@
  *  writes and order, create, rename, title, peer sessions). */
 import { Fragment } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { X, ArrowUpDown, EyeOff, ChevronRight, Clock, Check, List, ListTree, RotateCcw, Server, Pause, Play, WifiOff } from 'lucide-react'
+import { X, ArrowUpDown, EyeOff, ZapOff, ChevronRight, Clock, Check, List, ListTree, RotateCcw, Rows3, Server, Pause, Play, WifiOff } from 'lucide-react'
 import ErrorNotice from '../../components/ErrorNotice'
 import FolderGlyph from '../../components/FolderGlyph'
 import { useQuery } from '@tanstack/react-query'
@@ -20,6 +20,7 @@ import { errMessage } from '../../utils/thunkError'
 import { Btn, IconButton } from '../../components/ui'
 import SimpleSelect from '../../components/SimpleSelect'
 import { isEmbeddedPane } from '../../lib/embedded'
+import { crewModeEnabled } from '../../lib/crewMode'
 import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../../components/SearchFilterBar'
 import { FOLDER_SORT_MODES, folderHasCreatedStamp, type FolderSortMode } from '../../utils/folderTree'
 import { type RecentUnit, RECENT_WINDOW_PRESETS, formatRecentWindow } from '../recentWindow'
@@ -39,12 +40,26 @@ import type { SidebarScope } from './scope'
  * phone, where those options render inline rather than in a flyout — the
  * dormant-collapse thresholds. One component so the two lists cannot drift, and
  * so the duplicated class/style pair does not read as copy-paste.
+ *
+ * `role="radio"`, not the toggle-button `aria-pressed`: each list is one choice
+ * out of a mutually exclusive set, so a screen reader must hear "which one is in
+ * effect", not "this toggle is on". The caller wraps the chips in a
+ * `role="radiogroup"` (`DurationChipGroup`) so the set is one named group,
+ * matching the desktop submenu's `menuitemradio` grammar.
+ *
+ * A radio is operated as a group, not as N buttons: only one chip is a Tab stop
+ * (`tabbable` — the checked one, or the first when none is checked) and the
+ * group's arrow keys move between them. The caller decides `tabbable` because
+ * only it knows whether ANY chip is checked (a custom Recent window matches no
+ * preset).
  */
-function DurationChip({ label, selected, onSelect }: { label: string; selected: boolean; onSelect: () => void }) {
+function DurationChip({ label, selected, tabbable, onSelect }: { label: string; selected: boolean; tabbable: boolean; onSelect: () => void }) {
   return (
     <button
       type="button"
-      aria-pressed={selected}
+      role="radio"
+      aria-checked={selected}
+      tabIndex={tabbable ? 0 : -1}
       className="px-2 py-0.5 rounded-full text-[11px] cursor-pointer border transition-colors"
       style={selected
         ? { background: 'color-mix(in srgb, var(--ok) 12%, transparent)', color: 'var(--ok)', borderColor: 'color-mix(in srgb, var(--ok) 35%, transparent)' }
@@ -56,6 +71,45 @@ function DurationChip({ label, selected, onSelect }: { label: string; selected: 
     >
       {label}
     </button>
+  )
+}
+
+/** Arrow-key step through a radio group (WAI-ARIA radio pattern: Right/Down is
+ *  the next radio, Left/Up the previous, wrapping at either end). */
+const RADIO_KEY_STEP: Record<string, number> = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }
+
+/**
+ * The `role="radiogroup"` around a run of `DurationChip`s, with the radio
+ * keyboard behaviour: an arrow key (or Home/End) moves focus to the adjacent
+ * chip AND selects it, as a native radio group does. The key is consumed
+ * (`stopPropagation`) so the host Radix menu does not also treat it as its own
+ * item-to-item arrow navigation and pull focus out of the group.
+ */
+function DurationChipGroup({ ariaLabel, ariaLabelledBy, className, children }: {
+  ariaLabel?: string
+  ariaLabelledBy?: string
+  className?: string
+  children: React.ReactNode
+}) {
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const isEdge = e.key === 'Home' || e.key === 'End'
+    if (!isEdge && RADIO_KEY_STEP[e.key] === undefined) return
+    const radios = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="radio"]'))
+    if (radios.length === 0) return
+    e.preventDefault()
+    e.stopPropagation()
+    const current = radios.indexOf(document.activeElement as HTMLButtonElement)
+    const next = e.key === 'Home' ? 0
+      : e.key === 'End' ? radios.length - 1
+        : (Math.max(current, 0) + RADIO_KEY_STEP[e.key] + radios.length) % radios.length
+    radios[next].focus()
+    radios[next].click()
+  }
+  return (
+    // eslint-disable-next-line jsx-a11y/interactive-supports-focus -- a radiogroup is not itself a Tab stop; focus lives on its one tabbable radio (roving tabindex), and this handler only routes arrow keys between them
+    <div role="radiogroup" aria-label={ariaLabel} aria-labelledby={ariaLabelledBy} className={className} onKeyDown={onKeyDown}>
+      {children}
+    </div>
   )
 }
 
@@ -74,12 +128,14 @@ export const FILTER_LABEL_KEY: Record<SessionFilterKey, string> = {
   running: 'pages.chatSidebar.filter_running',
   pinned: 'pages.chatSidebar.filter_pinned',
   recent: 'pages.chatSidebar.filter_recent',
+  crew: 'pages.chatSidebar.filter_crew',
 }
 export const FILTER_DESCRIPTION_KEY: Record<SessionFilterKey, string> = {
   unread: 'pages.chatSidebar.filter_unread_description',
   running: 'pages.chatSidebar.filter_running_description',
   pinned: 'pages.chatSidebar.filter_pinned_description',
   recent: 'pages.chatSidebar.filter_recent_description',
+  crew: 'pages.chatSidebar.filter_crew_description',
 }
 
 /** Sort options, in menu order. The label lives in `SORT_LABEL_KEY`. */
@@ -145,7 +201,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
   const { activeFilters, activeModelKeys, activeModelRows, activeTagIds, activeTagNames, autoTitleError,
     availableLanes, boardLaneActive, changeRecentUnit, clearHiddenFilters, clearModelFilter, clearTagFilter,
     closeRefused, columnsError, columnsFailed, commitRecentAmount, conductorView, connected, cycleLane, dismissSortError, dispatch,
-    filterCounts, filterHiddenFolders, filterSortOpen, filtersPaused, flatLaneActive, folderActionError,
+    filterCounts, filterHiddenFolders, filterSortOpen, filtersPaused, flatLaneActive, folderActionError, groupByKind, toggleGroupByKind,
     folderFilterRows, folderOfflineNotice, folderReorderHint, folderReorderHintRef, folderRowsDrawn, folderSortMode,
     folderSortMut, folderSortRead, folders, foldersError, foldersFailed, foldersShelved,
     hasRemoteExecutedRow, hiddenFilters, hiddenFolderCount, instanceSessions, isMobile, lane,
@@ -247,6 +303,12 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   const active = activeFilters.has(filterDef.key)
                   const hidden = hiddenFilters.has(filterDef.key)
                   const slotCount = filterCounts[filterDef.key] ?? 0
+                  // The Crew Mode row is offered once a chat runs on the conductor
+                  // (a row the server stamps `crew_mode_root`), and stays while the
+                  // filter is on. With no such chat, on a gateway without Crew Mode
+                  // included, the menu reads as it does today.
+                  // With the Crew Mode preview off the row is never offered.
+                  if (filterDef.key === 'crew' && (!crewModeEnabled() || (!active && slotCount === 0))) return null
                   const isRecent = filterDef.key === 'recent'
                   if (isRecent) {
                     // The window picker is a NESTED FLYOUT on a wide viewport and
@@ -269,17 +331,17 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                         onMouseDown={e => e.stopPropagation()}
                         onKeyDown={e => e.stopPropagation()}
                       >
-                        <div className="px-1 pb-1 text-[11px] text-muted">{i18nT('pages.chatSidebar.within')}</div>
-                        <div className="flex flex-wrap gap-1 px-1 mb-2">
-                          {RECENT_WINDOW_PRESETS.map(preset => (
+                        <DurationChipGroup ariaLabel={i18nT(FILTER_LABEL_KEY.recent)} className="flex flex-wrap gap-1 px-1 mb-2">
+                          {RECENT_WINDOW_PRESETS.map((preset, i) => (
                             <DurationChip
                               key={preset.ms}
                               label={preset.label}
                               selected={recentWindowMs === preset.ms}
+                              tabbable={recentWindowMs === preset.ms || (i === 0 && !RECENT_WINDOW_PRESETS.some(p => p.ms === recentWindowMs))}
                               onSelect={() => selectRecentPreset(preset.ms)}
                             />
                           ))}
-                        </div>
+                        </DurationChipGroup>
                         <div className="px-1 text-[12px] text-muted">
                           <div className="mb-1">{i18nT('pages.chatSidebar.custom')}</div>
                           <div className="flex items-center gap-1.5">
@@ -340,7 +402,6 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                       return (
                         <Fragment key={filterDef.key}>
                           <DropdownMenuItem
-                            title={i18nT(FILTER_DESCRIPTION_KEY[filterDef.key])}
                             onSelect={e => { e.preventDefault(); toggleFilter('recent') }}
                           >
                             {rowBody}
@@ -362,7 +423,6 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                     return (
                       <DropdownMenuSub key={filterDef.key}>
                         <DropdownMenuSubTrigger
-                          title={i18nT(FILTER_DESCRIPTION_KEY[filterDef.key])}
                           onClick={() => toggleFilter('recent')}
                           onKeyDown={e => {
                             if (e.key === 'Enter' || e.key === ' ') {
@@ -385,7 +445,6 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   const showRow = (
                     <DropdownMenuItem
                       key={filterDef.key}
-                      title={i18nT(FILTER_DESCRIPTION_KEY[filterDef.key])}
                       // Keep the menu open so multiple filters can be toggled.
                       onSelect={e => { e.preventDefault(); toggleFilter(filterDef.key) }}
                       className={canHide ? 'flex-1 min-w-0' : undefined}
@@ -417,35 +476,57 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   const hideLabel = hidden
                     ? i18nT('pages.chatSidebar.filter_unhide_named', { filter: filterLabel })
                     : i18nT('pages.chatSidebar.filter_hide_named', { filter: filterLabel })
+                  // "In progress" gets a named "Not in progress" row instead of the
+                  // hover-only EyeOff button, so hiding running sessions is discoverable
+                  // without hovering. Unread and Pinned keep the EyeOff. The row stays
+                  // in the menu while show-only is on, so the menu keeps its shape:
+                  // toggleHideFilter clears show-only and toggleFilter drops the hide,
+                  // so one click moves between the two.
+                  const notRow = filterDef.key === 'running'
                   return (
-                    <div
-                      key={filterDef.key}
-                      role="group"
-                      className="group/filter flex items-center rounded-md transition-colors hover:bg-bg-hover focus-within:bg-bg-hover"
-                    >
-                      {showRow}
-                      {!active && (
-                        <DropdownMenuItem
-                          aria-label={hideLabel}
-                          title={hideLabel}
-                          onSelect={e => { e.preventDefault(); toggleHideFilter(filterDef.key) }}
-                          className="group/hide shrink-0"
-                          data-testid={`filter-hide-${filterDef.key}`}
-                          data-filter-hidden={hidden ? 'true' : undefined}
-                        >
-                          <span
-                            className={hidden
-                              ? 'inline-flex size-3.5 items-center justify-center rounded bg-accent-subtle text-accent ring-4 ring-accent-subtle'
-                              : 'inline-flex size-3.5 items-center justify-center text-muted group-focus/hide:text-text'}
+                    <Fragment key={filterDef.key}>
+                      <div
+                        role="group"
+                        className="group/filter flex items-center rounded-md transition-colors hover:bg-bg-hover focus-within:bg-bg-hover"
+                      >
+                        {showRow}
+                        {!active && !notRow && (
+                          <DropdownMenuItem
+                            aria-label={hideLabel}
+                            title={hideLabel}
+                            onSelect={e => { e.preventDefault(); toggleHideFilter(filterDef.key) }}
+                            className="group/hide shrink-0"
+                            data-testid={`filter-hide-${filterDef.key}`}
+                            data-filter-hidden={hidden ? 'true' : undefined}
                           >
-                            <EyeOff
-                              size={12}
-                              className={hidden ? undefined : 'opacity-0 group-hover/filter:opacity-100 group-focus-within/filter:opacity-100 [@media(hover:none)]:opacity-100'}
-                            />
-                          </span>
+                            <span
+                              className={hidden
+                                ? 'inline-flex size-3.5 items-center justify-center rounded bg-accent-subtle text-accent ring-4 ring-accent-subtle'
+                                : 'inline-flex size-3.5 items-center justify-center text-muted group-focus/hide:text-text'}
+                            >
+                              <EyeOff
+                                size={12}
+                                className={hidden ? undefined : 'opacity-0 group-hover/filter:opacity-100 group-focus-within/filter:opacity-100 [@media(hover:none)]:opacity-100'}
+                              />
+                            </span>
+                          </DropdownMenuItem>
+                        )}
+                      </div>
+                      {notRow && (
+                        <DropdownMenuItem
+                          title={i18nT('pages.chatSidebar.filter_not_running_description')}
+                          onSelect={e => { e.preventDefault(); toggleHideFilter(filterDef.key) }}
+                          data-testid={`filter-not-${filterDef.key}`}
+                          data-filter-hidden={hidden ? 'true' : undefined}
+                          role="menuitemcheckbox"
+                          aria-checked={hidden}
+                        >
+                          <ZapOff size={12} className={hidden ? 'text-[var(--warn)]' : 'text-muted'} />
+                          <span className="flex-1 truncate">{i18nT('pages.chatSidebar.filter_not_running')}</span>
+                          {hidden && <Check size={14} className="text-accent shrink-0" />}
                         </DropdownMenuItem>
                       )}
-                    </div>
+                    </Fragment>
                   )
                 })}
                 {/* Lift every active status filter at once, for a look at the
@@ -463,6 +544,31 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   >
                     {filtersPaused ? <Play size={12} className="text-muted" aria-hidden="true" /> : <Pause size={12} className="text-muted" aria-hidden="true" />}
                     <span className="flex-1 truncate">{filtersPaused ? i18nT('pages.chatSidebar.resume_all_filters') : i18nT('pages.chatSidebar.pause_all_filters')}</span>
+                  </DropdownMenuItem>
+                )}
+                {/* Why a Crew Mode chat's own sessions are not rows here: they are
+                    listed in its side panel. One line, so the absence is explained;
+                    shown with the Crew Mode row, so a list with no such chat says
+                    nothing about one. */}
+                {crewModeEnabled() && ((filterCounts['crew'] ?? 0) > 0 || activeFilters.has('crew')) && (
+                  <p className="px-2 pt-1 pb-1.5 text-[11px] text-muted max-w-[16rem]" data-testid="filter-crew-hint">{i18nT('pages.chatSidebar.filter_crew_hint')}</p>
+                )}
+                {/* A view option, not a filter: it hides nothing and splits each list
+                    into Crew Mode / Normal / From Mates sections (./kindSections).
+                    Not offered on the tag board, whose columns are already the
+                    grouping. */}
+                {!boardLaneActive && (
+                  <DropdownMenuItem
+                    data-testid="filter-group-by-kind"
+                    role="menuitemcheckbox"
+                    aria-checked={groupByKind}
+                    title={i18nT('pages.chatSidebar.group_by_kind_hint')}
+                    // Keep the menu open, like the filter rows above.
+                    onSelect={e => { e.preventDefault(); toggleGroupByKind() }}
+                  >
+                    <Rows3 size={12} className={groupByKind ? 'text-accent' : 'text-muted'} aria-hidden="true" />
+                    <span className="flex-1 truncate">{i18nT('pages.chatSidebar.group_by_kind')}</span>
+                    {groupByKind && <Check size={14} className="text-accent shrink-0" aria-hidden="true" />}
                   </DropdownMenuItem>
                 )}
                 <DropdownMenuSeparator />
@@ -625,20 +731,22 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                         <DropdownMenuLabel
                           className="text-[11px] uppercase tracking-[.04em] flex items-center gap-2"
                           data-testid="stale-collapse-menu"
+                          id="stale-collapse-presets-label"
                         >
                           {staleRowBody}
                         </DropdownMenuLabel>
                         {staleCaption}
-                        <div className="flex flex-wrap gap-1 px-2 pb-1.5">
-                          {STALE_COLLAPSE_PRESETS_MS.map(ms => (
+                        <DurationChipGroup ariaLabelledBy="stale-collapse-presets-label" className="flex flex-wrap gap-1 px-2 pb-1.5">
+                          {STALE_COLLAPSE_PRESETS_MS.map((ms, i) => (
                             <DurationChip
                               key={ms}
                               label={staleLabel(ms)}
                               selected={staleCollapseMs === ms}
+                              tabbable={staleCollapseMs === ms || (i === 0 && !STALE_COLLAPSE_PRESETS_MS.includes(staleCollapseMs))}
                               onSelect={() => setStaleCollapseMs(ms)}
                             />
                           ))}
-                        </div>
+                        </DurationChipGroup>
                       </>
                     )
                   }
@@ -651,15 +759,27 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   </DropdownMenuSubTrigger>
                   <DropdownMenuSubContent className="min-w-[150px] max-w-[240px]">
                     {staleCaption}
-                    {STALE_COLLAPSE_PRESETS_MS.map(ms => (
-                      <DropdownMenuItem
-                        key={ms}
-                        onSelect={() => setStaleCollapseMs(ms)}
-                      >
-                        <span className="flex-1">{staleLabel(ms)}</span>
-                        {staleCollapseMs === ms && <Check size={14} className="text-accent shrink-0" />}
-                      </DropdownMenuItem>
-                    ))}
+                    {/* A switcher over mutually exclusive thresholds, so each row
+                        is a `menuitemradio` reporting `aria-checked` — a screen
+                        reader says WHICH threshold is in effect, which a plain
+                        item's check icon (kept, sighted-only) cannot convey. The
+                        write stays on each row's `onSelect`, not the group's
+                        `onValueChange`, so a re-pick of the already-active
+                        threshold still fires; the group's `value` is the ms
+                        preset serialized to a string (Radix radio values are
+                        strings). */}
+                    <DropdownMenuRadioGroup value={String(staleCollapseMs)}>
+                      {STALE_COLLAPSE_PRESETS_MS.map(ms => (
+                        <DropdownMenuRadioItem
+                          key={ms}
+                          value={String(ms)}
+                          onSelect={() => setStaleCollapseMs(ms)}
+                        >
+                          <span className="flex-1">{staleLabel(ms)}</span>
+                          {staleCollapseMs === ms && <Check size={14} className="text-accent shrink-0" aria-hidden="true" />}
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuRadioGroup>
                   </DropdownMenuSubContent>
                 </DropdownMenuSub>
                   )
@@ -930,9 +1050,30 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
           </div>
         )
       })()}
-      {activeFilters.size > 0 && (
+      {/* The Crew Mode chip in its own row, above the status chips, for the same
+          AUTOSDE reason as the tag, model and hides chips: the status-chip row
+          below holds the base branch's four filter chips and must not grow
+          (max-two-buttons-per-row), so the fifth filter never joins it. */}
+      {activeFilters.has('crew') && (() => {
+        const slotCount = filterCounts['crew'] ?? 0
+        const filterLabel = i18nT(FILTER_LABEL_KEY['crew'])
+        return (
+          <div className="px-3 pb-1">
+            <FilterChip
+              testId="filter-chip-crew"
+              label={`${filterLabel}${slotCount > 0 ? ` (${slotCount})` : ''}`}
+              color="var(--accent)"
+              gradient
+              paused={filtersPaused}
+              clearLabel={i18nT('pages.chatSidebar.clear_named_filter', { filter: filterLabel })}
+              onClear={() => toggleFilter('crew')}
+            />
+          </div>
+        )
+      })()}
+      {SESSION_FILTERS.some(filterDef => filterDef.key !== 'crew' && activeFilters.has(filterDef.key)) && (
         <div className={FILTER_CHIP_ROW_CLS}>
-          {SESSION_FILTERS.filter(filterDef => activeFilters.has(filterDef.key)).map(filterDef => {
+          {SESSION_FILTERS.filter(filterDef => filterDef.key !== 'crew' && activeFilters.has(filterDef.key)).map(filterDef => {
             const slotCount = filterCounts[filterDef.key] ?? 0
             const filterLabel = i18nT(FILTER_LABEL_KEY[filterDef.key])
             // The label goes in as-is. It used to be `.toLowerCase()`d to read as

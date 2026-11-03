@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 from kiro_crew import model_registry, model_scope
-from kiro_crew.acp import runtime_models
+from kiro_crew.acp import launch_tuning, runtime_models
 from kiro_crew.acp._dispatch import build_session_new_params, parse_session_modes
 from kiro_crew.acp.client_timeouts import _INIT_TIMEOUT
 from kiro_crew.acp.runtime_models import DEFAULT_MODEL, model_is_unusable, pick_served_default
@@ -40,6 +40,7 @@ from kiro_crew.acp.transport_errors import AcpError, AcpModelUnavailable, AcpPro
 from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
+    ACP_BACKENDS_MODEL_AT_LAUNCH,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     METHOD_INITIALIZE,
@@ -51,7 +52,7 @@ from kiro_crew.acp.types import (
     effort_config_option_value,
 )
 from kiro_crew.agent import require_unchanged_derived_spec
-from kiro_crew.agent_sdk.backends import model_refusal_phrase
+from kiro_crew.agent_sdk.backends import effort_config_option_levels, model_refusal_phrase
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -191,6 +192,11 @@ async def set_model(self: AcpClient, model_id: str) -> None:
     """Switch model on a running session (used by warm pool post-claim)."""
     if not self._session_id:
         raise AcpError("Cannot set model before session is initialized")
+    if self.backend in ACP_BACKENDS_MODEL_AT_LAUNCH:
+        # The harness took its model when it started and has no wire channel to
+        # move it: the switch relaunches the process and reloads this session.
+        await launch_tuning.switch_launch_model(self, model_id)
+        return
     # This path deliberately does not scope: an explicit pick must reach the
     # adapter because its advertised list can omit an entitlement the adapter
     # accepts, and inherited pins are already scoped by their callers.
@@ -325,7 +331,9 @@ def _capture_available_models(self: AcpClient, session_resp: dict) -> None:
         # keyed by its own registry namespace.
         if self._uses_advertised_model_selection:
             self._advertised_models_changed = model_registry.refresh_advertised_models(
-                self._model_registry_namespace, self._advertised_model_ids()
+                self._model_registry_namespace,
+                self._advertised_model_ids(),
+                rows=self._available_models,
             )
 
 
@@ -919,6 +927,12 @@ async def _apply_startup_model(self: AcpClient) -> None:
     the base window. Same call as :meth:`set_model` uses, so an explicit switch
     and a startup application agree on one exact spelling.
     """
+    if self.backend in ACP_BACKENDS_MODEL_AT_LAUNCH:
+        # The launch passed the pin as an argument (the adapter's own model
+        # scoping applies there); nothing is sent on the wire.
+        self._resolved_model_id = self._model or DEFAULT_MODEL
+        logger.info("ACP model: %s (a launch argument)", self._model or "auto")
+        return
     if not self._model or self._model == DEFAULT_MODEL:
         logger.info(
             "ACP model: %s (from agent config; backend reports %s)",
@@ -1154,7 +1168,9 @@ def get_valid_effort_levels(self: AcpClient) -> list[str]:
     extracts its ``options[].value`` list in the order ACP reported them.
     Resolving the id here is what fills the dropdown on a backend that spells
     it differently; a hard-coded spelling returns an empty list there, which
-    every caller reads as "this model has no effort levels".
+    every caller reads as "this model has no effort levels". A value the
+    backend uses for "no override" (opencode's ``default``) is not a level and
+    is dropped.
     """
     effort_option = effort_config_option_id(self.backend)
     for opt in self._acp_config_options:
@@ -1163,5 +1179,8 @@ def get_valid_effort_levels(self: AcpClient) -> list[str]:
         if opt.get("id") == effort_option:
             options = opt.get("options", [])
             if isinstance(options, list):
-                return [o["value"] for o in options if isinstance(o, dict) and "value" in o]
+                return effort_config_option_levels(
+                    self.backend,
+                    [o["value"] for o in options if isinstance(o, dict) and "value" in o],
+                )
     return []

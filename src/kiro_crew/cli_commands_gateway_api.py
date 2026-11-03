@@ -24,8 +24,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from kiro_crew.config.loader import KiroCrewConfig, read_local_secret
-from kiro_crew.dashboard.origin import parse_dashboard_url
+from kiro_crew.config.loader import read_local_secret
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.subagent_wait_reasons import queued_wait_text
 from kiro_crew.terminal_safe import safe_terminal_line
@@ -88,8 +87,23 @@ def _spawn_row_text(row: dict[str, object]) -> str:
     return f"{row_id}  {task}"
 
 
+def _client_port(cli_port: int | None) -> int:
+    """The gateway port this command calls, found the way ``kirocrew status`` finds it.
+
+    ``resolve_client_port`` walks the flag, ``KIROCREW_PORT``, the bound port, the
+    port in ``dashboard.url`` and the running gateway's marker, so a gateway on a
+    non-default port is reached without a ``--port``. Imported in-function: a
+    module-scope import would surface on this split module's star-import facade
+    (cli_commands).
+    """
+    from kiro_crew.port_resolution import resolve_client_port
+
+    return resolve_client_port(cli_port)
+
+
 def _spawn(args: argparse.Namespace) -> None:
     """Dispatch spawn subcommands: run, list."""
+    args.port = _client_port(getattr(args, "port", None))
     base = f"http://127.0.0.1:{args.port}"
     action = getattr(args, "spawn_action", None)
 
@@ -162,19 +176,21 @@ def _spawn(args: argparse.Namespace) -> None:
 def _spawn_run(args: argparse.Namespace, base: str) -> None:
     """Spawn a subagent via the dashboard API.
 
-    ``--agent`` and ``--crew`` travel as the request's ``agent`` and ``crew``
-    fields, the ones the native ``spawn_run`` tool sends, so the gateway's
-    admission resolves and refuses them for both callers alike. A blank name
-    is refused here: the gateway reads an empty field as "no pin", which would
-    run the default the caller did not ask for.
+    ``--agent``, ``--crew`` and ``--model`` travel as the request's ``agent``,
+    ``crew`` and ``model`` fields, the ones the native ``spawn_run`` tool sends,
+    so the gateway's admission resolves and refuses them for both callers alike.
+    A value that sanitizes to empty is refused here: the gateway reads it as "no
+    pin", which would run the default the caller did not ask for.
     """
+    from kiro_crew.validation import sanitize_string
+
     body: dict[str, str] = {"task": args.task}
-    for flag in ("agent", "crew"):
+    for flag in ("agent", "crew", "model"):
         name = getattr(args, flag, None)
         if name is None:
             continue
-        if not name.strip():
-            print(f"Error: --{flag} needs a name")
+        if not sanitize_string(name):
+            print(f"Error: --{flag} needs a value")
             sys.exit(1)
         body[flag] = name
     data = json.dumps(body).encode()
@@ -352,8 +368,7 @@ def _handoff(args: argparse.Namespace) -> None:
 
 def _artifact(args: argparse.Namespace) -> None:
     """List, save, view, update, or delete artifacts."""
-    cfg = KiroCrewConfig.load()
-    _host, port = parse_dashboard_url(cfg.dashboard.url)
+    port = _client_port(None)
     base = f"http://127.0.0.1:{port}"
 
     action = getattr(args, "artifact_action", None) or "list"
@@ -391,7 +406,20 @@ def _artifact(args: argparse.Namespace) -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            return p.read_text(encoding="utf-8")
+            # A missing file, a folder or non-UTF-8 bytes is the caller's input,
+            # not a crash: one line and exit 1, like the other errors here.
+            try:
+                return p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                reason = "not UTF-8 text"
+            except OSError as exc:
+                reason = exc.strerror or str(exc)
+            print(
+                f"Error: could not read --content-file {safe_terminal_line(str(p))}: "
+                f"{safe_terminal_line(reason)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if getattr(args, "content", None):
             return args.content
         if not sys.stdin.isatty():
@@ -400,6 +428,24 @@ def _artifact(args: argparse.Namespace) -> None:
             "Error: provide --content, --content-file, or pipe content via stdin", file=sys.stderr
         )
         sys.exit(1)
+
+    def _slug_segment(slug: str) -> str:
+        """Return *slug* as one encoded URL path segment, or exit 2.
+
+        The slug is spliced into ``/api/artifacts/<slug>``. Unencoded, a slug
+        like ``x/publish`` reaches a different route (DELETE on it unpublishes
+        ``x``) and ``?``/``#`` cut the path short; ``.`` and ``..`` are dot
+        segments a URL normalizer collapses. Real slugs are none of these, so
+        refuse them and the empty slug outright, and encode everything else.
+        """
+        if not slug or "/" in slug or slug in (".", ".."):
+            print(
+                f"Error: invalid artifact slug {slug!r}: it must be non-empty, "
+                "not '.' or '..', and contain no '/'",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        return urllib.parse.quote(slug, safe="")
 
     def _parse_tags(s: str | None) -> list[str]:
         if not s:
@@ -422,19 +468,27 @@ def _artifact(args: argparse.Namespace) -> None:
             print("No artifacts.")
             return
         for a in items:
-            tags = f"  [{', '.join(a.get('tags') or [])}]" if a.get("tags") else ""
+            # Every cell prints the same way, on one line, so a stored value
+            # holding a newline or control character cannot break the table.
+            tags = (
+                f"  [{safe_terminal_line(', '.join(str(t) for t in a.get('tags') or []))}]"
+                if a.get("tags")
+                else ""
+            )
             print(
-                f"{a.get('slug', '?'):<40s}  v{a.get('version', '?'):<3} "
-                f"{a.get('kind', '?'):<10}{tags}  {a.get('name', '?')}"
+                f"{safe_terminal_line(str(a.get('slug', '?'))):<40s}  "
+                f"v{safe_terminal_line(str(a.get('version', '?'))):<3} "
+                f"{safe_terminal_line(str(a.get('kind', '?'))):<10}{tags}  "
+                f"{safe_terminal_line(str(a.get('name', '?')))}"
             )
         return
 
     if action == "show":
-        slug = args.slug
+        seg = _slug_segment(args.slug)
         version = getattr(args, "version", None)
-        path = f"/api/artifacts/{slug}"
-        if version:
-            path = f"/api/artifacts/{slug}/versions/{int(version)}"
+        path = f"/api/artifacts/{seg}"
+        if version is not None:
+            path = f"/api/artifacts/{seg}/versions/{int(version)}"
         d = _request("GET", path)
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
@@ -488,8 +542,8 @@ def _artifact(args: argparse.Namespace) -> None:
             )
         # Relayed from the gateway (same pattern as slug_collided_with): the
         # handler computes the theme-contrast verdict at the convergence
-        # point, so this CLI path -- the one the motivating incident traveled
-        # -- hears it without duplicating the detector. Advisory only.
+        # point, so this CLI path hears it without duplicating the detector.
+        # Advisory only.
         if d.get("theme_contrast_warning"):
             print(
                 "Warning: content hardcodes colors with no theme variables — it "
@@ -502,6 +556,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     if action == "update":
         slug = args.slug
+        seg = _slug_segment(slug)
         body = {}
         # Only read stdin when explicit content args are absent. In non-
         # interactive environments (CI, cron, piped /dev/null) sys.stdin.isatty()
@@ -524,14 +579,14 @@ def _artifact(args: argparse.Namespace) -> None:
         if not body:
             print("Error: provide content/--name/--description/--tags", file=sys.stderr)
             sys.exit(1)
-        d = _request("PATCH", f"/api/artifacts/{slug}", body)
+        d = _request("PATCH", f"/api/artifacts/{seg}", body)
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
         print(f"Updated: slug={d.get('slug', slug)} version={d.get('version', '?')}")
-        # Relayed from the gateway (see the save action above) -- the PATCH
-        # path is exactly how the motivating incident's script pushed its
-        # hardcoded-palette page. Advisory only; the update succeeded.
+        # Relayed from the gateway (see the save action above), so a script
+        # PATCHing a hardcoded-palette page hears it too. Advisory only; the
+        # update succeeded.
         if d.get("theme_contrast_warning"):
             print(
                 "Warning: content hardcodes colors with no theme variables — it "
@@ -544,7 +599,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     if action == "delete":
         slug = args.slug
-        d = _request("DELETE", f"/api/artifacts/{slug}")
+        d = _request("DELETE", f"/api/artifacts/{_slug_segment(slug)}")
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
@@ -553,7 +608,7 @@ def _artifact(args: argparse.Namespace) -> None:
 
     if action == "versions":
         slug = args.slug
-        d = _request("GET", f"/api/artifacts/{slug}/versions")
+        d = _request("GET", f"/api/artifacts/{_slug_segment(slug)}/versions")
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)

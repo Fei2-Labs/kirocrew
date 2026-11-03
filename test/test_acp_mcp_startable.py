@@ -20,6 +20,7 @@ from kiro_crew.acp.client import AcpClient
 from kiro_crew.acp.mcp_session_report import BUCKET_CAP, ERROR_CAP, NAME_CAP
 from kiro_crew.acp.mcp_startable import prune_unstartable, unstartable_reason
 from kiro_crew.acp_backends import (
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_OPENCODE,
@@ -95,8 +96,12 @@ def test_prune_keeps_order_and_names_each_pruned_server():
 # ── The session/new path ─────────────────────────────────────────────────────
 
 
-def test_goose_and_deepseek_are_the_pruned_backends():
-    assert ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP == {ACP_BACKEND_GOOSE, ACP_BACKEND_DEEPSEEK}
+def test_goose_deepseek_and_copilot_are_the_pruned_backends():
+    assert ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP == {
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_COPILOT,
+    }
 
 
 def _drive(tmp_path, monkeypatch, backend: str, *, rolls_back: bool):
@@ -127,21 +132,19 @@ def _drive(tmp_path, monkeypatch, backend: str, *, rolls_back: bool):
     monkeypatch.setattr(client, "_session_work_dir", _work_dir)
     monkeypatch.setattr(client, "_send_request", _send)
     monkeypatch.setattr(client, "_wait_for_response", _wait)
-    # The wire path is `_gated_session_mcp_servers`: the resolved spec array is
-    # the base half, the tool-gate delivery verdict authorizes the managed half,
-    # and the pooled broker append is empty for these mirrors. Delivery is
-    # opened through the verdict seam because the subject here is the prune,
-    # not the gate — the gate's own withhold posture is pinned in
-    # test_acp_spec_mcp_delivery.
-    monkeypatch.setattr(client, "_session_mcp_servers", lambda: [good, bad])
-    monkeypatch.setattr(client, "_spec_session_mcp_delivery", lambda: (True, []))
+    # Each backend is a mirror: each carries the bad element in its own spec half,
+    # and the pooled broker append is empty for them.
+    monkeypatch.setattr(client, "_goose_session_mcp_servers", lambda: [good, bad])
+    monkeypatch.setattr(client, "_deepseek_session_mcp_servers", lambda: [good, bad])
+    monkeypatch.setattr(client, "_copilot_session_mcp_servers", lambda: [good, bad])
     monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
     return client, sent
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("backend", "rolls_back"), [(ACP_BACKEND_GOOSE, False), (ACP_BACKEND_DEEPSEEK, True)]
+    ("backend", "rolls_back"),
+    [(ACP_BACKEND_GOOSE, False), (ACP_BACKEND_DEEPSEEK, True), (ACP_BACKEND_COPILOT, False)],
 )
 async def test_the_session_starts_without_the_bad_element_and_names_it(
     tmp_path, monkeypatch, backend, rolls_back
@@ -163,7 +166,8 @@ async def test_the_session_starts_without_the_bad_element_and_names_it(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("backend", "rolls_back"), [(ACP_BACKEND_GOOSE, False), (ACP_BACKEND_DEEPSEEK, True)]
+    ("backend", "rolls_back"),
+    [(ACP_BACKEND_GOOSE, False), (ACP_BACKEND_DEEPSEEK, True), (ACP_BACKEND_COPILOT, False)],
 )
 async def test_a_pruned_server_the_spec_refs_is_failed_not_unresolved(
     tmp_path, monkeypatch, backend, rolls_back
@@ -262,10 +266,7 @@ async def test_a_backend_outside_the_set_sends_the_array_untouched(tmp_path, mon
     monkeypatch.setattr(client, "_session_work_dir", _work_dir)
     monkeypatch.setattr(client, "_send_request", _send)
     monkeypatch.setattr(client, "_wait_for_response", _wait)
-    # Same seams as _drive: the opencode arm of _gated_session_mcp_servers
-    # takes the resolved array verbatim (its mirror owns the composition).
-    monkeypatch.setattr(client, "_session_mcp_servers", lambda: [bad])
-    monkeypatch.setattr(client, "_spec_session_mcp_delivery", lambda: (True, []))
+    monkeypatch.setattr(client, "_opencode_session_mcp_servers", lambda: [bad])
     monkeypatch.setattr(client, "_pooled_mcp_servers", lambda: [])
 
     await client._new_session_following_substitution()

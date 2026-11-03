@@ -43,7 +43,7 @@ name: Main Ratchet Audit
 # minutes here are only the individually-cheap ratchet lanes.
 #
 # The gate commands below are the same commands ci.yml's backend-lint,
-# frontend-lint and bundle-size jobs run, so the audit and the PR gates cannot
+# backend-ratchets, frontend-lint, frontend-ratchets and bundle-size jobs run, so the audit and the PR gates cannot
 # disagree about what a gate IS. If ci.yml adds or renames a gate script, mirror
 # it here. The eslint ceiling is deliberately NOT transcribed: it is read out of
 # ci.yml at run time, so ci.yml stays the one numeric source
@@ -142,8 +142,9 @@ jobs:
         run: python3 scripts/check_python_audit.py
 
       # Each gate is a SEPARATE step so a failure names exactly which ratchet
-      # drifted. Same commands as ci.yml backend-lint, whole-tree scoped, and
-      # the set of gate scripts is pinned equal to backend-lint's by
+      # drifted. Same commands as ci.yml backend-lint and backend-ratchets,
+      # whole-tree scoped, and the set of gate scripts is pinned to cover those
+      # two jobs' by
       # test/test_main_ratchet_audit.py -- a gate ADDED to ci.yml and not
       # mirrored here would silently never be measured on main's integrated
       # tree, which is the whole failure this lane exists to close. (A RENAME
@@ -434,7 +435,12 @@ jobs:
             | jq -r --arg marker "$MARKER" \
               '[.[] | select((.body // "") | contains($marker))] | sort_by(.number) | .[].number' \
             || true)"
-          EXISTING="$(printf '%s\n' "$OPEN" | head -n 1)"
+          # The first line by parameter expansion, not `printf | head -n 1`: the
+          # printf writes one line at a time, `head` may exit after the first,
+          # and the next write then dies of SIGPIPE, which pipefail and set -e
+          # turn into an exit 141 for the whole step. `tail` below reads all of
+          # its input, so it cannot close the pipe early.
+          EXISTING="${OPEN%%$'\n'*}"
           for duplicate in $(printf '%s\n' "$OPEN" | tail -n +2); do
             gh issue comment "$duplicate" --repo "$REPO" \
               --body "Duplicate of #$EXISTING, this workflow's single tracking issue. Closing; the drift record lives there." \

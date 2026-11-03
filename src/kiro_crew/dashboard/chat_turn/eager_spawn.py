@@ -10,16 +10,19 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew import resource_status
+from kiro_crew.agent_capabilities import CapabilityError
+from kiro_crew.agent_sdk.tool_search import resume_takes_tool_search_replay
+from kiro_crew.config.loader import normalize_agent_model
+from kiro_crew.security import redact_and_truncate
+from kiro_crew.session import SessionEndingError
+from kiro_crew.session_capabilities import CapabilityStartupError
 from kiro_crew.start_priority import StartPriority
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
-        CapabilityError,
-        CapabilityStartupError,
         DashboardState,
         KiroCrewConfig,
         SessionClosingError,
-        SessionEndingError,
         SpeculativeResumeRefused,
         _arm_generation,
         _armed_prefetches,
@@ -27,13 +30,10 @@ if TYPE_CHECKING:
         _eager_spawn_sem,
         effective_session_key,
         logger,
-        normalize_agent_model,
         record_agent_selection,
-        redact_and_truncate,
         refresh_materialized_agents,
         resolve_agent_bindings,
         resolve_session_agent_bindings,
-        resume_takes_tool_search_replay,
         select_provider_backend,
         shutdown_event,
         subprocess_executor,
@@ -158,7 +158,6 @@ _PRE_SPAWN_CAPABILITY_CODES = frozenset(
         "capability_harness_unsupported",
         "capability_tool_limits_unsupported",
         "capability_runtime_not_fresh",
-        "worker_kit_harness_unsupported",
     }
 )
 
@@ -173,6 +172,12 @@ def _is_pre_spawn_refusal(exc: BaseException) -> bool:
     feeds the churn the background-start cap bounds.
     """
     if isinstance(exc, CapabilityError):
+        return True
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable
+
+    if isinstance(exc, CrewmateHarnessUnavailable):
+        # Refused before the factory spawned anything, and a retry repeats it
+        # until someone changes the crewmate's harness.
         return True
     return isinstance(exc, CapabilityStartupError) and str(exc) in _PRE_SPAWN_CAPABILITY_CODES
 
@@ -462,6 +467,12 @@ def schedule_eager_spawn(
         cfg = live.snapshot()
         if cfg is None or not cfg.session.eager_spawn:
             return None
+        # Shared Crew: with fair admission on, a runtime starts only inside an
+        # admitted turn, so creating sessions cannot start unbounded processes.
+        from kiro_crew.shared_crew.turn_gate import admission_active
+
+        if admission_active():
+            return None
     except Exception:
         return None
     if _eager_spawn_held_off(slot):
@@ -510,6 +521,28 @@ def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str, str]:
         # The namespace the name is read in: a kind change is a binding change.
         slot.agent_kind,
     )
+
+
+async def _runs_on_a_session_environment(session_key: str) -> bool:
+    """Whether ``session_key`` is bound to a remote Session Environment profile.
+
+    Read from the persisted choice, never from what one request just did, so no
+    caller can prewarm a bound chat. An unreadable choices store answers yes: a
+    skipped prewarm costs one cold start, a wrong one starts billed compute.
+    Always no while the developer flag is off (the choice is never read).
+    """
+    from kiro_crew.session_environment import (
+        SessionEnvironmentUnavailable,
+        _choices,
+        session_environments_enabled,
+    )
+
+    if not session_environments_enabled():
+        return False
+    try:
+        return await asyncio.to_thread(_choices().get, session_key) is not None
+    except (OSError, ValueError, SessionEnvironmentUnavailable):
+        return True
 
 
 async def _eager_spawn(
@@ -573,6 +606,10 @@ async def _eager_spawn(
                 # simply stands down.
                 return
             session_key = effective_session_key(slot)
+            if await _runs_on_a_session_environment(session_key):
+                # Its start creates or wakes a billed remote workspace: that is
+                # left to the first real message, whichever signal armed this.
+                return
             if allow_resume:
                 # The focus signal only ever adds the RESUME case; fresh eager
                 # spawn stays owned by the create/project/agent signals. This
@@ -742,10 +779,15 @@ async def _eager_spawn(
             # same fresh-session path it always does. The backend is the
             # factory's own selection for this key, and the prefetch allocates
             # with no channel identity.
+            from kiro_crew.crewmate_harness import crewmate_backend_pin
+
             if allow_resume and resume_takes_tool_search_replay(
                 tool_search=cfg.agent.tool_search,
                 backend=select_provider_backend(
-                    session_key, cfg.agent.member_acp_backend, cfg.agent.acp_backend
+                    session_key,
+                    cfg.agent.member_acp_backend,
+                    cfg.agent.acp_backend,
+                    crew_backend=crewmate_backend_pin(cfg, session_key),
                 ),
                 channel_id=None,
                 session_key=session_key,

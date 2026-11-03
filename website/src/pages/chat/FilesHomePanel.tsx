@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { FileText, ExternalLink, TerminalSquare, MoreHorizontal, AppWindow } from 'lucide-react'
 import { useBranding } from '../../hooks/useBranding'
-import { revealOrOpen, useRevealFailure, useRevealLabel } from '../../components/FilePathMenu'
+import { revealOrOpen, useCanReveal, useRevealFailure, useRevealLabel } from '../../components/FilePathMenu'
 import ErrorNotice from '../../components/ErrorNotice'
 import { Btn } from '../../components/ui'
 import {
@@ -62,11 +62,15 @@ export default function FilesHomePanel({ projectDir, onFileOpen, onAddToContext,
 }) {
   const { t } = useTranslation()
   const qc = useQueryClient()
-  // Reveal shells out on the gateway host, so it only makes sense when the
-  // browser is on that same machine. On a remote/tunneled session the backend
-  // degrades reveal to a clipboard copy, so hide the affordance to match every
-  // other gated file-location surface (FilePathMenu, ReportProblemModal, …).
+  // The browser is on the gateway host. The external-terminal row below keys
+  // on this alone; the reveal button also needs that host to open a file manager.
   const isLocal = useBranding().directLocal
+  // Reveal shells out on the gateway host, so it only makes sense when the
+  // browser is on that same machine and the machine can open a file manager.
+  // Anywhere else the backend can only answer a clipboard copy, so the
+  // affordance is hidden, matching every other gated file-location surface
+  // (FilePathMenu, …).
+  const canReveal = useCanReveal()
   // The platform-aware wording every other file-location surface uses ("Open in
   // Finder" / "Open in File Explorer" / "Show in file manager"), read from the
   // gateway host that `/api/reveal` shells out on — not a static "file manager".
@@ -74,7 +78,7 @@ export default function FilesHomePanel({ projectDir, onFileOpen, onAddToContext,
   // A failed reveal (policy-blocked path, no file manager) renders under the
   // header; askAgent on — the Files panel holds no draft.
   const reveal = useRevealFailure(projectDir ?? undefined)
-  const treeState = useTreeState(projectDir)
+  const treeState = useTreeState(projectDir, active)
   // Every failed read lands in this panel's own error arm below, whichever of `useTreeState`'s
   // two failure states names it. The `recoverable` split exists for FolderPanel, which names the
   // tree over its one-level listing, and re-reads it on Refresh, only when another read can answer
@@ -83,7 +87,7 @@ export default function FilesHomePanel({ projectDir, onFileOpen, onAddToContext,
   // The failed read's own error, for the notice's copy: the verdict above says only that it
   // failed, and a refused or missing root must not read as an outage. Same key as the verdict's
   // query, so this is a second observer on the one request, not a second request.
-  const { error: treeErr } = useTreeQuery(projectDir)
+  const { error: treeErr } = useTreeQuery(projectDir, active)
   const treeAvailable = treeState === 'ready'
   // "Open in external terminal": the user's own terminal app, beside the
   // integrated one and never in its place. Offered only in the desktop shell
@@ -103,14 +107,14 @@ export default function FilesHomePanel({ projectDir, onFileOpen, onAddToContext,
   const appsQ = useQuery({
     queryKey: ['externalTerminalApps'],
     queryFn: detectExternalTerminals,
-    enabled: externalWanted,
+    enabled: externalWanted && active,
   })
   const shellCapable = appsQ.data?.capable === true
   const shellRefused = appsQ.data?.capable === false
   const cfgQ = useQuery<{ dashboard?: { terminal?: { external_app?: unknown } } }>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
-    enabled: externalWanted && shellCapable,
+    enabled: externalWanted && shellCapable && active,
   })
   // Either read failing means the row's absence says nothing, so it is said
   // instead of leaving the menu silently without it. A window the shell
@@ -176,7 +180,7 @@ export default function FilesHomePanel({ projectDir, onFileOpen, onAddToContext,
         <span className="flex-1" />
         {projectDir && (
           <>
-            {isLocal && (
+            {canReveal && (
               <button onClick={() => { void revealOrOpen(projectDir, 'reveal', reveal) }} className={iconBtn} title={revealLabel} aria-label={revealLabel}>
                 <ExternalLink size={14} />
               </button>

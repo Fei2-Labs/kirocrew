@@ -12,6 +12,32 @@ session's topics out to sub-sessions. It is retired — see
 (`/members`, served by `dashboard/handlers/members.py` and `members.py` in the
 table below), where each crew is a standing agent with its own thread.
 
+The name now belongs to something else: **Crew Mode** is the composer switch that
+runs a dashboard chat on a conductor template -- `agent.crew_mode_agent`, default
+`kirocrew-conductor`, with the Crew Mode family in `kiro_crew/crew_mode.py` (a UI over
+that agent; its rules are in [Crew Mode](#crew-mode) below, its session-control
+verbs in [session-control](session-control.md)). It shares nothing with the
+retired slot mode: no `"crew"` mode value, no `crew_chat.py`, no queue or topic
+store.
+
+## Crew Mode
+
+Crew Mode is a chat that runs a conductor and the sessions that conductor dispatches.
+The person sees the chat; the crew it dispatched is the chat's to show.
+
+| Rule | Where |
+|---|---|
+| `agent.crew_mode_agent` names THE conductor a chat switches to when Crew Mode is turned on (default `kirocrew-conductor`); read live from the config snapshot, so no restart | `config/sections_agent.py`, `crew_mode.crew_mode_agent` |
+| Every conductor is Crew Mode: `conductor_agents` is the shipped conductor templates plus the configured one and the deprecated names that resolve to it; the catalog lists them as `conductor_agents` and names `crew_mode_agent`, and masks both for a non-owner | `crew_mode.conductor_agents`, `handlers/agent_catalog.py` |
+| A chat that turned Crew Mode on carries the stamp `crew_mode_agent` (the slot field, persisted with the slot's own metadata), so a root on a custom conductor absent from the config stays Crew Mode | `crew_mode.STAMP_FIELD`, `slot_persistence/metadata_codec.py` |
+| A **Crew Mode root** is a root session (nothing dispatched it) running a conductor as a template. Every session it dispatched, directly or through another, is its **crew member**: the slot list stamps `crew_mode_root: true` on the root and `crew_root: <root key>` on each member, following the persisted lineage past closed sessions, so a member whose root's tab closed after this gateway saw the root, or one reopened from History while its root is known, keeps its root. The known roots are in memory: a root still closed when the gateway starts is not remembered until it is reopened (the migration part reads closed roots from saved metadata) | `crew_mode.stamp_rows`, `state_parts/slots_frame.py`; the lineage patch frame carries the two stamps when they change (`state_parts/slots_push.py`) |
+| **The person's session list leaves crew members out.** `GET /api/chat/slots` drops `crew_root` rows for a person; `?crew=all` keeps them (the dashboard reads this and filters on the client); a read with `internal_auth` (an agent's folder, status and lineage tools) keeps every row | `crew_mode.list_view`, `chat_api/slot_detail.py` |
+| A Crew Mode chat and its crew are filed in no folder: `session_create` and `session_fork` from inside the tree leave the child unfiled and say so, `chat_folder_file_self` is a no-op | [session-control](session-control.md) § `session_create`'s folder |
+| A new chat born on a conductor counts once in `kirocrew.crew_mode.turned_on`; every new chat counts once in `kirocrew.crew_mode.new_chats` with `crew_mode` true or false; no attribute carries a key, a title or an agent name | `metrics/crew_mode.py`, [metrics](metrics.md) |
+
+The design and its parts are recorded in
+`docs/decisions/2026-10-27-crew-mode-is-a-composer-switch-to-the-conductor-template.md`.
+
 A crew is not a *Remote Crew* — that is another machine running its own Kiro Crew
 gateway, which this one reaches through a tunnel (see [instances.md](instances.md))
 — and not an Issue Radar *crew*, which is that app's own repository work crew
@@ -33,23 +59,26 @@ which restates what a member's DM session carries in its context.
 | `src/kiro_crew/members.py` | The per-crew member space's import and patch surface: a mirror facade over the `members_parts` owners below, so every name is still read and patched through `kiro_crew.members`; new member-space code goes to the owner whose responsibility it is |
 | `src/kiro_crew/members_parts/member_space.py` | The space's layout (every file and directory name), member display names and crew ids, slugs, the containment-checked member paths, the first-welcome marker |
 | `src/kiro_crew/members_parts/member_sessions.py` | A member's DM session: its key and alias, the backend it routes to, the session-level MCP mounts, the member turn chokepoint |
-| `src/kiro_crew/members_parts/dm_bindings.py` | The DM-thread binding under `trust/` and the identity it answers for a session |
+| `src/kiro_crew/members_parts/dm_bindings.py` | The DM-thread binding under `member-records/` and the identity it answers for a session |
 | `src/kiro_crew/members_parts/self_edit.py` | What a mate may change on its own record: cleaning, the update, its undo, the rename |
 | `src/kiro_crew/members_parts/prompt_layers.py` | The permanent rules and the self-maintained briefing |
 | `src/kiro_crew/members_parts/member_activity.py` | The activity log |
 | `src/kiro_crew/subagent_parts/agent_policy.py` | `_validate_agent` — what an `agent=` name is checked against, and `UNADVERTISED_AGENTS` (both read and patched through `kiro_crew.subagent`) |
 | `src/kiro_crew/dashboard/handlers/agents.py` | The agents handlers' import and patch surface: `GET /api/agents`, the model picker reads and the crew model-pin checks, composed with the `agent_admin` owners below |
 | `src/kiro_crew/dashboard/agent_admin/` | Crew CRUD on `/api/agents` (`crew_records.py`, `crew_update.py`, `crew_removal.py`), the roster row serializer (`roster.py`), the Custom agents tab's detail, fork, publish and reset (`agent_detail.py`, `fork_publish.py`, `template_lineage.py`) and the default-agent write (`default_agent.py`) |
-| `src/kiro_crew/dashboard/handlers/agent_catalog.py` | Read-only `/api/agents/catalog` execution choices, with separate member and template namespaces |
+| `src/kiro_crew/dashboard/handlers/agent_catalog.py` | Read-only `/api/agents/catalog` execution choices, with separate member and template namespaces, plus Crew Mode's `crew_mode_agent` and `conductor_agents` |
+| `src/kiro_crew/crew_mode.py` | Crew Mode's facts: the configured conductor (`agent.crew_mode_agent`), the one conductor set (every conductor is Crew Mode, `conductor_agents`), the stamp that marks a chat as Crew Mode, the known roots and the persisted lineage, which slot rows are Crew Mode roots and which are their workers (`stamp_rows`), and the session list's view (`list_view`) |
+| `src/kiro_crew/dashboard/handlers/crew_workers.py` | A Crew Mode root's worker list (`GET /api/chat/slots/{slot}/crew-workers`), its timeline (`GET .../crew-timeline`) and the person's steer into one worker (`POST .../crew-workers/{worker}/steer`), owner only |
+| `src/kiro_crew/crew_timeline.py` | The timeline's lanes, bars, marks, hand-offs and header, derived from recorded transcript rows only, and the named gaps it does not draw |
 | `src/kiro_crew/dashboard/handlers/agent_templates.py` | The Custom agents tab's roster (`/api/agents/templates`), create, delete with reference guard, and the read-only rule the detail PATCH applies to definition edits |
 | `website/src/pages/overview/AgentTemplatesTab.tsx` | The **Custom agents** tab of `CapabilitiesPage` (Customize): list by origin, edit the shared definition, create, delete, chat-with / enroll (an enroll invalidates `['kirocrew-agents']` and `['kirocrewConfig']`) |
 | `src/kiro_crew/dashboard/handlers/members.py` and its `members_<role>.py` owners | `/api/members` roster, thread get-or-create, rules, activity |
 | `src/kiro_crew/crew_teams.py` + `src/kiro_crew/dashboard/handlers/teams.py` | Mate teams (`teams.json` in the masked gateway-only data-home directory `crew-teams`; `/api/teams`): the Mates page's roster grouping and team view — specified under [learn-cron-dashboard](learn-cron-dashboard.md) with the members handlers |
-| `website/src/pages/KiroCrewAgentsPage.tsx` | The mate roster, mounted as the **Mates** tab of `CapabilitiesPage` (Customize), and a host of the one mate editor. The page holds the roster query, the create door (`NewCrewmateDialog`), the deep links (`?crew=`, `&avatar=1`, `&pane=capabilities`, `?new=1`), the fresh-roster admission latch the editor opens behind, and the editor's guide facts, and composes the roster cards, rows, toolbar and list (`KiroCrewAgentsPageRoster.tsx`) and the binding fields every crew form shares (`KiroCrewAgentsPageFields.tsx`; consumers import them from the page, which re-exports each). Editing a mate opens `components/crew/CrewEditorModal.tsx` (`CrewEditorNextDialog` driven by `useCrewEditor`), the same editor the Mates page opens in place; that hook keeps its own `INHERIT_MODEL` twin |
+| `website/src/pages/KiroCrewAgentsPage.tsx` | The mate roster, mounted as the **Mates** tab of `CapabilitiesPage` (Customize), and a host of the one mate editor. The page holds the roster query, the create door (`NewCrewmateDialog`), the deep links (`?crew=`, `&avatar=1`, `&pane=capabilities`, `?new=1`), the fresh-roster admission latch the editor opens behind, and the editor's guide facts, and composes the roster cards, rows, toolbar and list (`KiroCrewAgentsPageRoster.tsx`) and mounts the binding fields every crew form shares (`components/crew/crewFields.tsx`; each consumer imports them from there, and the page re-exports each for its existing importers). Editing a mate opens `components/crew/CrewEditorModal.tsx` (`CrewEditorNextDialog` driven by `useCrewEditor`), the same editor the Mates page opens in place; that hook re-exports `INHERIT_MODEL` from `crewFields.tsx` |
 | `website/src/components/crew/crewEditorSections.ts` | The `CrewPaneKey` names and section facts `useCrewEditor` keeps for its deep links and dirty tracking. No dashboard editor renders a Routing, template or Capabilities pane from it, so `triggers` has no editing surface |
 | `website/src/components/CrewWakeSection.tsx` | "What wakes this agent" — schedules, deliberately distinct from `triggers` |
 | `website/src/components/chat/crewmateBubbles.ts` | A mate's chat: what the transcript draws (`filterCrewmateChat`) and the run / corner rule for its bubbles (`crewmateRunPosition`, `crewmateBubbleClass`) |
-| `src/kiro_crew/dashboard/warm_task_brief.py` | Owner-return trigger, 30-minute away time from the in-memory last-on-screen time with a durable chat-history fallback, durable task-fingerprint claims, two ordinary mate summary messages, one bounded background call, and stale-result suppression |
+| `src/kiro_crew/dashboard/warm_task_brief.py` | Owner-return trigger, 30-minute away time from the in-memory last-on-screen time with a durable chat-history fallback, durable task-fingerprint claims, one ordinary mate message (a fixed quiet line, or one bounded background call over sectioned inputs from `warm_task_brief_inputs.py`), and stale-result suppression |
 | `website/src/pages/chat/CrewmateMessage.tsx` | One mate message in its chat: the bubble alone, placed by its run position (no author line, no avatar gutter) |
 
 Crew creation reports `409 agent_exists` for both an existing name and a
@@ -191,13 +220,22 @@ refusal in the user's language inside the dialog that sent the name
 
 ## Custom agents tab
 
-The **Built from** section of the mate editor is read-only: it shows the
-custom agent a mate is built from (details, tools, MCP servers, skills),
-and only the choice of agent is edited there. The **Custom agents** tab under
-Customize (page title and sidebar label; route `/capabilities`) is the other
-half: it manages the shared templates themselves — "custom agents" in every
-user-facing string, the thing a mate is **built from** — the files under
-`~/.kiro/agents/` a chat or a mate runs. The tab sits flat in the pane like
+The **Abilities** section of the mate editor (section key `builtFrom`) is the
+**capabilities view**: "What *&lt;mate&gt;* can do", split into two bands —
+**Comes with** (read-only: what the worker base, `kirocrew-mate-worker`,
+provides) and **Added to** (what the crewmate's own file adds beyond that base).
+Both list tools, MCP servers and skills, partitioned by each capability row's
+`state` (`inherited` → Comes with, `local` → Added to). An added row that names
+a stored row carries **Remove**, which goes through the capabilities `remove`
+op; approvals are configured in the **Approvals** section, never here. The mate's
+**behavior directions** appear with **Remove**, which clears its single directions
+slot. **Add abilities** sits on the same page, under the bands
+(see "Adding abilities to a crewmate" below). General shows the section's name
+with **View abilities**, which opens it. The **Custom agents**
+tab under Customize (page title and sidebar label; route `/capabilities`) is the
+other half: it manages the shared templates themselves — "custom agents" in every
+user-facing string, the agents a chat or a mate copies abilities from — the files
+under `~/.kiro/agents/` a chat or a mate runs. The tab sits flat in the pane like
 the Mates tab: no card, no title row (the rail tab and the page title
 already say "Custom agents"), one toolbar row with the filter on the left and
 the **New custom agent** primary button on its right (the Skills tab's rhythm),
@@ -617,12 +655,19 @@ Duplicate affordance, so the three duplicate entry points read as one flow.
 ## Owner-reviewed capability inheritance
 
 **Dashboard surface.** The mate editor (`CrewEditorNextDialog`) shows a
-read-only **Built from** section, and its **Approvals** section
-(`CrewApprovalsEditor`) is the only dashboard writer of these routes. No
-dashboard surface edits enrollment, Stop following the parent, per-member MCP
-or skill rows, or a private copy's template: the classic `CrewCapabilitiesPane`
-and template pane that did are retired, and agent config is edited on the
-**Custom agents** tab. The routes and their refusal codes below are unchanged.
+two-band **capabilities view** (Comes with / Added to) in its **Abilities**
+section; Comes with is read-only, and an added tool / MCP server / skill can be
+removed (the capabilities `remove` op). Its **Approvals** section
+(`CrewApprovalsEditor`) is the writer for auto-run grants. **Add abilities**
+(`WorkerKitPane`), on the same page as the bands, adds abilities from
+another agent — connections, skills, resources and auto-approvals are additive,
+previewed as added vs. already-present (skipped). An agent with behavior directions
+replaces the mate's one directions slot; an agent without directions leaves it
+alone. No dashboard surface edits enrollment,
+Stop following the parent, per-member MCP or skill rows, or a private copy's
+template: the classic `CrewCapabilitiesPane` and template pane that did are
+retired, and agent config is edited on the **Custom agents** tab. The routes and
+their refusal codes below are unchanged.
 Where a paragraph below says "the pane", it records the copy that pane showed,
 kept as the contract the refusal codes were designed against; it is not a
 rendered surface.
@@ -934,7 +979,10 @@ opens that mate's editor on its **Approvals** section
 (`CrewApprovalsEditor`). There, Review and Save with an empty draft restamps the file when every changed key is
 one the review can vouch for (`_unvouched`); a changed key the review cannot
 show refuses with `409 unreviewable_drift`, naming the file
-(`_stamp_reviewed`).
+(`_stamp_reviewed`). Every stamp also records the file's top-level keys as
+`reviewed_keys` on the intent, and `_unvouched` compares those too, so a key
+removed from both the file and its parent since the last review is drift
+rather than invisible.
 
 Four sibling start refusals get the same row treatment, each with its own fix.
 `parent_identity_changed` and `foreign_private_copy` open the member editor at
@@ -1056,7 +1104,10 @@ line pointing at these tools.
 In a dashboard turn, a change to Kiro Crew itself that the user asked for (settings,
 schedules, mates and their capabilities, templates, MCP servers, connections, secrets,
 app trust, denied-command rules) is preferably offered as a change card, which the user
-confirms; a card is never a way around a denial. Cards do not replace the direct tools:
+confirms; a card is never a way around a denial. No kind lifts a built-in denied-command
+rule (`denied_command` adds a user rule or toggles one), so an agent never offers the user
+a card, or a suggested reply asking for one, to run a refused command; a crewmate chat
+drops such a chip ([A mate's chat](#a-mates-chat)). Cards do not replace the direct tools:
 an agent that schedules its own work, a conductor or a scheduled run keeps using
 `cron_add` and the other tools it is granted, under their own approvals. An agent proposes
 one registered kind with `propose_change`, after
@@ -1265,16 +1316,12 @@ Loading, a failed roster read and a genuinely empty roster remain distinct. The
 page's copy says mate / Mates and "Built from"; the crew record, its API
 and its identifiers are unchanged.
 
-With the Mates preview off, Mate still exists in the background, but every list
-that offers crew records leaves it out (`hideMateWithoutPreview` in
-`lib/assistantMember.ts`: the agent pickers fed by `useAgents`, Customize and a
-template's crew list), so nothing names it until the preview is on. With the
-preview on, Customize > Crewmates lists it as a card like any other crewmate:
-its row carries `member_id: "mate"`, so the legacy-binding rule
-(`mate_worker.is_legacy_binding`) never drops it.
+Customize > Crewmates lists Mate as a card like any other crewmate: its row
+carries `member_id: "mate"`, so it is not a legacy binding
+(`mate_worker.is_legacy_binding`) and the pickers list it unchatted.
 
 Mate's chat has no static welcome card. Mate speaks first instead: once the thread
-endpoint has confirmed Mate's pinned thread, with the Mates preview on, the page
+endpoint has confirmed Mate's pinned thread, the page
 calls `POST /api/members/{slug}/greet` (owner-only; app tokens get 404), once per
 thread per tab (`pages/members/useFirstGreeting.ts`). A failed request shows
 nothing: the chat works without the greeting, and the next open of the thread asks
@@ -1304,15 +1351,35 @@ is one real turn of that crewmate: `_run_chat` with a hidden kickoff
 (`_synthetic_payload=True`, actor `gateway`) and NO transcript row for it, so the
 user sees only the mate's own reply, which stays in its session context. The
 kickoff carries the whole welcome, since no system prompt explains it
-(`mate_welcome.welcome_kickoff`, wording in one place): it introduces itself by its
-label in everyday words with no developer terms; says it is the user's first
-mate (`FIRST_WELCOME`) -- or, when the roster already holds a mate besides
-Mate and `default`, one more teammate on their crew (`FIRST_WELCOME_WITH_CREW`) -- a
-teammate who remembers what they work on together and keeps at it over days; says it
-can help right now with getting Kiro Crew set up, sorting out anything not working in
-it, or showing the user around (those three only); and finishes by asking what the
-user would like to call it (the name in question is the mate's own). The kickoff
-is written as plain principles, and the greeting itself is the model's own words.
+(`mate_welcome.welcome_kickoff`, wording in one place). Its first sentence asks what
+the user would like to call it (the name in question is the mate's own). It then
+says what a mate is, in everyday words with no developer terms: always on, handed a
+whole area of the user's work rather than one task, keeping track of the goals it is
+given and following up unasked, and learning how the user likes things done. It says
+it is the user's first mate (`FIRST_WELCOME`), or one more mate on their crew when
+the roster already holds a mate besides Mate and `default` (`FIRST_WELCOME_WITH_CREW`).
+It ends by saying that once it has a name it will show the user how to work with it
+and then suggest something for it to own. It never offers to set up or fix Kiro Crew
+and lists no features. The kickoff is written as plain principles, and the greeting
+itself is the model's own words; because the kickoff stays in the session context,
+its instructions for the next turns carry over to them. The introduction comes
+first and choosing a goal comes last. In the reply to the name, the mate says how to
+work with it (talk to it here any time; it takes a whole area and keeps at it,
+handing hands-on parts to helpers and reporting back) and shows the user around with
+one `guide_start` whose three `ui.show` steps the kickoff names by id: the profile
+card's Profile (`members.profile-tab`), Schedules (`members.schedule-tab`) and Goals
+(`members.goals-tab`) tabs. The Dashboard, the side panel's first tab, it names in
+words: its opener (`members.details`) carries a condition the guide cannot check, so
+it has no guide plan, and one such step refuses the whole guide. That reply ends by asking whether to look at the user's recent work.
+When the user agrees, the mate reads its memory, the user's recent sessions and chat
+history, names two or three areas of what it saw that it could own, and asks which
+to track as its goal (or, with nothing to go on, what part of their work to hand
+it), naming only work it saw. On a pick it proposes the goal with `set_goal`, whose
+card carries the Heartbeat checkbox (checked by default) while the Heartbeat is off,
+so setting the goal and keeping it moving is one press. Saving the goal starts the
+ordinary goal setup, whose `[Goal set]` turn asks nothing more about the Heartbeat
+after a goal card, and then hands the milestone research to a worker (see the
+goal-setup nudge below).
 When the user answers with a name, that later turn says plainly that the mate now
 goes by it and calls the `kirocrew-mate` tool `update_self` with `display_name`
 (`POST /api/member/self/update`, `handlers/member_self.py`), which renames ONLY the calling
@@ -1328,7 +1395,14 @@ the roster and the switcher show the new name at once through the roster project
 with no reload and no confirm card. The kickoff says the user has typed nothing,
 frames it as the mate's first conversation with the user, so it greets as someone it is meeting for the first time, and allows a user name only when the User Preferences block
 or a memory result states one, never one inferred from a username, home path, email
-or host name. The route answers `{"outcome": ...}` (`started`, `already_greeted`,
+or host name. The kickoff carries exactly one language sentence: the preamble's
+"`[UI LANGUAGE]` when shown, else English" is swapped for one naming the tag to write
+in -- the configured `dashboard.language`, else the tab's `X-UI-Lang` header that
+`api.memberGreet` sends -- and left as it is for English or no usable tag
+(`mate_welcome.hidden_turn_language`, `with_language`;
+[config](config.md#the-tag-also-writes-a-crewmates-hidden-turns)); a goal check-in's
+`wake.preamble` sentence is swapped the same way, telling it to follow the user's
+language in the thread. The route answers `{"outcome": ...}` (`started`, `already_greeted`,
 `not_empty`, `busy`, `not_crewmate`, `no_thread`, `not_owed`). A welcome turn that
 fails surfaces through the ordinary turn error path once; the marker is already
 claimed, so it never loops, and the composer stays usable.
@@ -1468,7 +1542,7 @@ record for a picture or a pack. Apply pins the pick and sends it as
 pick the create still carries that name-seeded icon as its `avatar` (frozen into
 a stored choice at create, never re-derived from a later rename), so a new mate
 is born an icon rather than wearing the name's ghost. The **Advanced settings** row unfolds inline below
-the avatar, in the same card: Built from, What it looks after, and the crew
+the avatar, in the same card: Goal and the crew
 editor fields (workspace, model, triggers, session colour), ending with a second
 Create. It is folded by default; `startExpanded` opens it unfolded, which is what
 the hero's Advanced link and the crew manager's door pass. Folding unmounts those
@@ -1478,8 +1552,8 @@ Advanced row of its own.
 The card is the page's one creation surface. A drafted proposal (a mate's
 create link `/members?create=1&name=…&goal=…`, clicked in its chat or reached by
 address, or the `crewmate.create` guide, whose enter step is that link) opens the
-same card with the proposal filled in: the name in **Name**, the goal in **What it
-looks after**, with Advanced settings unfolded when a goal is proposed so it is in
+same card with the proposal filled in: the name in **Name**, the goal in **Goal**,
+with Advanced settings unfolded when a goal is proposed so it is in
 view (`initialDraft`). The page strips the link's parameters once read and keeps
 the chat the link was followed from as the one behind the card. A proposal left as
 proposed is not the user's draft: it leaves without asking, and a later proposal
@@ -1502,8 +1576,7 @@ dashed roster card (`pages.kiroCrewAgentsPage.add_crew_member` in
 has no separate create sheet. Both doors use the
 existing owner-gated `POST /api/agents`; editing an existing member still uses
 the crew manager. The crew manager's door opens with Advanced settings unfolded
-and `kirocrew` as the default **Built from** (labelled as the default), and shows
-no first-greeting hint, since it asks for none. What happens after a create
+and shows no first-greeting hint, since it asks for none. What happens after a create
 depends on the door. On the Mates page the card sends `first_greeting`, the
 page re-reads the roster and opens the new mate's verified thread (a failed
 re-read keeps its retry), and that open's greeting request starts the hidden goal
@@ -1511,24 +1584,39 @@ welcome; nothing is sent in the user's name. From
 the crew manager the door is CONFIG mode: the dialog closes and the crew manager
 re-reads its roster so the new card appears in place; it does NOT navigate to the
 mate's chat and asks for no greeting. The dialog's own success path (cache
-invalidation, the post-failure reconcile, "what it looks after" stored as
+invalidation, the post-failure reconcile, the goal stored as
 `description`) is identical on both doors; only the caller's `onCreated`
 differs. `NewCrewmateDialog` imports its field frame and field components from
-`KiroCrewAgentsPage` (which re-exports them from `KiroCrewAgentsPageFields.tsx`),
-so the two pages cannot drift; the resulting call-time
-import cycle is resolved because both reference the other's bindings only inside
-component bodies.
+`components/crew/crewFields.tsx`, the same module the crew editor mounts them
+from, so the two forms cannot drift. That module imports no page, so neither
+consumer closes an import cycle through it.
 
-The roster lists a row unasked only when its DM thread holds a message
-(`has_dm_message` on `GET /api/members`: the thread's transcript has a row, or
-the live slot holds one) or the user starred it -- whoever sent the message,
-the user, the mate, a scheduled run, an app -- or when it is Mate, the
-first mate (key `mate`), listed from the start so its welcome has a row to
-open. An empty thread is not listed,
-as a messages app lists no empty conversation; the search still reaches it, the
-mate open in the thread stays listed while open, and a remembered mate
-is restored even when the rule hides it. The built-in `default` mate, a
-dashboard-created mate and an app's mate follow the same rule. Recent
+The roster lists a row unasked (`listedByDefault`) when the user starred it;
+when it is Mate, the first mate (key `mate`), listed from the start so its
+welcome has a row to open; when it is a mate the PERSON created
+(`dashboard_created` on `GET /api/members`: `source` `kirocrew` and a member
+id, which both the Crewmates page's create and an approved `crewmate.create`
+or `crewmate.import` card write through `POST /api/agents`), even while its
+chat is empty and was never opened; and, for every other row, when its DM
+thread holds a message (`has_dm_message`: the thread's transcript has a row, or
+the live slot holds one), whoever sent it -- the user, the mate, a scheduled
+run, an app. The rows the product made on its own -- a template-derived or
+synced row, an app's mate, a legacy built-in binding with no member id -- are
+the ones an empty thread hides, as a messages app lists no conversation it did
+not start; the search still reaches them, the mate open in the thread stays
+listed while open, and a remembered mate is restored even when the rule hides
+it. The reserved `default` member is never `dashboard_created`, whatever its
+record says, and is listed only on a stricter signal: `has_user_dm_message`,
+shipped on that row alone, true once its thread (live file, archived segments
+or the live slot) holds a message the person sent -- a `user` row that is
+neither a `session_send` relay nor automation by the rule the session summary
+reads (`session_summary.is_injected_text`; `transcript_person_rows`), so the
+roster and the summary agree on whether a person spoke. A welcome, a cron result
+(`inject`), an auto-nudge (`nudge`) or a relayed message does not list it, so a
+fresh install's roster shows only Mate, and an upgraded install shows `default`
+only where the person talked to it. The rule is recorded in
+`docs/decisions/2026-10-27-a-crewmate-the-person-created-is-listed-with-an-empty-chat.md`.
+Recent
 order is by `last_active_ts`, the crew log's fold of the thread's last
 `member/message` (see `_recency_for_row`), so the list reads newest conversation
 first like a messages app. The client stamps a send on the row bound to the
@@ -1544,7 +1632,8 @@ list every mate the user put on that team -- placing a mate on a team is
 itself a choice to use it -- and a team whose mates are all hidden keeps its
 (empty) roster header. Where nothing auto-opens (below md) and every row is
 hidden, the roster says so and names the search. A row from an older gateway
-that carries no `has_dm_message` is listed. The header count and the filter
+that carries no `has_dm_message` is listed, and a `default` row that carries no
+`has_user_dm_message` keeps the `has_dm_message` rule. The header count and the filter
 tallies count the listed rows plus any hidden row the search reaches. So that
 count is not read as the whole crew (#21852), the list ends with one muted line
 naming the mates the rule hides by the label their row shows, the ones the
@@ -1555,8 +1644,7 @@ above leaves them out (`member-hidden-hint`); the form that names every hidden
 mate also says the search finds them. The line is drawn only
 while no search is typed, no filter narrows the list, and at least one row is
 listed (the every-row-hidden case already has its own line).
-Before any of the landing rules, a bare visit with the Mates preview on
-opens Mate while no message has been exchanged with it (`resolveMateLanding`:
+Before any of the landing rules, a bare visit opens Mate while no message has been exchanged with it (`resolveMateLanding`:
 Mate's row has neither `has_dm_message` nor a live `last_message`), ahead of a
 remembered, the last-chatted or a more recently used mate, at most once per
 page mount; once Mate's thread holds anything, that rule answers nothing and the
@@ -1638,9 +1726,10 @@ change, and edits the order pin (follow-up #20512 for the Schedules guard state)
 |---|---|
 | `MembersPage.tsx` | the composition; the page's selection state (open mate, crew being edited, open Profile card); the New mate card and its post-create follow-up; the guide facts and hand-offs; the exit guards (the native confirms the lint allowlist permits); the face-flight overlay |
 | `membersPageModel.ts` | pure rules: `resolveMateLanding`, `resolveDefaultMember`, `memberMemoryDisplay`, `panelSitsBeside`, `panelChrome`, the withheld view sets, `createDraftFromHref`, the `?member=` param and the roster width bounds |
-| `useMembersPageRoster.ts` | the roster read and its projection merge; per-row live readings (unread, patrol, loop, needs-you); applying the filters to the held order (`sortedMembers`) and the filter menu's tallies, which need those readings |
+| `useMembersPageRoster.ts` | the roster read and its projection merge; per-row live readings (unread, patrol, on watch = monitor OR heartbeat, needs-you, goal); applying the filters to the held order (`sortedMembers`) and the filter menu's tallies, which need those readings |
 | `MembersPageRoster.tsx` | the roster column (header and add menu, search, filter menu, chip, team groups, resize grip) and the roster view state: presence, the open mate's projected record and DM identity (`activeRoster`, `activeView`, `crewmateIdentity`), the persisted filters and sort with the question they ask (`rosterFilterQuery`) and the population it lists, starring, the held order |
-| `MembersPageRosterRows.tsx` | `MemberRow` (one roster row, reading its own `roster` projection) and `CrewmateEmptyHero` (the empty roster's call to action) |
+| `MembersPageRosterRows.tsx` | `MemberRow` (one roster row, reading its own `roster` projection, drawn through `CrewmateRowBody` plus the star) and `CrewmateEmptyHero` (the empty roster's call to action) |
+| `CrewmateRowBody.tsx` | the one crewmate row the full roster and the switcher's options share: the face with its presence dot and on-watch ring, the name with the goal mark at the row's top-right corner, the status line (`Stopped` chip, preview; an sr-only "On watch"), and the right-edge needs-you and unread marks, all read off one `MemberSignals` |
 | `useMembersPageCrewEditor.ts` | the in-place `CrewEditorDialog`: its registry reads, the admitted-roster latch, the unsaved and in-flight stakes |
 | `useMembersPageTeams.ts` | the team read, collapsed groups, the team dialog, and the team view (open, close, grouping) |
 | `useMembersPageLayout.ts` | column placement: roster width, pin and fold; the phone top bar; the side panel docked or overlaid |
@@ -1698,7 +1787,8 @@ motion); it is not drawn at rest, and neither is the roster count (#19045):
 what the page is and how big the crew is are not what a reader comes to this
 corner for. The action ("Switch mate") is the tooltip.
 Its popover lists the roster's own population, not every crewmate: the rows
-`listedByDefault` keeps (chatted-with, starred, Mate, the default crew) plus the
+`listedByDefault` keeps (chatted-with, starred, Mate, created by the person,
+and `default` once the person messaged it) plus the
 open mate (`rosterPopulation`), the same rule the roster column reads, so
 the chip can never disagree with the column. A typed search decides alone and
 falls back to the full roster, so a hidden row -- a background or app-driven
@@ -1762,29 +1852,59 @@ either read on an idle page, and the WebSocket may never have dropped.
 Because a bare `/members` reopens a mate, the folded roster is the desktop
 norm, so the switcher also carries the live per-crewmate signals the roster column
 used to. The page hands it the same `signalsOf` resolver its roster status filters
-read (`MemberSignals`: running / needsYou / unread / patrolling), so a cue here can
-never disagree with the filter that counts it. Each popover row shows the roster
-row's own cues — the `ok` presence dot on the face while working (named by the
-row's "Working" line), the accent unread dot on the right edge — plus a `warn`
-needs-you dot for a turn parked on an approval or a question; the two right-edge
-dots are named images, so the state is in the option's accessible name, and both
-labels reuse existing catalog keys (`filter_status_needs_you`, `unread_message`).
-Each right-edge dot also carries its state as a small muted word beside it
-(`team_needs_you` "Needs you", `switcher_unread` "Unread"): colour alone is not a
-state every reader can tell apart. The word is `aria-hidden`, because the named
-dot already puts the fuller sentence in the option's name and a spoken word
-would say it twice.
+read (`MemberSignals`: running / needsYou / unread / patrolling / goal) and the
+same `automationOf`, so a cue here can never disagree with the filter that counts
+it. Each popover row IS the roster row (#24687): both render `CrewmateRowBody`
+(`website/src/pages/members/CrewmateRowBody.tsx`), so what a state looks like is
+decided once. Before that the two rows were hand-written twice and had drifted
+(the switcher's unread dot was accent while the roster's was `ok`, its second line
+was "Working" / the agent template while the roster's was the preview, and only
+the roster drew the on-watch mark). The shared row: the `CrewMonitoredAvatar`
+face with the `ok` presence dot on its corner while working (no "Working" word:
+presence rides the dot) and the on-watch ring; the name with the **goal mark** at
+the row's top-right corner, a named `Goal` glyph (`row_goal` "Has a goal") drawn
+while the crewmate holds a goal (`has_goal` on the roster row) and nothing
+otherwise -- a goal is a working crewmate's ordinary state, so a word for it on
+every row would be noise; the status line, a `Stopped` chip then the preview; and
+the right-edge marks, a `warn` needs-you dot plus its `aria-hidden` word
+(`team_needs_you`) for a turn parked on an approval or a question, leading the
+`ok` unread dot (`unread_message`). The dots are named images, so the state is in
+the option's accessible name. **On watch** is the ring alone, visibly: the
+`loop_on` word is an sr-only span in the status line so the state is still spoken.
+The switcher's option draws no check mark: the open crewmate is already the row
+with `aria-selected` and the accent-subtle fill, and it is **pinned first** in the
+list (the rest keep the roster's order), so its place says which one is open. The
+host owns the chrome around the shared row: the roster's star and team indent, the
+switcher's `role=option`. Test ids are the shared row's with the host's prefix
+(`member-*`, `crewmate-switcher-row-*`).
+
+On watch has two sources and one reading (`isLoopOn`, in useMembersPageRoster.ts):
+an active monitor on the crewmate's own slot (`isAutomationActive` over the live
+automation frames, the legacy registry as the cold-start fallback) OR its
+heartbeat on (`heartbeat_on` on the roster row). The row's ring
+(`CrewMonitoredAvatar`'s `watch` prop, ORed with the record), the header pill's
+"On watch" and the **Scheduled check-ins** status filter (whose glyph is `Radar`,
+not `Goal`, which now means "has a goal") all read that one predicate.
+
+Both facts ride `GET /api/members`: `has_goal` and `heartbeat_on`, read off each
+member's own goal record (`member_goals.read_goals`) in one thread hop for the
+roster (`dashboard/members_roster_goals.goal_facts_for_rows`); an unreadable record
+reads as neither, so the row still renders and the Goals tab is where that fault
+is reported. A goal record changes rarely and nothing else announced those writes
+to the dashboard, so `members_roster_goals.start_roster_refresh` (started beside
+`crewmate_feed.start`) registers one `member_goals.add_change_listener` that pushes
+an `agents` refresh frame on the serving loop after every write -- the frame the
+roster query already re-reads on, its key sitting under `kirocrew-agents`.
 The closed chip shows a small `warn` needs-you dot over the face stack, and adds
 that label to its accessible name, only while a mate OTHER than the open one
 needs you: the open mate's parked turn is already on screen in its thread.
 The dot is absolutely placed, so the chip's width is the same with and without it.
 Working and unread elsewhere never light the chip. With no resolver passed, a row
-shows only its own `running` flag and the chip stays quiet. The full roster's rows
-(`MemberRow`, shown while pinned or with no thread open) carry the same needs-you
-cue on their right edge, leading the unread dot — the same `warn` named dot plus
-the same `aria-hidden` word, read through the same `signalsOf` resolver
-(`isNeedsYou`) — so the full roster, the folded switcher and the status filter
-never disagree about who is parked on a question.
+shows only its own `running`, `heartbeat_on` and `has_goal` flags and the chip
+stays quiet. The full roster's rows (`MemberRow`, shown while pinned or with no
+thread open) are the same `CrewmateRowBody` read through the same `signalsOf`
+resolver, so the full roster, the folded switcher and the status filter never
+disagree about who is parked on a question, on watch, or holding a goal.
 
 Unread is also the one signal drawn OUTSIDE the closed chip (#19045). Under it,
 in the header's floating band, hangs one small Glass pill per mate with an
@@ -1978,7 +2098,9 @@ the conductor) and each worker (a `template` record on `kirocrew-mate-worker`
 carrying the crewmate's `member_id`), so a session restored, revived or resumed
 after a restart runs under the crewmate's Permissions instead of asking for
 every tool. A worker opened by the conductor takes the record's mode at birth,
-not the thread's live grant. The governance ceiling still decides each call
+not the thread's live grant, read once its own record is on disk
+(`crewmate_approval.seed_new_worker`), so a Profile change saved while the
+worker was being created still reaches it. The governance ceiling still decides each call
 (`test/test_crewmate_worker_approval.py`). The profile locks its pickers while the
 thread is opening or refused.
 
@@ -2048,7 +2170,8 @@ exist yet.
 description (two lines with a pushed full-text page); when the registry read fails,
 the About section shows the shared actionable `ErrorNotice` above any retained
 description, and only omits the no-description claim when no cached description
-exists. The read-only Monitor section follows About. Every avatar and Profile surface shares the normalized record and strict `isAutomationActive` visual predicate through `CrewMonitoredAvatar`; that predicate extends `isAutomationRunning`, the broader lifecycle truth that keeps unsupported active records inside chat-sidebar close safety and its running filters. The Members page uses the strict predicate for its roster mark, header label, face flight, and **Patrolling** filter: a non-actionable record is lifecycle-busy but cannot truthfully make a visual on-watch claim. Live Redux frames remain the first source for roster and header visuals, while Profile's existing `session-automation` slot query supplies retained stopped state and full owner-gated details. A failed owner-gated Profile read deliberately hides its local avatar mark and detail rows even when Redux still has a reduced live record; the roster and header keep their live mark, but Profile never turns a failed authorization or refresh into a detailed claim. A failed roster refresh likewise discards its last-good legacy fallback, because stale active state cannot support a current visual claim. Missing cold reads cannot invent an active mark. It shows state, subject type, subject, cadence, current/maximum checks, runtime-clock start, next check, used/maximum runtime, and a retained stop reason; an absent check cap says **No limit**, while unavailable legacy runtime says **Unknown** rather than looking empty. A failed read shows only its State error with no recovery promise; loading says it is checking, never that it failed; a ready slot with no monitor says **Not watching anything** on one line. Structured targets and full state come only from the existing owner-gated `/api/monitors/slot/{slot_key}` read. The ungated compatibility read contributes legacy cadence and counters, but Profile never renders its prompt, banner, sentinel path, or session data. The section contains no control or action handler.
+exists. Profile carries no monitor readout: what the mate watches is the
+Schedules tab's business (below). Every avatar and Profile surface shares the normalized record and strict `isAutomationActive` visual predicate through `CrewMonitoredAvatar`; that predicate extends `isAutomationRunning`, the broader lifecycle truth that keeps unsupported active records inside chat-sidebar close safety and its running filters. The Members page uses the strict predicate for its roster mark, header label, face flight, and **Scheduled check-ins** filter: a non-actionable record is lifecycle-busy but cannot truthfully make a visual on-watch claim. The roster row, the header pill and that filter OR the predicate with the crewmate's heartbeat (`heartbeat_on`, `isLoopOn`), the other way a crewmate acts on its own; the Schedules patrol row and the face flight read the monitor record alone. Live Redux frames remain the first source for roster and header visuals, while the card's existing `session-automation` slot query supplies retained stopped state and full owner-gated details. A failed owner-gated read deliberately hides the card's local avatar mark and its Schedules patrol row even when Redux still has a reduced live record; the roster and header keep their live mark, but the card never turns a failed authorization or refresh into a claim. A failed roster refresh likewise discards its last-good legacy fallback, because stale active state cannot support a current visual claim. Missing cold reads cannot invent an active mark.
 Memory and
 Workspace sit side by side, but Memory is a flat readout — a solid `border-border`
 hairline, transparent background, no hover and no pointer; never dashed, which is
@@ -2097,8 +2220,78 @@ returns `409 briefing_slug_ambiguous`. Redaction and truncation are visible line
 not tooltips. Owner gating, app-token denial, and the `members.briefing.read` SEL
 record are unchanged.
 
-**Schedules** first shows the next enabled wake, then one `CrewScheduleList` row
-per schedule attributed to this mate. Each row states its name, active/paused/
+**Schedules** also answers what wakes the mate WITHOUT a schedule. While the
+mate's own slot holds a `work-ledger` goal loop -- the patrol the conductor
+prompt arms over the tasks it handed out, or the gateway's default patrol after
+a bind -- active, or retained after a stop that is not a finish (`patrolLoopOf`
+in `CrewOnItsOwn.tsx`: a loop that ended on `monitor_terminal` or
+`stop_sentinel` has nothing left to watch and cannot be revived, so it is no
+row), the tab's **On its own** header holds one more row after the Heartbeat row,
+**Watching its tasks** (the Heartbeat keeps the first row, decided 2026-10-22);
+with no such loop the Heartbeat row alone sits under that header. The row is in the
+schedule row's grammar: the state pill reads **Running** or **Paused**; line two
+says what wakes it ("Wakes when a task reports back, or every 15m", the
+loop's interval); line three is the facts a person acts on -- last check (or
+"Has not checked yet"), "Next in" only while the next due time is still
+ahead (a late loop promises nothing), and the open-item count from the masked
+crew-board read (`GET /api/crew-board`, omitted while unread or when the slot
+owns no ledger, a 404 that is not retried). A stopped patrol replaces last/next
+with one phrase: "You paused it" (`manual` / `user_stop`), "Hit its 7d time
+limit" (`runtime_budget`), "Hit its check limit" (`cycle_cap`), "Stopped while
+waiting for your approval" (`approval_stalled` / `approval_stall`), "Its chat
+was closed" (`session_close`), and the plain "Stopped" for every other code,
+never the raw value. A stop that is a FAILURE
+(`session_start_failures`, `session_unavailable`: "It could not start a check";
+`structural_terminal`, `model_refused`, `interrupted_cycle`,
+`consecutive_failures`: "Its last check failed"; `sentinel_dropped`,
+`verdict_stall`, `completion_evidence_unavailable`, `invalid_monitor_record`,
+`unsupported_monitor_version`: "It could not keep watching the way it was set
+up") is an error and renders through
+`ErrorNotice` under the row, each ending "Resume to try again"; line three then
+carries only the open-item count. While the row is present the list's empty line
+reads "No schedules yet." (`selfWaking`), as it does with the Heartbeat on. The budget bookkeeping
+the loop record carries (check count and cap, runtime clock and budget) is
+shown nowhere; it surfaces only as that one phrase when a budget ended the
+loop. The row's one control is **Pause** while it runs and **Resume** once it
+stopped, both the composer popover's own write (`PATCH /api/autonudge/{id}`
+with `active` alone, `api.autonudgeSetActive`); a success invalidates the
+shared loops query and the card's slot snapshot, a refusal renders through
+`ErrorNotice` under the row with no hand-off (the page may hold a schedule or
+crew-editor draft). A write in flight is published into the same guards as the
+Heartbeat row's (`heartbeatBusy` on the card, the host's leave guard), combined
+with it, so the tab rail, close and navigation refuse to unmount the row until
+the write settles. A pull-request watch or a plain timer on the slot marks the
+avatar but is no row here: that is the chat composer's popover's surface. The
+row renders no prompt, wake text, sentinel path or session key.
+
+Under the same **On its own** header, first, sits the **Heartbeat**
+row (`CrewHeartbeat.tsx`, `CrewHeartbeatRow`, mounted through the card's
+`heartbeatBody`); the header pair renders whenever either body is present, and
+the list stands alone with neither. Then, under **Your schedules**, the next
+enabled wake, then one `CrewScheduleList` row
+per schedule attributed to this mate. The Heartbeat sits here, not among the
+Goals tab's check-ins (decided 2026-10-22, docs/decisions): it is the one wake
+that is neither a schedule a person wrote nor a goal check-in, and "what wakes
+this mate on its own" is this tab's question. The row is a full-width card: a
+tinted tile, its name, the line "Every 1 hr, finds work on its own" with its
+interval and, while it is on, "Each run uses credits. · up to 12 runs a day"
+(the daily bound, `wakesPerDay`), and its switch at the right (a switch state,
+never "Running", which read as work in progress beside the mate's Idle);
+while it is on the interval picker (`HEARTBEAT_INTERVALS`, each option naming
+its daily bound) shows under the line. With no goal the switch is disabled and
+the row says "Set a goal to turn these on.", as the check-ins do. The row reads
+and writes the goal record's `schedules` (`useMemberGoals`,
+`PUT /api/members/{slug}/goals/schedules`, one gateway-owned cron per switch,
+`dashboard/goal_reminder.py`), the same record the Goals tab's check-ins use,
+serializing its own writes. A failed read shows the goals load-failed notice
+where the row would be (this tab has no other surface for that record); a
+failed save shows the agent hand-off notice. A write in flight is published
+as busy into the card's leave guard through the Goals pane's publisher (the
+two bodies are never mounted together), so close, navigation and the tab rail
+refuse to leave Schedules until it settles. While the Heartbeat is on, the
+schedule list's empty line reads "No schedules yet." (`schedule_none_self_waking`)
+instead of "Nothing wakes this mate on its own yet.", which the row above
+would contradict. Each row states its name, active/paused/
 running state, cadence, previous run, result, and next run. A failed list read
 shows an actionable `ErrorNotice` above any retained rows instead of replacing
 them. A failed previous run remains an inline row status and also produces one
@@ -2185,7 +2378,32 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   (`duplicate_goal`). A goal is numbered by its place in the list, and that
   number is what the tab, the card and the mate's context all show. The
   mate only proposes one (`set_goal` -> a `crewmate.goal` card: add, or a
-  new text for one goal by id). A record written before goals were a list holds
+  new text for one goal by id). While the mate's Heartbeat is off and was never
+  declined (the raw record's `heartbeat_offer` is not `declined`), the goal
+  card also carries a **Heartbeat checkbox**, checked by default: "Keep this
+  moving on its own (Heartbeat)", with a note naming the mate's own interval
+  ("Runs about every 1 hr", the default 60) and that each run uses credits and can
+  be turned off any time. It is the card's editable `heartbeat` param (default
+  true; the gateway sends it as a `heartbeat_offer` change row with `interval` and
+  `per_day`, which the dashboard draws as the checkbox in `GoalBody`, never as a
+  change line), and flipping it re-previews the card. Checked, the apply plan is
+  the goal write then the same schedules-route write a `crewmate.check_ins` card
+  makes (`heartbeat: true`, `expected: {heartbeat: false, interval}`), so the
+  Heartbeat turns on through the same hooked route and governance; its Undo turns
+  the Heartbeat off first (`expected: {heartbeat: true}`), then takes the goal
+  back. A Heartbeat the user already turned off counts as that step done
+  (`set_schedules(held_is_done=True)`, armed only on a goal card's Undo steps),
+  so the goal still comes back; on Apply the same mismatch stays a 409, so a
+  Heartbeat the user turned on by hand is never recorded as the card's and its
+  Undo never turns it off. Unchecked, only the goal is written. Either way the goal write carries
+  `heartbeat_offer` (`accepted` / `declined`), stored as the record's
+  `heartbeat_offer` in the same write: a decline means no later goal card shows
+  the checkbox, and with the Heartbeat already on there is none either. A
+  Heartbeat accepted and later turned off is offered again. The Heartbeat state
+  is left out of the goal card's compared snapshot (`comparable_state`), since
+  its own step is a compare-and-set; a goal card stored before the checkbox has
+  no `heartbeat` in its snapshot, offers nothing, and still rebuilds
+  (`change_cards_records.rebuild_record` accepts its old `editable` list). A record written before goals were a list holds
   one `long_term` string: it reads as a one-goal list under
   `member_goals.LEGACY_GOAL_ID` and is written in the list shape on its next
   write;
@@ -2227,19 +2445,26 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   `set_key_results` descriptions, the goal-setup nudge and its own context say
   that a few goals and milestones are easier to track, and to suggest merging
   as the list grows), and the whole record stays inside its 64 KiB byte bound;
-- the tab has **two pages**. The first only shows state, one card each with its
-  icon after its label: the goals (the card itself is not a button: one row per
-  goal, its number on a coloured circle then its text, each row a door to that
-  goal's page; a **+** icon button, labelled "Add a goal", at the label's right
-  opens that page with an empty editor and is always shown), the milestones
-  (each row a door to its own page: the latest reading large, every earlier
-  update, Edit milestone and Remove milestone), the check-ins as three tiles
-  saying on or off and when they run, with the **Heartbeat** as one full-width
-  row under them (its name, the line "Every 1 hr, finds work on its own" with
-  its interval, a second line "Each run uses credits. · up to 12 runs a day" while it is on (the daily bound, `wakesPerDay`), and Off
-  or Turned on -- a switch state, never "Running", which
-  read as work in progress beside the mate's Idle; the card is a door to the switches and
-  pickers), a full-width **Add something {name} should track** row, and the reports. The
+- the tab has **two pages**. The first only shows state, in four sections,
+  each card opening with its header as the FIRST row, a hairline under it
+  (`SectionHeader`: the icon on a tinted tile at the Profile tab's `Tile`
+  size, 36px, then the title in sentence case; a count or an action rides at
+  the header's right): **Goals**
+  (the card itself is not a button: one row per goal, its number on a coloured
+  circle then its text, each row a door to that goal's page; "No goal yet."
+  while there is none; the list's LAST row is **Create a goal**, a dashed
+  `+` circle in accent, always shown, which opens the New goal modal below,
+  not an editor), **Milestones** (each row a door to its own page: the
+  latest reading large, every earlier update, Edit milestone and Remove
+  milestone; the count at the header's right), **Check-ins** (the three tiles in
+  a row saying on or off and when they run, inside ONE button that is the door
+  to the Check-ins page, so the row carries one control and a screen reader
+  hears every tile's state as its name; "Set a goal to turn these on." above
+  the tiles while there is no goal), and
+  **Reports**.
+  The **Heartbeat** is NOT on this tab (see the Schedules tab above, decided
+  2026-10-22): it wakes the mate to find its own work, which is what Schedules
+  lists, where the goal check-ins read on the work. The
   goal colours are five theme tile hues (`--tile-blue`, `--tile-purple`,
   `--tile-pink`, `--tile-teal`, `--tile-indigo`), never the ok/warn green and
   yellow, picked by list position and cycling past five; a goal's number always
@@ -2249,32 +2474,50 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   control as About and Notes); outside the card the page replaces the first
   page with its own back control. A removed milestone or goal returns to the
   first page, where its Undo row is. Error notices offer the existing agent
-  hand-off for draft-free check-in, Undo and milestone-removal failures, but
-  keep it off while a goal, milestone or tracking form holds unsaved text.
-  Goal, milestone and tracking drafts publish dirty/busy state into Profile's
+  hand-off for draft-free check-in, Undo, milestone-removal and New-goal-send
+  failures, but keep it off while a goal or milestone form holds unsaved text.
+  Goal and milestone drafts publish dirty/busy state into Profile's
   existing leave and automatic-placement guards. Close, Back, Cancel, leaving
   Goals, route/browser navigation and member switches ask before dropping a
-  dirty draft; an in-flight save or tracking send refuses those exits. Automatic
+  dirty draft; an in-flight save or New-goal send refuses those exits. Automatic
   narrow-viewport relocation and a cross-tab panel reveal keep the same Profile
   mounted while either state is at stake. If the goal or milestone a dirty draft
   edits is removed elsewhere, the page stays open, says the item is gone and
   shows the unsaved text read-only; only its Discard button clears it. A
   successful save clears its draft;
   failed saves preserve it. Writes are serialized while one is pending;
-- **Add something {name} should track** opens a page with a text box; Send
-  posts what the user typed as their own message (`"Please track this for me:
-  <text>"`, localized) into the mate's thread through the
-  ordinary send path (`chat-core/transport/sendTurn`), so it shows in the
-  transcript as anything they typed would; no hidden nudge. Only a `dispatched`
-  or `queued` receipt clears the input and closes a floating profile card so
-  the reply is in view; a docked one stays. A refusal retains the input with
-  the failure notice. `unknown`, `response-late` and `transport-error` retain
-  it with the shared unconfirmed-delivery notice: check the conversation before
-  resending. No outcome automatically resends. What the mate
-  then tracks is an item in its work ledger (the Crew board's items): the
-  mate's own context teaches it to record what it is asked to track there
-  and to call it tracking, never a ledger, when it talks to the user. The Goals
-  tab shows no tracked item;
+- a NEW goal is set by TALKING to the mate, never typed into the tab (decided
+  2026-10-22, docs/decisions): **Create a goal** opens the **New goal** modal
+  (the shared `Modal`, 360px wide, no inner card), which says in plain words
+  what a goal is and how the mate uses one -- "A goal is the big thing you want
+  {name} to make happen." and three steps, *You say it* / *{name} writes it
+  down* / *{name} keeps at it* -- with no word the user has to learn first (no
+  "milestone", "card", "check-in" or "research"), then one button, a chat icon
+  and **Tell {name} what to aim for**. The button posts one opening message as
+  the user's own (`goals_new_goal_message`, "I want to set a goal for you. Ask
+  me what matters, then write it down for me to approve.", localized) into the
+  mate's thread through the ordinary send path (`chat-core/transport/sendTurn`),
+  so it shows in the transcript as anything they typed would; no hidden nudge.
+  The mate then asks back and proposes the goal on its `crewmate.goal` card as
+  it does today, so the goal is still written by the mate and approved by the
+  user, and no route changes. Only a `dispatched` or `queued` receipt closes the
+  modal and a floating profile card, so the reply is in view; a docked one
+  stays. A refusal keeps the modal open with the failure notice; `unknown`,
+  `response-late` and `transport-error` keep it open with the shared
+  unconfirmed-delivery notice: check the conversation before sending again. No
+  outcome automatically resends; the button is disabled with no thread to send
+  to. The editor page stays for an EXISTING goal: its row opens the text, Save
+  and Remove goal. Create a goal ALWAYS opens the modal, with no branch on the
+  crewmate's tools: every crewmate's chat holds `set_goal` (a crewmate on its
+  own file chats on the conductor, which the gateway builds with
+  `kirocrew-mate` whatever the template carried; `member_mate_tools`
+  `PLATFORM_PROVIDED`), so a chat that cannot write the goal down is a defect
+  in that chat, never a state this tab routes around. The mate's no-tools
+  prompts name the Schedules tab for the Heartbeat
+  (`context_assembly/member._NO_MATE_TOOLS_IDENTITY`, `goal_setup`,
+  `mcp_mate`'s `set_check_ins` description). The former **Add something {name} should track** row is
+  gone from this tab (same decision): what the mate tracks is an item in its
+  work ledger, which this tab never showed, and the user asks for it in chat;
 - three **check-ins**, each its own switch, off by default and disabled without
   a goal, sharing one time of day: **Daily Goal Reminder**, **Weekly
   report** (a weekday) and **Monthly review** (a day of the month, 1-28)
@@ -2316,7 +2559,20 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   mate one hidden turn once its thread is idle (waiting at most ten
   minutes; a newer save, of that goal or another, replaces a waiting nudge).
   It names the goal that changed by number and id, lists every goal, and asks
-  the crewmate to say back that goal in a sentence, hand the research to ONE
+  the crewmate to say back that goal in a sentence. A goal set on a `crewmate.goal`
+  card already answered the Heartbeat on its checkbox (the record's
+  `heartbeat_offer`, written with the goal, so the nudge sees it even before the
+  card's Heartbeat step lands), and so does a Heartbeat that is on or was once
+  declined there: then it asks nothing else (`goal_setup.kickoff_ask_nothing`), and
+  never proposes a second `set_check_ins` card for the Heartbeat. Only a goal saved
+  on the Goals tab with the Heartbeat off and unanswered makes it
+  ask once in plain words whether to keep track of the goal on its own between
+  chats (a wake every so often that keeps the work moving while the user is away,
+  the chat quiet, the Dashboard tab showing what it did, each run using credits),
+  naming the Heartbeat only after the user answers, since they do not know the word
+  yet; on yes it proposes `set_check_ins` with the Heartbeat on
+  (`goal_setup.kickoff_heartbeat_tools`, or without the mate tools a pointer to the
+  Schedules tab). `set_check_ins` stays the way to change the Heartbeat later. It then hands the research to ONE
   worker session (`session_create`, a self-contained brief with `session_send`)
   and end the turn so the chat stays free -- nothing waits or polls -- then
   propose milestones with `set_key_results` (each linked with `goal_ids`) when
@@ -2332,12 +2588,12 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   `crewmate.key_results` card (its Apply step sets
   `REQ_CARD_KEY_RESULTS_APPLY`; a Goals-tab edit and an Undo do not) always
   sends a second hidden turn, `[Milestones confirmed]`, the same way, listing
-  each milestone with the goals it serves: with no
-  check-in on it offers them with `set_check_ins` (the Daily Goal Reminder, the
-  Weekly report, the Monthly review, and the Heartbeat, which is off by default:
-  a wake every so often that keeps the work moving while the user is away, the
-  chat quiet, the Dashboard tab showing what it did, each run using credits),
-  otherwise it says what the mate works on first.
+  each milestone with the goals it serves: with none of the three reminders on
+  (the Daily Goal Reminder, the Weekly report, the Monthly review; the Heartbeat is
+  not counted, since the goal-setup nudge already asked about it) it offers those
+  three with `set_check_ins` (`goal_setup.milestones_offer_tools`, or on the Goals
+  tab without the mate tools), and with one already on it says what the mate works
+  on first. It never offers the Heartbeat.
 - the **build-your-page line** (`goal_reminder.dashboard_line`): only while the
   mate's Dashboard tab shows nothing of its own -- no package bound to it
   (`dashboard_agentic.bound_package`) and the suggestions page
@@ -2351,7 +2607,7 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   the loop, end with `goal_reminder.DASHBOARD_BUILD_LINE`: write your own HTML page
   (`view.html`) with the dashboard skill, stored by `dashboard_save` and put
   live by `dashboard_apply`, reading `dashboard_types` for paths and row keys
-  (`work` and `workstreams` for progress, hourly history and project
+  (`workers`, `work` and `workstreams` for progress, hourly history and project
   spend, `goal` for relevant milestones, `waiting`, `timeline`, and `tools` and
   `usage` for the live session's activity); a verified project snapshot may be
   an agentic field with its source and observation time shown. The look is
@@ -2379,7 +2635,9 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   where the tab stands (`dashboard_agentic.SUGGESTIONS_STATE`), since there is no
   `dashboard_save` to build with. The member protocol's page item says the same
   (progress on the page; the first report is when the page is built) and names
-  the three parts `dashboard_save` takes as fields, `view.html` and theme; its
+  the three parts `dashboard_save` takes as fields, `view.html` and theme, and
+  names `dashboard_snapshot` as the way the mate looks at a picture of its own
+  page; its
   front-desk item says the thread is read once or twice a day, so it gets few
   reports, each one message covering several things, never a stream of small
   updates. The Daily Goal Reminder puts where things stand on the page and
@@ -2449,7 +2707,8 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   `set_check_ins` and card-kind text, which tells the mate to write it to
   the user that way and, since the card has no timing control, to point at the
   Goals tab's Check-ins (where each check-in is switched off on its own and
-  its time or interval changed) rather than at the card; the Goals tab's `fmtInterval` gives the same English
+  its time changed) and the Schedules tab's Heartbeat row (its switch and
+  interval) rather than at the card; the Goals tab's `fmtInterval` gives the same English
   words through `Intl` short units,
   writing through the schedules route, which is a
   card-hooked route (`change_card_catalog.HOOKED_ROUTES`) like the goal and
@@ -2490,17 +2749,49 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   figures, plain words that agree with the readings, and the user's stated style
   over the crewmate's own. Written as principles; prompt-only, with no save-time
   look check on reports.
-  A check-in that fires with the thread not open or busy does nothing that time;
+  A check-in that finds no slot for the thread loads it first
+  (`goal_reminder._load_thread`: `rehydrate_slot_from_history_async` with
+  `adopt_closed`, the reopen the member-thread endpoint uses), so a thread a
+  restart left unloaded still gets its wake. The owner's rule is that a mate's
+  heartbeat always wakes the mate: the check-in is something the owner turned
+  on, and its switch, not the tab, stops it. So a mate's DM thread closed with
+  ✕ or by the idle sweep is reloaded and woken like an unloaded one; that
+  reopening applies to the crewmate's own DM key only, and every other kind of
+  thread keeps the restore's close-stays-closed rule. Only a thread that cannot
+  be built (no transcript, or a binding that resolves to no crewmate) skips,
+  logging `skipped: the mate's thread could not be loaded`. A check-in
+  that fires with the thread busy does nothing that time;
   the weekly and monthly ones check again after reading the work ledger, so a
-  turn that started meanwhile never carries the review mark.
+  turn that started meanwhile never carries the review mark. Every check-in's
+  outcome line (`started` or the skip) is the run's result in the job's history
+  (`cron_fire`, `job.set_run_result`), silent job or not. At boot, a crewmate
+  thread whose intact binding names a crewmate id the config read did not
+  resolve is not dropped: the restore keeps its key in the reopen seed
+  (`chat_persistence._DEFER_MEMBER_RESTORE`,
+  `members.dm_binding_depends_on_config`) and `dashboard.member_slot_retry`
+  tries it once more `MEMBER_RESTORE_RETRY_DELAY_S` after the restore. The key
+  leaves the seed when the retry builds it, when another path built or closed
+  it first (a check-in's load ends the deferral at once,
+  `member_slot_retry.end_deferral`), and when its binding still names no
+  crewmate, so a crewmate deleted for good is pruned by the next flush. A read
+  error or a transcript that does not build keeps the seed for the next boot's
+  restore to decide. The retry works only on the keys the restore deferred
+  (`state.deferred_member_slot_keys`); a seed kept for another reason (an
+  unreadable read, a remote-only transcript) is left alone. A thread built after the boot restore, by that retry or by a
+  check-in's load, gets the boot's parked-send pass
+  (`member_slot_retry.resume_parked_sends`, which runs
+  `drain_restored_parked_sends`), so an accepted parked send runs before the wake.
   The check-in jobs are not listed on the Schedule page or in the mate's
   Schedules tab (`GET /api/crons` drops them through
   `goal_reminder.is_reminder_job`); the switches are their only control;
-- the **Heartbeat**, a fourth check-in (`member_goals.CADENCE_HEARTBEAT`; related:
+- the **Heartbeat**, a fourth cadence of the same record (`member_goals.CADENCE_HEARTBEAT`; related:
   the RFC "Mate heartbeat", rfc-crewmate-heartbeat.md under
-  docs/request-for-change), off by default and
+  docs/request-for-change; its switch is the Schedules tab's row, not a Goals
+  tab check-in), off by default and
   disabled without a goal like the other three. A record written before it reads
-  with `heartbeat` off and `interval` 60. Its `interval` is one of
+  with `heartbeat` off and `interval` 60, and with no `heartbeat_offer` (the
+  answer to a goal card's Heartbeat checkbox, `accepted` or `declined`; any
+  other stored value reads as none). Its `interval` is one of
   `member_goals.HEARTBEAT_INTERVALS` (30, 60, 120, 240 minutes; anything
   else is refused `invalid_interval`, and a stored value outside the list reads
   as 60), and its one schedule (`goal-heartbeat:<slug>`, removed with the
@@ -2531,7 +2822,8 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   own bound ("Every 1 hr · up to 24 runs a day"). Only the owner's schedules route and an applied
   `crewmate.check_ins` card write the switch, so the mate proposes it with
   `set_check_ins` and cannot turn it on itself. A wake goes through the same
-  `goal_reminder.fire` path and the same skips (thread not open, a turn running
+  `goal_reminder.fire` path, loads an unloaded thread the same way, and takes
+  the same skips (thread cannot be loaded, a turn running
   or queued, switch off, no goal), checking the thread again after the
   off-loop tools check, and dispatches one hidden turn
   (`mate_welcome.dispatch_hidden_turn`, `human_seen=False`)
@@ -2589,13 +2881,16 @@ the report. A record written while short-term goals existed still carries
 `short_term` and `last_crewmate_change`: `_normalize` reads past them and the
 next write drops them.
 
-The record lives at `trust/member-goals/<slug>.json` and has the same
-protection as `member-rules/`: the tool gate (the sensitive-path floor covers
-`trust/`, so the mate's file-write and edit tools are refused there), not an
-OS seal (`trust/` is a read-write leaf of the crew sandbox, so a sandboxed shell
-command can still write it). Because that shell can also plant a symlink there
-and the gateway writing the record is not sandboxed, the record is never reached
-through a link: `trust`, `member-goals` and the record are each opened relative
+The record lives at `member-records/member-goals/<slug>.json` and has the same
+protection as the rules file beside it (`member-records/member-rules/`): the
+OS sandbox masks the whole `member-records/` directory in every mode, and the
+sensitive-path floor refuses the mate's file tools there (security.md, "Crewmate
+records"). The DM binding (`member-records/member-bindings/`) is held the same
+way. An older build kept all three under `trust/`; `member_records` moves them
+once, before a spawn and before any record path is used, and nothing under
+`trust/` is read after that. The gateway writing the record is not sandboxed,
+so the record is never reached
+through a link: `member-records`, `member-goals` and the record are each opened relative
 to the one before with `O_NOFOLLOW` and written inside that pinned directory
 (`member_goals._open_goals_dir`); a link at any of them is refused as
 `GoalsUnreadable`, so the gateway cannot be pointed at `profiles/` or another
@@ -2617,7 +2912,8 @@ and key-results compare-and-sets accept the scrubbed form the page was shown as
 keeps the stored text (`member_goals.keep_unscrubbed`), so saving one milestone
 never replaces another's real text with redaction placeholders. Deleting a mate removes its check-in schedules
 (`crew_removal._remove_goal_check_ins`) unless another live crew still derives
-the slug; the goal record stays, like the rules file.
+the slug; the goal record stays, like the rules file. Both deletes run it, the
+route and `kirocrew agent delete`, through `crew_removal._remove_member_leftovers`.
 
 Since such a mate has a goal and no description, the Profile card's About
 shows its first goal, marked **From the goal**, while the description is
@@ -2714,7 +3010,8 @@ a milestone is reached is the mate's own word in that reading, never judged by t
 gateway), and
 `dashboard/waiting_changed` when `waiting_items` differs from the last list
 recorded, checked after each growth of that DM log (`emit.add_growth_listener`,
-coalesced for 0.4 s), folded as `waiting` (`items`, `count`, `omitted`, `newest`). The list
+coalesced for 0.4 s; only a session's first growth in that window walks the open
+slots to learn which thread it is, and a retired question looks its slot up by key), folded as `waiting` (`items`, `count`, `omitted`, `newest`). The list
 reads the change-card store, and the settle runs on the serving loop, so each
 settle first awaits `CardStore.warm()` (the file and vault-key read in a worker
 thread); when warming fails nothing is recorded, so the last complete list stands
@@ -2753,14 +3050,17 @@ in the tab there is no unsent answer for the page to hold or guard, so exits ask
 only about a Schedules draft. The mate's `panel_publish` record keeps its MCP
 tool and its `GET /api/members/{slug}/panel` read; no surface on this page draws
 it. Files is the standard SidePanel browser scoped
-to the workspace rule above. Dashboard and Files are the only STANDING tabs.
-Side Chat remains available dynamically through selection Ask and the plus
-menu; it is not a standing entry — and the plus menu keeps every other dynamic
-view the chat page offers (Terminal, Browser, Git, Subagents, Workflows, the
-Developer-Mode Logs / Context / Crew log, app-contributed tabs), bound to the
-member's slot once the thread is confirmed. Withheld outright are the
+to the workspace rule above, labelled **Workspace** on this page's strip (the
+Profile card's word for the same directory; `SidePanel.viewTitles` changes the
+title only, the tab id stays `files`). Dashboard and Files are the only
+STANDING tabs. Side Chat remains available dynamically through selection Ask
+and the plus menu; it is not a standing entry — and the plus menu offers
+Terminal, Browser and app-contributed tabs, bound to the member's slot
+once the thread is confirmed (#25378). Withheld outright are the
 transcript-fed views (Changes / Issues / Links / Pins, plus the session
-Summary), the chat page's Command Center, and Artifacts — a pinned standing
+Summary), Subagents, Workflows and Git (a mate hands its work to workers), the
+diagnostics group (Logs / Context / Crew log), the chat page's Command Center,
+and Artifacts — a pinned standing
 tab on the chat page that has no place in this page's Dashboard + Files set
 (`MEMBERS_WITHHELD_VIEWS`). Withholding that LIST does not withhold an
 artifact DOCUMENT: `SidePanel.isWithheld` ties every document tab (file, diff,
@@ -3043,7 +3343,8 @@ every gateway wake (`wake.preamble` and `reminder.*` in
 `dashboard/goal_reminder.py`; `goal_setup.*` in
 `dashboard/goal_setup.py`; `worker_report.*` in
 `dashboard/mate_thread_wakes.py`; `welcome.*` in `dashboard/mate_welcome.py`;
-`upgrade_notice` in `mate_upgrade_notice.py`). One key per
+`upgrade_notice` in `mate_upgrade_notice.py`) and the hand-off capability
+note (`dispatch.*`, `mate_capability_catalog.dispatch_summary`). One key per
 piece; its `_about` entry names where it is assembled and which placeholders
 it takes. The modules keep only the assembly: `crewmate_prompts.text(key)`
 returns a piece, `crewmate_prompts.fill(key, **values)` fills its named
@@ -3063,14 +3364,54 @@ the Kiro Crew docs search (`search_docs`, `find_ui` on `kirocrew-guide`, which
 both the conductor's fixed servers and the worker's base config mount);
 `work_ledger_record` / `work_ledger_read`, `save_goal_report`, `save_notes`;
 the worker's kit, the capability card that adds to it, the Profile's
-Permissions reaching its sessions. `test_every_crewmate_only_tool_is_named_in_the_assembled_conductor_prompt`
+Permissions reaching its sessions, and its own worktree under the crew/
+prefix. `test_every_crewmate_only_tool_is_named_in_the_assembled_conductor_prompt`
 reads the tool names from the `kirocrew-mate`, `kirocrew-panel`,
 `kirocrew-crew-log` and `kirocrew-work` server sources plus the guide and
 session tools, and fails when the assembled prompt omits one, with an explicit
 exempt list (`panel_templates`, `work_brief`, `work_report`,
-`work_ledger_rebuild`). The worker's principles add one line: facts the
+`work_ledger_rebuild`, `offer_dashboard_page`). `offer_dashboard_page` is exempt
+because its per-turn note names it (`dashboard/page_offer.py`), and its tool
+description says to call it only when that note does. The worker's principles add one line: facts the
 crewmate's Dashboard depends on are recorded as crew-log events, through the
-tools that record them.
+tools that record them. It also says its project directory is the crewmate's
+own worktree on `crew/<crewmate>/<repo>`, to commit there and name further
+branches under that prefix, to rebase onto the default branch itself when it
+needs that branch's changes, and to check a branch with `git merge-tree` before
+it pushes.
+
+A crewmate promises only what it knows it can do (bug-bash H4: it said "I'll
+install Rust", hit the `pipe-to-shell` rule, then offered the chip "Ask for a
+card to let you install it", which no card kind can raise).
+`conductor.how_you_work` item 1 tells it to hedge an action a safety rule or an
+approval can stop ("I'll try; if a safety rule blocks it I'll give you the
+command"), and when one is blocked to put the exact command in a
+`run-yourself` fence whose info string carries `summary="…"`, one factual line of what it
+installs or does and from where (no persuasion; `worker.principles` asks the worker for the
+same line), never offering to ask for a permission, setting or
+card to get past it. An assistant chat turn draws that fence as the run-it-yourself card
+(`RunYourselfCard`, [learn-cron-dashboard](learn-cron-dashboard.md#direct-terminal-commands-from-the-composer)):
+the command verbatim, the crewmate's summary when given, the fixed line "I can't run this, but you can.", Run in
+terminal through the existing confirm dialog, and Copy, so a new user need not know where a terminal is. Any other surface draws the fence
+as a plain code block, so text from outside the agent cannot pose as its hand-over.
+The `denied_command` change-card kind was not used for this: it adds or toggles a
+user deny rule, a settings change, while this is the person running one command. Item 5 says a suggested reply (an `[OPTIONS:]` chip) offers only
+what the crewmate can then do, never asks it for a card (a card that fits is
+raised directly, since the card is the question), and carries no internal word
+(card, worker, helper, a tool name such as `propose_change`).
+`worker.principles` tells the worker to report a blocked command with the exact
+command in a code block rather than look for a way around it. The refusal
+itself also says this to any session: the `pipe-to-shell` category has its own
+remediation class ([security](security.md), `deny_guidance.DENY_CLASS_REMOTE_SCRIPT`).
+No gate moves. `test_crewmate_prompts.py` pins the wording, and
+`website/src/components/chat/crewmateChips.ts` is the render-time backstop: in a
+crewmate chat (`ChatPane` with `crewmate`) a chip that asks for a card is not
+offered. It matches narrowly: one of our card names after an article ("a change card",
+"an approval card", and the same names per language), `propose_change`, or the H4 shape
+"ask for a card" / "raise a card". A generic verb with a card noun ("Give me the card
+number", "Make the cards bigger", "Change card colors") is the user's own task and is
+kept; the matcher errs toward keeping. It is display only; the
+transcript keeps the reply as written.
 
 `scripts/crewmate_prompt_preview.py --fixture <name> [--piece <p>] [--diff | --write]`
 runs the real assembly over a fixture in a throwaway data home and prints
@@ -3097,7 +3438,14 @@ therefore a turn whose final assistant text is empty: the model's own silence
 is the signal, and no heuristic over the words decides for it — a row with
 visible words is always shown, so a finding or a question can never be
 filtered away. No "N quiet patrols" divider is drawn in their place. Rows the
-user must see or act on stay: `user`, `error`, `file`, `mcp_oauth`,
+user must see or act on stay: `user`, `error` — except the PENDING links of the
+gateway's transient-5xx ladder (`meta.notice` of `transient_retrying` /
+`transient_resuming`, `isPendingTransientNotice` in
+`pages/chat/gatewayNotice.ts`), which are runtime notices in all but role:
+the turn is already re-queued, and on a patroller they otherwise stack one
+"Connection restored" card per retried wake with nothing of the crewmate's
+between them; the terminal `transient_give_up` keeps drawing because the person
+must act on it — `file`, `mcp_oauth`,
 `permission` (pending native and background-spawn approvals remain actionable),
 question cards, change cards, the stop card (a `system` row of kind
 `stop_event`, the record of the person's own Stop press, which breaks a run like
@@ -3181,8 +3529,10 @@ both the pill and the pane, so a Stop from another tab reads "Stopping…" on
 both surfaces from the one seam — as the footer the caption replaces did. The caption's text is the DM
 header identity pill's OWN reading, through the one shared hook
 `useSlotActivity` (`pages/members/useSlotActivity.ts` → `resolvePillActivity`
-over the slot's live status record `slotStatusDetail`, the stream state and
-the tool log's returned flag, labelled by the shared `toolStatusLabel`), so
+over the slot's live status record `slotStatusDetail` and the stream state,
+labelled by the shared `toolStatusLabel`; a returned call needs no flag of its
+own, because `sseToolResult` moves `slotStatusDetail` to thinking when the
+named call's final result arrives, for every surface that renders it), so
 the header and the chat read one moment from one seam and can never disagree
 on WHAT the mate is doing — only on when the chat line says it, see the
 hold below. It answers
@@ -3269,9 +3619,12 @@ starts that turn seconds later): `awaitingCrewmateReply` holds while the
 pane's newest send still has its row (sent, queued or drained), its delivery
 is not in doubt (`deliveryUnconfirmed`), and nothing after it has answered --
 no assistant row (speech or the say-nothing row of a quiet end), error, stop
-card, pending approval or change card. A refused send's bubble is gone, so it
-waits on nothing. A live turn that ends while the send is not parked in the
-queue ends the wait too (the turn that answers it wrote no row); a turn that
+card, pending approval or change card. A pending link of the transient-5xx
+ladder (`isPendingTransientNotice`) is not an answer: its card is hidden in a
+crewmate's chat and the turn is already re-queued, so the bubble holds until
+the retried turn answers or the ladder's give-up row lands. A refused send's
+bubble is gone, so it waits on nothing. A live turn that ends while the send
+is not parked in the queue ends the wait too (the turn that answers it wrote no row); a turn that
 ends while the send is still queued is the one before it. So does a slots
 frame, while the slot is not live, naming a different turn than the one
 current at Send (`turn`, or `turn_gen` after a gateway restart): the answering
@@ -3490,13 +3843,29 @@ agent-SDK boundary gate holds none of them), which adds it to that
 set in the same call (`loader.publish_mate_agents`): the create route and the
 `agent create` command share the copy-and-repoint `mate_config.adopt_own_file`,
 and the startup migration (which also gives the first crewmate its file) writes
-through it too. So a crewmate's first chat, the goal-setup turn included, is
+through it too. Instances with separate data homes can share one Kiro home, so
+the writer records which data home wrote each file (`~/.kiro/mates/owners.json`)
+and never replaces one another instance wrote. The owner check and both writes
+run under one cross-process lock (`mates/owners.lock`), so two instances
+writing one name at once cannot both pass the check
+(`test/test_mate_owned_config.py`). So a crewmate's first chat, the goal-setup turn included, is
 already on the conductor. A name the set does not know at all (a file another
-process wrote) is rescanned before the answer off the loop, and on the loop a
-rescan is scheduled. A `member` record whose `template_id` names the crewmate's
+process wrote) is rescanned before the answer off the loop. On the loop a rescan
+is scheduled and the answer is two file stats, never a directory scan
+(`mate_worker._mate_file_on_disk`): mate-owned when `~/.kiro/mates/agents/<name>.json`
+exists and `~/.kiro/agents/<name>.json` does not, so a crewmate created a moment
+ago chats on the conductor, never on its own file, and a user-level agent of that
+name stays itself. A `member` record whose `template_id` names the crewmate's
 own file is read as the conductor (`mate_worker.member_chat_template`) by the
 chat, the hand-off (`_dispatching_crewmate`) and `is_conductor_execution` alike
-(`test/test_mate_conductor_every_create_path.py`). The three parts:
+(`test/test_mate_conductor_every_create_path.py`). With the config at hand, the
+chat and `is_conductor_execution` also read the member's CURRENT bound
+`kiro_agent` (`mate_worker.member_record_template`): when that binding owns a
+crewmate file the record is the conductor, whatever older `template_id` it kept
+(the pre-conductor `kirocrew-conductor`), with no record rewritten. Any other
+member keeps the template its record names, so a shared-agent crewmate's thread
+runs the agent it recorded. A `template` record (a worker included) stays exact
+(`test/test_mate_chat_agent_resolution.py`). The three parts:
 
 - **The conductor**, `kirocrew-mate-conductor`, is what its own chat runs on.
   `mate_worker.member_chat_agent` maps the binding to it, and it is the one rule
@@ -3525,7 +3894,12 @@ chat, the hand-off (`_dispatching_crewmate`) and `is_conductor_execution` alike
   `mate_worker.cron_worker_execution` turns the job's captured `member`
   selection into the worker's record shape (a `template` selection on
   `kirocrew-mate-worker`; member, store, memory mode and app kept) for a
-  crewmate whose binding owns its file, read from the gateway's live config, and
+  crewmate whose binding owns its file, or claims it (`kiro_agent` is its own
+  alias) while the file is absent and the crewmate owner record names it for
+  this data home (`mate_config.crewmate_file_on_record`, written with every crewmate file and never pruned;
+  `_claimed_crewmate_file`). A self-named binding to an installed, workspace or
+  built-in agent was never on that record and keeps the member route. Read from
+  the gateway's live config, and
   `cron_fire._resolve_cron_agent` dispatches the worker in the crewmate's
   workspace with no crew alias, as a hand-off opens it. The job keeps its
   `cron:` key and principal, so the worker projection reads that crewmate's kit
@@ -3533,7 +3907,9 @@ chat, the hand-off (`_dispatching_crewmate`) and `is_conductor_execution` alike
   backend. A 1.0 job (`template_id` `kirocrew` with the member id) takes the
   same path; the record its stable key holds is rewritten once by
   `cron_service.identity.rebind_cron_session_template`, compare-and-set, with no
-  data migration. A crewmate still on a shared template, a non-crewmate job and
+  data migration. A deleted own file fails closed: the worker refuses the turn
+  (`WorkerKitUnreadable`) instead of the conductor running it without the
+  crewmate's limits. A crewmate still on a shared template, a non-crewmate job and
   a declared `agent_sequence` dispatch as before (`test_cron_crewmate_worker.py`).
   When the result CHANGED (the cron's `last_posted_hash` dedupe), the cron
   session reports to the crewmate's thread as one of its workers
@@ -3631,17 +4007,96 @@ chat, the hand-off (`_dispatching_crewmate`) and `is_conductor_execution` alike
   routes it like one: a key `mate_worker.note_worker_session` published -- at
   the child's birth in `session_create`, and on the record read every turn and
   resume prefetch makes before allocating (`resolve_session_agent_bindings`), so
-  a restart keeps it -- takes `agent.member_acp_backend` through the same gate
-  (a stored `kiro` reads as KAS), never `agent.acp_backend`. The identity is
+  a restart keeps it -- takes its crewmate's own harness pin
+  (`agents.<name>.acp_backend`, see "A crewmate's own harness" below) when it has
+  one, else `agent.member_acp_backend` through the same gate (a stored `kiro`
+  reads as KAS), never `agent.acp_backend`. The identity is
   positive: a `template` record on `kirocrew-mate-worker` with a member id
-  (`mate_worker.is_own_worker_execution`). The pin is that record, so the worker
-  follows its crewmate's backend for its whole life. Only a backend in
-  `ACP_BACKENDS_MATE_WORKER_KIT` carries the per-session spec (harness-parity.md);
-  today that is KAS. `session_create` refuses a worker anywhere else
-  (`worker_kit_harness_unsupported`), and so does the allocation for a provider
-  that does not answer `mate_worker_kit_supported`, so a worker never runs the
-  bare base. The worker's model pin is judged against the same backend
+  (`mate_worker.is_own_worker_execution`). A record that no longer says so drops the
+  key, on every read before an allocation and at an explicit selection's commit
+  (`slot_guards._record_explicit_agent_selection`), so a session switched off the
+  worker template leaves the crewmate's backend too. The pin is that record, so the worker
+  follows its crewmate's backend for its whole life. It runs on a backend in
+  `ACP_BACKENDS_MATE_WORKER_KIT` (KAS, claude; harness-parity.md),
+  its spec carried the way a member chat's
+  saved spec is -- KAS through its per-session projection, the mirrored hosts
+  through the session MCP projection, which reads the worker's own spec by the
+  session (`acp.session_mcp._crewmate_worker_spec`). kiro-cli reads `--agent` off
+  disk and cannot find the worker spec, so it is not in the set. `session_create` refuses a
+  hand-off whose worker would run anywhere else (`capability_harness_unsupported`,
+  naming the backends that carry it), and the allocation refuses the same before
+  spawn, plus a crewmate whose file turns off single tools (`disabledTools`, or
+  a server or native tool its own `excludedTools` names) on a backend outside
+  `ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS` (`capability_tool_limits_unsupported`;
+  KAS honours the limits as the worker spec's `excludedTools`, so only claude
+  refuses them). The worker's model pin is judged against the same backend
   (`mate_worker.crewmate_worker_backend`).
+
+**A stale worker is released, not capped.** A crewmate opens as many workers as
+its work needs; memory is bounded by the cgroup `max_memory_mb`. A worker idle
+past `session.timeout_secs` is stopped by the idle sweep like any session, its
+conversation kept, and the next `session_send` resumes it through
+`session/load` on the same execution record, so with the same kit. A long-idle
+worker is archived by `dashboard.idle_slot_sweep_days` like any tab, and a
+conductor's `session_send` to it revives it first (session-control.md). The
+conductor reads `process: live | released` on `session_status`, and the worker
+tab shows a released one with a small marker (`session-row-released`).
+
+**Each crewmate works in a git worktree of its own** (`kiro_crew.crewmate_worktree`,
+`dashboard/crewmate_worktree_scope.py`), so two crewmates handed one repository
+never share a working tree or a checked-out branch. The gateway does three
+things here and leaves every other git step to the worker's prompt
+(`worker.principles`):
+
+1. **One worktree per crewmate per repository.** `crewmate_worktree.ensure`
+   makes it at `<crewmate workspace>/worktrees/<crewmate slug>/<repo>-<hash>`
+   (`path_for`: the slug keeps two crewmates sharing a workspace apart, the
+   hash two repositories sharing a name), on the branch
+   `crew/<crewmate slug>/<repo>` (`branch_for`), cut the first time from the
+   repository's default branch (`refs/remotes/origin/HEAD`, else `refs/heads/main`
+   or `master`, else `HEAD`; full ref names, so a tag never stands in for the <!-- wokeignore:rule=master -->
+   branch). After that a worktree git registers at that place is used as it is,
+   on whatever branch the worker has checked out; one whose folder was deleted
+   by hand is pruned and made again. A name segment the cleaning changed (or
+   one over 40 characters) keeps a digest of the whole and is a legal git ref
+   component. A repository that contains the crewmate's own workspace is not
+   one it was handed and gets none. The repository is read from git's common
+   directory, so a path inside another crewmate's worktree maps to the same
+   repository.
+2. **The worker runs there.** At the start of a worker's turn (a `template`
+   record on `kirocrew-mate-worker` with the crewmate's `member_id`; the
+   conductor is left alone), after its Permissions are seeded and before the
+   provider is claimed, turn admission (`chat_turn/turn_admission._turn_admit`)
+   calls `scope_worker_turn`. It reads the repository from the paths the
+   turn's message names (absolute or `~` paths, and drive paths on Windows; a
+   quoted one is read whole; one not made yet is read from its nearest existing
+   folder; `crewmate_worktree.paths_in`), then from the slot's project, and sets
+   `slot.project` to the crewmate's worktree of the first one in a git
+   repository (the same subfolder when the path named one, unless that folder
+   is a link out of the worktree or holds a control character or bracket). A
+   path in the worktree the worker already runs in, or in that repository's own
+   checkout, moves nothing. The binding is re-captured under the dispatch lock,
+   and a session already running takes the deferred reset `set_project` uses.
+   Git failing (or no sandbox) leaves the turn on its project. The
+   repository's `aws.project_profiles` binding still applies in the worktree:
+   the cwd is matched as the same path in the checkout, asked of git each time
+   (`crewmate_worktree.source_path`; config.md, "Project AWS profiles").
+3. **It goes with the crewmate.** Deleting the crewmate, from the dashboard
+   or with `kirocrew agent delete` (`crew_removal._remove_member_leftovers`,
+   `crewmate_worktree.remove_for_member`) lists `<workspace>/worktrees/<slug>` and removes each folder git registers as
+   a worktree of its repository with `git worktree remove` (never `--force`).
+   One with uncommitted changes, ignored files or a repository that configures a
+   checkout filter is kept and logged; so is anything git does not register.
+   Branches stay, and the repositories' own checkouts are never touched.
+
+Git runs through the follow-up card's sandboxed runner
+(`handlers/worktree._run_git`): no hooks, no fsmonitor, and a repository
+declaring a checkout filter is refused. The folders sit in the agent-writable
+workspace, so the gateway makes a new worktree's folder through no-follow
+descriptors (`pinned_fs.open_pinned_descendant_dir`) and, after a failed
+`worktree add`, removes it only by descriptor and only while it is still the
+folder it made (`remove_tree_pinned`, by `(dev, ino)`), then drops the branch
+it cut (`test/test_crewmate_worktree.py`).
 
 **A worker reports back on its own** (`dashboard/mate_thread_wakes.py`), so the
 conductor dispatches and ends its turn. Every top-level turn end calls
@@ -3652,68 +4107,168 @@ stamped by `session_send`), the thread is woken with ONE hidden turn
 `report_prompt`: the `[Worker report]` envelope, the worker's title and key, and
 its reply scrubbed (`member_goals.scrub_text`), capped at 4,000 characters (held
 cut, with its cut flag) and fenced between `<<<worker reply` / `>>>end of worker
-reply` as data. Transcript metadata alone wakes nothing. A busy thread keeps one
+reply` as data. The wake ends on one Dashboard line (`page_line`, read off the
+loop just before the turn starts), because a worker report is where a dispatched
+job's state changes and the check-ins that otherwise ask for the page run only
+with a goal and a switch on: a page in force with fields the crewmate writes
+gets `worker_report.dashboard_fields`, naming those fields and asking for them
+to be written with `dashboard_write` before the turn ends; a tab still on the
+suggestions page gets `dashboard_agentic.SUGGESTIONS_LINE`; no line with
+`agent.crew_panel` off, under the lock while the tab shows suggestions, or for a
+page whose every field is folded. A thread closed (`is_closing`), removed or
+replaced while that read runs gets no wake, and its reports stay pending.
+After a restart or a revive, when the in-memory witness is gone, the crew
+log's session tree (gateway-written at the child's first turn,
+`mate_thread_wakes._lineage_names`) naming the thread as the worker's parent
+stands in for it; with the crew log off or its tree not yet loaded the
+fallback answers no, and that worker's report is not delivered.
+Transcript metadata alone wakes nothing. A busy thread keeps one
 pending report per worker (`_mate_wakes`, counting turns) and its flush waits on
 the thread's own turn task, so a report is delivered once, never twice; pending
 reports live in memory. While the app is stopping
 (`mate_welcome.app_is_stopping`) no hidden turn starts and reports stay pending.
 
-**The worker's extra kit** (`kiro_crew.mate_worker_kit`, owner-only
+**Adding abilities to a crewmate** (`kiro_crew.mate_worker_kit`, owner-only
 `GET/PUT /api/agents/{name}/worker-kit` and `POST .../worker-kit/preview`,
-handler `dashboard/handlers/member_worker_kit.py`): the owner names ONE
-template, and its `prompt`, `mcpServers` (with `autoApprove`), `resources`,
-`skills`, `allowedTools` and the `tools` selectors for its servers are copied
-into the crewmate's file once, governed before the write. The file does not
-track the template. `~/.kiro/mates/kits/<id>.json` records what the last copy
-wrote (`record_initial_kit` writes it at create for a non-default template). A
-preview lists each change and writes nothing; `keep_additions` (default true)
-keeps what the file gained since the last copy (`added_since`). A re-copy
-replaces the kit's selectors, so a narrowed template narrows the file. The
-apply needs the preview's `revision` (`_plan_revision`, binding the file and the
-result shown) or answers `stale_revision`. The template's `excludedTools` join
-the file's. A template with `permissions` deny/ask rules, `toolsSettings` or
-hooks the worker would not carry (`uncarried_restrictions`) is refused
-`template_restrictions_uncarried`, and a create from it keeps the crewmate on
-that template. Other refusals: `not_a_mate_file`, `template_unreadable`,
-`template_required`, `revision_required`. The surface is the crew editor's
-**Advanced** section (`components/crew/WorkerKitPane.tsx`, only for
-`mode: "mate"`); its rows name items through `components/crew/workerKitLabels.ts`.
-For such a crewmate, General shows the template read-only with **Open
-Advanced**. A switch changes only the file: a running worker keeps the kit it
-started with (`acp/harness/kas.mate_worker_projection` reads it at session
-start). Every "Built from" shows a template's name, never an id
-(`components/crew/builtFromName.ts`); a `crew-<hex>` copy is named by its origin
-(`mate_worker_kit._private_copy_origin`) or "Its own copy". The Built From
-summary counts the WORKER's merged tools, servers and skills
-(`mate_capabilities.worker_summary`). The Customize > Crewmates roster
+handler `dashboard/handlers/member_worker_kit.py`): the owner picks another
+agent, and its `mcpServers` (with `autoApprove`), `resources`, `skills`, the
+`allowedTools` for servers the add writes, and the `tools` selectors for those
+servers are unioned into the crewmate's file, governed before the write. The add
+is purely additive: anything the file or the worker base already has is skipped,
+never replaced. The one exception is the file's `prompt`, the crewmate's single
+**behavior directions** slot, which the worker merge appends after the worker's
+source-defined prompt: an agent whose own spec names a prompt writes that prompt,
+minus any opening text the worker base already carries (`_directions_of`), over
+whatever the slot held; an agent with none leaves the slot alone. The preview
+shows the text (`directions`) and a `prompt` row, `added` into an empty slot,
+`replaced` over other directions, `skipped` when they match; the slot records no
+source agent. There is no kit record and the file does not track the agent; the
+file is the sum of what was added to it. A new crewmate's file is minimal
+(`mate_config.write_mate_config`): its name and empty additions, written without
+reading any agent file, so everything it can do at first comes from the worker
+base. A preview writes nothing and lists each `added` and each `skipped` item,
+plus every auto-approval the add writes
+(`allowedTools` rows, from either channel) and every tool the template newly
+excludes. The apply needs the preview's `revision` (`_plan_revision`, binding
+the file and the result shown) or answers `stale_revision`. The template's
+`excludedTools` join the file's. A template with `permissions` deny/ask rules,
+`toolsSettings` or hooks the worker would not carry (`uncarried_restrictions`)
+is refused `template_restrictions_uncarried`. Other refusals: `not_a_mate_file`,
+`template_unreadable`, `template_required`, `revision_required`,
+`invalid_spec`. Each code reads as a localized sentence
+(`components/crew/workerKitErrors.ts`), never as the code. The surface is **Add
+abilities** in the editor's Abilities section (`components/crew/WorkerKitPane.tsx`,
+only for `mode: "mate"`): picking an agent previews at once. A `stale_revision`
+or `revision_required` apply makes a fresh preview for the same agent and keeps
+the reason above it, because re-picking the same agent fires no change; a failed
+preview offers **Try again** and **Cancel**. A finished add says so under the
+picker ("Added N to <name>."), and when it granted auto-approvals it says those
+tools now run without asking and offers **Open Approvals**. Its rows name items through
+`components/crew/workerKitLabels.ts`, grouped by kind in a fixed order under a
+counted heading, added before skipped (`components/crew/workerKitGroups.ts`),
+each change word a badge tinted by its hue with a hue-coloured glyph, the word
+itself in `--text`; a tool selector reads as what the worker can use ("Can use
+every jira tool"). An add changes only the file: a running worker keeps the
+abilities it started with (`acp/harness/kas.mate_worker_projection` reads the
+file at session start). Every "Built from" shows a template's name, never an id
+(`components/crew/builtFromName.ts`); a crewmate that owns its file shows the
+generic "Mate" label (`builtFromName.mateAbilitiesLabel`). The Abilities
+section and its Tools / MCP Servers / Skills lists read one set, the WORKER's
+merged rows (`mate_capabilities.worker_summary`, the view's `worker.rows`); a
+skill row carries no label, and the pane names a `skill://` row with the
+preview's own `workerKitLabels.skillLabel`. The Customize > Crewmates roster
 (`pages/kiroCrewAgentsPageRosterLabels.ts`) names bindings the same way and
 shows **Memory store** as "Private to this crewmate", "Shared" or "Open to
 check".
 
 **Existing crewmates move at startup** (`kiro_crew.mate_config_migration`, off
 the loop before the slot restores, never gating readiness). Every crewmate whose
-`kiro_agent` does not name its own file is a candidate. A binding with an empty
-`member_id` is not a crewmate (an old `assistant`): skipped silently, and left
-out of `GET /api/agents` and `GET /api/members` (`mate_worker.is_legacy_binding`).
+`kiro_agent` does not name its own file is a candidate
+(the 2026-10-28 owner decision in docs/decisions, every crewmate on a user-level agent moves to the conductor
+supersedes the 2026-10-27 entry). A binding with an empty `member_id` is not a crewmate
+(an old `assistant`, the built-in `kirocrew-conductor`): skipped silently, except a used
+row a person or a package sync wrote on a user-level spec Kiro Crew does not own. Such a
+row (`source` `kirocrew`, `package` or `aim`; not `default`, the default agent, a legacy
+built-in or an app's row) whose DM thread holds a turn (the evidence the synced-crewmate
+prune keeps a row on) is first given a `member_id` and its own V2 store
+(`_move_with_identity`, `provision_member_memory(upgrade=True)`) once its crewmate file is
+written and proven, published together with its repoint in one compare-and-set (a failure
+before that publish retires the allocation), the id allocated as the upgrade allocates it
+so it keeps the name-derived slug its DM binding and member directory already use; a row
+that stays keeps the memory it had. A conversation from before the move keeps the template
+and store its own record names, so the notice says a new chat starts on its conductor, and
+the agent the crewmate ran on stays one a kiro-cli start is checked on
+(`moved_from_agents`, read from the ledger's `threads.<name>.from`). A row never chatted
+with is left for the prune. Its roster rows follow the rule for
+any row the person did not create: `GET /api/members` ships it with
+`dashboard_created` false and the page lists it once `has_dm_message` holds,
+and `GET /api/agents` (the pickers) lists it only when its DM thread holds a
+message (`mate_worker.is_legacy_binding` names the candidates; no name is
+special-cased). Otherwise the search still reaches it.
 A crewmate already on the conductor (the first crewmate) owes no notice and has
 no kit; its file is the default template's additions (`_default_template_file`).
 Otherwise its source is the agent `kiro_agent` names (a shared template or its
 `crew-<hex>` copy), read with its prompt inlined and governed, and the file is
 what it adds to the worker base (`migration_file`, via `worker_additions`):
 prompt, servers the base lacks with their approvals and selectors, skills, and
-its restrictions. Before any write, `dry_run` merges the planned file as a
-worker session would: nothing the source has beyond the base is lost, nothing
-is gained, no switched-off server starts, the prompt is carried, and the source
-has no `hooks`. What the base withholds by design is no loss
-(`_by_design`, 2026-10-19 owner decision). A crewmate whose id is also a
-user-level agent's name is skipped. A failing crewmate is left as it was, with
-one WARNING (`MigrationReport.dry_run_failed`), and is tried again next boot. A
-written file is read back and checked, and the kit record names its source.
+its restrictions. Before any write, `plan_move` merges the planned file as a
+worker session would (`differences`; `dry_run` is the same as one sentence)
+and sorts what differs (`docs/decisions/2026-10-27-every-used-crewmate-moves-to-the-conductor.md`).
+A **loosening** keeps the crewmate where it is: a grant the worker would gain
+or a switched-off server it would start. A `hooks` entry it would not run or a
+`permissions` / `toolsSettings` restriction it would not keep does not: the crewmate
+moves as it is, no tool is withheld for it, and its one notice names each restriction
+that no longer applies (`dropped_restrictions`, `restrictions_notice`); the governance
+ceiling still governs the merged worker spec. The two loosenings are cured
+first: a server the source switched off is written `{"disabled": true}`, and a
+grant the worker would gain is taken out of the file (`_strip_grants`), so
+nothing the old agent lacked is ever granted; the user gets it only through
+the capability card (`request_capabilities`, `mate_capability_catalog`).
+A **loss** (a grant the source had beyond the base that the worker cannot
+carry, such as a built-in tool the base does not mount, or its prompt) no
+longer keeps it: it moves, and its one upgrade notice names what it lost and
+what was withheld (`change_notice`, `MigrationReport.moved_with_changes`).
+What the base withholds by design is no loss (`_by_design`, 2026-10-19 owner
+decision). An agent that cannot be read is no reason to stay either: the
+crewmate moves onto the default template's file (`_default_template_file`,
+`MigrationReport.moved_from_default`), and its notice says
+the agent could not be read. An agent whose spec parses but cannot be read
+governed (its `file://` prompt does not resolve) still has its stated limits
+read raw, and the default template's file never loosens them
+(`_fallback_keeping_limits`): a server it switched off is written
+`{"disabled": true}`, a tool it excludes or disables goes into
+`excludedTools`, and a grant it never had is taken out. A hook or a
+`permissions` / `toolsSettings` restriction the file cannot carry moves with it
+and is named in its notice. Governance applies as before: the source is read
+governed, and the worker session still passes POLICY ∩ PROFILE. A crewmate
+whose id is also a user-level agent's name is moved only when that agent is its
+own private copy (a fork whose lineage is private to it and that its binding runs,
+`_crew_owned_shadow`): the copy is moved to `~/.kiro/mates/retired/` and its
+lineage dropped just before the repoint (`_retire_shadow`), so pointing the binding
+back and moving the file back is a rollback. Any other user-level agent under its id
+is not Kiro Crew's: the crewmate stays and is told once, and that spec is never
+written. A crewmate named after a spec Kiro Crew generates is skipped. Its file would
+never be read, and giving it another file name breaks every reader that knows a
+crewmate's file by its binding key (`mate_capabilities.binding_is_mate`,
+`member_mate_tools`, `mate_worker._claimed_file`, the revocations keyed by file id). Any other binding
+with no `member_id` stays out of the migration: a `member_id` on a store that is not
+its own V2 store fails every turn (`memory_stores.require_member_memory_store`), which
+is why a minted row gets its store with its id.
+A crewmate left where it was gets one WARNING (`MigrationReport.dry_run_failed`)
+and is tried again next boot. A written file is read back and checked against
+the same loosening rule. The ledger keeps
+how each crewmate moved under `reasons.<name>`.
 Only after every candidate is proven are bindings repointed, one at a time:
 the ledger entry (`~/.kiro/mates/migrated.json`, `threads.<name>`) is written
 first as intent, then the binding is repointed (the create path's locked
 write), then the crewmate is marked moved, so a crash in between still owes its
-thread pass. Nothing is deleted: setting `kiro_agent` back rolls the crewmate's
+thread pass. A moved crewmate is known by name and `member_id`
+(`migrated_ids`), so one deleted and made again under the same name is a
+candidate again; a name a ledger from before the ids lists stays moved. A
+ledger that exists but cannot be read, or is not an object, moves nobody and is
+left as it is, with one WARNING, until it is fixed or removed
+(`LedgerUnreadable`): read as empty it would move a rolled-back crewmate again
+and the next write would drop the thread passes it still owes. Nothing is deleted: setting `kiro_agent` back rolls the crewmate's
 new chats back; threads already moved stay on the conductor.
 
 **Its pre-upgrade threads move with it**
@@ -3731,30 +4286,135 @@ The migration writes `members/<slug>/worker_notice_owed.json` after a repoint.
 The gateway offers it to each open crewmate thread after the slots restore
 (`offer_upgrade_notices`), or at a thread's first turn end, and claims it with
 `O_EXCL` on `worker_notice_claimed.json`, so it is posted at most once, as one
-hidden turn (`NOTICE_PROMPT`, `[Worker upgrade]`) ahead of any report.
+hidden turn (`NOTICE_PROMPT`, `[Worker upgrade]`) ahead of any report. It names
+where the user sees what the worker can do and adds more (Edit mate,
+Abilities). A
+crewmate the pass left where it was (`dry_run_failed`, `skipped_no_source`,
+`copy_failed`, `repoint_failed`) owes its own notice instead
+(`mate_config_migration._tell_kept`, `members/<slug>/worker_kept_owed.json`),
+naming why: the dry-run reason as written, else a plain cause. It is claimed
+once the same way (`worker_kept_claimed.json`), so a crewmate still left behind
+at a later start is not told again. A crewmate that moves later drops its
+unclaimed kept record (`clear_kept_owed`), and a kept notice is never claimed
+once a moved notice is owed or claimed. A crewmate moved with a loss, a
+withheld gain or an unreadable agent has its sentence stored in the owed record
+(`changes`); the same one notice then appends it (`notice_prompt`,
+`upgrade_notice_changes`) and tells the conductor to raise any withheld grant
+with `request_capabilities` on the user's next message. One claimed while the thread is busy
+waits for its next turn end, like a pending report
+(`test/test_mate_upgrade_notice.py`).
 
 **What the worker lacks, the conductor asks for.** A worker that lacks a tool or
 a skill says so in its report; it has no request tool (its spec lists
-`@kirocrew-mate/request_capabilities` in `excludedTools`,
-`mate_worker.MATE_WORKER_EXCLUDED_TOOLS`). Its source-defined prompt is the
-default prompt followed by `mate_worker.MATE_WORKER_PROMPT`
+`@kirocrew-mate/request_capabilities` and `@kirocrew-mate/find_capabilities` in
+`excludedTools`, `mate_worker.MATE_WORKER_EXCLUDED_TOOLS`). Its source-defined
+prompt is the default prompt followed by `mate_worker.MATE_WORKER_PROMPT`
 (`service_agents._install_mate_worker_agent`): a task that needs a tool, server
 or skill it does not have is reported, not worked around, on a first line
 `MISSING CAPABILITY: <what> -- <why>` (`mate_worker.MISSING_CAPABILITY_PREFIX`).
 The `[Worker report]` the crewmate's thread receives finds that line in the
 excerpt (`mate_thread_wakes.missing_capability`, Markdown emphasis and quote
-marks tolerated, bounded) and adds one line naming the gap: `request_capabilities`
-is refused on that wake turn (`not_user_turn`), so the conductor tells the user
-and asks with the card on the user's next turn. A reply line that says a step is blocked and names the
-missing tool gets the same line (`mate_thread_wakes._blocked_for_a_tool`). Before
-telling the user a source is missing, the conductor hands a worker the question
-of where it lives (`conductor.mate_tools_identity`). The card is the question
-to the user, so the chat does not ask first. Pressing it applies through `/api/agents/{name}/capabilities`, which
-for a crewmate that owns its file is `mate_capabilities.put`: the gateway
-writes `~/.kiro/mates/agents/<id>.json` in place under its optimistic lock,
-never the user's MCP config; neither the conductor nor the worker writes the
-file. The worker picks the change up at its next spawn, when the projection
-merges the file again.
+marks tolerated, bounded) and adds one line naming the gap and pointing at
+`find_capabilities` and `request_capabilities`. A worker that states the gap in
+prose instead gets the same line when one line of its reply says a step is
+blocked (or could not be done) and names the tool or server it lacked ("blocked
+on issuetracker (no issuetracker tool)"; `mate_thread_wakes._blocked_for_a_tool`);
+a blocked step that names no tool, or a tool named with no blocked step, adds
+nothing. The conductor also learns what
+its worker can use when it hands work off: the result of its own
+`session_create` and `session_send` to a worker of the same crewmate (both
+attested execution records: the caller a conductor, the target a
+`kirocrew-mate-worker` record with the same `member_id`) carries
+`worker_capabilities`, the worker's MCP servers and the servers this gateway has
+loaded that it lacks and the user has not switched off (one switched off cannot be
+added, so it is not offered; `dashboard/crewmate_dispatch_capabilities.own_worker_note`,
+`mate_capability_catalog.dispatch_summary`: steps 1 and 2 of `find_capabilities`,
+names only, cut to a plain character set and twelve per line; the registry stays
+on demand), which the MCP tool appends to its reply. Every other caller and
+target gets nothing, and nothing is added to the conductor's per-turn context
+(`test/test_crewmate_dispatch_capabilities.py`). Before telling the user a
+source is missing, the conductor checks what the worker and the gateway can
+reach, also when the ask names no system (what users said, reported or
+complained about lives in some source): `find_capabilities`, or a worker handed
+the question of where it lives (`conductor.mate_tools_identity`). The gateway
+adds nothing to a reply that says something is unavailable; the hand-off note
+above already shows the catalog. Once the catalog
+names the addition the work needs, the conductor raises the card straight away
+(its prompt and the `find_capabilities` description say so): the card is the
+question to the user, so the chat does not ask first. On the worker-report
+wake, which is not a user turn, only a card whose additions are all servers
+this gateway already runs is admitted (`member_self._gateway_servers_only`);
+any other `request_capabilities` is refused there (`not_user_turn`), so the
+conductor tells the user and raises the card on the user's next turn. The conductor reads
+the catalog with `find_capabilities` (`POST /api/member/self/capabilities`,
+`dashboard/handlers/member_capability_catalog.py`, any turn in the crewmate's
+own thread, refused `not_a_crewmate` elsewhere and `no_crewmate_file` for a
+binding that owns no file), which answers in order: `worker` -- what
+`resolve_worker_spec` projects for this crewmate (servers, the tools each runs
+without asking, the tools switched off, skills; `mate_capability_catalog.worker_has`);
+`gateway` -- servers (`mcp_discovery.list_servers`) and skills (the capability
+editor's own catalog) loaded here that the worker lacks (`gateway_lacks`); and,
+for a `query`, `registry` -- `mcp_discover.search_registry`, the search behind
+`/api/mcp/discover`, with every provider field redacted. It never returns a
+transport. The conductor then calls `request_capabilities` with a draft naming
+`additions`: `{server, source: "gateway"}` copies this gateway's own entry
+(`_find_server_spec_anywhere`, minus `autoApprove`, `disabled` and
+`disabledTools`) of a server the gateway lists as switched on
+(`member_capability_catalog._switched_on`), and only when that entry sets no
+`env` or `headers` value and nothing in it is masked by
+`agent_capabilities.safe_view` (a credential argument such as `--api-key <value>`,
+`--token=<value>` or `-e NAME=<value>`): a card's params and plan reach the proposing
+crewmate, so an entry that may hold a credential is refused
+`carries_settings` and the conductor tells the user to add it in advanced
+settings; `{server, source: "registry", registry_id}` takes the official
+registry's install plan (`mcp_discover.official_install_plan`, the spec
+`/api/mcp/discover/install` would write, under the name that install would give
+it); `{skill}` adds a loaded skill; each server may name `auto_approve` tools.
+`additions_to_draft` resolves them into `mcpServers` / `tools` / `allowedTools`
+/ `skills` operations and an `origins` map, refusing `already_has`,
+`not_on_gateway` (absent or switched off), `carries_settings`, `name_in_use` (a registry name this gateway already runs),
+`unknown_skill`, `registry_unavailable` and any other provider than the official
+registry (an edition provider installs into the user's config, not the
+crewmate's). A draft of additions takes only `additions` and `enroll`
+(`invalid_additions` otherwise): the card folds its raw rows under Details, so a
+raw operation riding along would be folded there unseen. The `crewmate.capabilities` card shows the full launch line, a
+"comes from" row per server (this gateway's only while the draft's entry still
+equals, key for key, what a file takes from the gateway's switched-on entry
+(`transport_for_file`: command, args, env, headers, cwd and the rest),
+`member_capability_catalog.gateway_matches`, re-read when the card is built; the
+registry id otherwise). The `origins` map is the gateway's own record:
+`propose_change` (`POST /api/cards/agent/propose`) refuses a
+`crewmate.capabilities` card that carries one (`invalid_param`), so only
+`request_capabilities` sets it, after resolving the additions and a "runs without
+asking" row listing exactly the approvals the preview kept after the governance
+ceiling (`mate_capability_catalog.origin_rows`). The card's main view is one
+plain line per addition (`addition_summary`: a row carrying `addition`, which
+the dashboard words in the reader's language as what the worker gets, where it
+comes from and what runs without asking, named by the crewmate's display name; an addition with no `auto_approve` says it adds no new grant to run a tool unasked and that the current approval settings still apply, never that every call asks, since the crewmate's own approval mode, Trust included, still decides);
+every raw row above is kept on the card marked `detail` and drawn under a
+collapsed Details. When every server the card adds is one this gateway already
+runs as drafted (`only_gateway_servers`), no new outside code comes in, so the
+card carries no `code_exec` and shows no third-party warning; an approval it
+would widen keeps its acknowledgement: `widen` is measured from the preview's
+impact as on any capabilities card, so an auto-approved tool or a whole-server
+grant (`@server`, worded "every tool" with `auto_approve_all` on the addition)
+needs the "runs without asking" checkbox, and each widening `allowedTools` /
+`autoApprove` row stays in the main view rather than under Details. A gateway
+addition with no new approval carries neither flag; a registry install keeps
+both. Pressing it applies through
+`/api/agents/{name}/capabilities`, which for a crewmate that owns its file is
+`mate_capabilities.put`: the gateway writes `~/.kiro/mates/agents/<id>.json` in
+place under its optimistic lock, never the user's MCP config; neither the
+conductor nor the worker writes the file. The worker picks the change up at its
+next spawn, when the projection merges the file again. A card press starts no
+turn, so once a `crewmate.capabilities` card reaches applied or partly applied
+(`handlers/change_cards._complete`), the crewmate's own thread gets one hidden
+`[Capabilities added]` turn once it is idle, when the card's `params.member` is
+that thread's crewmate (a card for another crewmate raised there wakes nobody)
+(`goal_setup.schedule_capabilities_nudge`, the goal nudges' wait, piece
+`goal_setup.capabilities_added`): it names the card's title and says a worker
+already running started without the addition, so the work that waited on it
+goes to a new worker session.
 
 **A revoked approval stays revoked.** The worker base wins for every approval
 it grants itself, so removing one in a crewmate's Approvals (an `allowedTools`
@@ -3766,7 +4426,17 @@ switched off (`present: false`, `mate_capabilities._approval_rows`), so it can b
 turned back on, which drops the record. Revocations are written before the file
 and re-grants only after it.
 
-**Other guards.** A create whose template has the crew's own name is refused
+**Other guards.** A create names its starting template, and the only one it
+accepts is the built-in worker, `kirocrew` (`DEFAULT_CREWMATE_TEMPLATE`).
+`adopt_own_file` writes the source-free worker file and reads no template, so
+another template's tools, `excludedTools`, `disabledTools`, deny rules, servers,
+skills and prompt would never reach the crewmate. Any other value is refused
+before anything is written, by one rule both doors call
+(`mate_config.start_template_refusal`, judged against the config key
+`key_new_crew` derives, not the typed name): `400 mate_template_unsupported` on
+the route, exit 1 with the same sentence on `agent create`. Abilities from
+another agent are added afterwards in the crewmate's editor. A template named
+after the crew's own key passes that rule and is refused
 `409 template_name_in_use` (the route and `agent create`): the crewmate's file is
 resolved under its name, so the copy would be skipped. A stored `member_acp_backend: "kiro"` runs as `kas`, the Kiro
 backend that carries a member DM's dispatch tools, logged once per process at
@@ -3778,6 +4448,173 @@ read-time pass (`kas_agents._ceiling_permitted`) withholds again, so an addition
 cannot lift the worker above POLICY ∩ PROFILE; a withheld grant leaves the
 server mounted and its calls prompting. Crew's PreToolUse gate evaluates every
 call regardless.
+
+### A crewmate's own harness
+
+`agents.<name>.acp_backend` pins the agent harness one crewmate's sessions run on,
+spelled as `agent.acp_backend` is (`kiro`, `kas`, `claude`, ...). Empty, the
+default, inherits `agent.member_acp_backend` exactly as before the field existed.
+
+- **One gate, one more tier.** `members.select_provider_backend` takes the pin as
+  `crew_backend`: an explicit `spawn_run(backend=...)` still wins, then the pin,
+  then the member route, then the configured default. Every caller passes the
+  argument (`None` included); `test_crewmate_harness.py` fails on a call that
+  omits it.
+- **Which sessions.** `crewmate_harness.crewmate_for_session` names the crewmate
+  from the session key alone: its `member-<slug>` DM thread, or its own worker,
+  whose `member_id` `mate_worker.note_worker_session` records beside the worker
+  key. No other session (a template chat, a sub-agent, a cron turn not on the
+  worker) takes the pin.
+- **Fails closed, before the gate.** A pin this gateway cannot start (not
+  registered, denied by policy, unservable on this host, including one that was
+  selectable when it was saved) raises `CrewmateHarnessUnavailable`
+  (`crewmate_harness_unavailable`) before any process exists, and the chat shows
+  the reason. It never degrades to kiro-cli, unlike the other tiers. The check is
+  `crewmate_harness.crewmate_backend_pin`, run as the gate's `crew_backend`
+  argument, so the gate only ever sees a confirmed pin and never raises
+  (harness-parity H17, the one exception to H3). Displays that name the pin as
+  stored read `crewmate_stored_pin`, which never raises.
+- **A `kiro` pin on a v3 kiro-cli.** A stored `kiro` pin moves onto KAS under the
+  same rule as a stored `agent.acp_backend: kiro` (`CrewBackendPin.resolve` calls
+  `kiro_cli_pick_backend()` when `agent.kas_bundle` is off), for the DM chat and
+  the workers alike, while the stored value still reads `kiro`
+  (`docs/decisions/2026-10-28-a-kiro-cli-choice-runs-on-kas.md`).
+- **Save time.** `PUT /api/agents/{name}` accepts `acp_backend` only as `""` or a
+  selectable harness, and judges `model` and `worker_model` against the harness
+  the record will hold, re-judging the stored pins when the harness changes.
+  Without a harness change, an inherit value and a value equal to the stored
+  one judge nothing (`crewmate_harness.judges_a_model_edit`), both in the
+  pre-lock probe and in the locked check: the editor re-sends both models with
+  every save, so an unrelated edit to a crewmate whose stored pin has since
+  become unstartable still saves, while a changed real model is still refused
+  with the `crewmate_harness_unavailable` reason. Saving it rebuilds the provider
+  factory (`refresh_defaults`), and so does an edit outside the dashboard
+  (`session_parts.config_apply`).
+- **Read path.** Only the owner-only `GET /api/agents/resolved-model` reads the
+  pin (`acp_backend`, the effective `harness`, `harnesses`, `worker_harnesses`,
+  and `harness_error` when it cannot start). `GET /api/agents` and
+  `GET /api/members` leave it out. `GET /api/models?backend=<harness>` lists one
+  harness's models for the picker.
+- **When it applies.** A save that changes the pin reloads the crewmate's live
+  DM chat (`crew_update.api_kirocrew_agent_update`) through `reload_slot_session`,
+  and writes the record in that reload's `after_reset_in_lock` hook: after the
+  busy and sub-agent guards pass and the old process is gone, with the slot and
+  session locks still held. A turn that cold-starts in the meantime waits on the
+  session lock, so the next message starts on the new harness. The same hook
+  refreshes the provider factory and clears the slot's own `model`,
+  `reasoning_effort` and pending-pick state, so that session inherits the
+  record. A dormant bound DM's persisted model and effort are cleared through
+  the guarded metadata writer without reopening its tab, including when another
+  DM slot is live. The transcript and resume pointer stay; the provider-switch check
+  drops the old harness's resume and replays the conversation. While a reply,
+  a queued message or sub-agents run on that chat, the save is refused with 409
+  `crewmate_harness_busy`, naming the crewmate, and nothing is written. A mate
+  with more than one live DM chat is refused the same way, before any teardown,
+  until the others are closed, and the permission compare-and-set
+  (`memory_stores.check_member_approval_mode`) runs before the reload. A save
+  that leaves the pin unchanged reloads nothing, and with no live chat it is a
+  plain write. Workers already running keep their harness; new workers start on
+  the new one.
+
+### Dynamic capabilities
+
+**A per-crewmate preview, off by default.** Each crewmate's record carries
+`dynamic_capabilities` (`agents.<name>` in `config.json`,
+`KiroCrewAgentConfig.dynamic_capabilities`, a strict bool; absent or any other
+value is off). It holds only that crewmate's crewmate-driven capability path: it
+finding a skill or an MCP server for its own worker and asking for it on a card.
+There is no global key. It is set on the crewmate's own Profile card
+(`pages/members/CrewProfileSettings.tsx`: a **Dynamic capabilities** row with a
+**Preview** tag), which writes
+`PUT /api/agents/{name}` `{dynamic_capabilities}` for that crewmate alone; the
+roster serves it. `kiro_crew/crewmate_dynamic_capabilities.py` reads it per
+request: `enabled_for(member)` is the crewmate's flag,
+`restricted_for(member)` is the flag off. A check with no crewmate in
+scope (no name, not on the roster) is off. Both capability tools stay listed on
+every crewmate's conductor: the pooled `kirocrew-mate` server caches a session's
+tool policy with no way to drop it, so a tool cut there would outlive a Turn on.
+The routes read the flag on every call instead, so a change takes effect at once,
+also in a running session. Off, for that crewmate:
+
+| Entry point | Off |
+| --- | --- |
+| `member_capability_catalog.api_member_self_capabilities` | `403 dynamic_capabilities_off` for that crewmate (`find_capabilities`' route), pointing at `request_capabilities` |
+| `member_self.api_member_self_propose` | `request: capabilities` raises the Preview opt-in card on its first call (below); after that, `409 opt_in_pending` while it waits and `403 dynamic_capabilities_off` once it was declined, expired or failed; the other crewmate cards are proposed as before |
+| `handlers/change_cards.api_cards_agent_propose` (`_crewmate_drives_capabilities_off`) | 403 `dynamic_capabilities_off` for a `crewmate.capabilities` card from the crewmate's thread or its worker (judged by that worker's own crewmate; one that cannot be named counts as off); any other caller proposes it |
+| `crewmate_dispatch_capabilities._note` | no capability summary on `session_create` / `session_send` |
+| `mate_thread_wakes.report_prompt` (`_missing_capability_line`, read in `_flush` off the loop) | a worker's gap (the `MISSING CAPABILITY:` line or the prose "blocked, no X tool") gets `worker_report.missing_capability_manual`: tell the user, and ask with `request_capabilities` on their next message (no `find_capabilities`) |
+| `handlers/change_cards._complete` | no `[Capabilities added]` nudge (the card's `params.member`) |
+| `context_assembly/member.build_member_section` | `conductor.mate_tools_identity_manual` and `conductor.crew_log_section_manual`: no `find_capabilities`; a gap goes to `request_capabilities`, as before the preview |
+
+**The Preview opt-in** (`kiro_crew/mate_tool_access.py`). With the flag off,
+`request_capabilities` stays mounted, so no crewmate loses it. Its first call
+(`member_self.api_member_self_propose`, `request: capabilities`) is checked and
+resolved exactly as with the flag on (the user-turn rule, `additions_to_draft`),
+then raises ONE `crewmate.update` card instead of the capabilities card, writing
+`fields: {dynamic_capabilities: true}` for the calling crewmate alone (it adds no
+capability), titled "Allow <name> to ask you for tools its worker needs? Each
+one still needs your approval.", drawn with the Profile switch's **Preview**
+badge and the buttons **Turn on** and **Not now** (`cardRegistry.isToolAccessCard`;
+no other card wears them). The call answers that card with `opt_in: true`, and
+`mcp_mate` tells the conductor its request follows once the user turns the
+preview on, so it does not ask again. The request is held in the crewmate's
+record, written BEFORE the card is raised (`mate_tool_access.reserve_offer`,
+which also claims the one ask, so a second call at the same time gets
+`409 opt_in_pending`): a record that cannot be written raises no card
+(`503 opt_in_unrecorded`), a card that is then not raised takes the record back
+(`release_offer`), and the card's id is filled in after (`bind_card`; while it is
+missing the offer counts as waiting for `RESERVATION_GRACE_SECS`, then as a card
+the store does not hold). **Turn on** applies the card (Undo writes the flag back off); the gateway
+then raises the held request as its own `crewmate.capabilities` card in the same
+thread, resolved again against the gateway as it is now and taken once
+(`member_self.continue_after_opt_in`, `mate_tool_access.take_held`), reloads the
+conductor so its session-start context names `find_capabilities`, and wakes it with `goal_setup.tool_access_on`,
+or `goal_setup.tool_access_on_ask` when the held request could no longer be
+raised (`goal_setup.schedule_tool_access_nudge`, from
+`handlers/change_cards._complete`). Only a card that turned on the thread's OWN
+crewmate does this (its `params.name` is the thread's crewmate; a card for
+another crewmate raised in this thread wakes nobody here), and
+`continue_after_opt_in` raises nothing while that crewmate's flag is off
+(`dynamic_capabilities_off`), since the raise skips the caller's own flag check. **Not now** cancels the card. It is asked
+once per crewmate: `~/.kiro/mates/tool-access.json` records the card by crewmate
+name, and the next call records its outcome from the card store (`applied`,
+`declined` for a cancelled or undone card, `expired`, `failed`; a card the store
+has pruned counts as `expired`, and a store that cannot be read leaves the
+record waiting). While the card
+waits a call answers `409 opt_in_pending`; after any outcome, with the flag
+still off, `403 dynamic_capabilities_off` with a plain line (tell the user what
+the worker needs and that they can add it, or turn the preview on, in advanced
+settings), and no second card (`test/test_mate_tool_access.py`).
+
+Every capability approved for a crewmate (its file's additions, on or off this
+switch) is mounted on every one of its workers: the conductor picks nothing per
+hand-off, so a worker started after a grant has it. One already running is
+reloaded in place (`dashboard/crewmate_worker_reload.py`): after a
+`PUT /api/agents/{name}/capabilities` on a crewmate that owns its file (a
+`request_capabilities` card applied, or the user adding one in advanced settings),
+each of the crewmate's live workers (a `template` record on `kirocrew-mate-worker`
+with its `member_id`) is torn down with the tab menu's Reload teardown
+(`reload_slot_session`) and resumes the SAME conversation on the rebuilt spec; no
+new worker is opened. Only an idle one is reloaded; a busy one (a turn in flight,
+a queued message, attached sub-agents, or a turn that starts inside the teardown)
+is recorded as owed on the state and reloaded after its next top-level turn end
+(`note_turn_end`, from `chat_turn.queue_cycle._end_turn_tail`, a few short tries
+each re-checking idle). The busy check runs before the no-provider check, so a
+worker still cold-starting (its turn dispatched, its provider not yet
+registered, spawning on the kit it already projected) stays owed too. One not
+running reads the new spec at its next spawn.
+The `[Capabilities added]` nudge tells the conductor to send the waiting work back
+to that same worker (`test/test_crewmate_worker_reload.py`).
+
+Not this switch's, so on either way: the user adding or removing worker
+capabilities by hand in the crewmate's advanced settings
+(`/api/agents/{member}/capabilities` through `mate_capabilities.put`, and the
+custom agent template through `/api/agents/{member}/worker-kit`), the worker kit
+built from base, template and what the user added, the conductor, the hand-off,
+heartbeat and the Dashboard. The suite runs with every crewmate's
+flag on (`test/conftest.py::_crewmate_dynamic_capabilities_on`, the module's
+`_override` seam); `test/test_crewmate_dynamic_capabilities.py` pins the
+per-crewmate reads.
 
 ## Selection: the `select_crew` contract
 
@@ -3870,7 +4707,8 @@ matter:
   key.
 
 These entries are **intent, not execution**: binding a crew does not oblige the
-model to delegate to it, and no `via="spawn"` execution entry exists today.
+model to delegate to it. The run itself is recorded as `via="spawn"` when a
+`spawn_run(crew=...)` run's session opens.
 
 ## Delegating to a bound crew
 
@@ -3888,6 +4726,22 @@ owner/app and governance permissions. Memory ownership itself adds no separate
 cross-member ACL. Continuations retain the original run's member/store even if
 a different member now requests the continuation. The gateway still requires
 ordinary authenticated session identity before accepting a parent session.
+
+A crewmate whose binding owns its file chats on `kirocrew-mate-conductor`, whose
+spec lives in the crewmate folder and is no agent a sub-agent loads by name. A
+`spawn_run(crew=<member>)` (or `target_member`) that names no `agent` runs on
+that crewmate's WORKER instead: `mate_worker.spawn_worker_execution` turns the
+resolved `member` selection on the conductor into the worker's record shape (a
+`template` selection on `kirocrew-mate-worker`; member, store, memory mode and
+app kept), the shape a hand-off and a scheduled turn give it. Answered from the
+record alone, so it reads no file on the loop. The run is never looked up by
+name (`_validate_agent` is unchanged, so neither the conductor nor the worker
+can be spawned as `agent=`); the run turn publishes the session as the
+crewmate's worker (`note_worker_session`), so its backend selection and kit
+follow the crewmate, and refuses a worker whose backend cannot carry its kit
+(`worker_kit_backend_refusal` over `crewmate_worker_backend`, or the spawn's own
+`backend`) with `capability_harness_unsupported`. A crewmate on a shared
+template, and a crew spawn that names its `agent`, are unchanged.
 
 A named-but-unknown agent is **refused**, never silently answered by the default
 agent, with the machine-readable code `agent_not_found`. That refusal is a
@@ -4021,7 +4875,59 @@ its own standing thread. What remains, and why:
   arm. With no slot able to carry the mode the entry is unreachable, and it is
   left in place rather than re-litigating a security boundary in a removal PR.
 
-The sidebar's create-menu entry that used to create a crew-mode session is now
-a "Crew Members" door: it opens `/members` when `PREVIEW_CREW` (Settings →
-Developer → Feature Previews) is on and lands on that flag's card when it is
-off.
+The sidebar's create menu no longer carries the entry that used to create a
+crew-mode session: `/members` is reached from its rail item.
+
+## Crew Mode in the dashboard: the person's lists
+
+The server rules are in [Crew Mode](#crew-mode) above: a conductor's **crew
+members** are the rows stamped `crew_root: <root key>`, the root carries
+`crew_mode_root: true`. The dashboard reads every row (`GET /api/chat/slots?crew=all`,
+and the live slot frame carries them all) and leaves crew members out of the
+person's lists on the client.
+
+**The dashboard's Crew Mode is a feature preview, default off**
+(`PREVIEW_CREW_MODE` in `website/src/utils/previewFlags.ts`, the **Ultra Mode** card
+in Settings > Developer > Feature Previews, a plain switch with no preview dialog). `crewModeEnabled()` in
+`website/src/lib/crewMode.ts` is the one read of it, and `useCrewMode()` subscribes
+to the same key for a component or memo that must redraw on a flip. Every rule in
+this section and in [Crew Mode](#crew-mode)'s client half reads through it:
+
+| Preview | What the client does |
+|---|---|
+| on | Everything below, unchanged |
+| off | `gatewayRunsCrewMode()`, `isConductorAgent()` and `runsCrewMode()` answer `false`, as for a gateway without Crew Mode: no composer switch, no welcome, and the agent picker and chords list every conductor. The one ungated read is the row's raw `crew_mode_root` stamp, the server's own classification of a Crew Mode root (`crew_mode.slot_is_crew_mode_root`: a Persistent session nothing dispatched): a root that has a user message offers no agent picker (main pane or Split View pane, and no Crew Mode mark), and `agentCycleTarget` answers `null` on it (its `locked` argument), since the gateway refuses every such switch (`409 crew_mode_locked`). A conductor chat that is no root (Incognito, Temporary, dispatched) keeps its picker and chords, as the gateway lets it switch; the chords still never land on a conductor. A Crew tab restored from storage is withheld from the side panel strip, its stored state kept. `crewModeRoot(row)` and `crewRootOf(row)`, the only reads of the two stamps, answer `false` and `''`: no crew card, eyebrow, filter row (a stored Crew Mode filter is turned off, its key rewritten to `0`), Crew tab, breadcrumb or approval card; `crewModeView` hands the rows back unchanged, so a crew member is an ordinary row; its approval and finished turn alert like any chat's, in its own name and slot (`crewWorkerRoot` answers `''`, `crewWorkerQuiet`); and its approval is decided where it is shown |
+
+A chat already in Crew Mode, read with the preview off, is an ordinary chat on its
+conductor agent: its transcript, composer and agent label as for any chat, and its
+crew members are rows of the list. Once it has a message it offers no agent switch,
+since the gateway keeps it on its conductor. Nothing is hidden or unreachable. The gateway
+does not read the flag: the Crew Mode lock (`409 crew_mode_locked`), the unfiled
+crew members and the stamps all stay, so turning the preview back on shows the same
+Crew Mode chat.
+
+| Rule | Where |
+|---|---|
+| The one client filter is `crewModeView(rows, rootsOnly?)`: drop every `crew_root` row whose root is a row of the same list; `rootsOnly` keeps the roots alone. A crew member whose root is closed keeps its row -- no Crew panel lists it, the server keeps its stamp, and its own approval or question must still reach the person -- so the sidebar, All Dashboards and the Command Bar's Needs You show it and its approval as any chat's. `selectPersonSlots` is the memoized store read of it. The `crew_root` drop went live with the Crew panel (the side panel's Crew tab), which lists a root's crew members; the part before wired every person-facing list through this one function with the drop inert, so no list ever lost a row it could not reach elsewhere | `website/src/lib/crewMode.ts`, `website/src/store/personSlots.ts` |
+| Neither a close nor the page's own pick lands on a crew member: `deleteSlot` leaves `crew_root` rows out of both landing sets (the sidebar's displayed order and recency), and the chat page's auto-open reads `autoOpenRows`, so a first visit or a close with only crew members left creates an ordinary chat. A crew member opened on purpose stays open | `store/chatSlice.ts`, `lib/crewMode.ts`, `pages/chat/useChatPageSessionController.ts` |
+| `website/src/lib/crewMode.ts`, `website/src/lib/crewWorkers.ts`, `website/src/pages/chat/command-center/CrewWorkerList.tsx`, `website/src/pages/chat/command-center/UltraCrewPanel.tsx`, `website/src/components/crew/` | The dashboard's Crew Mode helpers (`runsConductor`, `withoutConductors`, `crewModeView`, `agentCycleTarget`, the worker groups), the side panel's Crew tab (shown as Ultra Mode) with its Status \| List switch, and the crew marks (badge, eyebrow, breadcrumb, the turn-on effect) |
+| The Crew tab's list has two sources. The slot store's own rows -- every open slot stamped `crew_root` for the root, a peer's left out -- are shaped as list rows (`liveCrewWorkers`: state to status and group, lineage from `created_by`) and are always in, so a crew member the person's lists leave out is reachable from the tab whether or not the gateway serves `GET /api/chat/slots/{root}/crew-workers`. That route adds what the store has not (closed crew members, the ledger item, the summary, the server's own group) and its rows win where both name a key (`mergeCrewWorkers`). A 404 on a crew route (an older gateway, or the part that serves it has not landed) is NO DATA, not a failure (`crewRouteNotServed`): the list, the sidebar row's crew summary and the Timeline say nothing is wrong and hand nothing to the agent -- the list shows the open crew members or "No crew yet", the Timeline one muted line that this gateway has no timeline yet -- and the route is not polled again. A read that fails for a real reason still says so | `website/src/lib/crewWorkers.ts`, `website/src/pages/chat/command-center/CrewWorkerList.tsx` |
+| A PEER's crew members stay rows in the federated session list (`sessionSources.ts`): a local crew member leaves the list because its root's Crew panel lists it, but a peer's root opens in the crew window, which has no such panel, and the panel reads this gateway's slots and routes, so for a peer's crew member the list is the one way in. The rows keep their `crew_root` / `crew_mode_root` stamps for the marks | `website/src/pages/chat-sidebar/sessionSources.ts`, `website/src/hooks/useInstanceSessions.ts` |
+| What a hidden crew member (its root open) owes the person rides on its root. The Command Bar's Needs You lifts a Crew Mode root whose workers wait on a tool approval with the Approve pill and the count (`crewWaitingApprovals` over the FULL slot set, the count the fleet page's command center uses); the root's own approval, when it has one, reads as any session's. The sessions view still lists no crew member | `website/src/apps/command-bar/CommandBarOverlay.tsx`, `website/src/apps/command-bar/CommandBarOverlayRootRows.tsx` |
+| Crew panel data: a worker's group (`approval`, `working`, `with_conductor`, `waiting`, `done`), the root summary, the sub-dispatcher order, the Status view's milestone state, Done-when and Recap rules, and the steer receipt notice | `lib/crewWorkers.ts`, `pages/chat/command-center/UltraCrewPanel.tsx`, `lib/crewSteerNotice.ts`, `types/index.chat.ts` |
+| While a crew member is on screen, the Crew tab opens with a **Back to main chat** row (`CrewPanelBack`, above both views); it reads **Open main chat** while the root is closed, and then reopens the root from its saved transcript before opening it. Desktop keeps the side panel open on the root; a phone lands on the chat. A failed reopen shows the inline notice under the row (`commandCenter.worker_reopen_failed`, with the agent hand-off). The row takes its label and action from `useCrewBack`, the one place a Back comes from; the worker view's breadcrumb is plain text read through `useCrewRoot` and has no control | `components/crew/useCrewBack.ts`, `pages/chat/command-center/CrewWorkerList.tsx`, `pages/chat/command-center/UltraCrewPanel.tsx`, `components/crew/CrewWorkerBreadcrumb.tsx` |
+| While one of a root's crew members is the active chat, the sidebar marks the root's row as its parent: class `session-crew-parent`, `data-crew-parent`, and a screen-reader line (`components.crewMode.parent_row_hint`). `ChatSidebar` derives `crewParent` from the active slot's `crew_root`; `rowView` sets `isCrewParent` only when no crew window covers the pane, and the mark never makes the root the active row | `pages/ChatSidebar.tsx`, `pages/chat-sidebar/rows.ts`, `pages/chat-sidebar/SessionRow.tsx`, `styles/crew-mode.css` |
+| The List view folds finished members (group `done`) under one **Finished · N** row, folded by default. The open or folded choice is kept per browser in localStorage (`CREW_FINISHED_OPEN_KEY`, `mc-crew-workers-finished-open`). The fold hides every finished row, the one on screen included; the Back row stays the way to the root | `pages/chat/command-center/UltraCrewPanel.tsx`, `pages/chat/command-center/CrewWorkerList.tsx` |
+| The List view shows a search box (`CrewWorkerSearch`) from `CREW_WORKER_SEARCH_MIN` (6) crew members up, or while a query is set. It matches a member's title and task line, case-insensitive after NFKC normalization, so accents still count (`searchCrewWorkers`), finished members included. The query is kept per root for the browser tab in sessionStorage (`mc-crew-workers-search:<root>`), so opening a match keeps the search. No match shows one status line (`crew-search-empty`). Esc clears a typed query; on an empty box Esc is left to the panel. While a query is set, finished matches show unfolded and a toggle does not change the stored fold; clearing the query returns the Finished row to the stored choice. The Status view has no search | `pages/chat/command-center/CrewWorkerList.tsx`, `pages/chat/command-center/UltraCrewPanel.tsx`, `lib/crewWorkers.ts` |
+| `withoutConductors(choices)` is the one filter a normal chat's agent picker and the Split View pane picker read their rows through: every conductor template left out, since the composer's Crew Mode switch is the way onto one (crewmates kept whatever their name). The part before wired both pickers through it with the rule inert; the part that added the switch turned it on in this one function. The agent chords (`agentCycleTarget`) skip every conductor whatever this filter does, so a chord never turns Crew Mode on by accident. `useAgents` keys both picker memos on the catalog's Crew Mode fields (`crewCatalogKey`), so a catalog read that changes only `agent.crew_mode_agent` re-filters the picker even when the roster is unchanged. A chat already on a conductor has no picker to mirror, so the chords do nothing there (the server refuses to move a Crew Mode root) | `website/src/lib/crewMode.ts`, `website/src/hooks/useAgents.ts` |
+| A crew member's pending tool approval is decided only on its conductor's approval card (`crewApprovalDecidableHere`); every other surface in `CREW_APPROVAL_SURFACES` (the crew member's own composer in the main pane or a Split View pane, the conductor side panel's Approvals, All Dashboards' Needs you) shows it as information with a way to that card; when the conductor is closed, that way reopens it from its saved transcript first, since its key is no live slot. A crew member's approval always alerts the person (`docs/decisions/2026-10-29-crew-member-approvals-notify.md`): while its conductor is open the chime, unread mark, bell note, banner and OS toast point at the conductor, under the crew member's name, and the note offers no Approve or Reject (`crewWorkerRoot`); the conductor's row shows the wait even while it runs, unless the conductor itself owes the person a decision (`crewWaitingApprovals`). With the conductor closed there is no card to show it, so it alerts like any chat's. A session that is no crew member keeps its usual controls everywhere | `lib/crewMode.ts`, `pages/chat/page/ComposerDockView.tsx`, `components/ChatPane.tsx`, `pages/chat/command-center/model.ts`, `pages/chat/command-center/AttentionCard.tsx`, `hooks/websocket/approvals.ts`, `hooks/websocket/chatStream.ts`, `components/notifications/NotificationFeed.tsx`, `pages/chat-sidebar/SessionRow.tsx` |
+| The chat page keeps TWO lists (`pages/chat/page/pageEnvironment.ts`): `chatPageSlots`, every chat-surface row with crew members included, which the page's active-slot rules read so a crew member opened from its root's Crew panel stays the active chat in the main pane; and `personChatPageSlots`, the same list through `crewModeView`, which the collapsed-sidebar flyout lists and the unread count counts (`surfaceUnreadKeys`). The global counts skip crew members the same way: the Sessions badge and the tab title (`selectUnreadByMode`) and the count relayed to the Instances hub (`relayedUnreadKeys`) leave out every crew member whose root is open (`crewMemberKeys`, the same rule as `crewModeView`), while its unread entry stays for its root's Crew panel. The sidebar component applies `crewModeView` at its own `slots` door, so no lane, the Broadcast dialog, the bulk model switch or any other reader of that collection sees a crew member; the Sessions page, Recents, the Command Bar, Send-to-session and Split View read `selectPersonSlots`. A crew member opened from its root's Crew panel is the active chat without a sidebar row; on a screen narrower than `CREW_WORKER_ROOMY_PX` the sessions list steps aside while it is open | `website/src/pages/ChatSidebar.tsx`, `website/src/pages/SessionsPage.tsx`, `commandPalette/providers/recentsProvider.ts`, `apps/command-bar/CommandBarOverlay.tsx`, `components/SessionGridView.tsx`, `pages/chat/page/sessionsDrawer.ts`, `store/dashboardSlice.ts`, `store/dashboard/unread.ts` |
+| Recents' **Older** rows read the full History inventory as before (closed channel conversations and subagent transcripts belong there, and `/api/sessions` carries no crew signal yet, so a closed crew member is still an Older row until the history rows carry one); a LIVE crew member never comes back as an Older row, because the dedupe set is every live row | `recentsProvider.ts` |
+| The sidebar filter menu offers a **Crew Mode** row (roots only) once a root is in the list; a stored filter keeps its row while on | `pages/chat-sidebar/filters.tsx`, `SearchDock.tsx` |
+| The catalog (`crew_mode_agent`, `conductor_agents`) is kept in `setCrewModeCatalog`: `crewModeAgent()` is the agent the composer switch turns a chat onto, `gatewayRunsCrewMode()` whether this gateway sent the fields at all. A catalog that carries neither field names no conductor, so a gateway without Crew Mode keeps every list, picker row and chord it had, and offers no switch | `lib/crewMode.ts` |
+
+A `<mcwidget>` whose body is markdown rather than HTML (a conductor's task board,
+say) renders as markdown under its title (`website/src/components/MarkdownWidget.tsx`)
+and keeps the artifact identity every widget has: the title links to the artifact
+page and the star pins it, through the same `useWidgetArtifact` hook the HTML frame
+uses (`website/src/components/WidgetArtifact.tsx`; see [artifacts](artifacts.md)).

@@ -51,6 +51,8 @@ vi.mock('../api/client', () => ({
     chatSlotModel: vi.fn().mockResolvedValue({}),
     chatMode: vi.fn().mockResolvedValue({}),
     listInstances: vi.fn().mockResolvedValue({ instances: [], warm_set_cap: 5 }),
+    // ThemeProvider's catalog query retries every 1s, 2s, 4s... until a read succeeds, and each failed retry notifies it.
+    themes: vi.fn().mockResolvedValue({ themes: [] }),
   },
   isAuthBannerShown: vi.fn(() => false),
   ApiError: class ApiError extends Error {
@@ -111,7 +113,7 @@ describe('top-bar credit segment — failed vs loading', () => {
     })
     renderWithProviders(<App />, { route: '/chat', preloadedState: connectedState })
 
-    expect(await screen.findByLabelText(i18nT('components.kiroAccountModal.kiro_credit_usage'))).toBeTruthy()
+    expect(await screen.findByLabelText(i18nT('app.kiro_account_credits'))).toBeTruthy()
     expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_unavailable'))).toBeNull()
     expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_checking_2'))).toBeNull()
   })
@@ -131,31 +133,17 @@ describe('top-bar credit segment — failed vs loading', () => {
     expect(document.querySelector('.tb-capsule')).toBeNull()
   })
 
-  it('treats an api_key_auth unavailable payload as terminal, not still loading', async () => {
-    // The backend fail-fasts API-key accounts with a reasoned marker (#5728).
-    // That payload must stop the spinner and say WHY — before the fix the
-    // panel spun forever because no terminal state ever arrived.
-    sessionsUsageMock.mockResolvedValue({ usage: { available: false, reason: 'api_key_auth' } })
-    renderWithProviders(<App />, { route: '/chat', preloadedState: connectedState })
-
-    const pill = await screen.findByLabelText(i18nT('app.kiro_credit_usage_api_key'))
-    expect(pill.textContent).toContain('—')
-    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_checking_2'))).toBeNull()
-    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_unavailable'))).toBeNull()
-  })
-
   it('keeps the pill as a dash on a reasonless unavailable payload, naming where to refresh', async () => {
     // The gateway holds no reading (plan-less account with the scrape parked or
     // failed). The modal this dash opens carries the Refresh that can fix that,
     // so the dash must stay on screen -- a hidden pill would make that path
-    // unreachable. Distinct from the api_key_auth dash: the label differs.
+    // unreachable.
     sessionsUsageMock.mockResolvedValue({ usage: { available: false } })
     renderWithProviders(<App />, { route: '/chat', preloadedState: connectedState })
 
     const pill = await screen.findByLabelText(i18nT('app.kiro_credit_usage_no_reading'))
     expect(pill.textContent).toContain('—')
     expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_checking_2'))).toBeNull()
-    expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_api_key'))).toBeNull()
     expect(screen.queryByLabelText(i18nT('app.kiro_credit_usage_unavailable'))).toBeNull()
   })
 
@@ -264,6 +252,9 @@ describe('top-bar credit segment — failed vs loading', () => {
     // The modal re-renders with the no-reading notice and the primary Refresh...
     await screen.findByText(i18nT('components.kiroAccountModal.credit_usage_no_reading'))
     expect(screen.getByRole('button', { name: i18nT('components.kiroAccountModal.refresh_balance') })).toBeEnabled()
+    // AppShell retires its entrance class from a 600ms backstop timer armed at mount, then re-renders. Let that
+    // update land before the window opens, or it arrives mid-window outside act. The 5000 is the ceiling for it.
+    await waitFor(() => expect(screen.getByTestId('dashboard-shell')).not.toHaveClass('animate-rise'), { timeout: 5000 })
     // ...and is still there once any close (and its exit animation) would have
     // landed. An auto-close on `none` removes the dialog well inside this window.
     await new Promise(resolve => setTimeout(resolve, 600))

@@ -513,6 +513,11 @@ class TestClientSeam:
         and with the substitute model inline, never with the first attempt's
         envelope.
         """
+        # Another settings source defines availableModels, so the warm cache is written.
+        monkeypatch.setattr(
+            "kiro_crew.acp.client_claude_seed.other_sources_define_available_models",
+            lambda *a, **k: True,
+        )
         from kiro_crew import model_registry
 
         substitute = "global.anthropic.claude-sonnet-4-6[1m]"
@@ -1194,6 +1199,36 @@ class TestClientSeam:
         assert [p for m, p in sent if m == "session/set_mode"] == [
             {"sessionId": client._session_id, "modeId": "default"}
         ]
+        assert killed == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["new", "load"])
+    @pytest.mark.parametrize(
+        ("tools", "strict"), [([], True), (["@foo"], False)], ids=["toolless", "tooled"]
+    )
+    async def test_a_toolless_spec_mounts_only_the_wire_array(
+        self, tmp_path, agents_dir, monkeypatch, path, tools, strict
+    ):
+        """A spec with ``"tools": []`` keeps the harness's own MCP servers out.
+
+        The background ``kirocrew-lite`` helpers run on such a spec, and without
+        ``strictMcpConfig`` the adapter mounts the user's, the project's and
+        plugins' servers beside the empty wire array. A spec that names
+        tools keeps the adapter's default.
+        """
+        servers = {"foo": {"command": "/bin/foo"}} if tools else {}
+        _write_spec(agents_dir, servers=servers, tools=tools, name="kirocrew-lite")
+        client = self._seeded(tmp_path, agent="kirocrew-lite", acp_backend=ACP_BACKEND_CLAUDE)
+        if path == "load":
+            client._resume_session_id = "s-old"
+        sent, killed = self._adapter_transport(client, monkeypatch, started_mode="default")
+
+        await client._initialize_session()
+
+        params = dict(sent)["session/load" if path == "load" else "session/new"]
+        options = params["_meta"]["claudeCode"]["options"]
+        assert options.get("strictMcpConfig", False) is strict
+        assert client.spec_zero_tools is strict
         assert killed == []
 
     def test_a_side_read_only_session_keeps_the_exclusions_restrictions(self, tmp_path, agents_dir):

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
     from kiro_crew.slack.gateway import (
         DIGEST_HOLD_SECS,
+        LEAKED_TOOL_CALL_NOTE,
         NEVER_STARTED_MEMORY_PREFIX,
         NO_TOOL_CALLS_NOTE,
         OUTCOME_FAILED,
@@ -83,10 +84,16 @@ class _SubagentReport(NamedTuple):
 
 
 class _WaveDigest(NamedTuple):
-    """The announce and card facts a completion routes; see ``_subagent_wave_digest``."""
+    """The announce and card facts a completion routes; see ``_subagent_wave_digest``.
+
+    ``carried`` names every member whose result the announce delivers: the
+    completion itself, or each member of a digest chunk. A route may skip the
+    announce only when every one of them already reached the parent inline.
+    """
 
     announce: str
     sub_meta: dict[str, Any]
+    carried: tuple[str, ...]
 
 
 def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _SubagentReport:
@@ -168,6 +175,13 @@ def _compose_subagent_completion(info: SubagentInfo, *, _flush_only: bool) -> _S
     no_tools_note = ""
     if single_outcome == OUTCOME_OK and not _flush_only and info.made_no_tool_calls:
         no_tools_note = f"⚠ Agent `{info.id}` {NO_TOOL_CALLS_NOTE}"
+    # A completed run whose final segment wrote a tool call as text instead of
+    # running it (``SubagentInfo.leaked_tool_call``) reads as a success while
+    # that call never executed. Same channel as the note above, so a lone run
+    # and a wave digest line both carry it; the outcome stays completed.
+    if single_outcome == OUTCOME_OK and not _flush_only and info.leaked_tool_call:
+        _leak_note = f"⚠ Agent `{info.id}` {LEAKED_TOOL_CALL_NOTE}"
+        no_tools_note = f"{no_tools_note}\n{_leak_note}" if no_tools_note else _leak_note
     announce = (
         f"{SUBAGENT_COMPLETION_PREFIX}\n"
         f"Agent `{info.id}`"
@@ -235,6 +249,8 @@ def _subagent_wave_digest(
     task_text, usage, result_path = report.task_text, report.usage, report.result_path
     no_tools_note = report.no_tools_note
     announce, sub_meta = report.announce, report.sub_meta
+    # A single completion carries itself; a digest chunk replaces this below.
+    carried = [info.id]
     if _batch_id:
         if _flush_only:
             # Nothing to release (wave already closed / already flushed
@@ -324,9 +340,19 @@ def _subagent_wave_digest(
         # Exception-first digest content: failures/stops carry detail,
         # successes are one pointer line (full output stays on disk).
         if _oc == "completed":
-            # A run that kept its output after a generate failure is
-            # completed but partial; the digest must say so.
-            _kept = " (partial: backend failed to generate the final response)"
+            # A completed run is partial for one of two causes, and the
+            # digest names which: it kept its streamed output after a
+            # generate failure, or it called tools and then closed with no
+            # reply. The second case always ends with
+            # EMPTY_TURN_NOTICE_AFTER_WORK, which run_turn appends after the
+            # keep cap. Imported here: these functions run with the
+            # gateway's module globals, which do not carry the notice.
+            from kiro_crew.messaging.empty_turn_copy import EMPTY_TURN_NOTICE_AFTER_WORK
+
+            if (info.result or "").endswith(EMPTY_TURN_NOTICE_AFTER_WORK):
+                _kept = " (partial: ended without a closing reply after tool calls)"
+            else:
+                _kept = " (partial: backend failed to generate the final response)"
             bp["ok_lines"].append(
                 f"— `{info.id}` ✅{_kept if info.partial else ''} {task_text[:80]}"
                 f"{_model_tag} · {usage}"
@@ -438,7 +464,12 @@ def _subagent_wave_digest(
                 bp.setdefault("held_infos", []).append(info)
                 if _oc == "completed":
                     bp["held_ok_deliveries"].append(
-                        SubagentDelivery(info.id, info.elapsed, info.credits)
+                        SubagentDelivery(
+                            info.id,
+                            info.elapsed,
+                            info.credits,
+                            leaked_process=getattr(info, "_leaked_process", False) is True,
+                        )
                     )
                 elif getattr(info, "_report_owed", False) is True:
                     # A memory-wait expiry the store owes a report until
@@ -467,6 +498,9 @@ def _subagent_wave_digest(
             # These members are released: stop the hold clock so
             # the reaper's deadline sweep does not force a second flush
             # for results this chunk already carries.
+            carried = [_held.id for _held in bp.get("held_infos", [])]
+            if not _flush_only:
+                carried.append(info.id)
             for _held in bp.get("held_infos", []):
                 _held._digest_held_at = 0.0
             bp["held_infos"] = []
@@ -618,4 +652,4 @@ def _subagent_wave_digest(
                 bp["fail_lines"] = []
                 bp["ok_lines"] = []
                 bp["held_ok_deliveries"] = []
-    return _WaveDigest(announce, sub_meta)
+    return _WaveDigest(announce, sub_meta, tuple(carried))

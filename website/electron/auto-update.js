@@ -146,6 +146,9 @@ const EXTERNALLY_MANAGED_MAX_BYTES = 8192;
 const MANAGED_BY_MAX_CHARS = 128;
 const UPDATE_COMMAND_MAX_CHARS = 512;
 const CHECK_COMMAND_MAX_CHARS = 512;
+// A path, so an over-cap value is refused rather than cut: a truncated path
+// names a different file.
+const RELAUNCH_PATH_MAX_CHARS = 1024;
 
 /**
  * Is this install's update lifecycle owned by an external package manager?
@@ -178,8 +181,14 @@ const CHECK_COMMAND_MAX_CHARS = 512;
  * `managedBy` names the owning system for the About panel, `updateCommand` is
  * the command the panel offers to copy AND (when the managed auto-update path
  * is active) the command run to apply an update, and `checkCommand` is the
- * optional command run to discover whether an update is available. Every
- * degenerate marker — empty, unparsable,
+ * optional command run to discover whether an update is available. The optional
+ * `relaunchPath` is the executable (absolute, or `~/`-relative; see
+ * resolveRelaunchPath) the managed lane relaunches after a
+ * successful apply, instead of the path this process was started as: a macOS
+ * app opened from the Dock runs its version's own payload path, so a bare
+ * `app.relaunch()` brings back the version that was just replaced (#22774). A
+ * packager that keeps a stable launch link names the binary behind it here.
+ * Every degenerate marker — empty, unparsable,
  * over-cap, a directory, a symlink, a dangling symlink — still means MANAGED:
  * an operator who dropped SOMETHING at that name gets the safe behavior
  * (updater off) even when the metadata is wrong, never a silent fallback to
@@ -202,7 +211,8 @@ const CHECK_COMMAND_MAX_CHARS = 512;
  * @param {(p:string)=>boolean} [o.probeMarkerRewritable=canRewriteMarker]
  * @param {string} [o.bakedMarkerPath]  where the in-code marker lives; defaults
  *   to `EXTERNALLY-MANAGED` beside this module (inside app.asar when packaged)
- * @returns {{managedBy:string, updateCommand:string, checkCommand:string}|null} null when not managed
+ * @param {() => string} [o.homeDir]  the account's home, for a `~/` relaunchPath
+ * @returns {{managedBy:string, updateCommand:string, checkCommand:string, relaunchPath:string}|null} null when not managed
  */
 function readExternallyManaged({
   env = process.env,
@@ -226,6 +236,8 @@ function readExternallyManaged({
   // (Electron's fs shim reads through the archive), and the module directory
   // in a dev checkout, where the file simply does not exist.
   bakedMarkerPath = require("path").join(__dirname, EXTERNALLY_MANAGED_MARKER),
+  // The account's home, for a `~/` relaunchPath (see resolveRelaunchPath).
+  homeDir = () => require("os").userInfo().homedir,
 } = {}) {
   let raw = null;
   let markerPath = "";
@@ -294,6 +306,7 @@ function readExternallyManaged({
   let managedBy = "";
   let updateCommand = "";
   let checkCommand = "";
+  let relaunchPath = "";
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object") {
@@ -306,11 +319,43 @@ function readExternallyManaged({
       if (typeof parsed.checkCommand === "string") {
         checkCommand = parsed.checkCommand.trim().slice(0, CHECK_COMMAND_MAX_CHARS);
       }
+      if (typeof parsed.relaunchPath === "string") {
+        relaunchPath = resolveRelaunchPath(parsed.relaunchPath, { homeDir });
+      }
     }
   } catch {
     // Presence alone is the signal; a bare marker means managed, no metadata.
   }
-  return { managedBy, updateCommand, checkCommand };
+  return { managedBy, updateCommand, checkCommand, relaunchPath };
+}
+
+/**
+ * The marker's `relaunchPath`, as the absolute path the lane relaunches, or ""
+ * to keep the bare relaunch.
+ *
+ * Kept: an absolute path, or one starting with `~/`, which is the account's
+ * home. A baked marker is the same file for every user, and a stable launch
+ * link usually lives under the home, so `~/` is how it names one. The home is
+ * read from the account entry (os.userInfo), not from HOME: the launch
+ * environment is the user's to rewrite, the account entry is not, and the
+ * marker's own commands derive the home the same way. Dropped: anything
+ * relative, with a NUL, or over the cap (a cut path names another file).
+ *
+ * @param {string} raw
+ * @param {{homeDir?: () => string}} [o]  injectable for tests
+ * @returns {string}
+ */
+function resolveRelaunchPath(raw, { homeDir = () => require("os").userInfo().homedir } = {}) {
+  const path = require("path");
+  let p = String(raw).trim();
+  if (!p || p.length > RELAUNCH_PATH_MAX_CHARS || p.includes("\0")) return "";
+  if (p.startsWith("~/")) {
+    let home = "";
+    try { home = homeDir() || ""; } catch { home = ""; }
+    if (!home || !path.isAbsolute(home)) return "";
+    p = path.join(home, p.slice(2));
+  }
+  return path.isAbsolute(p) ? p : "";
 }
 
 // Can THIS process rewrite the externally-managed marker?
@@ -547,13 +592,23 @@ function channelForVersion(version) {
  * About panel's "you are running prerelease bytes" note is keyed on); only the
  * followed feed is decoupled from it here.
  *
+ * A channel the policy requires (`required`, see runtime/update/policy-channel.js)
+ * replaces the preference. A build that cannot follow it (a nightly install
+ * asked for another lane, or a production install asked for nightly, which is a
+ * separate side-by-side app) has no lane: null, so updates stay off.
+ *
  * @param {"nightly"|"insider"|"stable"|null} stamped - channelForVersion(version)
  * @param {"insider"|"stable"|""|null|undefined} preference - user opt-in, falsy = default
+ * @param {"nightly"|"insider"|"stable"|""} [required] - policy channel, "" = none
  * @returns {"nightly"|"insider"|"stable"|null}
  */
-function resolveChannel(stamped, preference) {
-  if (stamped === "nightly") return "nightly";
+function resolveChannel(stamped, preference, required = "") {
   if (stamped === null) return null;
+  if (required) {
+    if (stamped === "nightly") return required === "nightly" ? "nightly" : null;
+    return required === "insider" || required === "stable" ? required : null;
+  }
+  if (stamped === "nightly") return "nightly";
   if (preference === "insider" || preference === "stable") return preference;
   return "stable";
 }
@@ -979,6 +1034,9 @@ function initAutoUpdate(deps) {
     Notification,
     getFlavor,
     getChannelPreference = () => "",
+    // The channel the policy requires, "" when none (an oss build). Read fresh,
+    // like the preference, which it replaces (resolveChannel).
+    getRequiredChannel = () => "",
     // Whether discovery may proceed straight to a download without a click.
     // Read FRESH per event, like getChannelPreference, so toggling it in
     // Settings takes effect on the next check with no re-init.
@@ -992,6 +1050,9 @@ function initAutoUpdate(deps) {
     getAutoDownloadPreference = () => false,
     notifyUpdateFound = null,
     stopGateway,
+    // On Windows, BaseWindow emits 'session-end' but App does not. Pass the window
+    // provider so feed-lane can register the pending-update notice on the right object.
+    getMainWindow = () => null,
     // Host hook: an install is now in flight, so a gateway that stops answering
     // is INTENTIONAL. main.js uses it to disarm the liveness watchdog, which
     // otherwise resurrects the gateway mid-swap. Optional (absent in tests).
@@ -1030,6 +1091,11 @@ function initAutoUpdate(deps) {
     feedBase = process.env.KIROCREW_UPDATE_FEED || DEFAULT_FEED_BASE,
     onUpdateState = null,
     log = console,
+    // Whether a security policy provider currently governs this install's
+    // updates, making the Electron feed lane stand down. Wired by the
+    // caller (ipc-registrar.js) to a variable the renderer updates via
+    // update:notify-policy-governed once the gateway status is known.
+    isPolicyGoverned = () => false,
   } = deps;
 
   // Linux install shape. Resolved once, and BEFORE getInfo() is defined: the
@@ -1067,6 +1133,7 @@ function initAutoUpdate(deps) {
     app,
     getFlavor,
     getChannelPreference,
+    getRequiredChannel,
     getAutoDownloadPreference,
     onUpdateState,
     uiDriven,
@@ -1084,7 +1151,7 @@ function initAutoUpdate(deps) {
     isNewerVersion,
     manualDownloadUrl,
   });
-  const { currentChannel, getInfo } = reporter;
+  const { currentChannel, getInfo, policyRefusal } = reporter;
 
   // An operator or distro packager that dropped the EXTERNALLY-MANAGED marker
   // owns this install's update lifecycle: the external package manager replaces
@@ -1116,6 +1183,7 @@ function initAutoUpdate(deps) {
       managedPath,
       launchCheckDelayMs: LAUNCH_CHECK_DELAY_MS,
       checkIntervalMs: CHECK_INTERVAL_MS,
+      isPolicyGoverned,
       log,
     });
   }
@@ -1158,6 +1226,12 @@ function initAutoUpdate(deps) {
   // Evaluated once at init, while currentChannel() is read per check: switching
   // channels in Settings mid-session surfaces the ordinary failure card until
   // the next launch, which the UI already handles.
+  // The policy requires a channel this build cannot follow: updates off, rather
+  // than the stable fallback currentChannel() reports for display.
+  if (policyRefusal()) {
+    log.info(`[update] ${policyRefusal()} — auto-update disabled`);
+    return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "policy-channel" };
+  }
   if (!channelHasLane(currentChannel())) {
     log.info(`[update] ${osPlatform} has no ${currentChannel()} publish lane — auto-update disabled`);
     return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "channel" };
@@ -1234,6 +1308,7 @@ function initAutoUpdate(deps) {
     linux,
     macDistArch,
     nativeAutoUpdater,
+    getMainWindow,
     feedBase,
     uiDriven,
     log,
@@ -1245,6 +1320,7 @@ function initAutoUpdate(deps) {
     channelForVersion,
     launchCheckDelayMs: LAUNCH_CHECK_DELAY_MS,
     checkIntervalMs: CHECK_INTERVAL_MS,
+    isPolicyGoverned,
   });
 }
 

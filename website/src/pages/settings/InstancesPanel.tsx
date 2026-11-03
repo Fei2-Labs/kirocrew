@@ -91,6 +91,23 @@ export function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
   )
 }
 
+/** The "enabled, but not active yet" banner text, shared by this panel and
+ *  Remote Crew. One catalog sentence with the command as a tag, so it says
+ *  where to run the restart (a terminal on the gateway's computer) and what
+ *  works afterwards, in every word order. */
+export function RestartToActivateText() {
+  return (
+    <span>
+      <Trans
+        i18nKey="pages.settings.instancesPanel.restart_to_activate"
+        components={{
+          restartCmd: <code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>,
+        }}
+      />
+    </span>
+  )
+}
+
 export function AddInstanceForm({ onAdded }: { onAdded: () => void }) {
   // Resume what the user typed before a hand-off navigated them away. Read once
   // per mount: a later read would fight the live form state.
@@ -379,7 +396,7 @@ export function InstancesPanel() {
           <span className={`inline-block w-2 h-2 rounded-full ${active ? 'bg-ok' : 'bg-warn'}`} aria-hidden />
           <span className="text-muted">
             {i18nT('pages.settings.instancesPanel.multi_instance_management_is')} <span className="text-text font-medium">{i18nT('pages.settings.instancesPanel.enabled')}</span>
-            {active ? '' : ' — not active until restart'}
+            {active ? '' : ` ${i18nT('pages.settings.instancesPanel.not_active_until_restart')}`}
           </span>
         </div>
         <Btn onClick={() => setEnabledMutation.mutate(false)} disabled={setEnabledMutation.isPending} aria-label={i18nT('pages.settings.instancesPanel.disable_multi_instance_management')}>
@@ -389,10 +406,7 @@ export function InstancesPanel() {
       {!active && (
         <div role="status" className="flex items-start gap-2 px-3 py-2 text-[13px] rounded-md bg-warn/10 text-warn-text border border-warn/30">
           <AlertTriangle size={14} className="lucide-inline mt-0.5 shrink-0" />
-          <span>
-            {i18nT('pages.settings.instancesPanel.enabled_but_not_active_yet_restart_the_gateway')}<code className="text-text">{i18nT('pages.settings.instancesPanel.kirocrew_restart')}</code>){' '}
-            {i18nT('pages.settings.instancesPanel.to_start_the_ssh_tunnel_manager_and_activate_ins')}
-          </span>
+          <RestartToActivateText />
         </div>
       )}
       {connectedNote && (

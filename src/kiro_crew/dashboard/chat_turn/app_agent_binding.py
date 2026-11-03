@@ -9,13 +9,14 @@ import asyncio
 import functools
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_sdk.capabilities import SessionCapabilities
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         DashboardState,
         KiroCrewConfig,
         ResolvedBindings,
         Routing,
-        SessionCapabilities,
         _ChatSlot,
         _MemoryUnavailable,
         effective_session_key,
@@ -190,7 +191,14 @@ async def _app_agent_turn_backend(
         return _provider_backend(provider)
     if cfg is None:
         cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    return select_provider_backend(session_key, cfg.agent.member_acp_backend, cfg.agent.acp_backend)
+    from kiro_crew.crewmate_harness import crewmate_backend_pin
+
+    return select_provider_backend(
+        session_key,
+        cfg.agent.member_acp_backend,
+        cfg.agent.acp_backend,
+        crew_backend=crewmate_backend_pin(cfg, session_key),
+    )
 
 
 async def _on_app_agent_not_loaded(turn: _ChatTurn, exc) -> None:

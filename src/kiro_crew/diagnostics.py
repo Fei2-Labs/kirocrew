@@ -45,6 +45,7 @@ from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
 )
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.validation import strip_hidden_unicode
 
 logger = logging.getLogger(__name__)
@@ -331,10 +332,11 @@ def _kiro_log_dirs() -> list[Path]:
     `process exited (rc=None)` class this collector exists for. Rather than
     guessing which one is authoritative per platform, try every candidate and
     take the first that actually exists; ``KIRO_CHAT_LOG_FILE`` overrides all of
-    them for anyone running a non-default layout.
+    them for anyone running a non-default layout. Windows sets ``TEMP``/``TMP``
+    and usually leaves ``TMPDIR`` unset, so those follow ``TMPDIR``.
     """
     out: list[Path] = []
-    for env in ("XDG_RUNTIME_DIR", "TMPDIR"):
+    for env in ("XDG_RUNTIME_DIR", "TMPDIR", "TEMP", "TMP"):
         value = os.environ.get(env)
         if value:
             out.append(Path(value) / "kiro-log")
@@ -380,6 +382,21 @@ def _usable_dir(p: Path) -> bool:
     return not platform_compat.is_link_or_junction(p) and p.is_dir()
 
 
+#: kiro-cli on Windows writes its logs one level deeper, under
+#: ``kiro-log\logs\``, while Linux and macOS write them in ``kiro-log/`` itself.
+_KIRO_LOG_NESTED_SUBDIR = "logs"
+
+
+def _kiro_log_levels(base: Path) -> list[Path]:
+    """The directories inside one ``kiro-log`` dir that may hold its logs.
+
+    The flat level comes first; the nested ``logs`` level is listed only when it
+    passes :func:`_usable_dir`, so a linked ``logs`` is never walked.
+    """
+    nested = base / _KIRO_LOG_NESTED_SUBDIR
+    return [base, nested] if _usable_dir(nested) else [base]
+
+
 def _kiro_cli_chat_log() -> Path | None:
     """Locate the kiro-cli chat log (``<runtime-or-tmp>/kiro-log/kiro-chat.log``)."""
     override = os.environ.get("KIRO_CHAT_LOG_FILE")
@@ -395,23 +412,25 @@ def _kiro_cli_chat_log() -> Path | None:
             return None
         return p if _usable_log(p) else None
     for base in _kiro_log_dirs():
-        p = base / "kiro-chat.log"
-        if _usable_log(p):
-            return p
+        for level in _kiro_log_levels(base):
+            p = level / "kiro-chat.log"
+            if _usable_log(p):
+                return p
     return None
 
 
 def _kiro_cli_extra_logs() -> list[Path]:
     out: list[Path] = []
     for base in _kiro_log_dirs():
-        for name in ("mcp.log", "lsp.log"):
-            p = base / name
-            if _usable_log(p) and p.stat().st_size > 0:
-                out.append(p)
-        if out:
-            # One kiro-log dir wins; do not mix members from two of them, or the
-            # zip would carry two different `mcp.log` entries under one name.
-            break
+        for level in _kiro_log_levels(base):
+            for name in ("mcp.log", "lsp.log"):
+                p = level / name
+                if _usable_log(p) and p.stat().st_size > 0:
+                    out.append(p)
+            if out:
+                # One log dir wins; do not mix members from two of them, or the
+                # zip would carry two different `mcp.log` entries under one name.
+                return out
     return out
 
 
@@ -420,8 +439,10 @@ def _scratch_kiro_chat_logs() -> list[Path]:
 
     On Linux and macOS ``agent_scratch.scratch_env`` pins the log of every
     kiro-cli Kiro Crew spawns to ``<scratch root>/<dir>/kiro-log/kiro-chat.log``,
-    which none of :func:`_kiro_log_dirs`' shared candidates reach. Each directory
-    level must pass :func:`_usable_dir` and the log :func:`_usable_log`, so a
+    which none of :func:`_kiro_log_dirs`' shared candidates reach. On Windows the
+    log is not pinned, and kiro-cli writes it to ``<dir>/kiro-log/logs/`` instead
+    (see :func:`_kiro_log_levels`); the flat path wins when both exist. Each
+    directory level must pass :func:`_usable_dir` and the log :func:`_usable_log`, so a
     linked scratch dir or ``kiro-log`` is skipped rather than walked out of the
     tree. Sorted by the log's mtime and capped at :data:`_MAX_SCRATCH_CHAT_LOGS`.
     A dead process's directory is swept once it has been idle about an hour
@@ -437,14 +458,33 @@ def _scratch_kiro_chat_logs() -> list[Path]:
     found: list[tuple[float, Path]] = []
     for child in children:
         log_dir = child / agent_scratch.KIRO_CLI_LOG_SUBDIR
-        log = log_dir / agent_scratch.KIRO_CLI_CHAT_LOG_NAME
         try:
-            if _usable_dir(child) and _usable_dir(log_dir) and _usable_log(log):
-                found.append((log.lstat().st_mtime, log))
+            if not (_usable_dir(child) and _usable_dir(log_dir)):
+                continue
+            for level in _kiro_log_levels(log_dir):
+                log = level / agent_scratch.KIRO_CLI_CHAT_LOG_NAME
+                if _usable_log(log):
+                    found.append((log.lstat().st_mtime, log))
+                    break
         except OSError:
             continue
     found.sort(key=lambda entry: entry[0], reverse=True)
     return [log for _, log in found[:_MAX_SCRATCH_CHAT_LOGS]]
+
+
+def _scratch_log_dir_name(log: Path) -> str:
+    """The scratch dir name for a log :func:`_scratch_kiro_chat_logs` returned.
+
+    The log sits at ``<dir>/kiro-log/kiro-chat.log`` or, on Windows,
+    ``<dir>/kiro-log/logs/kiro-chat.log``; both name the member for ``<dir>``.
+    """
+    log_dir = log.parent
+    if (
+        log_dir.name == _KIRO_LOG_NESTED_SUBDIR
+        and log_dir.parent.name == agent_scratch.KIRO_CLI_LOG_SUBDIR
+    ):
+        log_dir = log_dir.parent
+    return log_dir.parent.name
 
 
 # ── Live log reader (kiro_cli_logs MCP tool) ─────────────────────────────────
@@ -941,7 +981,8 @@ def read_kiro_cli_logs(
     if not sections:
         return (
             "No kiro-cli protocol logs found. kiro-cli writes mcp.log / lsp.log "
-            "under $XDG_RUNTIME_DIR|$TMPDIR/kiro-log/; none exist or are readable "
+            "under $XDG_RUNTIME_DIR|$TMPDIR|%TEMP%/kiro-log/ (kiro-log/logs/ on "
+            "Windows); none exist or are readable "
             "here. (kiro-chat.log is a single shared host file carrying every "
             "session's conversation, so it is deliberately not a source for this "
             "tool.)"
@@ -1009,22 +1050,56 @@ def _kiro_cli_version() -> str:
     Everything is contained: diagnostics must work precisely when the rest of
     the system is broken, so a raising lookup degrades like a failed spawn.
     """
+    # Deferred: the bundle module brings the agent-SDK pin with it, which this
+    # module -- imported on the dashboard's boot path -- does not need until a
+    # bundle is collected.
+    from kiro_crew.agent_sdk import kas_bundle
+
     try:
         binary, unpinned_exists = pin_kiro_cli()
         if binary is None:
             if unpinned_exists:
                 return f"not pinned ({PATH_ONLY_INSTALL_NOTE})"
+            if kas_bundle.kas_bundle_route():
+                # Absent AND not part of this installation: the selected harness
+                # runs Crew's own engine (``kas_engine:`` beside this line). A bare
+                # ``unavailable`` would read as the gap it is on the relay route.
+                return "unavailable (not used: KAS runs Kiro Crew's own engine bundle)"
             return "unavailable"
         out = subprocess.run(
             [binary, "--version"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=5,
             check=False,
         )
         return (out.stdout or out.stderr).strip() or "unknown"
     except (OSError, subprocess.SubprocessError):
         return "unavailable"
+
+
+def _kas_engine_version() -> str:
+    """The engine line for ``versions.txt``: what the KAS bundle route runs, if selected.
+
+    ``not selected`` when the installation is on the relay route (or another
+    harness), so the kiro-cli line above it is the one that matters; on the bundle
+    route the installed engine with the release pin beside it, or ``not installed``
+    with the command, because a maintainer reading a bundle from such a host wants
+    the engine version where they would otherwise look for kiro-cli's. Contained
+    like the kiro-cli probe: a raising config read degrades to ``unknown``.
+    """
+    from kiro_crew.agent_sdk import kas_bundle
+
+    try:
+        if not kas_bundle.kas_bundle_route():
+            return "not selected"
+        engine = kas_bundle.installed_engine_label()
+        pin = kas_bundle.KAS_PIN_VERSION
+        if engine is None:
+            return f"not installed (release pins KAS {pin}; kirocrew kas install)"
+        return f"{engine} (release pins KAS {pin})"
+    except Exception:  # noqa: BLE001 - diagnostics must survive a broken setup
+        return "unknown"
 
 
 #: PEP 440 prerelease segment — see
@@ -1093,6 +1168,7 @@ def _versions_text(note: str, identity: release_channel.Provenance) -> str:
         f"channel: {identity.channel or 'unknown'}",
         f"channel_record: {identity.recorded or 'absent'}",
         f"kiro_cli_version: {_kiro_cli_version()}",
+        f"kas_engine: {_kas_engine_version()}",
         f"python: {platform.python_version()}",
         f"platform: {platform.platform()}",
         f"machine: {platform.machine()}",
@@ -1338,7 +1414,7 @@ def collect_bundle(
             text_sources.append(("kiro-chat.log", chat, True))
         for log in _scratch_kiro_chat_logs():
             # Named for its scratch dir: every per-process log is `kiro-chat.log`.
-            text_sources.append((f"kiro-chat/{log.parent.parent.name}.log", log, True))
+            text_sources.append((f"kiro-chat/{_scratch_log_dir_name(log)}.log", log, True))
         for extra in _kiro_cli_extra_logs():
             text_sources.append((f"kiro-cli-{extra.name}", extra, True))
 

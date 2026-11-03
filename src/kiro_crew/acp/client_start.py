@@ -18,7 +18,7 @@ Instance fields written: ``_activated_model``, ``_agent_accepts_image``,
 
 Instance fields read: ``_agent``, ``_available_mode_ids``, ``_channel_id``,
 ``_extra_env``, ``_modes_advertised``, ``_sandbox_mode``, ``_scratch_dir``,
-``_session_key``, ``_session_mcp_snapshot``, ``_shared_scratch``,
+``_session_key``, ``_session_mcp_snapshot``, ``_shared_scratch``, ``_side_read_only``,
 ``_stdin_stalled``, ``_windows_tree_cleanup_failed``, ``_work_dir``, ``last_prompt_stats``.
 """
 
@@ -34,7 +34,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew import __version__, acp_tool_gate, agent_scratch, platform_compat
-from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp import managed_agent_shadow as managed_shadow_mod
 from kiro_crew.acp import runtime_process_tree
 from kiro_crew.acp._dispatch import agent_version_from_init
@@ -42,6 +41,7 @@ from kiro_crew.acp.client_claude_session import (
     CLAUDE_ACP_FORK_POINT_MIN_VERSION,
     _adapter_version_at_least,
 )
+from kiro_crew.acp.client_native_children import client_capabilities_for
 from kiro_crew.acp.client_spawn_env import (
     KIRO_CLI_BIN,
     KIRO_CLI_SUBCMD,
@@ -52,10 +52,8 @@ from kiro_crew.acp.client_spawn_env import (
     kiro_cli_not_found_message,
 )
 from kiro_crew.acp.client_timeouts import _ACP_RESPAWN_BACKOFF_S, _INIT_TIMEOUT
-from kiro_crew.acp.client_turn_control import steering_advertised
 from kiro_crew.acp.harness import process_adapter_for
 from kiro_crew.acp.harness.base import SpawnContext, SpawnPlan
-from kiro_crew.acp import launch as _launch_mod
 from kiro_crew.acp.launch import LaunchRequest, launch
 from kiro_crew.acp.transport_errors import (
     AcpAuthRequired,
@@ -67,22 +65,20 @@ from kiro_crew.acp.transport_errors import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_CLIENT_CAPABILITIES,
+    ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
-    ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKENDS_FORK_AT_MESSAGE,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_INTERNAL_SANDBOX,
-    ACP_BACKENDS_KIRO_DIALECT,
     ACP_BACKENDS_LOAD_WITHOUT_MODES,
     ACP_BACKENDS_POD_HOME_REMAP,
     ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP,
     ACP_BACKENDS_RESUME_WITHOUT_LOAD,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
-    ACP_CLIENT_CAPABILITIES,
-    ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER,
     KIRO_CLI_CLIENT_APPLICATION,
     METHOD_INITIALIZE,
     METHOD_SESSION_FORK,
@@ -90,18 +86,25 @@ from kiro_crew.acp.types import (
     METHOD_SESSION_NEW,
     METHOD_SESSION_RESUME,
     METHOD_SET_MODE,
+    steering_advertised,
 )
 from kiro_crew.agent import (
     DerivedSpecSnapshot,
     DerivedSpecStale,
     ForkGovernanceUnresolved,
+    SharedTemplateOverCeiling,
     ensure_agent_materialized,
     require_fork_governance,
     require_fresh_derived_spec,
+    require_shared_template_within_ceiling,
     require_unchanged_derived_spec,
 )
 from kiro_crew.agent_sdk import host_auth
-from kiro_crew.agent_sdk.backends import ACP_BACKEND_LAUNCH, launch_for
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_FORBIDDEN_MODES,
+    ACP_BACKEND_LAUNCH,
+    launch_for,
+)
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.dashboard.side_readonly_spec import unavailable_mode_explanation
 from kiro_crew.executors import subprocess_executor
@@ -111,6 +114,7 @@ from kiro_crew.sandbox import (
     delegated_workspace_exposes_sealed_target,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.slack.team_ids import apply_slack_team_env
 
 if TYPE_CHECKING:
     from kiro_crew.acp.client import AcpClient
@@ -177,37 +181,24 @@ _PROTOCOL_VERSION_BY_BACKEND: dict[str, int | str] = {
     **{backend: record.protocol_version for backend, record in sorted(ACP_BACKEND_LAUNCH.items())},
 }
 
-# The public ACP spec's integer protocol version — the dialect default for every
-# spec adapter. Kiro's own literal differs; a backend's stated version overrides
-# either through ``_PROTOCOL_VERSION_BY_BACKEND``.
-PROTOCOL_VERSION_SPEC = 1
+
+def _roster_of(client: AcpClient, wire_servers: Any) -> Any:
+    """The MCP set a session actually starts with: the launch composition when the
+    harness took its servers at launch (``_launch_mcp_servers``), else the wire array."""
+    launched = client._launch_mcp_servers
+    return wire_servers if launched is None else launched
 
 
-def _wire_contract_for_backend(backend: str) -> tuple[int | str, dict[str, Any]]:
-    """Return the exact initialize contract for a backend's declared dialect.
+def _jsonl_size(path: Path) -> int:
+    """Byte size of a kiro-cli session transcript, 0 when it is missing or unreadable.
 
-    Every dialect opts into a protocol version and capability set together.
-    A newly added dialect therefore fails before the first wire request instead
-    of silently inheriting Kiro's contract through an ``else`` arm (H5).
+    Blocking: call it through ``asyncio.to_thread``. The tool-result reader seeks
+    to this offset, so a session reads only the results written after it starts.
     """
-    contracts: dict[acp_backends.Dialect, tuple[int | str, dict[str, Any]]] = {
-        acp_backends.Dialect.KIRO: (PROTOCOL_VERSION, ACP_CLIENT_CAPABILITIES),
-        acp_backends.Dialect.SPEC: (
-            PROTOCOL_VERSION_SPEC,
-            ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER,
-        ),
-    }
-    # H10: a harness's protocolVersion is its OWN literal, so a divergence is a
-    # one-line edit rather than a silent downgrade of whichever harness moved
-    # first. The dialect supplies the default; the per-harness overrides live in
-    # ONE table (``_PROTOCOL_VERSION_BY_BACKEND``), applied by the caller: two
-    # tables is how a harness gains a version in one and keeps the dialect
-    # default in the other, which is a downgrade nothing reports.
-    dialect = acp_backends.dialect_of(backend)
     try:
-        return contracts[dialect]
-    except KeyError as exc:
-        raise AcpError(f"Unsupported ACP dialect {dialect!r} for backend {backend!r}") from exc
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 async def _spawn(self: AcpClient) -> None:
@@ -239,10 +230,6 @@ async def _spawn(self: AcpClient) -> None:
         await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
 
     adapter = process_adapter_for(self.backend)
-    # Filled only by the registry arm; merged into the child env below, before
-    # the session identity so a host value never stands in for it.
-    registry_env: dict[str, str] = {}
-    registry_offline_env: dict[str, str] = {}
     if adapter is not None:
         # The host's own launch knowledge -- its binary, argv, labels, credential
         # mask and gate -- in its own file. The context names this session, which
@@ -261,11 +248,7 @@ async def _spawn(self: AcpClient) -> None:
                 session=self,
             )
         )
-    elif self.backend in ACP_BACKENDS_KIRO_DIALECT:
-        # The SET, not ``== ACP_BACKEND_KIRO``: ``kas`` speaks the same dialect
-        # and spawns the same kiro-cli argv. A known id that reaches here with
-        # no arm of its own must fall to the registry arm's refusal rather than
-        # inherit this one by absence (harness-parity H5).
+    else:
         # Pin ONE reading of the environment for both the search and the
         # message that reports it. The previous code resolved against the live
         # ``os.environ`` and then, on failure, recomputed the directory set
@@ -331,6 +314,15 @@ async def _spawn(self: AcpClient) -> None:
             await asyncio.to_thread(require_fork_governance, self._agent, self._work_dir)
         except ForkGovernanceUnresolved as exc:
             raise AcpError(str(exc)) from exc
+        # A harness that may read the spec file's own grants is refused on a
+        # crew-bound spec Crew does not own that the ceiling would narrow: Crew never
+        # rewrites such a file.
+        try:
+            await asyncio.to_thread(
+                require_shared_template_within_ceiling, self._agent, self.backend
+            )
+        except SharedTemplateOverCeiling as exc:
+            raise AcpError(str(exc)) from exc
         # The same cwd-first resolution makes a checkout that declares a MANAGED
         # agent name the spec that runs, whatever Kiro Crew installed under it.
         shadowed = await asyncio.to_thread(
@@ -381,48 +373,21 @@ async def _spawn(self: AcpClient) -> None:
         spawn_label = f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
         stderr_label = KIRO_CLI_BIN
         plan = SpawnPlan(argv=argv, spawn_label=spawn_label, stderr_label=stderr_label)
-    else:
-        # FORK arm: everything not named above is a REGISTRY adapter, resolved
-        # from the registry entry that declares it -- and REFUSED when no
-        # launchable entry exists. This is what stops a known-but-unmapped id
-        # inheriting the kiro spawn arm by absence; it has no compile-time
-        # constant to label it with, so both labels come from the entry that
-        # resolved the argv.
-        from kiro_crew.acp import registry
-
-        registry_adapter = (await asyncio.to_thread(registry.cached)).get(self.backend)
-        if registry_adapter is None or not registry_adapter.is_launchable:
-            raise AcpError(
-                f"ACP backend {self.backend!r} has no spawn implementation; "
-                "refresh the ACP backend list and select it again."
-            )
-        registry_argv = await asyncio.to_thread(registry_adapter.resolve_launch_argv)
-        if not registry_argv:
-            raise AcpError(
-                f"ACP backend {self.backend!r} is not installed at its pinned version. "
-                f"Run `{registry_adapter.install_command}`, then retry."
-            )
-        registry_env.update(registry_adapter.env)
-        registry_offline_env.update(registry_adapter.offline_env)
-        plan = SpawnPlan(
-            argv=registry_argv,
-            spawn_label=_launch_mod._adapter_spawn_label(registry_argv, registry_adapter.name),
-            stderr_label=registry_adapter.name,
-        )
 
     async def _env_before_scrub(env: dict[str, str], spawned_binary: str | None) -> dict[str, str]:
         # The host's own variables first, then this session's identity, so a
         # host value can never stand in for the identity the session carries.
         if adapter is not None:
             await adapter.prepare_spawn_env(env, to_thread=self._to_thread_guarding_sandbox)
-        else:
-            env.update(registry_env)
-            env.update(registry_offline_env)
         self._apply_session_identity_env(env)
         if self._channel_id:
             env["KIROCREW_CHANNEL_ID"] = self._channel_id
         else:
             env.pop("KIROCREW_CHANNEL_ID", None)
+        # The workspace the channel lives in, beside the channel, so a hook can
+        # open slack://channel?team=<TEAM>&id=<CHANNEL>. Set when known, popped
+        # otherwise, exactly like the channel id (slack/team_ids.py).
+        apply_slack_team_env(env, self._channel_id)
         # Resolve SSH_AUTH_SOCK dynamically — the gateway's env may be stale
         # after an ssh-agent restart — and KRB5CCNAME to a FILE: ccache (the
         # kernel keyring, the default on some Linux distros, is invisible to
@@ -438,14 +403,13 @@ async def _spawn(self: AcpClient) -> None:
         # it, and KIRO_API_KEY stays available only to the positively
         # identified Kiro backend.
         return await self._to_thread_guarding_sandbox(
-            functools.partial(_resolve_spawn_env, kiro_api_key=self.backend == ACP_BACKEND_KIRO),
-            env,
+            functools.partial(_resolve_spawn_env, kiro_api_key=self._is_kiro), env
         )
 
     def _env_after_scrub(env: dict[str, str]) -> None:
         # The auxiliary kiro-cli children never reach a harness's apply_spawn_env,
         # so they are named here.
-        if self.backend == ACP_BACKEND_KIRO:
+        if self._is_kiro:
             from kiro_crew.acp.harness._common import apply_client_application_env
 
             apply_client_application_env(env)
@@ -665,15 +629,24 @@ async def _new_session_following_substitution(self: AcpClient) -> dict:
         # path warmed, NOT executor hops: this call site is shared with
         # kiro-cli, and adapter work must not add a scheduling or failure
         # point to that backend's construction path (harness-parity H13).
-        # The pooled read stays off the loop, as it already was: the gate
-        # reduces ``_pooled_mcp_servers`` INSIDE itself, so a backend whose
-        # permission route is unproven is withheld the stubs along with the
-        # translated entries rather than pooled on a session it cannot gate.
+        # The pooled read stays off the loop, as it already was.
         # A claude Side Chat session mounts no server: READ_ONLY refuses every
         # MCP call, and a tool that is not mounted cannot be pre-approved by
         # a settings allow rule. Checked at the splice, not in the seam, so
         # an edition's override of the seam cannot mount servers there.
-        "mcpServers": await self._gated_session_mcp_servers(),
+        "mcpServers": [
+            *(
+                self._claude_session_mcp_servers()
+                if self._is_claude and not getattr(self, "_side_read_only", False)
+                else []
+            ),
+            *(self._opencode_session_mcp_servers() if self._is_opencode else []),
+            *(self._goose_session_mcp_servers() if self._is_goose else []),
+            *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
+            *(self._copilot_session_mcp_servers() if self._is_copilot else []),
+            *(self._pi_session_mcp_servers() if self._is_pi else []),
+            *(await asyncio.to_thread(self._pooled_mcp_servers)),
+        ],
     }
     if self.backend in ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP:
         new_params["mcpServers"] = await self._prune_unstartable_mcp(new_params["mcpServers"])
@@ -683,10 +656,12 @@ async def _new_session_following_substitution(self: AcpClient) -> dict:
     # The roster this session put ON THE WIRE. Distinct from the agent spec
     # on disk: the backend starts the spec's own servers too, so the frames
     # that come back are a superset of this list.
-    self._begin_session_report(new_params.get("mcpServers"))
+    # A harness whose servers ride a launch file (Strands) sends an empty wire
+    # array by design; its roster is the launch composition.
+    self._begin_session_report(_roster_of(self, new_params.get("mcpServers")))
     # AFTER begin_session_report, which clears the report: the guard writes a
     # row on it, and writing before the clear would erase the finding.
-    self._guard_unresolved_mcp_refs(new_params.get("mcpServers"))
+    self._guard_unresolved_mcp_refs(_roster_of(self, new_params.get("mcpServers")))
 
     self._last_substitution_model = None
     if self._is_pi:
@@ -740,15 +715,27 @@ async def _new_session_following_substitution(self: AcpClient) -> dict:
         # re-delivering the first attempt's stale roster.
         resolved_mcp = await asyncio.to_thread(self._resolve_session_mcp_servers)
         self._session_mcp_cache = resolved_mcp
-        new_params["mcpServers"] = await self._gated_session_mcp_servers()
+        new_params["mcpServers"] = [
+            *(
+                self._claude_session_mcp_servers()
+                if self._is_claude and not getattr(self, "_side_read_only", False)
+                else []
+            ),
+            *(self._opencode_session_mcp_servers() if self._is_opencode else []),
+            *(self._goose_session_mcp_servers() if self._is_goose else []),
+            *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
+            *(self._copilot_session_mcp_servers() if self._is_copilot else []),
+            *(self._pi_session_mcp_servers() if self._is_pi else []),
+            *(await asyncio.to_thread(self._pooled_mcp_servers)),
+        ]
         if self.backend in ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP:
             new_params["mcpServers"] = await self._prune_unstartable_mcp(new_params["mcpServers"])
         # Rebuilt AFTER the array, from the same re-seed: the envelope carries
         # the setting sources the array was authorized under and the inline
         # settings naming the substitute model.
         new_params["_meta"] = self._claude_session_meta()
-        self._begin_session_report(new_params.get("mcpServers"))
-        self._guard_unresolved_mcp_refs(new_params.get("mcpServers"))
+        self._begin_session_report(_roster_of(self, new_params.get("mcpServers")))
+        self._guard_unresolved_mcp_refs(_roster_of(self, new_params.get("mcpServers")))
         self._last_substitution_model = None
         retry_id = await self._send_request(METHOD_SESSION_NEW, new_params)
         session_resp = await self._wait_for_response(
@@ -768,15 +755,11 @@ def _initialize_params(self: AcpClient) -> dict[str, Any]:
     handshake (:meth:`_entitlement_probe_answer`), so the probe process is
     introduced to kiro-cli exactly as the session it probes for was.
     """
-    dialect_version, client_capabilities = _wire_contract_for_backend(self.backend)
-    # The dialect supplies the default; a harness that has stated its own
-    # ``protocolVersion`` literal overrides it through the per-harness table
-    # (harness-parity H10), so the handshake evaluates no adapter conditional.
-    protocol_version = _PROTOCOL_VERSION_BY_BACKEND.get(self.backend, dialect_version)
+    protocol_version: int | str = _PROTOCOL_VERSION_BY_BACKEND.get(self.backend, PROTOCOL_VERSION)
     return {
         "protocolVersion": protocol_version,
         "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
-        "clientCapabilities": client_capabilities,
+        "clientCapabilities": client_capabilities_for(self.backend),
     }
 
 
@@ -825,7 +808,16 @@ async def _initialize_session(self: AcpClient) -> None:
     """Handshake: initialize → session/load or session/new → set_mode → set_model."""
     # 1. Initialize
     init_id = await self._send_request(METHOD_INITIALIZE, self._initialize_params())
-    init_resp = await self._wait_for_response(init_id, timeout=_INIT_TIMEOUT)
+    try:
+        init_resp = await self._wait_for_response(init_id, timeout=_INIT_TIMEOUT)
+    finally:
+        # Copilot CLI reads its launch MCP config when it boots (measured on 1.0.100:
+        # the file deleted right after the initialize answer, the stdio server it
+        # names still mounted and answered tools/call). It carries a session
+        # credential, so it goes now, on a failed handshake too. The Strands CLI reads
+        # its --mcp-config file at start as well, before it serves initialize.
+        if self._is_copilot or self._is_strands:
+            await self._discard_copilot_mcp_config()
     logger.info("ACP initialized (protocol=%s)", init_resp.get("protocolVersion"))
 
     # Whether this harness can restore a session at all, asked of whichever
@@ -843,14 +835,6 @@ async def _initialize_session(self: AcpClient) -> None:
         )
     else:
         self._can_load_session = bool(capabilities.get("loadSession", False))
-    # A wire advertisement says the method exists, not that Crew has verified
-    # transcript restoration. Keep the capability descriptor authoritative; an
-    # unavailable or unverified resume path always starts a fresh session.
-    try:
-        native_resume_verified = acp_backends.supports(self.backend, acp_backends.CAP_NATIVE_RESUME)
-    except acp_backends.UnknownAcpBackend:
-        native_resume_verified = False
-    self._can_load_session = self._can_load_session and native_resume_verified
     # Read on every handshake so a respawn onto a harness that dropped image
     # support cannot keep a stale yes. Only a literal ``true`` counts.
     prompt_capabilities = capabilities.get("promptCapabilities")
@@ -867,8 +851,13 @@ async def _initialize_session(self: AcpClient) -> None:
     self._agent_version = agent_version_from_init(init_resp)
     self._agent_version_read = True
     self._steering_advertised = steering_advertised(init_resp)
+    self._initialize_result = init_resp if isinstance(init_resp, dict) else {}
     self._note_pi_adapter_version()
     self._note_goose_version()
+    # Copilot only: a release other than the verified one is refused here, before
+    # any session exists; the AcpToolGateUnroutable it raises ends the child with no
+    # respawn (see ``ensure_ready``).
+    self._refuse_unverified_copilot_version()
 
     # The subprocess has now read its agent spec, which closes the window the
     # pre-spawn snapshot opened: a write landing before this point is caught here,
@@ -925,7 +914,9 @@ async def _initialize_session(self: AcpClient) -> None:
             file_ok = True
         else:
             session_file = str(kiro_sessions_dir() / f"{resume_sid}.json")
-            file_ok = Path(session_file).exists()
+            # Off the loop: the sessions dir sits under the home directory,
+            # which can be a network mount, and this runs on every resume.
+            file_ok = await asyncio.to_thread(Path(session_file).exists)
         if file_ok:
             # WHICH restore verb, from the same membership set that chose the
             # capability above. The two calls share a contract --
@@ -953,11 +944,21 @@ async def _initialize_session(self: AcpClient) -> None:
                     # session re-declares everything Crew mounts on it or comes
                     # back with no tools (see session/new above). Pooled stubs are
                     # re-declared so a resumed session keeps talking to the
-                    # broker; the same ``_pooled_mcp_servers`` reduction rides
-                    # inside the gate, withheld with the array when the route
-                    # is unproven. Gated per backend, and in-memory here vs
+                    # broker. Gated per backend, and in-memory here vs
                     # off-loop there, for the same reasons as session/new.
-                    "mcpServers": await self._gated_session_mcp_servers(),
+                    "mcpServers": [
+                        *(
+                            self._claude_session_mcp_servers()
+                            if self._is_claude and not getattr(self, "_side_read_only", False)
+                            else []
+                        ),
+                        *(self._opencode_session_mcp_servers() if self._is_opencode else []),
+                        *(self._goose_session_mcp_servers() if self._is_goose else []),
+                        *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
+                        *(self._copilot_session_mcp_servers() if self._is_copilot else []),
+                        *(self._pi_session_mcp_servers() if self._is_pi else []),
+                        *(await asyncio.to_thread(self._pooled_mcp_servers)),
+                    ],
                 }
                 if self.backend in ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP:
                     load_params["mcpServers"] = await self._prune_unstartable_mcp(
@@ -971,10 +972,10 @@ async def _initialize_session(self: AcpClient) -> None:
                     # so it gets neither key rather than a kiro session_file
                     # it would not know what to do with.
                     load_params["_meta"] = {"_kiro.dev/session_file": session_file}
-                self._begin_session_report(load_params.get("mcpServers"))
+                self._begin_session_report(_roster_of(self, load_params.get("mcpServers")))
                 # A resumed session re-declares everything Crew mounts on it, so it
                 # can be short of a referenced server exactly as a fresh one can.
-                self._guard_unresolved_mcp_refs(load_params.get("mcpServers"))
+                self._guard_unresolved_mcp_refs(_roster_of(self, load_params.get("mcpServers")))
                 if self._is_pi:
                     await self._republish_pi_mcp_handoff()
                 load_id = await self._send_request(restore_method, load_params)
@@ -1086,25 +1087,22 @@ async def _initialize_session(self: AcpClient) -> None:
         logger.info("ACP session created: %s (model=%s)", self._session_id, _model_log)
         if self._is_claude:
             await self._pin_claude_starting_mode(session_resp)
-    # The host's own model listing may name only the active model; a host that
-    # keeps further enabled rows in its operator config gets them merged here,
-    # after either session/new or load, so every picker and availability check
-    # sees the selectable siblings. The which-hosts question is the merge's own.
-    await self._merge_configured_models()
     self._last_activity = time.monotonic()
     # The session exists, so the pi process that read the MCP handoff file has
     # started; the file has no further reader and goes now.
     if self._is_pi:
         await self._discard_pi_mcp_handoff()
+    # Copilot CLI read its launch MCP config when its process started; the file
+    # carries a session credential and nothing reads it again. Same for the Strands CLI.
+    if self._is_copilot or self._is_strands:
+        await self._discard_copilot_mcp_config()
 
     # Seek to end of JSONL so we only read new tool results.
     # claude-agent-acp stores sessions via its own SDK, not ~/.kiro/ — skip.
     if self._session_id and self._is_kiro:
-        _jpath = kiro_sessions_dir() / f"{self._session_id}.jsonl"
-        try:
-            self._jsonl_pos = _jpath.stat().st_size if _jpath.exists() else 0
-        except OSError:
-            self._jsonl_pos = 0
+        self._jsonl_pos = await asyncio.to_thread(
+            _jsonl_size, kiro_sessions_dir() / f"{self._session_id}.jsonl"
+        )
 
     # The host has now consumed the ``mcpServers`` array, by whichever route created
     # the session -- ``session/load``, ``session/new``, or the substitution retry --
@@ -1205,8 +1203,15 @@ async def _initialize_session(self: AcpClient) -> None:
     #  persist, rather than as a step of its own down here: see
     #  _reseed_after_capture on why it rides an EXISTING adapter-only branch.)
 
+    # Frames buffered before the routing write answered can name the state a
+    # restored session was left in; the answer supersedes them, so they are not
+    # replayed, and everything the drain reads after it is checked below.
+    if self.backend in ACP_BACKEND_FORBIDDEN_MODES:
+        self._drop_superseded_config_frames()
     # Drain MCP server init notifications
     await self._drain_notifications()
+    if self.backend in ACP_BACKEND_FORBIDDEN_MODES:
+        await self._refuse_session_config_drift()
 
     # The drain usually reads step 4's agent/switched frame; judge the model
     # it named before the first prompt can run on it.
@@ -1406,3 +1411,36 @@ async def ensure_ready(self: AcpClient) -> None:
             )
         except Exception:  # never let telemetry break session startup
             logger.debug("session startup metric emit failed", exc_info=True)
+
+
+#: Numeric protocol literal the public ACP spec dialect speaks (spec adapters).
+PROTOCOL_VERSION_SPEC = 1
+
+
+def _wire_contract_for_backend(backend: str) -> tuple[int | str, dict[str, Any]]:
+    """Return the exact initialize contract for a backend's declared dialect.
+
+    Every dialect opts into a protocol version and capability set together.
+    A newly added dialect therefore fails before the first wire request instead
+    of silently inheriting Kiro's contract through an ``else`` arm (H5).
+    """
+    from kiro_crew.acp.backends import Dialect, dialect_of
+
+    contracts: dict[Dialect, tuple[int | str, dict[str, Any]]] = {
+        Dialect.KIRO: (PROTOCOL_VERSION, ACP_CLIENT_CAPABILITIES),
+        Dialect.SPEC: (
+            PROTOCOL_VERSION_SPEC,
+            ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER,
+        ),
+    }
+    # H10: a harness's protocolVersion is its OWN literal, so a divergence is a
+    # one-line edit rather than a silent downgrade of whichever harness moved
+    # first. The dialect supplies the default; the per-harness overrides live in
+    # ONE table (``_PROTOCOL_VERSION_BY_BACKEND``), applied by the caller: two
+    # tables is how a harness gains a version in one and keeps the dialect
+    # default in the other, which is a downgrade nothing reports.
+    dialect = dialect_of(backend)
+    try:
+        return contracts[dialect]
+    except KeyError as exc:
+        raise AcpError(f"Unsupported ACP dialect {dialect!r} for backend {backend!r}") from exc

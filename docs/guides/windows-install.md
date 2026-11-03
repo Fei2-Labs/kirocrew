@@ -173,9 +173,11 @@ Current status:
   writes it and where its updater reads it back), that the install
   claimed an owned subdirectory rather than the pre-existing directory it was
   pointed at, that a Start Menu shortcut targets the executable THIS install
-  wrote, that the bundled CLI runs, that the installed gateway answers
-  `/api/health`, and that a silent uninstall removes the registration, the
-  install-info key and the tree. `build-windows.yml` is `workflow_call`-only from `nightly.yml` and
+  wrote, that the bundled CLI runs, that the staged KAS engine root is in the
+  installed tree and the installed `kirocrew kas status` reports it `(built
+  into the app)` when `KIROCREW_BUNDLED_KAS_DIR` names it, that the installed
+  gateway answers `/api/health`, and that a silent uninstall removes the
+  registration, the install-info key and the tree. `build-windows.yml` is `workflow_call`-only from `nightly.yml` and
   `release.yml` plus a `workflow_dispatch` packaging probe, so this leg costs a
   PR nothing and a packaging change that only breaks a real install is caught by
   the next nightly — or before merge by dispatching that probe. There is **no
@@ -263,9 +265,17 @@ python -m kiro_crew.frontend stage .
 Then:
 
 ```powershell
+kirocrew kas install   # the built-in KAS engine this release pins (optional)
 kirocrew setup
 kirocrew gateway
 ```
+
+`kirocrew kas install` downloads the KAS engine this release pins into the data
+home, so the built-in engine route (`agent.kas_bundle`, off by default) can be
+turned on with no further download. A source build does not run it for you; the
+desktop installer already carries the engine inside the app. `install.ps1` is
+the cloud path's thin client and runs no gateway on this machine: the instance
+it launches installs with `install.sh`, which downloads the engine by default.
 
 Open the dashboard URL printed by the gateway. On first launch, Kiro Crew checks
 the **Windows gateway host** for a runnable and authenticated Kiro CLI. If it is
@@ -375,7 +385,7 @@ while the other 503s. Concretely:
 | LLM cron jobs (the `message` kind) | works |
 | Script cron jobs | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) — they run through `wrap_argv`, which permits them on Windows because no backend is installable. With that opt-out declared the job fails with a message naming the setting |
 | Command cron jobs (`sh -c "…"`) | not supported on Windows — the stored command is vetted under POSIX-sh semantics, and Windows ships no shell whose language matches: cmd.exe is not POSIX at all, and Git-for-Windows's `sh.exe` is bash. Routing a string vetted for one language through a shell that widens it is the hazard, so the resolver refuses rather than picking a shell. (Brace expansion is refused separately, at storage time and on every fire; the refusal here rests on the shell language being wider than the one the vet was written against.) The job fails-closed with an explanation. Use a **script cron** or an LLM `message` cron on this platform |
-| Script hooks (Settings → Hooks) | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) (like script crons — the hook command routes through `wrap_argv`, which permits them on Windows because no backend is installable; with that opt-out declared the hook returns that message as its `error`). They run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
+| Script hooks (Customize → Hooks) | run unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse them) (like script crons — the hook command routes through `wrap_argv`, which permits them on Windows because no backend is installable; with that opt-out declared the hook returns that message as its `error`). They run in **cmd.exe** language: a hook `command` runs as `%ComSpec% /c "<command>"`, so read the context env vars as `%KIROCREW_HOOK_EVENT%` / `%KIROCREW_HOOK_CONTEXT%` (not `$VAR`), and group arguments with double quotes only (cmd.exe gives `'…'` no meaning). The line reaches cmd.exe verbatim, so a quoted interpreter path with a space works. A hook authored on macOS/Linux is not portable and must be rewritten |
 | Pull-request source drawer provider fetch/check/resolve | runs unconfined under this platform's default (declare `sandbox_allow_unsandboxed_exec=false` to refuse it), like script crons and hooks. The drawer keeps its own async, sandbox-routed spawn (`source_providers.runner._run_json`); Windows has no OS sandbox backend, so it reaches the same no-backend policy, and `sandbox_allow_unsandboxed_exec` resolves true on win32. With that opt-out declared, `sandboxed_spawn_argv` refuses with a message naming the setting. The provider-CLI **trust** check applies here too (see Issue Radar below), and the allowlisted executable, env allowlist, output cap, timeout and audit still bound every call |
 | Issue Radar | works — its `gh` spawn is not sandbox-routed, so the trust check is the only gate, and that is answered by reading the binary's Windows ACL (`kiro_crew.windows_acl`) in place of the POSIX `st_uid` + write-bit walk, which reports nothing on this platform. Refused when any principal outside `{you, SYSTEM, Administrators, TrustedInstaller}` can replace the binary or a parent directory, or when the security descriptor is unreadable. An **elevated** gateway (the built-in `Administrator` account, or a "Run as administrator" launch) is not refused for being elevated: Windows has no OS sandbox in this codebase, so the agent's shell already holds the gateway's full token and a refusal would remove the feature without removing any exposure — the same ACL walk applies, keyed on the gateway user's SID. GitHub only on this platform unless `glab` is installed. **If a `gh` you trust is refused**, the override variables (`KIROCREW_ISSUE_RADAR_GH`, `KIROCREW_GH_BIN`) re-enter the same check rather than bypassing it, so the recourse is to install `gh` somewhere only you and the system can write — a per-user `%LOCALAPPDATA%` install is accepted — or to file an issue quoting the refusal, which names the offending principal or the ACE type it could not evaluate |
 | Spec Builder | works, except **Duplicate** — crash-safe copy publication pins a staging directory and uses the platform's atomic no-replace rename (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS). Windows provides neither that native contract nor CPython's directory-descriptor operations, so the backend reports the capability as unavailable and the dashboard omits Duplicate instead of falling back to a check-then-rename race or a junction-prone path write. Approval, per-task runs, labels, archive/restore, chat, and whole-plan execution work normally |
@@ -531,8 +541,9 @@ platform-neutral names.
 
 ### The five-whys log lock follows the same rule
 
-`scripts/five_whys.py` serializes each mutating command on a `<log>.lock`
-sidecar, and it cannot import `platform_compat`: a skill script is copied out of
+`src/kiro_crew/builtin_skills/five-whys/scripts/five_whys.py` serializes each
+mutating command on a `<log>.lock` sidecar, and it cannot import
+`platform_compat`: a skill script is copied out of
 the package and run as a bare `python3` file, so `kiro_crew` is usually not on
 its path. Its `_flock` therefore applies the rule above itself, with the
 helper's poll interval and ceiling. On Windows it polls
@@ -602,8 +613,8 @@ budget as `TasksMax` and `JobMemoryLimit` against `MemoryMax`, and
 `sandbox.apply_windows_resource_ceiling` reads the **same** `resource_limits`
 config as the cgroup path, but the Job object enforces only two of its keys:
 `max_processes` and `max_memory_mb`. The others — `cpu_weight`,
-`max_cpu_percent`, `max_cpu_seconds`, `max_open_files`, `max_total_memory_mb`
-and `max_total_processes` — are accepted but inert on Windows, and the gateway
+`max_cpu_percent`, `max_cpu_seconds`, `max_open_files`, `max_total_memory_mb`,
+`max_total_processes`, `scope_memory_high_pct` and `slice_reclaim_trigger_pct` — are accepted but inert on Windows, and the gateway
 logs one warning naming each one that is set. The memory limits are equivalent; the process limits are not one-for-one, because
 `TasksMax` counts every thread while `ActiveProcessLimit` counts processes — the
 same number is therefore a looser bound here, though it still bounds a fork
@@ -693,7 +704,7 @@ POSIX fleet too, where the Windows branches never execute.
 
 ## The RSS-recycle ceiling measures real trees on Windows
 
-`session.watchdog_rss_max_mb` (default `0`, off) recycles a
+`session.watchdog_rss_max_mb` (default `4096`) recycles a
 non-busy session whose process tree exceeds the ceiling. Its measurement is
 `/proc`-based on POSIX. On Windows `get_session_rss_mb` delegates to
 `platform_compat.proc_rss_tree_mb_for_pid`; a `/proc` read there would measure

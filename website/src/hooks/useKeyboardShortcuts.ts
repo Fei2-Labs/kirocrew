@@ -39,6 +39,7 @@ import { MOBILE_BREAKPOINT } from './useIsMobile'
 import { isEditableTarget } from '../utils/editableTarget'
 import { closeShownCrewWindow, crewWindowShown } from '../pages/chat/crew-window/crewWindowStore'
 import { stepTurn } from '../pages/chat/turnStep'
+import { noteEscapeStoppedSpeech } from '../utils/speechStopKey'
 
 /** Shortcuts scoped to the session on screen (see the crew-window guard). */
 const CREW_WINDOW_SCOPED: ReadonlySet<string> = new Set([
@@ -250,8 +251,14 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'chat-8': 'hooks.useKeyboardShortcuts.jump_to_chat',
   'chat-9': 'hooks.useKeyboardShortcuts.jump_to_chat',
   'chat-letters': 'hooks.useKeyboardShortcuts.jump_to_chat_letters',
-  'chat-prev': 'hooks.useKeyboardShortcuts.previous_chat',
-  'chat-next': 'hooks.useKeyboardShortcuts.next_chat',
+  // The Alt+arrow rows name their focus rule: the handler leaves those chords
+  // to a focused text field (word-jump / paragraph movement on macOS), so
+  // without it the list advertises a chord that silently does nothing in the
+  // composer. The bracket chat rows below are the twin that works while
+  // typing, and keep the plain label; turn-prev/turn-next carry the rule in
+  // their own (unshared) catalog values.
+  'chat-prev': 'hooks.useKeyboardShortcuts.previous_chat_outside_text_fields',
+  'chat-next': 'hooks.useKeyboardShortcuts.next_chat_outside_text_fields',
   'chat-prev-bracket': 'hooks.useKeyboardShortcuts.previous_chat',
   'chat-next-bracket': 'hooks.useKeyboardShortcuts.next_chat',
   'chat-mru': 'hooks.useKeyboardShortcuts.last_visited_chat_mru',
@@ -817,7 +824,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       // the leaked flag would blur the composer with no refocus AND silently
       // eat the NEXT pointer-driven switch's autofocus.
       if (isMacPlatform() && key !== activeSlot) releaseComposerForKeyboardSwitch()
-      dispatch(switchSlot({ key, announceOnMissing: true }))
+      dispatch(switchSlot({ key, announceOnMissing: true, gesture: true }))
       navigate('/chat')
     }
 
@@ -1171,6 +1178,9 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       if (e.key !== 'Escape') return
       const { voicePlaying, voicePreparing } = appStore.getState().chat
       if (!voicePlaying && !voicePreparing) return
+      // Spent on speech: the composer's Escape-to-stop gate reads this and
+      // leaves the running turn alone (utils/speechStopKey.ts, #22315).
+      noteEscapeStoppedSpeech(e)
       window.dispatchEvent(new Event('voice-stop'))
     }
     document.addEventListener('keydown', onEsc, true)

@@ -128,6 +128,7 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         halt_pod,
         install_backend,
         loaded_teardown_hook,
+        restart_pod,
         start_pod,
         stop_pod,
         time,
@@ -1014,9 +1015,12 @@ def recent_journal(
     cp = subprocess.run(
         ["journalctl", "--user", "-u", pod_unit(cfg, name), "-n", str(lines), "--no-pager", *bound],
         capture_output=True,
-        text=True,
         timeout=10,
         env=_systemctl_env(),
+        # The journal stores UTF-8 and journalctl prints it raw, even under the
+        # LC_ALL=C that _systemctl_env pins, so a locale decode can garble or
+        # raise on a non-ASCII path in the very boot failure this surfaces.
+        **UTF8_TEXT,
     )
     return cp.stdout
 
@@ -1594,6 +1598,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "halt_pod",
         "install_backend",
         "loaded_teardown_hook",
+        "restart_pod",
         "start_pod",
         "stop_pod",
         "time",

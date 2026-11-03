@@ -79,6 +79,7 @@ async def _resolve_app_approval(
     # Imported here: chat_handlers imports this package at module scope.
     from kiro_crew.dashboard.chat_handlers import (
         _app_may_send_to_slot,
+        _pending_elicitation_ids,
         deny_session_approval_caller,
     )
 
@@ -88,10 +89,16 @@ async def _resolve_app_approval(
     live: list[tuple[Any, asyncio.Future[str]]] = []
     if "origin" not in request.query:
         # Snapshot before any await: the permission reads below yield the loop.
+        # An MCP elicitation shares the slot's registry so a Stop and the Board
+        # see it, but it is the SERVER's question to a person, not a tool
+        # approval this grant covers: its future is not a candidate here, and
+        # the id reads as "does not exist" like every other refusal.
         live = [
             (slot, future)
             for slot in list(state._slots.values())
-            if (future := slot._approval_futures.get(approval_id)) and not future.done()
+            if (future := slot._approval_futures.get(approval_id))
+            and not future.done()
+            and approval_id not in _pending_elicitation_ids(slot)
         ]
     controllable = [pair for pair in live if await _app_may_send_to_slot(request_app, pair[0])]
     if len(controllable) == 1:
@@ -164,9 +171,33 @@ async def api_approval_resolve(request: web.Request) -> web.Response:
                 },
                 status=404,
             )
-        ok = state.resolve_approval(
-            approval_id, action == "approve", rejected_once=action == "reject_once"
+        # Shared Crew: resolve once under the decision registry, naming the
+        # verified responder; a different collaborator's later click gets 409
+        # with the winning decision, a retry of the same click replays it.
+        from kiro_crew.shared_crew import decisions as shared_decisions
+
+        try:
+            raw_body = await request.json() if request.can_read_body is True else {}
+        except ValueError:
+            raw_body = {}
+        response_id, response_id_ok = shared_decisions.read_response_id(
+            raw_body if isinstance(raw_body, dict) else {}
         )
+        if not response_id_ok:
+            return web.json_response(
+                {"error": "invalid response_id", "code": "invalid_response_id"}, status=400
+            )
+        reply = shared_decisions.resolve_approval_by_id(
+            state,
+            request,
+            approval_id,
+            approved=action == "approve",
+            rejected_once=action == "reject_once",
+            response_id=response_id,
+        )
+        if reply is not None:
+            return shared_decisions.respond(reply)
+        ok = False
     if not ok:
         return web.json_response({"error": "not found or expired"}, status=404)
     return web.json_response({"ok": True})

@@ -69,6 +69,7 @@ from kiro_crew.browser_cli.install_launcher import (
     bootstrap_tool_provenance,
     cli_command,
     cli_path,
+    staged_node_failure,
 )
 from kiro_crew.browser_cli.install_runner import (
     _BROWSER_INSTALL_TIMEOUT_S,
@@ -81,6 +82,7 @@ from kiro_crew.browser_cli.install_runner import (
     _run,
     redact_install_output,
 )
+from kiro_crew.browser_cli.managed_launcher import ensure_managed_launcher
 from kiro_crew.config.paths import config_dir
 from kiro_crew.env import augmented_path, find_node_tool, node_augmented_path
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -523,6 +525,10 @@ def install(on_stage: StageCallback | None = None) -> dict[str, Any]:
             "path": str(staged_node),
         }
     )
+    # The agent-facing launcher (``managed-bin``), which puts ``attach`` under its
+    # time limit. Written after the staged Node it names; a failure is logged and
+    # leaves npm's own shim in use, and the next gateway start retries it.
+    ensure_managed_launcher()
 
     # Resolved after the global install, not before: the binary does not exist
     # until that step succeeds.
@@ -625,6 +631,23 @@ def install_browser(engine: str, on_stage: StageCallback | None = None) -> dict[
                 }
             ],
         }
+    # A gateway-node staged before stage-node ran its probe can be a copy that
+    # cannot load its shared libraries; report it here, not as a loader crash
+    # inside the download.
+    node_failure = staged_node_failure(command)
+    if node_failure is not None:
+        node_rc, node_detail = node_failure
+        return {
+            "ok": False,
+            "steps": [
+                {
+                    "name": "check-node",
+                    "ok": False,
+                    "returncode": node_rc,
+                    "stderr": redact_install_output(node_detail),
+                }
+            ],
+        }
     _emit_stage(on_stage, STAGE_DOWNLOADING_BROWSER)
     steps = _download_browser(command, engine)
     _emit_stage(on_stage, STAGE_FINISHING)
@@ -681,6 +704,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.browser_cli.install_launcher import (  # noqa: F401
         _BROWSERS_MANIFEST,
         _MANAGED_TOOLS_LEAF,
+        _MISSING_LIBRARY_RE,
         _NODE_EXECUTABLE_PROBE,
         _NODE_MODULES,
         _PLAYWRIGHT_CORE_PKG,
@@ -691,6 +715,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         CLI_LEGACY_UNTRUSTED_REASON,
         CLI_NOT_INSTALLED_REASON,
         _agent_writable_roots,
+        _clear_retired_managed_nodes,
         _cli_package_dirs,
         _common_candidate_rejection,
         _direct_cli_command,
@@ -701,6 +726,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _managed_cli_root,
         _managed_node_path,
         _manifest_for_cli_package,
+        _probe_staged_node,
         _regular_file_within,
         _resolve_cli_candidate,
         _resolve_executable,
@@ -708,11 +734,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _resolve_managed_cli,
         _staged_node_runs,
         _standalone_node_modules,
+        _swap_in_managed_node,
         _system_candidate,
         _system_cli_candidates,
         _system_node_candidates,
         _system_node_for_launcher,
         _under,
+        _unrunnable_node_remedy,
         _warn_cli_refusal,
         _warned_cli_refusals,
         legacy_launcher_refused,

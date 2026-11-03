@@ -98,7 +98,7 @@ class ContinuationCoordinator(ManagerComponent):
             sid = unit_for_session_key(self._manager._sessions, info.parent_session_key)
             if not sid:
                 return
-            setattr(info, "_crew_log_followup_asked", (sid, crew_log_emit.live_turn(sid)))
+            setattr(info, "_crew_log_followup_asked", (sid, *crew_log_emit.asking_turn(sid)))
         except Exception:
             _logger.debug("crew log: pinning a follow-up origin failed", exc_info=True)
 
@@ -374,7 +374,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
-        _crew_log_asked: "tuple[str, int] | None" = None,
+        _crew_log_asked: "tuple[str, int, int] | None" = None,
     ) -> SubagentInfo | None:
         """Dispatch a follow-up *task* into conversation *conv_id* (sync callers).
 
@@ -422,7 +422,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
-        _crew_log_asked: "tuple[str, int] | None" = None,
+        _crew_log_asked: "tuple[str, int, int] | None" = None,
     ) -> SubagentInfo | None:
         """:meth:`continue_conversation_impl` for event-loop callers: the same
         prelude, then ``spawn_async`` (write-before-ack with the store write on
@@ -512,7 +512,7 @@ class ContinuationCoordinator(ManagerComponent):
         cwd: str = "",
         _preassigned_id: str = "",
         _memory_mode: str | None = None,
-        _crew_log_asked: "tuple[str, int] | None" = None,
+        _crew_log_asked: "tuple[str, int, int] | None" = None,
         *,
         _execution_context=None,
         _captured_state=...,
@@ -722,6 +722,18 @@ class ContinuationCoordinator(ManagerComponent):
         )
         if not isinstance(backend, str):
             backend = None
+        # Another turn of the same run sits at the same place in its tree.
+        # Admission keeps the deeper of this and what the parent proves now,
+        # so a run whose parent's record is gone cannot restart the count.
+        run_depth = (
+            original.depth
+            if original is not None
+            else ((read_state(conv_id) or {}) if _captured_state is ... else _captured_state).get(
+                "depth"
+            )
+        )
+        if type(run_depth) is not int:
+            run_depth = None
         # A continuation has to run WHERE THE RUN RAN. `spawn` resolves an empty
         # cwd to the pool project before it validates the agent name, so a run
         # spawned against a project-local agent (defined under that project's
@@ -758,6 +770,7 @@ class ContinuationCoordinator(ManagerComponent):
             # follow-up reads the global store -- a split nothing reports.
             memory_store=memory_store,
             _memory_mode=_memory_mode,
+            _depth=run_depth,
             app=app,
             **(
                 {"_execution_context": _execution_context.to_record()}
@@ -1254,8 +1267,31 @@ class ContinuationCoordinator(ManagerComponent):
             self._persistence.forget_live_run_state(conv_id)
 
     @staticmethod
-    def _release_disk_sync(conv_id: str, sid: str, provider_label: str) -> None:
+    def _release_answer(sid: str, provider_label: str, disposed: bool) -> tuple[bool, str]:
+        """What a release answers once both halves have run.
+
+        ``not_disposed`` keeps ``ok`` true: Crew did forget the conversation and
+        demote ``keep``. It only says the backend's session was not deleted, so
+        a later continue may still resume it. Nothing here deletes a store that
+        Crew does not own.
+        """
+        if not sid:
+            return False, "conversation_gone: nothing to release"
+        if not disposed:
+            return True, (
+                f"not_disposed: Crew forgot this conversation, but its {provider_label} "
+                "session was not deleted, so a later continue may still resume it"
+            )
+        return True, "released"
+
+    @staticmethod
+    def _release_disk_sync(conv_id: str, sid: str, provider_label: str) -> bool:
         """The disk half of a release: demote ``keep``, then delete session files.
+
+        Returns whether the session files were disposed (``True`` when there
+        was no sid to dispose). A backend that owns its own session store has
+        no delete route here, so its release answers ``False`` and the caller
+        reports ``not_disposed`` instead of ``released``.
 
         Demoting the persisted source of truth matters: with the disk fallback in
         place, a stale ``keep=True`` would re-warm the continuable cache after
@@ -1273,11 +1309,12 @@ class ContinuationCoordinator(ManagerComponent):
         except Exception:
             logger.debug("release: failed to demote state for %s", conv_id, exc_info=True)
         if not sid:
-            return
+            return True
         try:
-            _cleanup_session_files_sync(sid, provider_label)
+            return bool(_cleanup_session_files_sync(sid, provider_label))
         except Exception:
             logger.debug("release_conversation: file cleanup failed", exc_info=True)
+            return False
 
     def release_conversation_impl(self, conv_id: str) -> tuple[bool, str]:
         """Release conversation *conv_id*: forget the sid and delete files.
@@ -1290,11 +1327,9 @@ class ContinuationCoordinator(ManagerComponent):
         if prefix[0] is False:
             return prefix
         sid, provider_label, original = prefix
-        self._release_disk_sync(conv_id, sid, provider_label)
+        disposed = self._release_disk_sync(conv_id, sid, provider_label)
         self._release_forget_live_state(conv_id, original)
-        if not sid:
-            return False, "conversation_gone: nothing to release"
-        return True, "released"
+        return self._release_answer(sid, provider_label, disposed)
 
     async def release_conversation_async_impl(self, conv_id: str) -> tuple[bool, str]:
         """:meth:`release_conversation_impl` for event-loop callers.
@@ -1334,10 +1369,8 @@ class ContinuationCoordinator(ManagerComponent):
                 logger.debug("release: disk half failed for %s: %r", conv_id, fut.exception())
 
         worker.add_done_callback(_settled)
-        await asyncio.shield(worker)
-        if not sid:
-            return False, "conversation_gone: nothing to release"
-        return True, "released"
+        disposed = await asyncio.shield(worker)
+        return self._release_answer(sid, provider_label, disposed)
 
     async def _sweep_conversations_async_impl(self, now: float) -> None:
         """Reaper hook: expire continuable conversations idle past TTL.

@@ -192,8 +192,9 @@ class TestBuiltinServiceHelpers:
 
 
 class TestUnregisterNotificationChannels:
-    def test_noop_without_state_or_bus(self) -> None:
+    def test_noop_without_state_or_bus(self, caplog: pytest.LogCaptureFixture) -> None:
         # No state at all, and state without a bus, must both be silent.
+        caplog.set_level("INFO", logger="kiro_crew.apps.routes")
         _unregister_notification_channels(
             make_mocked_request("POST", "/x", app=web.Application()), APP
         )
@@ -202,8 +203,10 @@ class TestUnregisterNotificationChannels:
         _unregister_notification_channels(
             make_mocked_request("POST", "/x", app=app), APP
         )
+        assert [r for r in caplog.records if r.name == "kiro_crew.apps.routes"] == []
 
-    def test_unregisters_via_bus(self) -> None:
+    def test_unregisters_via_bus(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level("INFO", logger="kiro_crew.apps.routes")
         bus = MagicMock()
         bus.unregister_app_channels.return_value = 2
         app = web.Application()
@@ -212,6 +215,8 @@ class TestUnregisterNotificationChannels:
             make_mocked_request("POST", "/x", app=app), APP
         )
         bus.unregister_app_channels.assert_called_once_with(APP)
+        messages = [r.getMessage() for r in caplog.records if r.name == "kiro_crew.apps.routes"]
+        assert messages == [f"Unregistered 2 notification channel(s) for app {APP}"]
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +573,55 @@ class TestInstallValidation:
         assert body["retryable"] is True
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("manifest", "kind"), [("[]", "list"), ('"my-app"', "str")], ids=["list", "string"]
+    )
+    async def test_a_manifest_that_is_not_an_object_is_an_invalid_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manifest: str, kind: str
+    ) -> None:
+        # Valid JSON that is not an object would reach `.get()` in the version
+        # check as a 500. It is a settled invalid manifest, so it gets the 400
+        # install_app gives that manifest, before anything is copied.
+        home = _setup_env(tmp_path, monkeypatch)
+        src = tmp_path / "source" / APP
+        src.mkdir(parents=True)
+        (src / APP_MANIFEST_FILENAME).write_text(manifest, encoding="utf-8")
+
+        def _must_not_install(*args: Any, **kwargs: Any) -> AppResult:
+            raise AssertionError("a non-object manifest must be refused before install")
+
+        monkeypatch.setattr(routes_mod, "install_app", _must_not_install)
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post("/api/apps/install", json={"source": str(src)})
+            assert resp.status == 400
+            body = await resp.json()
+        assert body == {
+            "ok": False,
+            "name": "",
+            "error": f"invalid app.json: app.json must be a JSON object, got {kind}",
+            "code": "manifest_not_object",
+        }
+        assert not (home / "apps").exists() or not any((home / "apps").iterdir())
+
+    @pytest.mark.asyncio
+    async def test_a_non_object_manifest_gets_the_answer_install_app_gives_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The route's refusal says what install_app says about the same manifest,
+        # plus the machine-readable code, so the two paths cannot disagree.
+        _setup_env(tmp_path, monkeypatch)
+        src = tmp_path / "source" / APP
+        src.mkdir(parents=True)
+        (src / APP_MANIFEST_FILENAME).write_text("[]", encoding="utf-8")
+        direct = routes_mod.install_app(str(src))
+        assert direct.ok is False
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post("/api/apps/install", json={"source": str(src)})
+            assert resp.status == 400
+            body = await resp.json()
+        assert body == {**direct.to_dict(), "code": "manifest_not_object"}
+
+    @pytest.mark.asyncio
     async def test_manifest_name_change_refuses_before_copy(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -879,6 +933,52 @@ class TestRegisterExternal:
         assert json.loads(persisted)["source"] == safe_source
         assert json.loads(detail_text)["source"] == safe_source
         assert json.loads(listing_text)[0]["source"] == safe_source
+
+    @pytest.mark.asyncio
+    async def test_registration_republishes_declared_config_keys_off_the_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A self-managed app's manifest can declare ``config_keys``. Config validation
+        reads them from a snapshot install and update republish; registering must
+        republish it too, or the app's section reads as an unrecognized key until a
+        restart. The refresh scans the apps directory, so it runs off the loop."""
+        from kiro_crew.config import validation
+
+        _setup_env(tmp_path, monkeypatch)
+        refresh_threads: list[int] = []
+        from kiro_crew.apps.manager import refresh_app_config_keys as real_refresh
+
+        def _observed_refresh() -> frozenset[str]:
+            refresh_threads.append(threading.get_ident())
+            return real_refresh()
+
+        # raising=False: the route reads the name through this facade, and on a
+        # build where the route never refreshes the name is absent.
+        monkeypatch.setattr(routes_mod, "refresh_app_config_keys", _observed_refresh, raising=False)
+        validation.replace_extension_config_keys("apps", ())
+        try:
+            async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+                response = await client.post(
+                    "/api/apps/register",
+                    json={
+                        "name": "ext-app",
+                        "version": "1.0.0",
+                        "displayName": "External App",
+                        "manifest": {
+                            "name": "ext-app",
+                            "version": "1.0.0",
+                            "displayName": "External App",
+                            "description": "Test app",
+                            "config_keys": ["ext_app"],
+                        },
+                    },
+                )
+            assert response.status == 201, await response.text()
+            assert validation.extension_config_keys("apps") == frozenset({"ext_app"})
+            assert len(refresh_threads) == 1
+            assert refresh_threads[0] != threading.get_ident()
+        finally:
+            validation.replace_extension_config_keys("apps", ())
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("repository_bound", [False, True])

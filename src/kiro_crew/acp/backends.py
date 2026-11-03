@@ -40,6 +40,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
     ACP_BACKENDS_KIRO_CREDITS,
 )
 
@@ -546,8 +547,55 @@ _DEEPSEEK = BackendDescriptor(
     effort_config_id=EFFORT_CONFIG_ID_REASONING,
 )
 
+_STRANDS = BackendDescriptor(
+    id=ACP_BACKEND_STRANDS,
+    label="Strands",
+    experimental=True,
+    dialect=Dialect.SPEC,
+    # Same mechanism class as the DeepSeek Harness: the CLI's project mode is
+    # started on Crew's own sealed gate module and its load is read back before
+    # the session begins. The newer routing table carries that as
+    # VERIFIED_GATE_EXTENSION; this vocabulary has no gate-extension member, and
+    # this table answers only for what THIS layer can enforce by itself.
+    routing=Routing.UNVERIFIED,
+    # Provider keys arrive through Crew's vault (agent.strands_env); the vendor
+    # CLI owns whatever sign-in flow they back, so the doctor line names the CLI.
+    signin_command="strands",
+    install_command="npm install -g @strands-agents/cli",
+    registry_id="",
+    credential_leaves=(),
+    process_markers=("strands",),
+    permission_config_id="",
+    permission_config_value="",
+    capabilities={
+        # One process per session on the AcpClient path, like the other
+        # adapters; the CLI runs a project, not a multiplexed runtime.
+        CAP_SESSION_SHARING: Level.UNAVAILABLE,
+        # Model and effort are launch arguments only (--model/--effort); a
+        # change relaunches the process. The relaunch path is not measured
+        # from a live Strands process yet.
+        CAP_REASONING_EFFORT: Level.UNVERIFIED,
+        CAP_TOOL_SEARCH: Level.UNVERIFIED,
+        # Prompt instructions and skills are injected; restricted tool
+        # profiles cannot be enforced.
+        CAP_AGENT_PROFILES: Level.DEGRADED,
+        # The CLI serves its own harness commands, not Kiro Crew's set.
+        CAP_SLASH_COMMANDS: Level.DEGRADED,
+        CAP_TURN_USAGE: Level.UNVERIFIED,
+        CAP_BILLING: Level.UNAVAILABLE,
+        # The CLI joins LOAD_WITHOUT_MODES / RELOAD_DISPOSED_SESSION, but a
+        # session/load RPC answering is not a measured transcript restore —
+        # do not mark SUPPORTED off the membership alone.
+        CAP_NATIVE_RESUME: Level.UNVERIFIED,
+        # Strands model ids come from the project's provider, so they are not
+        # model_registry keys.
+        CAP_REGISTRY_MODEL_IDS: Level.UNAVAILABLE,
+        CAP_MID_TURN_STEER: Level.UNAVAILABLE,
+    },
+)
+
 _BY_ID: dict[str, BackendDescriptor] = {
-    d.id: d for d in (_KIRO, _CLAUDE, _CODEX, _COPILOT, _KAS, _GOOSE, _OPENCODE, _PI, _DEEPSEEK)
+    d.id: d for d in (_KIRO, _CLAUDE, _CODEX, _COPILOT, _KAS, _STRANDS, _GOOSE, _OPENCODE, _PI, _DEEPSEEK)
 }
 
 

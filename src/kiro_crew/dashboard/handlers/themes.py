@@ -65,6 +65,7 @@ from kiro_crew.dashboard.theme_validate import (
     _validate_theme_data,
     _validate_theme_dir,
 )
+from kiro_crew.dashboard.theme_zip import THEME_ZIP_MAX_UPLOAD_BYTES, extract_theme_zip
 from kiro_crew.executors import discovery_executor
 from kiro_crew.hooks import (
     FileTooLargeError,
@@ -104,6 +105,10 @@ def _list_themes_sync() -> list[dict[str, Any]]:
         for f in themes_path.glob("*.json"):
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
+                # Valid JSON that is not an object (a list, a number) is skipped
+                # like a corrupt file, so one bad file never fails the whole list.
+                if not isinstance(data, dict):
+                    continue
                 result.append(
                     {
                         "slug": f.stem,
@@ -112,7 +117,7 @@ def _list_themes_sync() -> list[dict[str, Any]]:
                         "created_at": data.get("created_at", ""),
                     }
                 )
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
                 continue
         # Installed themes are directories (<slug>/) carrying a theme.json.
         # Dot-prefixed dirs are transient install staging/backup snapshots
@@ -127,7 +132,9 @@ def _list_themes_sync() -> list[dict[str, Any]]:
                 continue
             try:
                 m = json.loads(mpath.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                continue
+            if not isinstance(m, dict):
                 continue
             result.append(
                 {
@@ -791,14 +798,8 @@ def _audit_theme_install_governance(
         pass
 
 
-async def api_themes_install(request: web.Request) -> web.Response:
-    """POST /api/themes/install — install a Level-0 theme directory.
-
-    Body: ``{"source": {"type": "local", "path": "..."}}`` or
-    ``{"source": {"type": "github", "url": "https://github.com/..."}}``.
-    Fetch/move -> validate (data + structure) -> register as
-    ``_themes_dir()/<slug>/``.
-    """
+def _theme_install_admission() -> web.Response | None:
+    """The governance refusal for a theme install, or ``None`` when permitted."""
     # Governance admission gate: installing a pack ingests third-party content
     # (local move or server-side git clone) and serves sandboxed JS into the
     # dashboard, so an enterprise POLICY must be able to ban it wholesale
@@ -826,6 +827,33 @@ async def api_themes_install(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "theme installation blocked (governance unavailable)"}, status=403
         )
+    return None
+
+
+def _install_response(
+    theme: dict[str, Any] | None, err: str | None, status: int, code: str | None = None
+) -> web.Response:
+    if err or theme is None:
+        payload = {"error": err or "install failed"}
+        if err == _THEME_GIT_SANDBOX_UNAVAILABLE:
+            payload["code"] = "theme_install_sandbox_unavailable"
+        elif code:
+            payload["code"] = code
+        return web.json_response(payload, status=status)
+    return web.json_response({"ok": True, "slug": theme["slug"], "theme": theme})
+
+
+async def api_themes_install(request: web.Request) -> web.Response:
+    """POST /api/themes/install — install a Level-0 theme directory.
+
+    Body: ``{"source": {"type": "local", "path": "..."}}`` or
+    ``{"source": {"type": "github", "url": "https://github.com/..."}}``.
+    Fetch/move -> validate (data + structure) -> register as
+    ``_themes_dir()/<slug>/``.
+    """
+    refused = _theme_install_admission()
+    if refused is not None:
+        return refused
 
     try:
         body = await request.json()
@@ -843,13 +871,65 @@ async def api_themes_install(request: web.Request) -> web.Response:
     theme, err, status = await asyncio.get_running_loop().run_in_executor(
         discovery_executor(), _do_install, stype, source
     )
-    if err or theme is None:
-        payload = {"error": err or "install failed"}
-        if err == _THEME_GIT_SANDBOX_UNAVAILABLE:
-            payload["code"] = "theme_install_sandbox_unavailable"
-        return web.json_response(payload, status=status)
+    return _install_response(theme, err, status)
 
-    return web.json_response({"ok": True, "slug": theme["slug"], "theme": theme})
+
+def _do_install_zip(
+    data: bytes,
+) -> tuple[dict[str, Any] | None, str | None, int, str | None]:
+    """Unpack an uploaded archive privately, then run the local install on it.
+
+    The fourth element is the error ``code`` for an archive the unpacker refused.
+    """
+    tmp_root = Path(tempfile.mkdtemp(prefix="theme-zip-"))
+    try:
+        unpacked = tmp_root / "pack"
+        unpacked.mkdir()
+        try:
+            root = extract_theme_zip(data, unpacked)
+        except ValueError as exc:
+            return None, str(exc), 400, "theme_zip_invalid"
+        theme, err, status = _do_install("local", {"path": str(root)})
+        return theme, err, status, None
+    finally:
+        rmtree_force(tmp_root)
+
+
+async def api_themes_install_zip(request: web.Request) -> web.Response:
+    """POST /api/themes/install-zip — install a theme from an uploaded ``.zip``.
+
+    The body is the archive itself (``Content-Type: application/zip``). This is
+    the install path for a browser that is not on the gateway host, which the
+    folder-path source cannot serve. The archive is unpacked into a private
+    temporary directory and installed through the same stage -> validate ->
+    promote pipeline as a local folder.
+    """
+    refused = _theme_install_admission()
+    if refused is not None:
+        return refused
+    if request.content_length and request.content_length > THEME_ZIP_MAX_UPLOAD_BYTES:
+        return web.json_response(
+            {"error": "the theme archive is too large", "code": "theme_zip_too_large"},
+            status=413,
+        )
+    chunks: list[bytes] = []
+    received = 0
+    async for chunk in request.content.iter_chunked(64 * 1024):
+        received += len(chunk)
+        if received > THEME_ZIP_MAX_UPLOAD_BYTES:
+            return web.json_response(
+                {"error": "the theme archive is too large", "code": "theme_zip_too_large"},
+                status=413,
+            )
+        chunks.append(chunk)
+    if not received:
+        return web.json_response(
+            {"error": "no theme archive was uploaded", "code": "theme_zip_empty"}, status=400
+        )
+    theme, err, status, code = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _do_install_zip, b"".join(chunks)
+    )
+    return _install_response(theme, err, status, code)
 
 
 async def api_theme_detail(request: web.Request) -> web.Response:
@@ -892,12 +972,26 @@ async def api_theme_detail(request: web.Request) -> web.Response:
             # Acquire the per-slug install lock (same key _do_install stages/swaps
             # under) so we never rmtree mid-reinstall and race its stage→rename;
             # re-check is_dir() under the lock in case a reinstall just replaced it.
-            def _locked_remove() -> None:
+            # ``rmtree_force`` answers whether the folder is gone: a file another
+            # process holds open (a Windows lock) can survive it, and a partly
+            # removed pack reports an error instead of a false success that
+            # later lists as an invalid installed theme.
+            def _locked_remove() -> bool:
                 with _theme_install_lock(safe_slug):
-                    if dir_target.is_dir():
-                        shutil.rmtree(dir_target, ignore_errors=True)
+                    if not dir_target.is_dir():
+                        return True
+                    return rmtree_force(dir_target)
 
-            await loop.run_in_executor(discovery_executor(), _locked_remove)
+            removed = await loop.run_in_executor(discovery_executor(), _locked_remove)
+            if not removed:
+                return web.json_response(
+                    {
+                        "error": "the theme folder could not be fully removed; "
+                        "close any program using its files and try again",
+                        "code": "theme_delete_incomplete",
+                    },
+                    status=500,
+                )
             return web.json_response({"ok": True})
         return web.json_response({"error": "not found"}, status=404)
 
@@ -929,7 +1023,9 @@ async def api_theme_detail(request: web.Request) -> web.Response:
             with _theme_install_lock(safe_slug):
                 try:
                     existing = json.loads(target.read_text("utf-8"))
-                except (json.JSONDecodeError, OSError):
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    existing = {}
+                if not isinstance(existing, dict):
                     existing = {}
                 td = {
                     "name": name,
@@ -956,7 +1052,7 @@ async def api_theme_detail(request: web.Request) -> web.Response:
                 discovery_executor(), target.read_text, "utf-8"
             )
             data = json.loads(raw)
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             return web.json_response({"error": "failed to read theme"}, status=500)
         return web.json_response(data)
     if dir_is_dir:
