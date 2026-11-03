@@ -67,6 +67,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("run", "Run an autonomous task from a spec file"),
             ("cron", "Manage scheduled jobs"),
             ("spawn", "Manage background subagents"),
+            ("handoff", "Hand off work to a new Kiro Crew session"),
             ("computer", "Computer-use (desktop automation) diagnostics"),
         ),
     ),
