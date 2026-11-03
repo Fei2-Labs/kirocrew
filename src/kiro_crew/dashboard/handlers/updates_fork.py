@@ -102,7 +102,7 @@ async def api_update_fork_check(request: web.Request) -> web.Response:
 async def api_update_fork_apply(request: web.Request) -> web.Response:
     """POST /api/update/fork — download latest wheel and install it."""
     # Owner gate — only the dashboard owner can trigger an upgrade.
-    refused = await require_owner_dashboard_request(request)
+    refused = await require_owner_dashboard_request(request, "update_fork")
     if refused is not None:
         return refused
 
