@@ -172,6 +172,7 @@ def build_session_context(
     and hooks are injected for all agents.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
+    from kiro_crew.acp.types import is_spec_adapter_provider_label
     from kiro_crew.agent_files import is_kirocrew_default_agent
 
     execution_context, desk_member, member, memory_store, blocks_reads = _member.resolve_turn_owner(
@@ -182,7 +183,7 @@ def build_session_context(
     # keeps: steering resources and custom-agent skill globs are injected on
     # EVERY spec adapter (none of them reads the agent spec natively), never
     # keyed to claude alone.
-    is_spec_adapter = ctx.is_spec_adapter_provider_label(provider_type or "")
+    is_spec_adapter = is_spec_adapter_provider_label(provider_type or "")
     caps = ctx._resolve_caps(model_window)
     blocks = _budgets.ContextParts()
     parts = blocks.parts

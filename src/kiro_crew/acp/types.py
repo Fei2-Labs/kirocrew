@@ -1129,6 +1129,11 @@ class AcpEvent:
     #: deny that name is under cannot be checked, and every site that answers a
     #: permission request refuses it outright instead of judging it by title.
     mcp_identity_unreadable: bool = False
+    #: mcp_identity_ambiguous: the MCP identity could resolve to more than one
+    #: tool on the exact session roster. The title encoding has no escaping, so
+    #: no security identity can be recovered; permission consumers must hard-deny
+    #: the call.
+    mcp_identity_ambiguous: bool = False
     #: kas_builtin_ids: this permission event was built for a member of
     #: ``ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL`` (KAS), so a bare built-in
     #: ``tool_name`` is a KAS id (``read_file``) that ``platform.tool_names``
