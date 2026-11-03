@@ -35,8 +35,7 @@ jobs:
     # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
     # "Larger runners for the review lanes and CodeQL" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     timeout-minutes: 10
     outputs:
       version: ${{ steps.channel.outputs.version }}
@@ -201,8 +200,7 @@ jobs:
     # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
     # "Larger runners for the review lanes and CodeQL" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     permissions:
       actions: read
       contents: read
@@ -274,8 +272,7 @@ jobs:
     # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
     # "Larger runners for the review lanes and CodeQL" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     timeout-minutes: 10
     # Replaces the workflow default: `actions: read` is what lets the promotion
     # check ask whether a prerelease tag's release run actually SUCCEEDED.
@@ -979,8 +976,7 @@ jobs:
     # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
     # "Larger runners for the review lanes and CodeQL" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     # 60, not 20: the assets now upload one at a time (see `preserve_order` on
     # the Create GitHub Release step), several GB in all.
     timeout-minutes: 60
@@ -1482,8 +1478,7 @@ jobs:
     # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
     # "Larger runners for the review lanes and CodeQL" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     permissions:
       contents: read
     steps:
