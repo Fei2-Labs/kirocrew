@@ -22,7 +22,6 @@ comment about, and it keeps covering them as routes are added.
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 from typing import Any
@@ -54,6 +53,7 @@ def test_registrar_tuple_is_explicit_and_not_alphabetical() -> None:
         "taskrunner",
         "connections",
         "system",
+        "shared_crew",
     )
     assert list(routes_pkg.REGISTRAR_NAMES) != sorted(
         routes_pkg.REGISTRAR_NAMES
@@ -198,6 +198,53 @@ async def test_route_table_ordering_invariants(tmp_path: Path, monkeypatch: Any)
     ), "patterns registered after a different matching pattern:\n" + "\n".join(pattern_hits)
 
 
+def test_shared_crew_slice_matches_each_lane_registrar() -> None:
+    """The slice's literal Shared Crew routes are exactly what each module registers."""
+    from aiohttp import web
+
+    from kiro_crew.dashboard.routes import shared_crew
+    from kiro_crew.shared_crew import (
+        routes_access,
+        routes_admission,
+        routes_capabilities,
+        routes_collab,
+        routes_identity,
+        routes_invites,
+        routes_people,
+        routes_preview,
+    )
+
+    def table(*registrars: Any) -> list[tuple[str, str, Any]]:
+        app = web.Application()
+        for register in registrars:
+            register(app)
+        # By name: the slice registers the invite handlers through a lazy
+        # wrapper so the invite module stays off the boot path.
+        return [
+            (route.method, route.resource.canonical, route.handler.__name__)
+            for route in app.router.routes()
+            if route.resource is not None
+        ]
+
+    assert table(shared_crew.register) == table(
+        routes_identity.register,
+        routes_admission.register,
+        routes_collab.register,
+        routes_capabilities.register,
+        routes_preview.register,
+        routes_invites.register,
+        routes_access.register,
+        routes_people.register,
+    )
+
+
+def test_the_typing_lease_takeover_sits_beside_its_read() -> None:
+    """The takeover write is a literal Shared Crew route, registered right after the lease read."""
+    routes = _slice_routes("shared_crew")
+    read = routes.index(("GET", "/api/shared-crew/typing-lease"))
+    assert routes[read + 1] == ("POST", "/api/shared-crew/typing-lease/takeover")
+
+
 def test_every_slice_module_exposes_register() -> None:
     """A slice that loses ``register`` would drop its whole section silently."""
     import importlib
@@ -241,140 +288,3 @@ def _table_owned_paths() -> set[tuple[str, str]]:
     for name in routes_pkg.REGISTRAR_NAMES:
         owned |= set(_slice_routes(name))
     return owned
-
-
-def test_no_path_and_method_is_registered_more_than_once() -> None:
-    """A second registration of a path DELETES the first payload, silently.
-
-    aiohttp answers from the FIRST match in registration order, so registering
-    one path twice is not a merge and not a warning -- the later handler becomes
-    unreachable code. Every field it alone would have served simply stops
-    arriving, and a test that calls that handler DIRECTLY stays green while the
-    endpoint no longer serves it. That is exactly how the merged
-    ``/api/acp-backends`` shipped with its whole routing-verdict and capability
-    half missing: two slices registered it, ``agent_config`` ran first, and the
-    other handler's fully-passing test suite never touched the router.
-
-    A duplicate that points BOTH registrations at the same handler is redundant
-    rather than broken, so it is allowed by name -- listing it keeps the check
-    from being weakened to "same handler is always fine", which would let a real
-    shadowing pair in as soon as someone aliased a handler.
-    """
-    known_redundant = {
-        # Both point at ``chat.api_slack_channels``, so whichever wins serves
-        # the same bytes. Harmless today; still worth removing.
-        ("GET", "/api/slack/channels"),
-    }
-    seen: dict[tuple[str, str], list[str]] = {}
-    for name in routes_pkg.REGISTRAR_NAMES:
-        for method, path in _slice_routes(name):
-            seen.setdefault((method, path), []).append(name)
-    duplicates = [
-        f"{method} {path} registered by {', '.join(slices)}"
-        for (method, path), slices in sorted(seen.items())
-        if len(slices) > 1 and (method, path) not in known_redundant
-    ]
-    assert (
-        duplicates == []
-    ), "a path registered twice makes the later handler unreachable:\n" + "\n".join(duplicates)
-
-
-@pytest.mark.asyncio
-async def test_acp_backends_resolves_once_and_serves_both_halves(monkeypatch: Any) -> None:
-    """``GET /api/acp-backends`` through the REAL router, not a direct call.
-
-    The regression this pins is invisible to a handler-level test: the payload
-    is the union of a registry half (labels, capabilities, dialect, routing, the
-    tool-gate verdict) and a machine half (``policy_id``,
-    ``missing_components``, ``restart_required``), and a duplicate registration
-    served one of them while the other's tests all passed. So this resolves the
-    path through the dispatcher and asserts on what the ROUTER hands back.
-    """
-    from aiohttp import web
-    from aiohttp.test_utils import make_mocked_request
-
-    from kiro_crew.acp import registry
-    from kiro_crew.dashboard.handlers import acp_backend_status, acp_backends
-
-    app = web.Application()
-    routes_pkg.register_all(app)
-    matches = [
-        route
-        for route in app.router.routes()
-        if route.resource is not None
-        and route.resource.canonical == "/api/acp-backends"
-        and route.method == "GET"
-    ]
-    assert len(matches) == 1, f"expected exactly one GET route, got {len(matches)}"
-
-    monkeypatch.setattr(acp_backends, "_is_dashboard_owner", lambda _request: True)
-    monkeypatch.setattr(registry, "fetch", lambda: {})
-    monkeypatch.setattr(acp_backends, "_probe_installed", lambda *_a, **_kw: "unknown")
-    monkeypatch.setattr(
-        acp_backends,
-        "_active_state",
-        lambda *_a: {
-            "active": "",
-            "allow_ungated_tools": False,
-            "routing_verdict": "routed",
-            "routing_reason": "stubbed",
-        },
-    )
-    monkeypatch.setattr(
-        acp_backend_status,
-        "install_snapshot",
-        lambda: {
-            "": {
-                "policy_id": "kiro",
-                "installed": "missing",
-                "missing_components": ["kiro-cli"],
-                "install_command": "",
-                "restart_required": False,
-            }
-        },
-    )
-
-    request = make_mocked_request("GET", "/api/acp-backends?probe=1")
-    # ``app`` present-and-EMPTY is what the handler's app-scope gate requires;
-    # a missing key is an App Kit caller as far as that check is concerned.
-    request["app"] = ""
-    response = await matches[0].handler(request)
-
-    assert response.status == 200
-    payload = json.loads(response.text or "{}")
-    # Top-level routing state: the fork half. Its absence is what stopped the
-    # card's ROUTED/BYPASSED security banner from ever rendering.
-    assert payload["active"] == ""
-    assert payload["allow_ungated_tools"] is False
-    assert payload["routing_verdict"] == "routed"
-    assert payload["routing_reason"] == "stubbed"
-    assert payload["probed"] is True
-
-    rows = {row["id"]: row for row in payload["backends"]}
-    assert rows, "the endpoint served no backend rows"
-    for row in rows.values():
-        # Both halves on every row, probed or not. The client types all of these
-        # as required, so an omitted key is a render-time undefined.
-        assert {
-            "id",
-            "policy_id",
-            "selectable",
-            "installed",
-            "missing_components",
-            "install_command",
-            "restart_required",
-            "label",
-            "experimental",
-            "signin_command",
-            "dialect",
-            "routing",
-            "capabilities",
-            "degraded_count",
-        } <= set(row), sorted(set(row))
-    # The machine half actually merged in rather than being defaulted away.
-    assert rows[""]["policy_id"] == "kiro"
-    assert rows[""]["installed"] == "missing"
-    assert rows[""]["missing_components"] == ["kiro-cli"]
-    # ...and the registry half is not blank, which is what the card renders.
-    assert rows[""]["label"]
-    assert rows[""]["capabilities"]

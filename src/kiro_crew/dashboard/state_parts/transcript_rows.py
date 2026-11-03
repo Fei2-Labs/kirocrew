@@ -182,10 +182,12 @@ def chat_message_note(slot_key: str, msg: dict, *, workspace: str | None) -> dic
         # The same allowed-host scope as _prepare_messages, so the live
         # frame and the history agree on an allowed link: its placeholder
         # becomes the address again, then the display pass runs.
-        from kiro_crew.security.exfil import scoped_exempt_hosts
-        from kiro_crew.security.redaction_allow import allowed_hosts_for
+        from kiro_crew.security.exfil import allowed_host_audit_epoch, scoped_exempt_hosts
+        from kiro_crew.security.redaction_allow import allowed_hosts_for, normalize_workspace
 
-        with scoped_exempt_hosts(allowed_hosts_for(workspace)):
+        epoch = allowed_host_audit_epoch()
+        hosts = allowed_hosts_for(workspace)
+        with scoped_exempt_hosts(hosts, normalize_workspace(workspace), epoch):
             if isinstance(content, str) and isinstance(msg.get("meta"), dict):
                 shown = with_allowed_links_restored({"content": content, "meta": msg["meta"]})
                 content = shown["content"]
@@ -485,7 +487,7 @@ def _mark_permission_resolved(
 #: count the durable rows it folds into the frozen prefix — and re-exported by
 #: ``chat_persistence`` as ``_TRANSIENT_ROLES`` for its readers, so there is one
 #: definition rather than two that can drift.
-_TRANSIENT_ROLES = frozenset({"chunk", "done", "streaming", "queued", "permission"})
+_TRANSIENT_ROLES = frozenset({"chunk", "done", "streaming", "queued", "permission", "elicitation"})
 
 
 def durable_row_count(rows: Iterable[dict]) -> int:

@@ -42,6 +42,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.cron import CronJob, CronService
 from kiro_crew.dashboard.chat_utils import slot_history_key
@@ -983,7 +984,11 @@ class TestMovingTheTabAtTheSave:
 
     @pytest.mark.asyncio
     async def test_a_job_with_no_tab_at_all_is_a_no_op(self) -> None:
-        await move_cron_job_tab(_make_state(), _job(), FOLDER, "")
+        state = _make_state()
+        await move_cron_job_tab(state, _job(), FOLDER, "")
+        # No tab is conjured up for the job, and the sidebar is not told anything moved.
+        assert state._slots == {}
+        state.push_slots_update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_refused_write_restores_the_prior_folder(self, monkeypatch) -> None:
@@ -1132,7 +1137,7 @@ def _app(handler, route: str, *, folders=(FOLDER,), **store) -> web.Application:
         push_slots_update=MagicMock(),
     )
     app.router.add_route("*", route, handler)
-    return app
+    return as_owner(app)
 
 
 _BODY = {"name": "brief", "message": "Write it.", "every": 3600}
@@ -1214,15 +1219,16 @@ class TestRestCreate:
             assert resp.status == 200
         assert add.await_args.kwargs["chat_folder_id"] == ""
 
-    async def test_the_schedule_folder_is_unaffected(self) -> None:
-        add = AsyncMock(return_value=_job())
-        app = _app(api_crons_create, "/api/crons", add_job_async=add)
+    async def test_the_schedule_folder_is_unaffected(self, tmp_path) -> None:
+        svc = CronService(base_dir=tmp_path)
+        app = _app(api_crons_create, "/api/crons", add_job_async=svc.add_job_async)
         async with TestClient(TestServer(app)) as client:
-            await client.post(
+            resp = await client.post(
                 "/api/crons", json={**_BODY, "chat_folder_id": FOLDER, "folder_id": "sched9"}
             )
-        assert add.await_args.kwargs["folder_id"] == "sched9"
-        assert add.await_args.kwargs["chat_folder_id"] == FOLDER
+            assert resp.status == 200
+        (stored,) = CronService(base_dir=tmp_path).list_jobs()
+        assert (stored.folder_id, stored.chat_folder_id) == ("sched9", FOLDER)
 
 
 @pytest.mark.asyncio
@@ -1315,7 +1321,7 @@ class TestRestUpdate:
     async def test_the_handler_makes_no_extra_read_of_its_own(self, monkeypatch) -> None:
         """The store reports the transition, so a second query would only re-open the
         race the sink exists to close."""
-        self._capture_unfile(monkeypatch)
+        calls = self._capture_unfile(monkeypatch)
         get_job = AsyncMock(return_value=_job(chat_folder_id=FOLDER))
         app = _app(
             api_cron_update,
@@ -1324,8 +1330,11 @@ class TestRestUpdate:
             get_job_async=get_job,
         )
         async with TestClient(TestServer(app)) as client:
-            await client.patch("/api/crons/job42", json={"chat_folder_id": ""})
+            resp = await client.patch("/api/crons/job42", json={"chat_folder_id": ""})
+            assert resp.status == 200
         get_job.assert_not_awaited()
+        # The move still runs, on the prior folder the store reported.
+        assert calls == [("job42", FOLDER, "")]
 
     async def test_the_handler_passes_a_sink_of_its_own(self, monkeypatch) -> None:
         """One sink per request is the property that makes concurrent folder edits
@@ -1414,13 +1423,22 @@ class TestRestUpdate:
             await client.patch("/api/crons/job42", json={"name": "renamed"})
         assert calls == []
 
-    async def test_an_untouched_field_is_not_sent_to_the_store(self) -> None:
+    async def test_an_untouched_field_is_not_sent_to_the_store(self, tmp_path) -> None:
         """Editing any other setting must not rewrite the placement."""
-        update = AsyncMock(return_value=_job(chat_folder_id=FOLDER))
-        app = _app(api_cron_update, "/api/crons/{job_id}", update_job_async=update)
+        svc = CronService(base_dir=tmp_path)
+        job = svc.add_job(name="brief", message="Write it.", every_secs=3600)
+        await svc.update_job_async(job.id, chat_folder_id=FOLDER)
+        app = _app(
+            api_cron_update,
+            "/api/crons/{job_id}",
+            update_job_async=svc.update_job_async,
+            get_job_async=svc.get_job_async,
+        )
         async with TestClient(TestServer(app)) as client:
-            await client.patch("/api/crons/job42", json={"silent": True})
-        assert "chat_folder_id" not in update.await_args.kwargs
+            resp = await client.patch(f"/api/crons/{job.id}", json={"silent": True})
+            assert resp.status == 200
+        stored = CronService(base_dir=tmp_path).get_job(job.id)
+        assert (stored.silent, stored.chat_folder_id) == (True, FOLDER)
 
 
 @pytest.mark.asyncio

@@ -8,14 +8,22 @@ name here stays readable and patchable as ``kiro_crew.sandbox.<name>``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
 import threading
 import time
+
 from pathlib import Path
 
 from kiro_crew.config.paths import CONFIG_DIR_NAME, RUN_COORDINATOR_DIR_NAME, config_dir
+from kiro_crew.constants import (
+    KIROCREW_SANDBOX_TOOL_ENV,
+    KIROCREW_SANDBOX_TOOL_VALUE,
+    KIROCREW_SPAWNED_ENV,
+    KIROCREW_SPAWNED_VALUE,
+)
 from kiro_crew.sandbox_argv import (
     _ENV_BINARY_CANDIDATES,
     _launcher_script_of,
@@ -52,6 +60,7 @@ from kiro_crew.sandbox_tiers import (
     _floor_mandates_sandbox,
     _governance_sandbox_floor,
     _mode_to_level,
+    enterprise_policy_cache_view,
 )
 from kiro_crew.sandbox_unavailable import (
     UNSANDBOXED_BY_OPERATOR,
@@ -74,40 +83,59 @@ from kiro_crew.sandbox_unavailable import (
 logger = logging.getLogger("kiro_crew.sandbox")
 
 
-def _run_coordinator_hidden_dir() -> str:
-    """Active coordinator ledger path, masked from every sandboxed child."""
-    return os.path.abspath(config_dir() / RUN_COORDINATOR_DIR_NAME)
+#: Parent-to-child handoff for a permanent Linux userns probe failure.
+#: ``sandboxed_spawn_argv`` writes or removes it on every child env beside its
+#: KIROCREW_SPAWNED and KIROCREW_SANDBOX_TOOL stamps, and the cgroup and ``env``
+#: wrappers and every descendant inherit all three, so the degraded and
+#: no-backend paths carry it without the launcher's marker.
+_INHERITED_USERNS_FAILURE_ENV = "_KIROCREW_USERNS_FAILURE"
 
 
-def _run_coordinator_uses_custom_home() -> bool:
-    """Whether the active coordinator ledger is outside the default data home."""
-    default_dir = os.path.abspath(Path.home() / CONFIG_DIR_NAME / RUN_COORDINATOR_DIR_NAME)
-    return _run_coordinator_hidden_dir() != default_dir
+def _read_inherited_userns_failure() -> tuple[bool, str, str] | None:
+    """Read a permanent parent verdict in a Linux tree the spawn chokepoint stamped.
 
-
-def _refuse_macos_sandbox_owner_conflict(argv: list[str], detail: str) -> None:
-    """Audit and refuse when Kiro's inner sandbox cannot enforce a custom mask."""
+    The value only ever seeds a permanent userns failure, which is what an
+    identically failing probe records, so it cannot select a stronger backend.
+    Placing it requires choosing this process's exec environment, which already
+    lets the writer run anything its own confinement allows, and kernel
+    confinement survives exec whatever backend this process picks.
+    """
+    if (
+        sys.platform != "linux"
+        or os.environ.get(KIROCREW_SPAWNED_ENV) != KIROCREW_SPAWNED_VALUE
+        or os.environ.get(KIROCREW_SANDBOX_TOOL_ENV) != KIROCREW_SANDBOX_TOOL_VALUE
+    ):
+        return None
+    raw = os.environ.get(_INHERITED_USERNS_FAILURE_ENV)
+    if raw is None:
+        return None
     try:
-        from kiro_crew.sel import sel
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or not isinstance(value[0], str)
+        or not value[0]
+        or not isinstance(value[1], str)
+    ):
+        return None
+    return (False, value[0], value[1])
 
-        sel().log_tool_invocation(
-            session_key="sandbox",
-            agent="system",
-            source="sandbox.wrap_argv",
-            tool_name=argv[0] if argv else "unknown",
-            tool_kind="subprocess",
-            outcome="denied",
-            error=detail,
-        )
-    except Exception:
-        logger.warning("Failed to emit SEL audit event for sandbox denial", exc_info=True)
-    raise SandboxUnavailableError(
-        "Kiro CLI's internal macOS sandbox cannot enforce the active "
-        "KIROCREW_HOME run-coordinator mask, and macOS Seatbelt layers cannot be nested. "
-        "Refusing to start the agent rather than expose the coordinator ledger.",
-        kind="foreign_sandbox",
-        detail=detail,
-    )
+
+def _set_inherited_userns_failure(env: dict[str, str]) -> None:
+    """Put only a permanent Linux userns verdict in a sandbox child env.
+
+    Overwrites or removes any caller-supplied value, so a child sees only what
+    this process knows.
+    """
+    failure = _last_unshare_failure
+    if sys.platform != "linux" or failure is None or failure[0]:
+        env.pop(_INHERITED_USERNS_FAILURE_ENV, None)
+        return
+    _transient, reason, remedy = failure
+    env[_INHERITED_USERNS_FAILURE_ENV] = json.dumps([reason, remedy], separators=(",", ":"))
 
 
 # Detail of the most recent failed userns probe: (transient, reason, remedy).
@@ -118,7 +146,8 @@ def _refuse_macos_sandbox_owner_conflict(argv: list[str], detail: str) -> None:
 # from the SAME probe. Holding the remedy in a second global would let a
 # concurrent re-probe land between the two reads and pair one probe's failure
 # with another's mechanism, which is the wrong fix presented as the right one.
-_last_unshare_failure: tuple[bool, str, str] | None = None
+_inherited_unshare_failure = _read_inherited_userns_failure()
+_last_unshare_failure: tuple[bool, str, str] | None = _inherited_unshare_failure
 
 
 def unavailable_remedy() -> str:
@@ -182,9 +211,19 @@ def _record_probe_failure(transient: bool, reason: str, remedy: str = "") -> Non
     _last_unshare_failure = (transient, reason, remedy)
 
 
+def _holds_inherited_unshare_failure() -> bool:
+    """True while this process still holds the verdict its spawner handed it."""
+    return _inherited_unshare_failure is not None and (
+        _last_unshare_failure is _inherited_unshare_failure
+    )
+
+
 def _background_warm() -> None:
     """Run the probe off-loop and populate the cache. Thread target."""
     global _backend, _last_unshare_failure
+    if _holds_inherited_unshare_failure():
+        _backend = "none"
+        return
     for attempt in (1, 2):
         ok, transient, reason, remedy = _probe_unshare_once()
         if ok:
@@ -284,6 +323,12 @@ def _probe_unshare() -> bool:
     global _last_unshare_failure
     if sys.platform != "linux":
         _record_probe_failure(False, "not Linux")
+        return False
+
+    # A chokepoint-stamped child receives the parent's permanent host verdict.
+    # An ordinary permanent result in this process still follows the existing
+    # caller-controlled cache and reset behavior.
+    if _holds_inherited_unshare_failure():
         return False
 
     # Fast path: the cache already proved user namespaces work -- no probe
@@ -473,6 +518,42 @@ def reset_backend() -> None:
     _last_unshare_failure = None
 
 
+def _run_coordinator_hidden_dir() -> str:
+    """Active coordinator ledger path, masked from every sandboxed child."""
+    return os.path.abspath(config_dir() / RUN_COORDINATOR_DIR_NAME)
+
+
+def _run_coordinator_uses_custom_home() -> bool:
+    """Whether the active coordinator ledger is outside the default data home."""
+    default_dir = os.path.abspath(Path.home() / CONFIG_DIR_NAME / RUN_COORDINATOR_DIR_NAME)
+    return _run_coordinator_hidden_dir() != default_dir
+
+
+def _refuse_macos_sandbox_owner_conflict(argv: list[str], detail: str) -> None:
+    """Audit and refuse when Kiro's inner sandbox cannot enforce a custom mask."""
+    try:
+        from kiro_crew.sel import sel
+
+        sel().log_tool_invocation(
+            session_key="sandbox",
+            agent="system",
+            source="sandbox.wrap_argv",
+            tool_name=argv[0] if argv else "unknown",
+            tool_kind="subprocess",
+            outcome="denied",
+            error=detail,
+        )
+    except Exception:
+        logger.warning("Failed to emit SEL audit event for sandbox denial", exc_info=True)
+    raise SandboxUnavailableError(
+        "Kiro CLI's internal macOS sandbox cannot enforce the active "
+        "KIROCREW_HOME run-coordinator mask, and macOS Seatbelt layers cannot be nested. "
+        "Refusing to start the agent rather than expose the coordinator ledger.",
+        kind="foreign_sandbox",
+        detail=detail,
+    )
+
+
 def wrap_argv(
     argv: list[str],
     mode: str = "auto",
@@ -529,8 +610,12 @@ def wrap_argv(
             Windows internal-sandbox delegation requires this to be exactly
             ``True``; basename inference can never grant that exception.
         first_party_fixed_argv: True ONLY for spawns whose full argv is derived
-            inside this package with zero agent/repo/user-config influence;
-            every passing site must be allowlisted in
+            inside this package with zero agent/repo/user-config influence,
+            or that run the kiro-cli Kiro Crew already launches for every ACP
+            session, resolved only by ``kiro_cli.find_kiro_cli_candidates``,
+            with a fixed argv (the enterprise sign-in check's ``--version`` /
+            ``whoami``): Crew already trusts and runs that binary, so the
+            carve-out adds no new trust. Every passing site must be allowlisted in
             ``test/test_spawn_audit.py::FIRST_PARTY_SPAWNS``. On a host with
             genuinely no sandbox backend (``no_backend`` — never a transient
             probe failure or a foreign outer sandbox) and no governance
@@ -582,10 +667,10 @@ def wrap_argv(
         except Exception:
             forward_ssh_auth_sock = False
 
-    kiro_spawn = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
+    kiro_spawn_preflight = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
     if (
         sys.platform == "darwin"
-        and kiro_spawn
+        and kiro_spawn_preflight
         and kiro_internal_sandbox_enabled()
         and _run_coordinator_uses_custom_home()
     ):
@@ -839,6 +924,7 @@ def wrap_argv(
     # no-backend fail-closed path. Checked before backend detection so this is a
     # deterministic capability decision, never a fallback after a probe failure.
     # Linux namespace isolation is unaffected.
+    kiro_spawn = _spawns_kiro_cli(argv) if is_kiro_cli is None else is_kiro_cli
     delegate_to_kiro = (
         sys.platform == "darwin" and kiro_spawn and kiro_internal_sandbox_enabled()
     ) or (sys.platform == "win32" and is_kiro_cli is True)
@@ -892,6 +978,18 @@ def wrap_argv(
                 )
 
     backend = detect_backend(config_mode=mode)
+
+    # An enterprise build's sandboxed processes resolve the ceiling from the governance
+    # cache, so it is shown to them READ-ONLY (the plan seals a lifted cache). After the
+    # delegation branch on purpose: a delegated sandbox applies none of Kiro Crew's masks,
+    # and adding a path here would cost the delegation.
+    cache_view = tuple(
+        path
+        for path in enterprise_policy_cache_view(mode, extra_hidden_dirs)
+        if path not in extra_visible_dirs
+    )
+    if cache_view:
+        extra_visible_dirs = (*extra_visible_dirs, *cache_view)
 
     if backend == "namespace":
         if (
@@ -1000,7 +1098,8 @@ def wrap_argv(
                 "",
             )
             # First-party carve-out: a spawn whose full argv is
-            # derived inside this package (never agent/repo/user-config text)
+            # derived inside this package (never agent/repo/user-config text),
+            # or the ACP kiro-cli run with a fixed argv (see the docstring),
             # may proceed unconfined on a host that GENUINELY has no backend.
             # All three preconditions, structurally:
             #   * the caller vouched via ``first_party_fixed_argv`` — a reviewed

@@ -31,6 +31,7 @@ from kiro_crew.dashboard.chat_tags_policy import (
 )
 from kiro_crew.dashboard.chat_tags_store import (
     _bump_slot_tags_revision,
+    _next_order,
     _order_key,
     _tags_write_lock,
 )
@@ -274,8 +275,8 @@ async def api_chat_slot_tags(request: web.Request) -> web.Response:
                 # must adopt; broadcast it so they reconverge now.
                 _bump_slot_tags_revision(slot)
             # The UNPINNED periodic flush may have persisted the provisional
-            # value to the slot's current transcript while this save awaited
-            # (review-caught): mark dirty so the next flush reconverges the
+            # value to the slot's current transcript while this save awaited:
+            # mark dirty so the next flush reconverges the
             # durable record to the rolled-back live state.
             slot._dirty = True
             state.push_slots_update()
@@ -469,7 +470,7 @@ async def api_chat_tag_column_create(request: web.Request) -> web.Response:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
     async with _tags_write_lock(state):
-        column = _normalize_column(state, {**body, "order": len(state._tag_boards)})
+        column = _normalize_column(state, {**body, "order": _next_order(state._tag_boards)})
         if column is None:
             return web.json_response(
                 {"error": "invalid column payload", "code": "invalid_column_payload"}, status=400
@@ -537,6 +538,10 @@ async def api_chat_tag_column_create(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
+    # An open tab learns of the column write through the tags generation
+    # on the slots frame, so the frame has to go out now.
+    state.bump_tags_generation()
+    state.push_slots_update()
     sel().log_api_access(
         caller=rl_caller,
         operation="chat.tag_column_create",
@@ -601,6 +606,10 @@ async def api_chat_tag_column_update(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
+    # An open tab learns of the column write through the tags generation
+    # on the slots frame, so the frame has to go out now.
+    state.bump_tags_generation()
+    state.push_slots_update()
     sel().log_api_access(
         caller=rl_caller,
         operation="chat.tag_column_update",
@@ -636,6 +645,10 @@ async def api_chat_tag_column_delete(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
+    # An open tab learns of the column write through the tags generation
+    # on the slots frame, so the frame has to go out now.
+    state.bump_tags_generation()
+    state.push_slots_update()
     sel().log_api_access(
         caller=rl_caller,
         operation="chat.tag_column_delete",
@@ -710,6 +723,10 @@ async def api_chat_tag_columns_reorder(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": "persist failed", "code": "persist_failed"}, status=500
             )
+    # An open tab learns of the column write through the tags generation
+    # on the slots frame, so the frame has to go out now.
+    state.bump_tags_generation()
+    state.push_slots_update()
     sel().log_api_access(
         caller=rl_caller,
         operation="chat.tag_columns_reorder",
@@ -819,7 +836,7 @@ async def api_chat_slot_drop(request: web.Request) -> web.Response:
 
     # Serialize the whole resolve/re-check/mutate/persist/rollback span under
     # the same lock every other tags writer holds (PUT /tags, the tag-delete
-    # strip, auto-tag). Two reasons, both review-caught: (1) with awaits
+    # strip, auto-tag). Two reasons: (1) with awaits
     # inside the span, a second concurrent writer would capture this one's
     # value as its rollback snapshot, and value-based rollback cannot tell
     # "my write survived" from "someone else wrote the same value" — a
@@ -941,7 +958,7 @@ async def api_chat_slot_drop(request: web.Request) -> web.Response:
                 # rejected tags.
                 _bump_slot_tags_revision(slot)
             # The UNPINNED periodic flush may have persisted the provisional
-            # value while this save awaited (review-caught): mark dirty so the
+            # value while this save awaited: mark dirty so the
             # next flush reconverges the durable record to the live state.
             slot._dirty = True
             state.push_slots_update()
@@ -991,6 +1008,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
 
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
+    from kiro_crew.dashboard.body_numbers import (  # noqa: F401
+        body_int,
+    )
     from kiro_crew.dashboard.chat_tag_grants import (  # noqa: F401
         GrantsSnapshot,
         has_grant_row,
@@ -1006,6 +1026,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.dashboard.handlers._shared import (  # noqa: F401
         _owner_denial_response,
+        string_field_error,
     )
     from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401
         is_owner_dashboard_request,

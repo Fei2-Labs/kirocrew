@@ -15,7 +15,7 @@ Instance fields written: ``_claude_inline_settings``,
 
 Instance fields read: ``_agent_version``, ``_agent_version_read``, ``_permission_mode``,
 ``_session_id``, ``_session_mcp_excludes_local``, ``_session_mcp_inline_settings``,
-``_side_read_only``.
+``_side_read_only``, ``_spec_zero_tools``.
 """
 
 from __future__ import annotations
@@ -25,10 +25,13 @@ import json
 import logging
 import os
 import re
-import stat
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.acp.claude_settings_sources import (
+    CLAUDE_SETTINGS_MAX_BYTES,
+    read_claude_settings_bytes,
+)
 from kiro_crew.acp.client_permissions import _scrub_observed
 from kiro_crew.acp.client_timeouts import _INIT_TIMEOUT
 from kiro_crew.acp.harness import claude as claude_mod
@@ -184,8 +187,8 @@ _CLAUDE_PROJECT_UNCARRIED_GUARD_KEYS: tuple[str, ...] = ("hooks", "sandbox")
 #: Crew's inline settings can only narrow what runs.
 _CLAUDE_CARRIED_PERMISSION_KEYS: tuple[str, ...] = ("deny", "ask")
 
-#: Ceiling on a project settings file read only to collect its deny rules.
-_CLAUDE_PROJECT_SETTINGS_MAX_BYTES = 1 << 20
+#: The shared settings-read ceiling, kept under this name for its importers.
+_CLAUDE_PROJECT_SETTINGS_MAX_BYTES = CLAUDE_SETTINGS_MAX_BYTES
 
 
 def _project_settings_restrictions(path: Path) -> list[tuple[str, str]] | None:
@@ -206,43 +209,18 @@ def _project_settings_restrictions(path: Path) -> list[tuple[str, str]] | None:
     :data:`_CLAUDE_PROJECT_UNCARRIED_GUARD_KEYS`, whose restriction leaving the
     tier out would drop.
 
-    Bounded and non-blocking like :meth:`AcpClient._settings_path_holds`: the
-    path is attacker-influenced, so ``O_NOFOLLOW`` and ``O_NONBLOCK`` on the open
-    and a size ceiling on the read. A file that changes after this read can only
+    Read through :func:`~kiro_crew.acp.claude_settings_sources.read_claude_settings_bytes`:
+    the path is attacker-influenced, so links are refused and the read is bounded
+    and non-blocking. A file that changes after this read can only
     have GAINED a rule Crew did not carry; it can never add an allow, because the
     tier still does not load.
     """
     try:
-        if path.is_symlink():
-            return None
-    except OSError:
-        return None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(path, flags)
+        raw = read_claude_settings_bytes(path, follow_links=False)
     except FileNotFoundError:
         return []
-    except OSError:
+    if raw is None:
         return None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > _CLAUDE_PROJECT_SETTINGS_MAX_BYTES:
-            return None
-        chunks: list[bytes] = []
-        total = 0
-        while total <= _CLAUDE_PROJECT_SETTINGS_MAX_BYTES:
-            chunk = os.read(fd, _CLAUDE_PROJECT_SETTINGS_MAX_BYTES + 1 - total)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-        if total > _CLAUDE_PROJECT_SETTINGS_MAX_BYTES:
-            return None
-        raw = b"".join(chunks)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
     try:
         # A hand-edited settings file may carry a leading UTF-8 byte-order mark,
         # and its rules must still be carried.
@@ -429,6 +407,11 @@ def _claude_session_meta(self: AcpClient) -> dict[str, Any]:
     under it always ships beside it; excluding the tier is never the
     widening direction.
 
+    A session whose spec declares ``"tools": []`` (``_spec_zero_tools``, the
+    background ``kirocrew-lite`` helpers) gets ``strictMcpConfig``, so only the
+    wire array mounts: the harness's own user, project and plugin servers stay
+    out of a session that must run no tool.
+
     A Side Chat session (``side_read_only``) also gets the read-only shape:
     ``tools`` limited to the read built-ins, ``strictMcpConfig``, bypass off,
     and inline settings that add an ``ask`` rule per read built-in, deny the host's
@@ -451,6 +434,11 @@ def _claude_session_meta(self: AcpClient) -> dict[str, Any]:
             inline = getattr(self, "_session_mcp_inline_settings", None)
         if isinstance(inline, dict) and inline:
             options["settings"] = dict(inline)
+    if getattr(self, "_spec_zero_tools", False):
+        # The spec declares ``"tools": []`` (the background ``kirocrew-lite``
+        # helpers): without this the harness mounts the user's, the project's and
+        # plugins' servers beside the wire array, and starts them on every call.
+        options["strictMcpConfig"] = True
     if getattr(self, "_side_read_only", False):
         # A Side Chat session: only the read built-ins exist, so no allow rule
         # in the user's settings can pre-approve a write. No MCP server either

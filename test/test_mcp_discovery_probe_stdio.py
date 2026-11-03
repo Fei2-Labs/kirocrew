@@ -51,9 +51,28 @@ class TestProbeServerProcessCleanup:
         return proc
 
     @pytest.mark.asyncio
-    async def test_graceful_stdin_close(self) -> None:
-        """Closing stdin causes process to exit within timeout."""
-        proc = self._make_mock_proc()
+    @pytest.mark.parametrize(
+        "wait_side_effect,stdin_open,expect_kill",
+        [
+            pytest.param(None, True, False, id="graceful-stdin-close"),
+            pytest.param([asyncio.TimeoutError(), 0], True, True, id="fallback-kill-on-timeout"),
+            # Both the graceful wait and the forceful one fail: the error is swallowed.
+            pytest.param(
+                [asyncio.TimeoutError(), OSError("kill failed")],
+                True,
+                True,
+                id="fallback-kill-also-fails",
+            ),
+            pytest.param(None, False, False, id="stdin-none-skips-close"),
+        ],
+    )
+    async def test_teardown_escalates_only_past_the_graceful_wait(
+        self, wait_side_effect, stdin_open, expect_kill
+    ) -> None:
+        proc = self._make_mock_proc(wait_side_effect=wait_side_effect)
+        stdin = proc.stdin
+        if not stdin_open:
+            proc.stdin = None
         server = McpServerInfo(name="test", command="echo")
 
         with (
@@ -62,65 +81,12 @@ class TestProbeServerProcessCleanup:
         ):
             proc.stdout = AsyncMock()
             proc.stdout.readline = AsyncMock(return_value=b"")
-            await probe_server(server)
+            result = await probe_server(server)
 
-        proc.stdin.close.assert_called_once()
-        proc.kill.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_fallback_kill_on_timeout(self) -> None:
-        """When graceful shutdown times out, falls back to proc.kill()."""
-        proc = self._make_mock_proc(wait_side_effect=[asyncio.TimeoutError(), 0])
-        server = McpServerInfo(name="test", command="echo")
-
-        with (
-            patch("kiro_crew.mcp_discovery.asyncio.create_subprocess_exec", return_value=proc),
-            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/echo"),
-        ):
-            proc.stdout = AsyncMock()
-            proc.stdout.readline = AsyncMock(return_value=b"")
-            await probe_server(server)
-
-        proc.stdin.close.assert_called_once()
-        proc.kill.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_fallback_kill_also_fails(self) -> None:
-        """When both graceful and forceful shutdown fail, exception is swallowed."""
-        proc = self._make_mock_proc(
-            wait_side_effect=[asyncio.TimeoutError(), OSError("kill failed")]
-        )
-        server = McpServerInfo(name="test", command="echo")
-
-        with (
-            patch("kiro_crew.mcp_discovery.asyncio.create_subprocess_exec", return_value=proc),
-            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/echo"),
-        ):
-            proc.stdout = AsyncMock()
-            proc.stdout.readline = AsyncMock(return_value=b"")
-            await probe_server(server)
-
-        # Should not raise — the exception is caught and swallowed
-        proc.stdin.close.assert_called_once()
-        proc.kill.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_stdin_none_skips_close(self) -> None:
-        """When proc.stdin is None, close is skipped without error."""
-        proc = self._make_mock_proc()
-        proc.stdin = None
-        server = McpServerInfo(name="test", command="echo")
-
-        with (
-            patch("kiro_crew.mcp_discovery.asyncio.create_subprocess_exec", return_value=proc),
-            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/usr/bin/echo"),
-        ):
-            proc.stdout = AsyncMock()
-            proc.stdout.readline = AsyncMock(return_value=b"")
-            await probe_server(server)
-
-        # Should not raise — stdin None is handled gracefully
-        proc.kill.assert_not_called()
+        # The teardown hands back the probe's own error verdict, never its own exception.
+        assert (result.name, result.status) == ("test", "error")
+        assert stdin.close.call_count == (1 if stdin_open else 0)
+        assert proc.kill.call_count == (1 if expect_kill else 0)
 
     @pytest.mark.asyncio
     async def test_probe_spawns_with_the_expanded_path(self, monkeypatch) -> None:
@@ -272,13 +238,15 @@ class TestProbeServerStderrCapture:
         tail is appended to `server.error`."""
         from kiro_crew.mcp_discovery import probe_server
 
-        stub = tmp_path / "broken-server.sh"
+        stub = tmp_path / "broken-server.py"
         stub.write_text(
-            "#!/bin/sh\n" "echo 'ModuleNotFoundError: No module named foo' >&2\n" "exit 1\n"
+            "import sys\n"
+            "print('ModuleNotFoundError: No module named foo', file=sys.stderr)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
         )
-        stub.chmod(0o755)
 
-        server = McpServerInfo(name="broken", command=str(stub))
+        server = McpServerInfo(name="broken", command=sys.executable, args=[str(stub)])
         with patch("kiro_crew.config.loader.KiroCrewConfig") as mock_cls:
             mock_cfg = MagicMock()
             mock_cfg.dashboard.mcp_probe_timeout_secs = 2
@@ -296,22 +264,24 @@ class TestProbeServerStderrCapture:
         `server.error`."""
         from kiro_crew.mcp_discovery import probe_server
 
-        stub = tmp_path / "noisy-ok-server.sh"
+        stub = tmp_path / "noisy-ok-server.py"
         stub.write_text(
-            "#!/bin/sh\n"
-            "echo 'WARNING: deprecated flag' >&2\n"
-            "while IFS= read -r line; do\n"
-            '  case "$line" in\n'
-            '    *\\"initialize\\"*) '
-            'printf \'{"jsonrpc":"2.0","id":1,"result":{}}\\n\' ;;\n'
-            '    *\\"tools/list\\"*) '
-            'printf \'{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\\n\' ;;\n'
-            "  esac\n"
-            "done\n"
+            "import json, sys\n"
+            "print('WARNING: deprecated flag', file=sys.stderr, flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    request = json.loads(line)\n"
+            "    if request.get('method') == 'initialize':\n"
+            "        result = {}\n"
+            "    elif request.get('method') == 'tools/list':\n"
+            "        result = {'tools': []}\n"
+            "    else:\n"
+            "        continue\n"
+            "    reply = {'jsonrpc': '2.0', 'id': request['id'], 'result': result}\n"
+            "    print(json.dumps(reply), flush=True)\n",
+            encoding="utf-8",
         )
-        stub.chmod(0o755)
 
-        server = McpServerInfo(name="noisy-ok", command=str(stub))
+        server = McpServerInfo(name="noisy-ok", command=sys.executable, args=[str(stub)])
         with patch("kiro_crew.config.loader.KiroCrewConfig") as mock_cls:
             mock_cfg = MagicMock()
             mock_cfg.dashboard.mcp_probe_timeout_secs = 3
@@ -329,17 +299,17 @@ class TestProbeServerStderrCapture:
         dashboard responses."""
         from kiro_crew.mcp_discovery import probe_server
 
-        stub = tmp_path / "verbose-broken.sh"
+        stub = tmp_path / "verbose-broken.py"
         stub.write_text(
-            "#!/bin/sh\n"
-            "for i in $(seq 1 200); do\n"
-            "  echo 'this is a long diagnostic line that repeats many times' >&2\n"
-            "done\n"
-            "exit 1\n"
+            "import sys\n"
+            "line = 'this is a long diagnostic line that repeats many times'\n"
+            "for _ in range(200):\n"
+            "    print(line, file=sys.stderr)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
         )
-        stub.chmod(0o755)
 
-        server = McpServerInfo(name="verbose", command=str(stub))
+        server = McpServerInfo(name="verbose", command=sys.executable, args=[str(stub)])
         with patch("kiro_crew.config.loader.KiroCrewConfig") as mock_cls:
             mock_cfg = MagicMock()
             mock_cfg.dashboard.mcp_probe_timeout_secs = 2
@@ -348,6 +318,8 @@ class TestProbeServerStderrCapture:
             result = await probe_server(server)
 
         assert result.status == "error"
+        # The bound is measured on a captured tail, not on an error that has none.
+        assert "stderr:" in (result.error or "")
         # 500-char stderr tail + 200-char error head + headers = well under 1KB.
         assert len(result.error or "") < 1024
 
@@ -357,17 +329,17 @@ class TestProbeServerStderrCapture:
         must be scrubbed before they land in `server.error`."""
         from kiro_crew.mcp_discovery import probe_server
 
-        stub = tmp_path / "leaky-server.sh"
+        stub = tmp_path / "leaky-server.py"
         stub.write_text(
-            "#!/bin/sh\n"
-            "echo 'config error: AWS_SECRET_"
+            "import sys\n"
+            "print('config error: AWS_SECRET_"
             "ACCESS_KEY=AKIAIOSFODNN7"
-            "EXAMPLEXXX' >&2\n"
-            "exit 1\n"
+            "EXAMPLEXXX', file=sys.stderr)\n"
+            "sys.exit(1)\n",
+            encoding="utf-8",
         )
-        stub.chmod(0o755)
 
-        server = McpServerInfo(name="leaky", command=str(stub))
+        server = McpServerInfo(name="leaky", command=sys.executable, args=[str(stub)])
         with patch("kiro_crew.config.loader.KiroCrewConfig") as mock_cls:
             mock_cfg = MagicMock()
             mock_cfg.dashboard.mcp_probe_timeout_secs = 2
@@ -376,6 +348,8 @@ class TestProbeServerStderrCapture:
             result = await probe_server(server)
 
         assert result.status == "error"
+        # The redaction is checked on a captured tail, not on an error that has none.
+        assert "stderr:" in (result.error or "")
         # The literal secret must not appear verbatim in the error field.
         assert "AKIAIOSFODNN7" "EXAMPLEXXX" not in (result.error or "")
 
@@ -507,6 +481,58 @@ class TestProbeStdioMalformedResponse:
         assert "malformed" in result.error
 
 
+class TestProbeStdioProtocolVersion:
+    """The stdio probe offers our newest revision and steps down once on -32602."""
+
+    def setup_method(self) -> None:
+        _clear_cache()
+
+    def _run(self, monkeypatch, lines: list[bytes]) -> tuple[McpServerInfo, list[dict]]:
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.stdin = MagicMock()
+        proc.stdin.drain = AsyncMock()
+        proc.stdout = MagicMock()
+        proc.stdout.readline = AsyncMock(side_effect=[*lines, b""])
+        proc.wait = AsyncMock(return_value=0)
+        monkeypatch.setattr("shutil.which", lambda cmd, path=None: "/usr/bin/srv")
+        with patch(
+            "kiro_crew.mcp_discovery.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=proc),
+        ):
+            result = asyncio.run(probe_server(McpServerInfo(name="srv", command="srv")))
+        sent = [json.loads(c.args[0]) for c in proc.stdin.write.call_args_list]
+        return result, [m for m in sent if m.get("method") == "initialize"]
+
+    def test_offers_the_newest_version_and_steps_down_once(self, monkeypatch) -> None:
+        refusal = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32602,
+                "message": "Unsupported",
+                "data": {"supported": ["2024-11-05"]},
+            },
+        }
+        ok = {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
+        tools = {"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "search"}]}}
+        lines = [json.dumps(m).encode() + b"\n" for m in (refusal, ok, tools)]
+
+        result, inits = self._run(monkeypatch, lines)
+
+        assert result.status == "ok"
+        assert result.protocol_version == "2024-11-05"
+        assert [m["params"]["protocolVersion"] for m in inits] == ["2025-06-18", "2024-11-05"]
+
+    def test_an_unknown_error_is_not_retried(self, monkeypatch) -> None:
+        boom = {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "boom"}}
+
+        result, inits = self._run(monkeypatch, [json.dumps(boom).encode() + b"\n"])
+
+        assert (result.status, result.error) == ("error", "boom")
+        assert [m["params"]["protocolVersion"] for m in inits] == ["2025-06-18"]
+
+
 def _make_stream(lines: list[bytes]) -> asyncio.StreamReader:
     """Build a StreamReader pre-fed with ``lines`` and an EOF marker."""
     reader = asyncio.StreamReader()
@@ -570,15 +596,23 @@ class TestReadStdioJsonrpcResponse:
         assert resp is None
 
     @pytest.mark.asyncio
-    async def test_banner_flood_capped(self) -> None:
-        """More than _MAX_BANNER_LINES junk lines → give up (None), don't hang."""
+    @pytest.mark.parametrize(
+        "over_cap,expected_id",
+        [
+            pytest.param(0, 7, id="exactly-the-cap-still-answers"),
+            pytest.param(1, None, id="one-over-drops-the-response"),
+            pytest.param(5, None, id="flood-gives-up-without-hanging"),
+        ],
+    )
+    async def test_banner_cap_boundary(self, over_cap, expected_id) -> None:
+        """Up to _MAX_BANNER_LINES junk lines are tolerated; one more gives up (None)."""
         from kiro_crew.mcp_discovery import _MAX_BANNER_LINES
 
-        lines = [b"noise\n"] * (_MAX_BANNER_LINES + 5)
-        lines.append(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+        lines = [b"noise\n"] * (_MAX_BANNER_LINES + over_cap)
+        lines.append(b'{"jsonrpc":"2.0","id":7,"result":{}}\n')
         stream = _make_stream(lines)
         resp = await _read_stdio_jsonrpc_response(stream, timeout=5)
-        assert resp is None
+        assert (resp["id"] if resp is not None else None) == expected_id
 
     @pytest.mark.asyncio
     async def test_skips_non_object_json_payloads(self) -> None:
@@ -643,29 +677,6 @@ class TestReadStdioJsonrpcResponse:
         resp = await _read_stdio_jsonrpc_response(stream, timeout=5)
         assert resp is not None
         assert resp["id"] == 3
-
-    @pytest.mark.asyncio
-    async def test_cap_boundary_exact(self) -> None:
-        """Exactly _MAX_BANNER_LINES junk lines still lets the response through."""
-        from kiro_crew.mcp_discovery import _MAX_BANNER_LINES
-
-        lines = [b"noise\n"] * _MAX_BANNER_LINES
-        lines.append(b'{"jsonrpc":"2.0","id":7,"result":{}}\n')
-        stream = _make_stream(lines)
-        resp = await _read_stdio_jsonrpc_response(stream, timeout=5)
-        assert resp is not None
-        assert resp["id"] == 7
-
-    @pytest.mark.asyncio
-    async def test_cap_boundary_one_over(self) -> None:
-        """One junk line past the cap drops the response (returns None)."""
-        from kiro_crew.mcp_discovery import _MAX_BANNER_LINES
-
-        lines = [b"noise\n"] * (_MAX_BANNER_LINES + 1)
-        lines.append(b'{"jsonrpc":"2.0","id":7,"result":{}}\n')
-        stream = _make_stream(lines)
-        resp = await _read_stdio_jsonrpc_response(stream, timeout=5)
-        assert resp is None
 
     @pytest.mark.asyncio
     async def test_timeout_raises(self) -> None:

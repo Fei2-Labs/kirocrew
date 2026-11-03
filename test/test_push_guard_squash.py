@@ -17,6 +17,7 @@ from pathlib import Path
 
 import push_guard_helpers
 import pytest
+from git_maintenance_helpers import git_maintenance_off_entries
 from installer_test_helpers import run_bounded
 from push_guard_helpers import (
     _INPROCESS_TIMEOUT_S,
@@ -429,15 +430,14 @@ class TestPushGuardSquash:
         )
         hook.chmod(0o755)
         _write_message(clone_dir)
-        rc, _, stderr = _run_push_guard(
-            clone_dir,
-            ["--squash"],
-            env_extra={
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "core.hooksPath",
-                "GIT_CONFIG_VALUE_0": str(hooks),
-            },
-        )
+        hooks_path = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": str(hooks),
+        }
+        # The count replaces the suite's entries, so the maintenance ones go after it.
+        hooks_path.update(git_maintenance_off_entries(hooks_path))
+        rc, _, stderr = _run_push_guard(clone_dir, ["--squash"], env_extra=hooks_path)
         assert rc == 0, stderr
         assert "Signed-off-by: Env" in _git(clone_dir, "log", "-1", "--format=%B")
 

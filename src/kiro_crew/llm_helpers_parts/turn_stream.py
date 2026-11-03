@@ -22,6 +22,7 @@ from kiro_crew.agent_sdk.drivers.acp_turn_vocab import (
     EVENT_STEER_CONSUMED,
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     AcpError,
     LLMEvent,
     LLMProvider,
@@ -119,6 +120,7 @@ async def stream_and_collect(
     model_fallback: bool = False,
     fallback_models: Sequence[str] = (),
     allow_image: bool = True,
+    undelivered_watch_key: str = "",
 ) -> str:
     """Stream a message through an LLM provider and collect the full response.
 
@@ -196,10 +198,20 @@ async def stream_and_collect(
             a later call on the same provider probes one primary restore.
         allow_image: ``False`` sends every attempt text-only (see
             ``LLMProvider.stream``), for a prompt that is text ABOUT a session.
+        undelivered_watch_key: The session key the caller authenticated for this
+            turn, used only to record a dispatched worker's work-tool call the
+            harness never delivered
+            (:class:`kiro_crew.undelivered_call_watch.UndeliveredCallWatch`).
+            Empty watches nothing.
 
     Returns:
         The complete response text.
     """
+    _undelivered_watch = None
+    if undelivered_watch_key:
+        from kiro_crew.undelivered_call_watch import UndeliveredCallWatch
+
+        _undelivered_watch = UndeliveredCallWatch(undelivered_watch_key, provider)
     transient_attempts = 0
     _model_fallback_attempted = False
     attempt = 0
@@ -257,6 +269,12 @@ async def stream_and_collect(
                 else provider.stream(message, allow_image=False)
             )
             async for event in events:
+                if _undelivered_watch is not None:
+                    # A dispatched worker's report the harness never delivered.
+                    if event.kind == EVENT_TOOL_CALL:
+                        _undelivered_watch.on_call(event)
+                    elif event.kind == EVENT_TOOL_RESULT:
+                        await _undelivered_watch.on_result(event)
                 if event.kind == EVENT_TEXT_CHUNK:
                     result_text += event.text
                     if on_chunk:
@@ -435,7 +453,7 @@ async def stream_and_collect(
             # ATTEMPTS), advance on transient failure, propagate non-transient
             # immediately (the classifier gate above already ensures that).
             # Empty chain ⇒ this block is inert and Case 3 surfaces the error
-            # exactly as before this feature existed.
+            # directly.
             #
             # ``not _turn_tool_activity`` is load-bearing over and above
             # ``not result_text``: a tool call can complete an EXTERNAL
@@ -595,6 +613,7 @@ async def stream_and_collect_json(
     *,
     approval_policy: ToolApprovalPolicy = ToolApprovalPolicy.AUTO_APPROVE,
     hooks: HookManager | None = None,
+    on_chunk: Callable[[str], None] | None = None,
     model_fallback: bool = False,
     allow_image: bool = True,
 ) -> dict | None:
@@ -608,6 +627,7 @@ async def stream_and_collect_json(
         message,
         approval_policy=approval_policy,
         hooks=hooks,
+        on_chunk=on_chunk,
         model_fallback=model_fallback,
         allow_image=allow_image,
     )

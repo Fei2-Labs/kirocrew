@@ -385,11 +385,19 @@ class TestAiReviewOverridePermissions:
     def test_override_handler_has_only_review_control_permissions(self) -> None:
         """The trusted comment handler can re-run reviews and update their
         checks/comments, but must never inherit model credentials or repository
-        contents write access."""
+        contents write access.
+
+        ``issues: read`` is the one read-only addition: class ``deferred`` reads
+        the follow-up issue it names with the workflow token, and a scope the
+        block does not list is ``none``, so without it every deferred override
+        fails closed. It is read, never write; ``test_workflow_token_scopes.py``
+        derives the scopes the handler's calls need and requires this block to
+        hold them."""
         assert _workflow_permissions("ai-review-human-override.yml") == {
             "actions": "write",
             "checks": "write",
             "contents": "read",
+            "issues": "read",
             "pull-requests": "write",
         }
 

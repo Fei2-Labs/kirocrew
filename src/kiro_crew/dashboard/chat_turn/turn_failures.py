@@ -14,21 +14,22 @@ from __future__ import annotations
 import functools
 from typing import TYPE_CHECKING
 
+from kiro_crew.agent_capabilities import CapabilityError
+from kiro_crew.dashboard.chat_utils import TRANSIENT_RETRY_KIND
+from kiro_crew.security import redact
+from kiro_crew.session_capabilities import CapabilityStartupError
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         _PROJECT_CHANGED_OTHER_TEXT,
         _SESSION_START_REFUSAL_TEXT,
         STOP_REASON_CANCELLED,
         SYNTHETIC_RECOVERY_KIND,
-        TRANSIENT_RETRY_KIND,
-        CapabilityError,
-        CapabilityStartupError,
         KiroCrewConfig,
         _member_capable_backend_names,
         _MemoryUnavailable,
         acp_error_is_transient,
         logger,
-        redact,
         run_bg_oneliner,
     )
     from kiro_crew.dashboard.chat_turn.account_identity import _mark_kiro_signed_out
@@ -76,7 +77,7 @@ async def _on_cancelled(turn: _ChatTurn) -> None:
     # Mark the cancel on _stop_reason too — every cancelled exit (the Stop
     # press AND the involuntary cases: tab close, idle sweep, shutdown, the
     # turn ceiling converted one frame above _run_chat) is a discarded turn whose history
-    # must stay owed, so the debt correctly stays armed (GPT 6.1 F1).
+    # must stay owed, so the debt correctly stays armed.
     _stop_reason = STOP_REASON_CANCELLED
     turn._stop_reason = _stop_reason
     await _persist_partial_reply(turn, _cancel_reason)
@@ -154,7 +155,7 @@ async def _on_prompt_busy(turn: _ChatTurn) -> None:
     _turn_emitted = turn._turn_emitted
     message = turn.message
     logger.info("Prompt busy exhausted in slot %s — resetting session", slot.key)
-    needs_session_reset = True  # checked in _run_chat's finally
+    needs_session_reset = True  # checked in _turn_release_session (chat_turn/session_reset.py)
     turn.needs_session_reset = needs_session_reset
     await _persist_partial_reply(turn, "error: prompt busy exhausted")
     slot._prompt_busy_retries += 1
@@ -187,6 +188,8 @@ _POISON_CANARY_TIMEOUT_SECS = 30.0
 
 async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
     """Any other ACP error: the error card and the turn's failure record."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _directive_loop_gen = turn._directive_loop_gen
     _directive_loop_id = turn._directive_loop_id
     _directive_self_wake = turn._directive_self_wake
@@ -355,7 +358,7 @@ async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
         # enqueued (mirrors _posttoken_retry_used accounting). The
         # streak stays: this discard came from it.
         _escalation.arm_discard(clear_streak=False)
-        needs_conversation_discard = True  # checked in _run_chat's finally
+        needs_conversation_discard = True  # checked in _turn_release_session (session_reset)
         turn.needs_conversation_discard = needs_conversation_discard
         slot.append(
             "error",
@@ -364,7 +367,10 @@ async def _on_acp_error_card(turn: _ChatTurn, exc) -> None:
             "messages are kept; the model rebuilds its working "
             "context from them)…",
             "msg msg-err",
-            meta={"kind": TRANSIENT_RETRY_KIND},
+            meta={
+                "kind": TRANSIENT_RETRY_KIND,
+                **gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CONVERSATION_REJECTED_RESTARTING),
+            },
         )
         # The verbatim requeue carries the retry identity forward via
         # _queue_recovery itself (one mechanism for every recovery
@@ -503,8 +509,9 @@ async def _on_session_closing(turn: _ChatTurn) -> None:
     # This arm carries no `as exc` binding, so the class is named literally
     # -- the same shape as _on_cancelled. It is read only when the turn had
     # already opened; the documented raise happens in turn prep, which leaves
-    # `_crew_log_turn_open` False and _run_chat's finally emits nothing at
-    # all. Naming it here is what keeps a turn closed by a shutdown from
+    # `_crew_log_turn_open` False and _turn_close_crew_log
+    # (chat_turn/crew_log_attribution.py) emits nothing at all. Naming it here
+    # is what keeps a turn closed by a shutdown from
     # being recorded as an unnamed failure.
     _crew_log_error = "SessionClosingError"
     turn._crew_log_error = _crew_log_error
@@ -566,14 +573,23 @@ async def _on_error(turn: _ChatTurn, exc) -> None:
             f"{_member_capable_backend_names()}, or reset the member's "
             "Capabilities page, then start a new chat."
         )
-        _err_meta = _terminal_error_meta(exc)
-    elif isinstance(exc, CapabilityStartupError) and str(exc) == "worker_kit_harness_unsupported":
-        from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
+        from kiro_crew.members import is_crewmate_worker_session
 
-        _err_text = "worker_kit_harness_unsupported: " + (
-            worker_kit_backend_refusal(crewmate_worker_backend(KiroCrewConfig.load().agent))
-            or "this worker's backend cannot carry its kit; start a new hand-off"
-        )
+        if is_crewmate_worker_session(session_key):
+            # A crewmate's worker is refused for its kit, which only some
+            # member backends carry, so the member card's remedy does not fit.
+            from kiro_crew.crewmate_harness import crewmate_for_session
+            from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
+
+            _cfg = KiroCrewConfig.load()
+            try:
+                _worker_reason = worker_kit_backend_refusal(
+                    crewmate_worker_backend(_cfg, crewmate_for_session(_cfg, session_key))
+                )
+            except Exception as _exc:  # noqa: BLE001 - the row must still be written
+                _worker_reason = str(_exc)
+            if _worker_reason:
+                _err_text = "capability_harness_unsupported: " + _worker_reason
         _err_meta = _terminal_error_meta(exc)
     elif (
         isinstance(exc, CapabilityStartupError) and str(exc) == "capability_tool_limits_unsupported"

@@ -8,39 +8,40 @@ import asyncio
 import functools
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.config.loader import normalize_agent_model
+from kiro_crew.context import discard_memory_prefetch
+from kiro_crew.dashboard.chat_utils import (
+    _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
+    APP_AGENT_REFUSED_KIND,
+    _normalize_model,
+    slot_history_key,
+    tighten_live_slot_memory_mode,
+)
+from kiro_crew.dashboard.state import durable_row_count
+from kiro_crew.llm_helpers import _billing_stats
+from kiro_crew.members import DM_SLOT_MODE, is_dispatchable_member_name, member_lifecycle
+from kiro_crew.platform import redact_log_via_context
+from kiro_crew.quick_prompts import QUICK_PROMPTS
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
-        _KIRO_ONLY_BLOCKED_SLASH_COMMANDS,
         ACP_BACKEND_KIRO,
-        APP_AGENT_REFUSED_KIND,
-        DM_SLOT_MODE,
         MAX_PROMPT_BYTES,
-        QUICK_PROMPTS,
         KiroCrewConfig,
         ResolvedBindings,
         Routing,
         SessionBusyError,
         _AppAgentNotLoaded,
-        _billing_stats,
-        _expand_prompt_mention_off_loop,
         _MemoryUnavailable,
-        _normalize_model,
-        _prewarm_startup_query,
         capabilities_of,
         crew_log_emit,
-        discard_memory_prefetch,
-        durable_row_count,
         effective_session_key,
         expire_slack_options,
         invalidate_stale_kas_session,
-        is_dispatchable_member_name,
         logger,
-        member_lifecycle,
-        normalize_agent_model,
         publish_turn_identity,
         record_activity,
         record_agent_selection,
-        redact_log_via_context,
         refresh_materialized_agents,
         reproject_claimed_session,
         resolve_agent_bindings,
@@ -48,11 +49,9 @@ if TYPE_CHECKING:
         routing_for,
         save_slot_off_loop,
         sel,
-        slot_history_key,
         slot_switch_session_lock,
         subprocess_executor,
         telemetry_channel_of,
-        tighten_live_slot_memory_mode,
         warm_project_agent_names,
     )
     from kiro_crew.dashboard.chat_turn.account_identity import _retire_sessions_on_identity_change
@@ -86,6 +85,11 @@ if TYPE_CHECKING:
         _inherited_default_model,
         _settle_session_model,
     )
+    from kiro_crew.dashboard.chat_turn.prompt_assembly import (
+        _expand_prompt_mention_off_loop,
+        _prewarm_startup_query,
+    )
+    from kiro_crew.dashboard.chat_turn.regenerate_swap import rows_before_regenerate_target
     from kiro_crew.dashboard.chat_turn.session_reset import _consume_pending_reset
     from kiro_crew.dashboard.chat_turn.slash_commands import _refuse_blocked_slash
     from kiro_crew.dashboard.chat_turn.tool_approval import _persistable_session_policy
@@ -189,6 +193,8 @@ def _release_dispatch_lock(turn) -> None:
 
 async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     """Admit the turn onto its session: the admission wait, the dispatch lock, the bindings and the session claim."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _spec_hooks: list
     _spec_hooks_cwd: str | None
     _turn_stats0: object
@@ -219,8 +225,9 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # the slot-switch busy scan, ``_switch_target_busy``) for the whole
     # memory-preparation wait, while ``slot.task`` already says a turn is
     # running. A turn refused at admission (timeout, Stop) leaves through
-    # the same finally, which compare-and-clears only an identity this
-    # turn actually published, so a successor's key is never wiped.
+    # the same finally, whose _turn_release_session (chat_turn/session_reset.py)
+    # compare-and-clears only an identity this turn actually published, so a
+    # successor's key is never wiped.
     slot._active_turn_session_key = session_key
 
     if slot.mode == DM_SLOT_MODE and not is_dispatchable_member_name(slot.agent):
@@ -232,6 +239,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             "error",
             "This thread's crew name cannot be dispatched. Rename or recreate the Crew Member.",
             "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CREW_NAME_UNDISPATCHABLE),
         )
         return _Flow.END
 
@@ -329,7 +337,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # be waited on in turn. Exits between acquire and release (a binding
     # that changed during preparation, a provider that failed to start,
     # cancellation) reach _run_chat's finally, which releases first
-    # thing.
+    # thing, in _turn_record_outcome (chat_turn/queue_cycle.py).
     _dispatch_lock = slot_switch_session_lock(session_key)
     turn._dispatch_lock = _dispatch_lock
     await _dispatch_lock.acquire()
@@ -385,14 +393,25 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         # miss falls through to the fail-loud below. Strictly guarded: the
         # common hot path (no ``_app``, or already resolved) does zero extra
         # work and zero extra I/O.
-        if slot._app and not bindings.requested_resolved:
+        #
+        # Step (1) also covers a named non-app slot while the installed snapshot
+        # is incomplete: a scan that could not read a spec, or a boot
+        # scan that has not landed, may be missing a template whose file is on
+        # disk, and the turn below would otherwise fail memory_unavailable for
+        # it. One rescan, then the same fail-loud. A complete snapshot is
+        # trusted, so a really removed agent costs no I/O here.
+        from kiro_crew.config.loader_snapshots import materialized_snapshot_complete
+
+        if not bindings.requested_resolved and (
+            slot._app or (slot.agent and not materialized_snapshot_complete())
+        ):
             try:
                 await asyncio.get_running_loop().run_in_executor(
                     subprocess_executor(), refresh_materialized_agents
                 )
             except Exception:  # noqa: BLE001 — warm failure only costs the fail-loud below
                 logger.warning(
-                    "Failed to warm materialized agents for app slot %s",
+                    "Failed to warm materialized agents for slot %s",
                     slot.key,
                     exc_info=True,
                 )
@@ -412,7 +431,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             turn.memory_store = memory_store
             agent_model = normalize_agent_model(bindings.model)
             turn.agent_model = agent_model
-            if not bindings.requested_resolved:
+            if slot._app and not bindings.requested_resolved:
                 bindings = await _recover_app_agent_binding(
                     cfg, slot, project=selected_binding[1] or None
                 )
@@ -455,6 +474,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             "error",
             "This thread's crew name cannot be dispatched. Rename or recreate the Crew Member.",
             "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CREW_NAME_UNDISPATCHABLE),
         )
         return _Flow.END
     # A session a palette command opened to run as its app's OWN agent runs the
@@ -652,6 +672,15 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         from kiro_crew.dashboard.crewmate_approval import seed_for_turn
 
         seed_for_turn(state, slot, loaded_cfg, execution_context)
+        # A crewmate's worker runs in the crewmate's own git worktree of the
+        # repository this turn is about, never in the shared checkout.
+        from kiro_crew.dashboard.crewmate_worktree_scope import scope_worker_turn
+
+        if await scope_worker_turn(state, slot, loaded_cfg, execution_context, message):
+            # The project is part of the captured binding; this turn now
+            # runs on the worktree, under the dispatch lock it still holds.
+            selected_binding = _current_binding(turn)
+            turn.selected_binding = selected_binding
 
     # FAIL-LOUD: an app-owned slot whose agent STILL did not resolve after the
     # self-heal must NOT run the default agent — that generic-substitution is
@@ -843,12 +872,18 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # session/new is on its send path: the first message's embedding starts now
     # and runs beside it. A resumable key restores its transcript instead and
     # builds no session-start memory.
-    if (
-        not _wait_if_busy
-        and not is_slash
-        and not state.sessions.resumable_hint(session_key)
-        and not _message_rewritten_before_build(slot, message)
-    ):
+    #
+    # A prewarmed session nobody has claimed yet is the other case that builds
+    # session-start memory. Its own registration mapped its id, so the resumable
+    # hint is set for it, but it restores nothing: the claim takes its FRESH
+    # observation. The reads then run beside the claim and the steps before the
+    # build (model settle, replay, store preparation).
+    _starts_fresh = (
+        state.sessions.fresh_start_unclaimed(session_key)
+        if _wait_if_busy
+        else not state.sessions.resumable_hint(session_key)
+    )
+    if _starts_fresh and not is_slash and not _message_rewritten_before_build(slot, message):
         await _prewarm_startup_query(
             state,
             slot,
@@ -1090,7 +1125,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # armed below from this turn's FRESH observation and settled once a turn
     # keeps its history with the provider, carries the debt across that
     # failure. Read without clearing, exactly like ``_replay_pending``. The
-    # debt is settled when _run_chat's finally predicate holds: a normal
+    # debt is settled when the predicate in _turn_settle_debts holds: a normal
     # ``STOP_REASON_END_TURN`` (non-synthetic, no empty-response verdict), OR
     # any exit that KEPT the session (``_turn_emitted`` and not cancelled and
     # no empty-response verdict — a non-transient error / timeout after output
@@ -1103,8 +1138,9 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # Arm the durable debt from a FRESH observation (``is_new`` with no native
     # resume): the context-bearing first turn is owed its history until a turn
     # durably delivers it. ``resumed`` sessions replayed their transcript
-    # natively and must NOT re-inject, so they never arm. _run_chat's finally-block
-    # settle consumes it on a kept-session exit: a normal ``end_turn``, any
+    # natively and must NOT re-inject, so they never arm. The settle in
+    # _turn_settle_debts (chat_turn/prompt_assembly.py) consumes it on a kept-session
+    # exit: a normal ``end_turn``, any
     # ``_turn_emitted`` exit that was not cancelled and had no empty-response
     # verdict (output stayed with the provider even if an error followed), or
     # a completed compaction. A cancelled / empty-response / pre-output-5xx
@@ -1116,8 +1152,8 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         # The sid's unlanded marker must land before the turn does, or a
         # crash in the debounce window keeps the sid without it. Awaited
         # off the loop; a failed write fails the turn before it is sent,
-        # and _run_chat's finally hands the session back. A marker left
-        # by an earlier turn whose write failed is flushed again here, as a
+        # and _turn_release_session (chat_turn/session_reset.py) hands the session back.
+        # A marker left by an earlier turn whose write failed is flushed again here, as a
         # warm retry is not ``is_new``. Only a backend whose resume honours
         # the marker ever carries one, so other turns await nothing.
         await state.sessions.aflush()
@@ -1145,8 +1181,8 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # the session client exists — not at the context build: every early
     # return between this point and build_message (a blocked/oversized
     # @prompt expansion, a pre-build abort) leaves a warm session whose
-    # member section was never delivered, and _run_chat's finally-block re-arm
-    # reads this flag to make the next turn re-deliver it. The
+    # member section was never delivered, and the re-arm in _turn_settle_debts
+    # (chat_turn/prompt_assembly.py) reads this flag to make the next turn re-deliver it. The
     # delivery-at-stake verdict is the chokepoint's own
     # (MemberLifecycle.delivers_section — the same source
     # member_turn_context reads), keyed on the slot's member MODE rather
@@ -1154,7 +1190,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # build, and delivery is at stake from this point regardless.
     # needs_reinjection is pinned False: the one-shot flag is not consumed
     # until the context build, and an aborted WARM_REINJECTION delivery is
-    # covered by _needs_reinjection in the same finally-block re-arm.
+    # covered by _needs_reinjection in the same _turn_settle_debts re-arm.
     _member_session_start_pending = (
         slot.mode == "member"
         and member_lifecycle(
@@ -1209,7 +1245,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
         await expire_slack_options(state, session_key)
     # Publish the live inner AcpClient onto the slot so a concurrent request
     # (the dashboard steer handler) can reach the running session's client
-    # to inject a mid-turn steer. Cleared in _run_chat's finally.
+    # to inject a mid-turn steer. Cleared in _turn_release_handles (chat_turn/turn_entry.py).
     slot._acp_client = getattr(client, "client", None)
     # Billing stats as they stand BEFORE this turn's prompt is sent. The
     # runtime installs a fresh per-turn stats object only inside the dispatch
@@ -1220,7 +1256,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     _turn_stats0 = _billing_stats(client)
     turn._turn_stats0 = _turn_stats0
     # Append-only the session's log (flag-gated, fail-soft). The id is read once here and
-    # reused at every later emit site in _turn_admit, _turn_dispatch_gates and _run_chat, so
+    # reused at every later emit site in _turn_admit, _turn_dispatch_gates and later phases, so
     # a turn that never got a session id emits nothing rather than guessing one. ``owner`` is
     # "default" because a crew-bound slot never reaches this local runner.
     _crew_log_sid = crew_log_emit.session_id_of(client)
@@ -1232,6 +1268,13 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # AcpSessionProvider forwards it to the handle, other providers ignore.
     try:
         setattr(client, "child_fidelity_aware", True)
+    except Exception:  # pragma: no cover - providers without the attr
+        pass
+    # This consumer can put an MCP server's elicitation to the person (the
+    # elicitation card) -- opt in so the driver yields those events here
+    # instead of declining them itself. Same attribute shape as above.
+    try:
+        setattr(client, "accepts_elicitation", True)
     except Exception:  # pragma: no cover - providers without the attr
         pass
     # Companion steer handle: lets the steer handler cut the current text
@@ -1439,8 +1482,11 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # `durable_row_count` is the SHARED counting rule every
     # site that sets or advances that base uses, so the ordinal cannot disagree
     # with the base about which rows are durable.
+    # A Regenerate leaves the reply it replaces in the window until the turn
+    # ends; that reply is not counted, so the re-run draws the ordinal of the
+    # turn it repeats and the emitter's `attempt` increments.
     _crew_log_turn_no = int(getattr(slot, "_disk_older_durable_count", 0) or 0) + durable_row_count(
-        slot.messages
+        rows_before_regenerate_target(slot, slot.messages)
     )
     turn._crew_log_turn_no = _crew_log_turn_no
     # A quick prompt is a REPLACING expansion, the same class as @prompt: the

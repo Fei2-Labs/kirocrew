@@ -189,7 +189,6 @@ async def _shutdown(self: GatewayOrchestrator) -> None:
         repair_task.cancel()
         await asyncio.gather(repair_task, return_exceptions=True)
 
-    # Cancel in-flight handler tasks
     for t in list(self._handler_tasks):
         t.cancel()
 
@@ -295,9 +294,9 @@ async def _stop_services_and_sessions(
     speculative session starts ``_shutdown`` stopped before its first await;
     they are awaited here with the session closes.
     """
-    # Keep the old handler-drain semantics, but only after AutoNudge has closed
-    # admission and drained every mutation that entered before closure. A handler
-    # still running after cancellation may now reach a closed mutation entry; the
+    # Drain handlers only after AutoNudge has closed admission and drained
+    # every mutation that entered before closure. A handler
+    # still running after cancellation may reach a closed mutation entry; the
     # shared mutation authorizer maps that expected shutdown refusal to 503. This
     # await is the first bounded teardown step so a removal that keeps absorbing
     # cancellation cannot prevent AutoNudge's drain from running.
@@ -308,6 +307,7 @@ async def _stop_services_and_sessions(
         await self.cron_svc.stop()
     if self.heartbeat_svc:
         self.heartbeat_svc.stop()
+        await self.heartbeat_svc.wait_closed()
 
     # Stop the pooled MCP gateway broker + its backends. gatewayd is
     # spawned with start_new_session (and no PR_SET_PDEATHSIG), so on a
@@ -521,8 +521,8 @@ async def _shutdown_and_exit(
     # the gateway down as asked. Non-zero when the stale-asset watchdog is
     # what set the event: that shutdown exists ONLY to be restarted, and
     # a supervisor with `Restart=on-failure` semantics never relaunches an
-    # exit 0 — a unit generated before `Restart=always` landed stranded a
-    # gateway for hours on exactly this path. The watchdog has already
+    # exit 0, and an older unit file may lack `Restart=always`, leaving
+    # the gateway down. The watchdog has already
     # returned (True on the vanish path) by the time it sets the event, so
     # its task result is the signal; see shutdown_exit_code.
     #
@@ -618,9 +618,19 @@ async def _shutdown_and_exit(
     # Off-loop: still inside the orchestrator coroutine here.
     #
     # The one call site that asks for the leaders narrowing. Nothing spawns a
-    # session by this point, so the sweep is not racing a mapping publisher --
-    # the same position the sweep already held here before this change.
+    # session by this point, so the sweep is not racing a mapping publisher.
     await asyncio.to_thread(cleanup_orphaned_sessions)
+    # Shared Crew per-principal slices. The dashboard's cleanup hook releases
+    # them, but a graceful shutdown that ran out of time never reaches it, and
+    # os._exit below skips it. The runtimes are gone by now, so their scopes
+    # are empty; a release that already ran leaves nothing to do here. Bounded
+    # like the drains below.
+    try:
+        from kiro_crew.shared_crew.admission_gate import shutdown_cleanup
+
+        await asyncio.wait_for(shutdown_cleanup(), timeout=6.0)
+    except Exception:  # noqa: BLE001 - shutdown must not raise
+        logger.debug("shared crew slice release at exit failed", exc_info=True)
     # The skill-usage ledgers debounce their writes to one per 60 s, and their
     # flush thread is a daemon: a hit accepted inside that window lives only in
     # memory, and os._exit below kills it. Flush them here, off-loop and

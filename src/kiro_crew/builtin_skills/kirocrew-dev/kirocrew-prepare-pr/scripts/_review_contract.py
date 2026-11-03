@@ -8,7 +8,10 @@ working directory.
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -31,7 +34,8 @@ _SECRET_RE = re.compile(
     # HMAC-SHA256 digest), the payload bound is a generator-derived floor rather
     # than a guess (a guessed floor is beatable by a verbose identifier), and the
     # left boundary (incl. `.`, so attribute access is excluded) keeps ordinary
-    # dotted code intact.
+    # dotted code intact unless what follows the `.` carries a `-` or a payload
+    # shaped as base64url of ASCII JSON, which no identifier chain does.
     #
     # Placing it after the three-segment alternative is defensive, not
     # load-bearing for real tokens: a conventional JWS header is only 33 chars
@@ -40,7 +44,13 @@ _SECRET_RE = re.compile(
     # clears that floor AND whose payload is exactly 43 chars, since the right
     # boundary is satisfied by a `.` and would leave `.signature` in the printed
     # log. That shape is covered by a test.
-    r"|(?<![A-Za-z0-9_.-])eyJ[A-Za-z0-9_-]{96,}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"
+    #
+    # The `(?-i:…)` wrapper keeps the copy case-sensitive, as the backend is:
+    # this regex runs under `(?i)`, which would let `[A-Za-f]` accept every
+    # letter and start a match after a `.` on ordinary dotted code.
+    r"|(?-i:"
+    r"(?<![A-Za-z0-9_-])(?!(?<=\.)(?!eyJ[A-Za-z0-9_]*-)(?!eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_]*-)(?!eyJ[A-Za-z0-9_-](?:[A-Za-f][A-Za-z0-9_-]{3})*(?:[A-Za-f][A-Za-z0-9_-]{1,2})?\.))eyJ[A-Za-z0-9_-]{96,}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"
+    r")"
     r"|-----BEGIN[A-Z ]*PRIVATE KEY-----)"
 )
 _KV_RE = re.compile(
@@ -177,6 +187,16 @@ OVERRIDE_MARKER_RE = re.compile(
     r"\A<!-- ai-review-human-override target=([a-z0-9-]+) head=([0-9a-fA-F]{7,40})"
     r" actor=(\S+) source=([0-9]+) -->"
 )
+# The class record: line 2 of the same bot comment, written by the same handler
+# (`.github/scripts/release_record.py render_record`). Line 1 alone is the
+# authority a lane clears on; line 2 only says WHICH release this was, for
+# `pr_status.py`, the ledger and the weekly audit. A record from before classes
+# has no line 2 and reads as `unclassified`, never as an error.
+OVERRIDE_CLASS_RE = re.compile(
+    r"\A[^\n]*\n<!-- ai-review-override-record class=([a-z-]+) issue=([0-9]+|none)"
+    r" author_is_actor=(true|false) -->"
+)
+OVERRIDE_CLASS_UNCLASSIFIED = "unclassified"
 OVERRIDE_TARGET_ALL = "all"
 # The command's target spellings, mapped to each lane's WORKFLOW-AUTHORED
 # comment key rather than straight to a reviewer name. Reviewer identity then
@@ -253,6 +273,31 @@ def parse_override_record(comment, authors=DEFAULT_MARKER_AUTHORS):
     return target.lower(), head.lower(), actor
 
 
+def parse_override_class(comment, authors=DEFAULT_MARKER_AUTHORS):
+    """Return ``{class, issue, author_is_actor}`` for a trusted record, else None.
+
+    Trust is ``parse_override_record``'s: a comment that is not a bot-authored
+    override record has no class. A trusted record without the class line (made
+    before classes existed) is ``unclassified`` with ``author_is_actor`` None,
+    which a counter can tell apart from a record that says ``false``.
+    """
+    if parse_override_record(comment, authors) is None:
+        return None
+    match = OVERRIDE_CLASS_RE.match(comment.get("body") or "")
+    if not match:
+        return {
+            "class": OVERRIDE_CLASS_UNCLASSIFIED,
+            "issue": "",
+            "author_is_actor": None,
+        }
+    klass, issue, author_is_actor = match.groups()
+    return {
+        "class": klass,
+        "issue": "" if issue == "none" else issue,
+        "author_is_actor": author_is_actor == "true",
+    }
+
+
 def override_reviewer_names(target, bindings, keys=DEFAULT_OVERRIDE_TARGET_KEYS):
     """Reviewer names one override target answers for, resolved via ``bindings``."""
     if target == OVERRIDE_TARGET_ALL:
@@ -306,6 +351,24 @@ def human_override_actors(comments, head_sha, bindings, authors=DEFAULT_MARKER_A
             continue
         for name in override_reviewer_names(target, bindings):
             named[name] = actor
+    return named, blanket
+
+
+def human_override_classes(comments, head_sha, bindings, authors=DEFAULT_MARKER_AUTHORS):
+    """Return ``(named, blanket)`` -- the class record of each accepted override.
+
+    The same records, in the same shape, as ``human_override_actors``, with the
+    ``parse_override_class`` dict in place of the actor.
+    """
+    named: dict = {}
+    blanket: dict = {}
+    for target, _actor, comment in _accepted_overrides(comments, head_sha, authors):
+        info = parse_override_class(comment, authors)
+        if target == OVERRIDE_TARGET_ALL:
+            blanket = info or {}
+            continue
+        for name in override_reviewer_names(target, bindings):
+            named[name] = info or {}
     return named, blanket
 
 
@@ -1454,3 +1517,62 @@ def disposition_violations(
                     "judged".format(span, where, target)
                 )
     return sorted(out)
+
+
+# --- Owners: fences, disposition rounds, the blocked-push count ----------------------
+#
+# Three sibling modules hold these responsibilities, and every name they define is
+# bound here, so a caller keeps reading them off this module. They load in a chain
+# (pushes -> rounds -> fences), and this module takes each from that one load.
+class _NoBytecodeSourceLoader(importlib.machinery.SourceFileLoader):
+    """Load shipped source normally while suppressing cache writes."""
+
+    def get_code(self, fullname):
+        path = self.get_filename(fullname)
+        return self.source_to_code(self.get_data(path), path)
+
+    def set_data(self, path, data, *, _mode=0o666):
+        return None
+
+
+def _load_sibling(filename, name):
+    """Load a sibling script without cwd, sys.path, or bytecode side effects."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    loader = _NoBytecodeSourceLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None:  # pragma: no cover - defensive
+        raise RuntimeError("cannot import kirocrew-prepare-pr sibling script: " + path)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def _load_owner(stem):
+    """Load ``<stem>.py`` beside this script, named under this module's own package."""
+    package = __name__.rpartition(".")[0]
+    return _load_sibling(stem + ".py", package + "." + stem if package else stem)
+
+
+_pushes = _load_owner("_review_pushes")
+_rounds = _pushes._rounds
+_fences = _rounds._fences
+
+fence_opening = _fences.fence_opening
+is_closing_fence = _fences.is_closing_fence
+split_lines = _fences.split_lines
+unfenced_lines = _fences.unfenced_lines
+drop_fenced_blocks = _fences.drop_fenced_blocks
+
+FIX_OUTCOMES = _rounds.FIX_OUTCOMES
+OTHER_OUTCOMES = _rounds.OTHER_OUTCOMES
+OUTCOME_WORDS = _rounds.OUTCOME_WORDS
+declared_outcome = _rounds.declared_outcome
+declared_resolution = _rounds.declared_resolution
+same_head = _rounds.same_head
+disposition_rounds = _rounds.disposition_rounds
+fix_rounds = _rounds.fix_rounds
+
+BLOCKED_PUSH_REPEAT = _pushes.BLOCKED_PUSH_REPEAT
+BLOCKED_PUSH_LIMIT = _pushes.BLOCKED_PUSH_LIMIT
+LANE_CHECK_RE = _pushes.LANE_CHECK_RE
+blocked_push_count = _pushes.blocked_push_count

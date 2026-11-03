@@ -523,9 +523,13 @@ def _board(unit: str, board: str, worker: str) -> None:
     _write(unit, **base, action="bind", item_id="it_p", worker_session_key=worker)
 
 
+#: Each board's own unit, where the report route writes the board's copy of a report.
+_BOARD_UNITS = {CONDUCTOR: "acp-c", OTHER: "acp-o"}
+
+
 def _report(unit: str, board: str, worker: str, stamp: str, *, status: str = "done") -> None:
-    _write(
-        unit,
+    """A worker's report as the route records it: the worker's copy, then the board's."""
+    fields = dict(
         slot=board,
         actor="worker",
         by=worker,
@@ -535,6 +539,9 @@ def _report(unit: str, board: str, worker: str, stamp: str, *, status: str = "do
         summary="s",
         last_report_at=stamp,
     )
+    _write(unit, **fields)
+    if _BOARD_UNITS[board] != unit:
+        _write(_BOARD_UNITS[board], **fields)
 
 
 async def _until(predicate, timeout: float | None = None) -> bool:
@@ -547,6 +554,15 @@ async def _sync_and_join(svc) -> None:
     """Sync the subscriptions, then wait for every join it started to land."""
     conductor_wake.sync_subscriptions(svc)
     await asyncio.gather(*list(conductor_wake._subscriptions.joining.values()))
+    # A board with no warm cell gets no baseline on the join: one background prime folds
+    # it and its first push is the board's first sight. Wait for that prime, then for the
+    # observations it scheduled on this loop, so every case starts from the board's
+    # first sight already recorded.
+    from kiro_crew.crew_log import slot_prime
+
+    assert await asyncio.to_thread(slot_prime.drain, 30.0), "a background prime never finished"
+    live = set(conductor_wake._subscriptions.live)
+    await _until(lambda: live <= set(conductor_wake._registry.boards))
 
 
 def _on_this_loop(monkeypatch, svc) -> None:

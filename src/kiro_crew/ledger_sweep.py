@@ -87,8 +87,9 @@ KIND_WORK = "work"
 #: wants a different answer.
 DEFAULT_OLDER_THAN_DAYS = 30
 
-#: Directory name under the work-ledger root that is NOT a conductor store.
-_BINDINGS_DIR_NAME = "bindings"
+#: Directory names under the work-ledger root that are NOT a conductor store
+#: (bindings, undelivered-call records), owned by the store itself.
+_RESERVED_ROOT_DIR_NAMES = wl.RESERVED_ROOT_DIRS
 
 #: Reason for a store directory that is a symbolic link or junction: it names
 #: somewhere else, and a delete aimed through it would land there.
@@ -496,7 +497,9 @@ def _scan_work_ledgers(*, older_than_days: float, now: datetime) -> tuple[list[C
     kept = 0
     root = wl._work_ledger_root()
     try:
-        children = sorted(p for p in root.iterdir() if p.is_dir() and p.name != _BINDINGS_DIR_NAME)
+        children = sorted(
+            p for p in root.iterdir() if p.is_dir() and p.name not in _RESERVED_ROOT_DIR_NAMES
+        )
     except FileNotFoundError:
         return candidates, kept
     # Same as the session scanner: an unreadable root is an error, not "empty".
@@ -728,7 +731,10 @@ def purge(report: SweepReport, *, include_unreadable: bool = False) -> PurgeResu
             logger.debug("ledger sweep: work ledger purge failed", exc_info=True)
             failed.append(candidate)
             continue
-        (removed if gone else failed).append(candidate)
+        # ``purge_conductor`` answers False for a store that is already gone (an
+        # overlapping sweep removed it). The session half counts a store by
+        # whether it still exists, and this half does the same.
+        (removed if gone or not candidate.path.exists() else failed).append(candidate)
 
     if session_targets:
         keys = {candidate.key for candidate in session_targets}
@@ -881,6 +887,12 @@ def run_command(*, purge: bool, older_than_days: float | None, purge_unreadable:
     if not math.isfinite(window) or window < 0:
         print("  ❌ --older-than-days must be a finite number of days, and not negative")
         sys.exit(2)
+    # ``--purge-unreadable`` is a modifier of ``--purge``. Run alone it would be
+    # the hazard this command exists to remove: a modifier parsed without its
+    # mode, a dry run that exits 0 and reads like a purge that found nothing.
+    if purge_unreadable and not purge:
+        print("  ❌ --purge-unreadable only works with --purge", file=sys.stderr)
+        sys.exit(2)
     header = "Ledger Sweep" + ("" if purge else " (dry run — nothing is deleted)")
     print(f"{header}\n")
     try:
@@ -900,3 +912,14 @@ def run_command(*, purge: bool, older_than_days: float | None, purge_unreadable:
         print(f"\n  Purge them with: kirocrew ledger-sweep --purge --older-than-days {window:g}")
     if not purge and report.unreadable:
         print("  Unreadable records need --purge-unreadable, and are worth reading first.")
+    if result is not None and result.failed:
+        # The sweep finishes every other delete first, then says which ones did
+        # not go: a script that runs the purge must not read a failed delete as
+        # a clean run. Stored text is sanitised like every other printed field.
+        for candidate in result.failed:
+            key = _safe(candidate.key) if candidate.key else "(no breadcrumb)"
+            print(
+                f"  ❌ could not delete {candidate.kind} {_safe(candidate.store)}  key={key}",
+                file=sys.stderr,
+            )
+        sys.exit(1)

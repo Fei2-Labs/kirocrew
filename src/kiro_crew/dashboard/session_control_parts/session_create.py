@@ -29,6 +29,7 @@ from kiro_crew.config.sections import (
     worker_session_defaults,
 )
 from kiro_crew.crew_log import emit as crew_log_emit
+from kiro_crew.dashboard.approval_inheritance import inherit_posture
 from kiro_crew.dashboard.chat_delivery import sanitize_outbound
 from kiro_crew.dashboard.chat_folders import (
     _folder_declared_project,
@@ -49,10 +50,14 @@ from kiro_crew.dashboard.session_control_parts.caller_access import (
     _channel_link_of,
     _cron_caller,
     _delegation_lineage_fenced,
-    _member_bypass,
+    _dispatch_bypass,
     _member_caller,
     caller_slot_key,
     session_control_enabled,
+)
+from kiro_crew.dashboard.session_control_parts.crew_filing import (
+    _crew_filing_answer,
+    _in_turned_on_crew_tree,
 )
 from kiro_crew.dashboard.session_control_parts.session_titles import _clean_new_session_title
 from kiro_crew.dashboard.session_control_parts.target_authorization import (
@@ -83,6 +88,8 @@ from kiro_crew.security import redact
 from kiro_crew.validation import _MODEL_NAME_RE, MAX_ACP_SESSION_ID_LEN, MAX_SHORT_STRING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Callable
+
     from kiro_crew.dashboard.state import DashboardState
 
 # The module's original logger name, which log filters and caplog assertions key on.
@@ -92,6 +99,16 @@ logger = logging.getLogger("kiro_crew.dashboard.session_control")
 # template: a crew member carrying this name is a leftover of an older agent
 # sync, and selecting it fences a shared-store conductor's dispatch.
 _STOCK_WORKER_AGENT = WORKER_AGENT_FILENAME.removesuffix(".json")
+
+# How a spawn makes its queued reparent edge visible to a concurrent adoption's loop
+# guard. The guard and its edge store live in ``session_tree``, a HIGHER owner layer
+# than this one, so this module must not import them -- the owner layering (one import
+# direction, lowest layer first) forbids it. ``session_tree`` instead injects its
+# ``_note_pending_edge`` here at import, the allowed direction (it already imports
+# ``_record_spawn`` from this module). ``None`` until it does; ``_record_spawn`` skips
+# the registration when it is unset, which is only ever before the facade is built, long
+# before any spawn runs. Signature: ``(child_slot, parent_slot, fence_future) -> None``.
+_register_spawn_pending_edge: "Callable[[str, str, asyncio.Future[bool]], None] | None" = None
 
 
 async def create_session(
@@ -225,10 +242,12 @@ async def create_session(
     # opt-in — passes without `agent.session_control`. That member bypass is
     # itself gated by the operator ceiling `agent.member_dispatch` (default
     # true = today's behaviour); with it off the member falls back under the
-    # switch like any other caller. Every other caller still needs the switch.
-    # The member's automatic grant is bounded by ownership in `authorize_target`,
-    # not here: creation makes the caller the owner by construction.
-    if not session_control_enabled() and not _member_bypass(state, caller_key):
+    # switch like any other caller. The Conductor in the owner's own tab gets the
+    # same bypass under the same ceiling (`_conductor_bypass`). Every other caller
+    # still needs the switch. Both automatic grants are bounded by ownership in
+    # `authorize_target`, not here: creation makes the caller the owner by
+    # construction.
+    if not session_control_enabled() and not _dispatch_bypass(state, caller_key):
         raise SessionControlError(
             "session control is disabled in config (agent.session_control)",
             code="session_control_disabled",
@@ -284,14 +303,46 @@ async def create_session(
     # stale folder intent.
     folder_project_raw: str | None = None
     folder_project = ""
+    # A Crew Mode chat and every session it dispatches stay out of the person's
+    # folders: the session is not FILED in the named folder, for every caller of
+    # this verb, by the same rule the slot list stamps (``crew_mode``), and the
+    # answer says so. The folder still gives the child its declared project
+    # directory, so a worker does its work in the folder's repository.
+    in_crew_tree = _in_turned_on_crew_tree(state, str(getattr(caller_slot, "key", "") or ""))
+    folder_ignored = bool(folder_id) and in_crew_tree
+    # A mate's own chat files everything it opens in the mate's home folder:
+    # a folder it names is kept only when it sits inside that home, and a
+    # person's folder it names still supplies the project directory. No other
+    # caller may file into a mate's home.
+    project_folder_id = folder_id
+    if not in_crew_tree:
+        from kiro_crew.dashboard.mate_folders import (
+            MateFolderError,
+            MateHomeLockedError,
+            mate_home_filing,
+        )
+
+        # The conductor test the worker hand-off below uses, off the loop: it
+        # reads the config and may rescan the installed agents inline.
+        conductor = await asyncio.to_thread(_conducts_for_a_worker, caller_slot, caller_execution)
+        try:
+            folder_id, project_folder_id = await mate_home_filing(
+                state, caller_execution, folder_id, conductor=conductor
+            )
+        except MateFolderError:
+            raise SessionControlError("folder cap reached", code="folder_cap_reached") from None
+        except MateHomeLockedError:
+            raise SessionControlError(
+                "this folder belongs to a mate", status=403, code="mate_home_locked"
+            ) from None
     if folder_id:
         folder_snapshot = await state.read_folders(
             lambda folders: [dict(folder) for folder in _safe_folder_tree(folders)]
         )
-        if not any(str(folder.get("id") or "") == folder_id for folder in folder_snapshot):
+        if not {folder_id, project_folder_id} <= {str(f.get("id") or "") for f in folder_snapshot}:
             raise SessionControlError("folder not found", code="folder_not_found")
         folder_project_raw, folder_project_error = _folder_declared_project(
-            folder_snapshot, folder_id
+            folder_snapshot, project_folder_id
         )
         if folder_project_error:
             raise SessionControlError(
@@ -299,7 +350,7 @@ async def create_session(
                 code="folder_project_invalid",
             )
         folder_project, folder_project_error = await asyncio.to_thread(
-            _resolve_folder_project_dir, folder_snapshot, folder_id
+            _resolve_folder_project_dir, folder_snapshot, project_folder_id
         )
         if folder_project_error:
             raise SessionControlError(
@@ -330,6 +381,16 @@ async def create_session(
     own_worker = agent_kind in ("", "template") and await asyncio.to_thread(
         _hands_off_to_own_worker, caller_slot, caller_execution, agent.strip(), agent_kind
     )
+    if own_worker and caller_execution is None:
+        # A conductor slot with no execution record (one from before records)
+        # names its crewmate by slot agent only. The worker's identity and store
+        # come from the record, so without one the child would be the worker on
+        # the shared store with no crewmate, which no turn of it can run.
+        raise SessionControlError(
+            "this chat has no memory record, so its crewmate's worker cannot be "
+            "opened from it; open a new chat with the crewmate",
+            code="conductor_record_missing",
+        )
     if own_worker:
         agent, agent_kind = MATE_WORKER_AGENT, "template"
     agent_name = sanitize_outbound(agent.strip() or (getattr(caller_slot, "agent", "") or ""))
@@ -549,17 +610,33 @@ async def create_session(
     # crewmate's backend (``members.select_provider_backend``), every other child
     # on the configured default. A worker on a backend that cannot carry its kit
     # is refused here, before anything is allocated.
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crew_for_member_id
     from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
 
-    child_backend = crewmate_worker_backend(cfg.agent) if own_worker else cfg.agent.acp_backend
+    try:
+        child_backend = (
+            crewmate_worker_backend(
+                cfg,
+                crew_for_member_id(cfg, getattr(caller_execution, "member_id", None) or ""),
+            )
+            if own_worker
+            else cfg.agent.acp_backend
+        )
+    except CrewmateHarnessUnavailable as exc:
+        # The crewmate's pinned harness cannot start, so neither can its worker.
+        raise SessionControlError(str(exc), code=exc.code, status=409) from None
     if own_worker:
         backend_reason = worker_kit_backend_refusal(child_backend)
         if backend_reason is not None:
-            raise SessionControlError(backend_reason, code="worker_kit_harness_unsupported")
+            raise SessionControlError(backend_reason, code="capability_harness_unsupported")
     model_reason = _model_pin_refusal(model_name, child_backend) if model_name else None
     if model_reason is None and "model" in inherited_fields:
         model_reason = _inherited_pin_foreign_to_child(
-            model_name, cfg, child_backend, validated_for_worker=model_from_worker_pin
+            model_name,
+            cfg,
+            child_backend,
+            validated_for_worker=model_from_worker_pin,
+            crew=crew_for_member_id(cfg, getattr(caller_execution, "member_id", None) or ""),
         )
     if model_reason is not None:
         if "model" not in inherited_fields:
@@ -875,7 +952,7 @@ async def create_session(
         ) -> tuple[bool, str | None, str | None]:
             tree = _safe_folder_tree(folders)
             exists = any(str(folder.get("id") or "") == folder_id for folder in tree)
-            raw_project, error = _folder_declared_project(tree, folder_id)
+            raw_project, error = _folder_declared_project(tree, project_folder_id)
             return exists, raw_project, error
 
         folder_exists, current_folder_project, current_folder_error = await state.read_folders(
@@ -956,6 +1033,23 @@ async def create_session(
             code="create_rate_limited",
             status=429,
         )
+    if not dry_run:
+        # Shared Crew: an agent's create is charged to the person whose work runs in
+        # the calling session, so one person's agents share that person's rate. The
+        # installed service is read synchronously: nothing may suspend between
+        # the eligibility gate above and the allocation below.
+        from kiro_crew.shared_crew import admission_gate
+
+        service = admission_gate.installed_service()
+        budget = (
+            service.budget_for_session(caller_key) if service is not None else None
+        ) or admission_gate.AUTOMATION_PRINCIPAL.id
+        if service is not None and service.check_session_create(budget) is not None:
+            raise SessionControlError(
+                "too many sessions created recently; retry shortly",
+                code="session_create_rate",
+                status=429,
+            )
     if state.live_slot_count() >= MAX_LIVE_SLOTS:
         raise SessionControlError(
             f"slot cap reached ({MAX_LIVE_SLOTS})",
@@ -1087,12 +1181,21 @@ async def create_session(
         # Profile Permissions from the crew record (`crewmate_approval`), the
         # same mode it is given again at every restore, so the worker runs the
         # same way whether it was just opened or brought back after a restart.
-        from kiro_crew.dashboard.crewmate_approval import seed_for_turn
+        # It starts untrusted and is seeded once its record is on disk (below),
+        # from the Profile as it is then: `cfg` was read before the suspensions
+        # above, and a Profile change then skips a worker with no record yet.
+        from kiro_crew.dashboard.crewmate_approval import crewmate_name_for
 
         slot._trust = slot._trust_reads = False
-        if not (own_worker and seed_for_turn(state, slot, cfg, child_execution)):
-            slot._trust = bool(getattr(live_caller, "_trust", False))
-            slot._trust_reads = bool(getattr(live_caller, "_trust_reads", False))
+        profile_worker = own_worker and bool(crewmate_name_for(cfg, child_execution))
+        if not profile_worker:
+            # A trust granted from a Crew Mode conductor's approval card ("Trust
+            # this crew member", ``_trust_card_scoped``) covers that crew member and
+            # the subagents it spawns, not the sessions it creates: those are born
+            # asking, on that same card (``trust_carries``).
+            # Marked inherited, so a later mode change on the creator reaches this
+            # child too (``approval_inheritance``), not only the posture held now.
+            inherit_posture(slot, live_caller)
         inherited_trust = bool(slot._trust)
         inherited_trust_reads = bool(slot._trust_reads)
         # The agent's memory silo, from the bindings already resolved above. Held
@@ -1114,7 +1217,7 @@ async def create_session(
         # authorization-vs-execution split as the agent binding, one layer down.
         if not slot.project:
             slot.project = project_dir
-        if folder_id:
+        if folder_id and not folder_ignored:
             # Filed inside the same synchronous window that configures the slot, so
             # the session is never observable unfiled -- that atomicity is the point.
             # Existence was confirmed under the store lock above, and folder
@@ -1307,6 +1410,12 @@ async def create_session(
                 raise
             if pct_override is not None:
                 _seed_live_pct()
+        if profile_worker:
+            from kiro_crew.dashboard.crewmate_approval import seed_new_worker
+
+            await seed_new_worker(state, slot, child_execution)
+            inherited_trust = bool(slot._trust)
+            inherited_trust_reads = bool(slot._trust_reads)
         if slot.folder_id:
             # Model-B un-hide, applied only NOW that the filing has actually
             # landed -- running it any earlier persists `hidden = False` for a
@@ -1375,6 +1484,12 @@ async def create_session(
             "lineage_recorded": "true" if lineage_recorded else "false",
         },
     )
+    # The "parallel chats" milestone: counted here, where the child session
+    # exists, rather than at the tool result, which reports a refusal as an
+    # ordinary completed call. Never raises.
+    from kiro_crew.milestones import record as record_milestone
+
+    record_milestone("parallel-chats")
     return {
         "ok": True,
         "target": slot.key,
@@ -1384,6 +1499,7 @@ async def create_session(
         **({"autocompact_pct": pct_override} if pct_override is not None else {}),
         **({"inherited": inherited_fields} if inherited_fields else {}),
         **({"inherited_model_dropped": True} if inherited_model_dropped else {}),
+        **_crew_filing_answer(folder_named=bool(folder_id), in_crew_tree=in_crew_tree),
     }
 
 
@@ -1412,13 +1528,18 @@ def _model_pin_refusal(model_name: str, backend: str) -> str | None:
 
 
 def _inherited_pin_foreign_to_child(
-    model_name: str, cfg: KiroCrewConfig, child_backend: str, *, validated_for_worker: bool
+    model_name: str,
+    cfg: KiroCrewConfig,
+    child_backend: str,
+    *,
+    validated_for_worker: bool,
+    crew: str = "",
 ) -> str | None:
     """Why a crewmate's model pin cannot follow its worker onto the child's harness, or ``None``.
 
-    A crewmate's own thread runs on ``agent.member_acp_backend`` and its own
-    ``model`` was validated against THAT harness's catalog
-    (``_pin_entitlement_backend``). A child that inherits is never a crewmate
+    A crewmate's own thread runs on its harness pin when *crew* has one, else
+    on ``agent.member_acp_backend``, and its own ``model`` was validated against
+    THAT harness's catalog (``_pin_entitlement_backend``). A child that inherits is never a crewmate
     itself: it runs on *child_backend* -- the crewmate's own backend for its
     worker, ``agent.acp_backend`` for any other child, as
     ``select_provider_backend`` picks them -- and an id one harness serves is
@@ -1438,13 +1559,28 @@ def _inherited_pin_foreign_to_child(
     """
     if model_name == DEFAULT_MODEL:
         return None
+    from kiro_crew.crewmate_harness import (
+        CrewmateHarnessUnavailable,
+        crewmate_pin_for,
+        pinned_backend,
+    )
+
     child_namespace = capabilities_for(child_backend).model_id_namespace
-    member_namespace = capabilities_for(cfg.agent.member_acp_backend).model_id_namespace
+    try:
+        own_backend = pinned_backend(cfg, crew, cfg.agent.member_acp_backend)
+    except CrewmateHarnessUnavailable:
+        # The crewmate's own harness stopped being startable (a policy narrowed
+        # it): the model it chose there is stale, dropped like any stale pin.
+        return "the crewmate's model pin was chosen for a harness this gateway cannot start"
+    member_namespace = capabilities_for(own_backend).model_id_namespace
     if not validated_for_worker and child_namespace != member_namespace:
+        pin = crewmate_pin_for(cfg, crew)
+        setting = (
+            pin.display_stored if pin is not None else (cfg.agent.member_acp_backend or "default")
+        )
         return (
-            "the crewmate's model pin was chosen for its own harness "
-            f"({cfg.agent.member_acp_backend or 'default'}), and the worker runs on "
-            f"{child_backend or 'the default backend'}"
+            f"the crewmate's model pin was chosen for its own harness ({setting}), "
+            f"and the worker runs on {child_backend or 'the default backend'}"
         )
     if not model_scope.pin_applies(model_name, child_namespace):
         return "the crewmate's model pin is not served by the harness the worker runs on"
@@ -1558,11 +1694,40 @@ def _caller_member_workspace(
     """
     if caller_execution is None:
         return None
-    crewmate = _dispatching_crewmate(cfg, caller_slot, caller_execution)
+    crewmate = _dispatching_crewmate(cfg, caller_slot, caller_execution) or _store_s_crewmate(
+        cfg, caller_execution
+    )
     if crewmate is None:
         return None
     name = crewmate.workspace or ""
     return name if name in cfg.workspaces else None
+
+
+def _store_s_crewmate(cfg: KiroCrewConfig, caller_execution: ExecutionContext) -> Any | None:
+    """The crewmate whose own store *caller_execution* runs on, or ``None``.
+
+    A crewmate's worker runs as a template, so :func:`_dispatching_crewmate`
+    does not name it, but its attested record keeps the crewmate's id (or, for
+    an id-less crewmate, its selection) and store. Only the workspace is read
+    from the answer: the child then runs where its worker runs, on the same
+    store. A store that is not that crewmate's own answers ``None``.
+    """
+    from kiro_crew.memory_stores import require_member_memory_store
+
+    try:
+        if caller_execution.member_id is not None:
+            alias, record = member_config_for_id(cfg, caller_execution.member_id)
+        elif caller_execution.selection_kind == "member":
+            alias = caller_execution.selection_name
+            record = cfg.agents.get(alias)
+        else:
+            return None
+        if record is None:
+            return None
+        store = require_member_memory_store(cfg, alias, require_directory=False)
+    except Exception:  # noqa: BLE001 - a missing or ambiguous member is "no crewmate"
+        return None
+    return record if store == caller_execution.store.store_id else None
 
 
 async def _record_spawn(caller_key: str, child: Any) -> bool:
@@ -1592,25 +1757,97 @@ async def _record_spawn(caller_key: str, child: Any) -> bool:
     creator_slot = str(getattr(child, "_created_by", "") or "")
     creator_sid = str(getattr(child, "_created_by_sid", "") or "")
     child_slot = str(getattr(child, "key", "") or "")
-    if not creator_sid or not creator_slot or creator_slot != caller_key:
+    # ``not child_slot`` stays in the guard, not only for the emit: the pending-edge
+    # registrar keys the edge store by the child slot and writes unconditionally, so an
+    # empty child slot would plant a ``"" -> creator`` edge that nothing drops. A spawn
+    # with no child slot has no edge to record either, so returning here is right.
+    if not creator_sid or not creator_slot or not child_slot or creator_slot != caller_key:
         return True
+    # The queued reparent edge this spawn adds -- the child gains *creator_slot* as its
+    # parent -- made visible to a concurrent adoption's loop guard for exactly as long as
+    # the append is in flight, the same contract adopt_target registers under its append's
+    # fence. Without it a spawn and an overlapping adoption read only the settled tree,
+    # neither of which carries the other's queued edge, and the two can close a cycle
+    # (child -> creator queued by the spawn, creator -> child committed by the adoption)
+    # the fold cannot present. The edge is keyed by the child and dropped by a done
+    # callback on *fence*. The fence is resolved ONLY when on_session_spawned actually
+    # settles (its ``on_settled`` -> _resolve_fence_threadsafe, which covers the early
+    # False, the written, the failed and the permanently-dropped outcomes), so the edge
+    # survives exactly as long as the append is queued -- mirroring how adopt leaves its
+    # fence standing on a timeout because awaiting_commit returning False does NOT mean the
+    # job was withdrawn: it may still land, and dropping the edge then would let an
+    # overlapping adoption re-close the cycle.
+    #
+    # The guard's edge store lives in ``session_tree``, a higher owner layer, so the
+    # registrar is injected here (``_register_spawn_pending_edge``) rather than imported
+    # upward. It is unset only before the facade is built, long before a spawn runs; with
+    # no registrar there is simply no queued-edge guard to feed and the append is unchanged.
+    register = _register_spawn_pending_edge
+
+    loop = asyncio.get_running_loop()
+    fence: "asyncio.Future[bool]" = loop.create_future()
+    if register is not None:
+        register(child_slot, creator_slot, fence)
+
+    def _resolve_fence(wrote: bool) -> None:
+        if not fence.done():
+            fence.set_result(wrote)
+
+    def _resolve_fence_threadsafe(wrote: bool) -> None:
+        # The append settles on the crew-log writer thread, not this loop. A Future is
+        # not thread-safe, so its result is set back on the loop via call_soon_threadsafe
+        # -- the same hop _tree_append_waiter makes -- and the done callback that drops the
+        # pending edge then also runs on the loop. Guard against a closed loop (shutdown
+        # racing a late settle): resolving inline is a last resort that still drops the
+        # edge, and the value is read by nothing after the loop is gone.
+        try:
+            loop.call_soon_threadsafe(_resolve_fence, wrote)
+        except RuntimeError:
+            _resolve_fence(wrote)
+
+    # Whether the append was handed to the writer. Until it is, ``on_session_spawned`` has
+    # not promised to call ``on_settled``, so an emitter that raised before queuing is the
+    # one case the fence has no settle path and the ``finally`` must drop the edge itself.
+    queued = False
     try:
         if not crew_log_emit.enabled():
             return True
-        landed = await crew_log_emit.awaiting_commit(
-            lambda settled: crew_log_emit.on_session_spawned(
+
+        def _emit_one(settled: "Callable[[bool], None]") -> None:
+            def _on_settled(wrote: bool) -> None:
+                # Drop the queued edge the moment the append settles, then hand the
+                # outcome on to awaiting_commit's own waiter. This is the ONLY path that
+                # resolves the fence on a settle: it fires for every outcome the writer
+                # reports (early False, written, failed, permanently dropped), so the edge
+                # lives exactly as long as the append is queued. on_session_spawned may
+                # call this from the writer thread, so the fence is resolved on the loop.
+                _resolve_fence_threadsafe(wrote)
+                settled(wrote)
+
+            crew_log_emit.on_session_spawned(
                 creator_sid,
                 creator_slot=creator_slot,
                 child_slot=child_slot,
-                on_settled=settled,
-            ),
-            what="session/spawned",
-        )
+                on_settled=_on_settled,
+            )
+
+        landed = await crew_log_emit.awaiting_commit(_emit_one, what="session/spawned")
+        # The job is queued once awaiting_commit has run _emit_one without raising, even
+        # when it then returns False on a timeout: on a timeout the write is still in
+        # flight and ``on_settled`` is still coming, so the fence must be LEFT standing.
+        queued = True
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.warning("session_control: could not record session/spawned", exc_info=True)
         return False
+    finally:
+        # Backstop for the ONLY path with no settle: the emitter raised before queuing, so
+        # ``on_settled`` will never fire and the edge would otherwise stand forever. A
+        # queued append (including one that only timed out) keeps its edge until the real
+        # settle drops it, exactly as adopt leaves its fence standing on a timeout.
+        if not queued:
+            _resolve_fence(False)
     if not landed:
         logger.warning(
             "session_control: the creating edge for %s did not land in its creator's crew "

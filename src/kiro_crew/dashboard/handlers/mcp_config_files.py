@@ -2,8 +2,9 @@
 
 The server-name check, the Kiro-global ``mcp.json`` path and the Kiro Crew one, the extra
 provider scopes an edition adds, the refusal of a commented (JSONC) file, the atomic write
-and its off-loop form, resolving which key of a file names a server, and the synchronous
-config lock the cleanup sweep takes.
+and its off-loop form, resolving which key of a file names a server, the synchronous
+config lock the cleanup sweep takes, and the coded error bodies the toggle routes answer
+when a file will not parse or write, or names no usable server.
 
 Part of the ``kiro_crew.dashboard.handlers.mcp`` family: callers and tests reach every
 name here as ``kiro_crew.dashboard.handlers.mcp.<name>``, and a patch there reaches this
@@ -253,6 +254,43 @@ def _string_identifier(body: dict, field: str) -> tuple[str, web.Response | None
 _KIROCREW_MCP_JSON: Path | None = None
 
 
+def _mcp_config_corrupt() -> web.Response:
+    """The global mcp.json did not parse."""
+    return web.json_response(
+        {"error": "cannot parse global mcp.json", "code": "config_corrupt"}, status=500
+    )
+
+
+def _mcp_write_failed(route: str) -> web.Response:
+    """A failed global mcp.json write, answered with a code and a fixed sentence.
+
+    The exception's own text is for the server log; the client switches on the
+    code. Call this inside the ``except`` block, where ``exc_info`` still sees it.
+    """
+    logger.warning("%s: global mcp.json write failed", route, exc_info=True)
+    return web.json_response(
+        {"error": "failed to write mcp.json", "code": "config_write_failed"}, status=500
+    )
+
+
+def _mcp_server_not_found(name: str) -> web.Response:
+    """No scope configures a server by this name."""
+    return web.json_response(
+        {"error": f"server {name!r} not found", "code": "mcp_server_not_found"}, status=404
+    )
+
+
+def _mcp_spec_invalid(name: str, spec: Any) -> web.Response:
+    """The server's entry is neither an object nor a bare command string."""
+    return web.json_response(
+        {
+            "error": f"server {name!r} has invalid config type: {type(spec).__name__}",
+            "code": "mcp_server_config_invalid",
+        },
+        status=500,
+    )
+
+
 def _kirocrew_mcp_json() -> Path:
     """Kiro Crew-scope ``mcp.json`` path, resolved against the live data home."""
     return _KIROCREW_MCP_JSON if _KIROCREW_MCP_JSON is not None else data_home() / "mcp.json"
@@ -362,12 +400,13 @@ def _load_json_or_empty(path: Path) -> dict[str, Any]:
     Catches the broad ``OSError`` (not just ``FileNotFoundError``) so a
     ``PermissionError`` or ``IsADirectoryError`` on a user-owned file like
     ``~/.claude.json`` won't crash ``api_mcp_apply`` mid-batch and leave
-    partially-applied changes without a rebuild.
+    partially-applied changes without a rebuild. ``UnicodeDecodeError`` covers a
+    hand-edited file saved in a legacy code page, which is not valid UTF-8.
     """
     try:
         data = loads_user_jsonc(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {}
 
 

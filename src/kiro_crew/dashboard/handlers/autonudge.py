@@ -36,6 +36,7 @@ from kiro_crew.autonudge_authz import (  # noqa: F401 - re-exported
     resolve_stop_sentinel,
 )
 from kiro_crew.autonudge_service.model import SERVICE_SHUTTING_DOWN_MESSAGE
+from kiro_crew.dashboard.body_numbers import body_int
 from kiro_crew.dashboard.handlers import source_providers
 from kiro_crew.dashboard.handlers.source_providers import (
     is_owner_dashboard_request,
@@ -988,10 +989,14 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    from kiro_crew.dashboard.handlers._shared import body_not_object_error
+
+    if (not_object := body_not_object_error(body)) is not None:
+        return not_object
     # idle_secs/max_cycles/max_runtime_secs come straight from the request
-    # body: int() raises ValueError on "abc", TypeError on null/list, and
-    # OverflowError on float("inf") (1e309 is legal JSON in aiohttp's parser),
-    # any of which would surface as a 500 instead of a 400. Non-integral
+    # body: body_int raises ValueError on "abc" and on float("inf") (1e309 is
+    # legal JSON in aiohttp's parser) and TypeError on null/list, any of which
+    # would surface as a 500 instead of a 400 if uncaught. Non-integral
     # floats are rejected rather than silently truncated (int(1.5) -> 1 would
     # store a value the caller never asked for). Coerce up front and reject
     # bad input, matching the sibling handlers_instances.api_instances_add
@@ -1004,9 +1009,9 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
                     {"error": f"{_name} must be a whole number", "code": "not_a_whole_number"},
                     status=400,
                 )
-        idle_secs = int(body.get("idle_secs", 60))
-        max_cycles = int(body.get("max_cycles", 0))
-    except (TypeError, ValueError, OverflowError):
+        idle_secs = body_int(body.get("idle_secs", 60))
+        max_cycles = body_int(body.get("max_cycles", 0))
+    except (TypeError, ValueError):
         return web.json_response(
             {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
@@ -1113,6 +1118,10 @@ async def api_autonudge_update(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
+    from kiro_crew.dashboard.handlers._shared import body_not_object_error
+
+    if (not_object := body_not_object_error(body)) is not None:
+        return not_object
     # The goal baseline the popover read when it opened (``goal_token``). Absent skips
     # the store's stale check; a present one is compared under the store's
     # lock, so a goal another writer saved meanwhile is refused instead of overwritten.

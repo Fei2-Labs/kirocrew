@@ -29,6 +29,7 @@ from handlers_memory_coverage_helpers import (  # noqa: F401 -- the autouse fixt
 )
 
 import kiro_crew.dashboard.handlers.memory as mem_mod
+from kiro_crew.testing.wait import await_until
 
 _MOD = "kiro_crew.dashboard.handlers.memory"
 
@@ -338,6 +339,8 @@ class TestPromote:
             '{"min_count": -1e999}',
             '{"min_count": [3]}',
             '{"min_count": null}',
+            # A JSON integer past float range: float() raises OverflowError.
+            '{"min_sim": 1' + "0" * 400 + "}",
         ],
     )
     async def test_infinite_or_non_number_min_count_is_400(self, raw: str) -> None:
@@ -355,7 +358,7 @@ class TestPromote:
     @pytest.mark.parametrize(
         ("raw", "expected"),
         [
-            ('{"min_count": -2}', (-2, 0.75)),
+            ('{"min_count": 2}', (2, 0.75)),
             ('{"min_count": 99999999999999999999999}', (99999999999999999999999, 0.75)),
         ],
     )
@@ -411,6 +414,10 @@ class TestConsolidate:
         """Pin the seeding helper above to the retrying path.
 
         A seed run on the loop thread re-raises the first simulated violation.
+        The seed replaces the transcript twice: once when ``append`` creates it
+        through ``atomic_write`` and once when the header is rewritten. The one
+        simulated violation lands on the first replace and is retried, so the
+        count is that violation, its retry, and the header rewrite.
         """
         from windows_sim import replace_sharing_violation
 
@@ -422,7 +429,7 @@ class TestConsolidate:
         log = ConversationLog(base_dir=tmp_path / "sessions")
         with replace_sharing_violation(match="dashboard_ghost-1.jsonl", times=1) as sim:
             await _seed_incognito_transcript(log, "dashboard:ghost-1")
-        assert sim["n"] == 2
+        assert sim["n"] == 3
         assert log.get_metadata("dashboard:ghost-1")["memory_mode"] == "incognito"
 
     @pytest.mark.asyncio
@@ -529,8 +536,7 @@ class TestConsolidate:
         assert "s1" in cons._running
         # Drain the spawned task so nothing is left pending at loop teardown.
         for task in list(cons._tasks):
-            # flake-ok: pre-existing await of a task this test drives to completion moved verbatim; tracked for a de-flake pass
-            await task
+            await await_until(task, what="the spawned consolidation task never finished")
         cons._consolidate.assert_awaited_once_with("s1", False)
 
     # -- the target's memory mode, not only the caller's ---------------------------
@@ -684,8 +690,7 @@ class TestConsolidate:
             "key": "dashboard:p1",
         }
         for task in list(cons._tasks):
-            # flake-ok: pre-existing await of a task this test drives to completion moved verbatim; tracked for a de-flake pass
-            await task
+            await await_until(task, what="the spawned consolidation task never finished")
         cons._consolidate.assert_awaited_once_with("dashboard:p1", False)
 
     @pytest.mark.asyncio

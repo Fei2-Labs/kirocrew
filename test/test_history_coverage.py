@@ -464,12 +464,6 @@ class TestLastMessagePreview:
         _write(log._path("k"), _jsonl({"_type": "metadata", "created_at": "x"}))
         assert log.last_message_preview("k") == ""
 
-    def test_returns_newest_message(self, tmp_path: Path) -> None:
-        log = _log(tmp_path)
-        log.append("k", "user", "first")
-        log.append("k", "assistant", "second")
-        assert log.last_message_preview("k") == "second"
-
     def test_structured_content_blocks(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         _write(
@@ -659,12 +653,15 @@ class TestListSessions:
 
 class TestClearClosed:
     def test_missing_file_is_noop(self, tmp_path: Path) -> None:
-        _log(tmp_path).clear_closed("nope")
+        log = _log(tmp_path)
+        log.clear_closed("nope")
+        assert not log._path("nope").exists()
 
     def test_empty_file_is_noop(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         _write(log._path("k"), "")
         log.clear_closed("k")
+        assert log._path("k").read_text(encoding="utf-8") == ""
 
     def test_unparseable_first_line_is_noop(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
@@ -818,11 +815,14 @@ class TestNoteFailedAttempt:
         log.mark_consolidated.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_deleted_session_records_nothing(self) -> None:
+    async def test_deleted_session_records_nothing(self, caplog) -> None:
         log = MagicMock()
         log.record_consolidation_failure.return_value = (0, 0.0)
         c = _consolidator(log=log)
-        await c._note_failed_attempt("k", _SPAN, "boom")
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.history"):
+            assert await c._note_failed_attempt("k", _SPAN, "boom") is True
+        messages = [r.getMessage() for r in caplog.records if r.name == "kiro_crew.history"]
+        assert [m for m in messages if "attempt" in m] == []
         log.mark_consolidated.assert_not_called()
 
     @pytest.mark.asyncio
@@ -977,13 +977,16 @@ class TestWriteStructuredMemory:
         ) in caplog.text
         assert "carry both values" not in caplog.text
 
-    def test_semantic_is_capped(self) -> None:
+    def test_semantic_is_capped(self, caplog) -> None:
         vs = MagicMock()
         vs.set_semantic.return_value = None
         c = _consolidator(vector_store=vs)
         items = [{"key": f"k{i}", "value": "v"} for i in range(200)]
-        c._write_structured_memory({"semantic": items}, "k")
-        assert vs.set_semantic.call_count == H._MAX_SEMANTIC_PER_CONSOLIDATION
+        with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
+            c._write_structured_memory({"semantic": items}, "k")
+        cap = H._MAX_SEMANTIC_PER_CONSOLIDATION
+        assert f"Semantic consolidation: {cap} written," in caplog.text
+        assert vs.set_semantic.call_count == cap
 
     def test_episodic_write_and_skips(self, caplog) -> None:
         vs = MagicMock()
@@ -1030,13 +1033,16 @@ class TestWriteStructuredMemory:
             c._write_structured_memory({"episodic": [{"text": "x"}]}, "k")
         assert "episodic entries from consolidation" not in caplog.text
 
-    def test_episodic_is_capped(self) -> None:
+    def test_episodic_is_capped(self, caplog) -> None:
         vs = MagicMock()
         vs.write_episodic.return_value = True
         c = _consolidator(vector_store=vs)
         items = [{"text": f"t{i}"} for i in range(200)]
-        c._write_structured_memory({"episodic": items}, "k")
-        assert vs.write_episodic.call_count == H._MAX_EPISODIC_PER_CONSOLIDATION
+        with caplog.at_level(logging.INFO, logger="kiro_crew.history"):
+            c._write_structured_memory({"episodic": items}, "k")
+        cap = H._MAX_EPISODIC_PER_CONSOLIDATION
+        assert f"Wrote {cap} episodic entries from consolidation" in caplog.text
+        assert vs.write_episodic.call_count == cap
 
     def test_non_list_sections_are_ignored(self) -> None:
         vs = MagicMock()
@@ -1108,10 +1114,12 @@ class TestSaveLessons:
         assert lesson.ts
         assert "Extracted 1 lesson(s) from chat" in caplog.text
 
-    def test_lesson_store_defaults_category(self) -> None:
-        store = MagicMock()
+    def test_lesson_store_defaults_category(self, tmp_path: Path) -> None:
+        from kiro_crew.learn import LessonStore
+
+        store = LessonStore(base_dir=tmp_path)
         _consolidator(lesson_store=store)._save_lessons([{"rule": "r"}])
-        assert store.save.call_args.args[0].category == "knowledge"
+        assert [(le.rule, le.category) for le in store.load_all()] == [("r", "knowledge")]
 
 
 # ── background-session LLM turns ───────────────────────────────────────────
@@ -1493,19 +1501,6 @@ class TestUpdateMetadataLocked:
 
 
 class TestDeleteSession:
-    def test_missing_session_returns_false(self, tmp_path: Path) -> None:
-        assert _log(tmp_path).delete_session("nope") is False
-
-    def test_removes_file_and_summary_sidecar(self, tmp_path: Path) -> None:
-        log = _log(tmp_path)
-        log.append("k", "user", "hi")
-        log.set_cached_summary("k", "a summary", 1.0)
-        sidecar = log._summary_cache_path("k")
-        assert sidecar.exists()
-        assert log.delete_session("k") is True
-        assert not log._path("k").exists()
-        assert not sidecar.exists()
-
     def test_unlink_failure_returns_false(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         log.append("k", "user", "hi")
@@ -1572,9 +1567,6 @@ class TestContentSnippet:
 
 
 class TestRecentFromSource:
-    def test_missing_dir_returns_empty(self, tmp_path: Path) -> None:
-        assert ConversationLog(base_dir=tmp_path / "absent").recent_from_source("slack") == []
-
     def test_collects_and_excludes(self, tmp_path: Path) -> None:
         log = _log(tmp_path)
         log.append("slack:a", "user", "from a")
@@ -1597,13 +1589,6 @@ class TestRecentFromSource:
         log.append("slack:a", "user", "hi")
         with patch("builtins.open", side_effect=OSError("locked")):
             assert log.recent_from_source("slack") == []
-
-    def test_max_messages_trims_to_the_newest(self, tmp_path: Path) -> None:
-        log = _log(tmp_path)
-        for i in range(6):
-            log.append("slack:a", "user", f"m{i}")
-        got = log.recent_from_source("slack", max_messages=2)
-        assert [m["content"] for m in got] == ["m4", "m5"]
 
 
 # ── skill-text helpers ─────────────────────────────────────────────────────

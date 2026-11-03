@@ -17,8 +17,7 @@ import { DEFAULT_CREWMATE_PATH } from './overview/defaultCrewmateLink'
 import { i18nT } from '../i18n/t'
 import { uiLocation } from '../uiLocations/uiLocation'
 import { guidePick } from '../uiLocations/targetRegistry'
-import ErrorNotice from '../components/ErrorNotice'
-import { memoryStoreLabel, useRosterBuiltFrom, type MemoryStores } from './kiroCrewAgentsPageRosterLabels'
+import { memoryStoreLabel, rosterBuiltFrom, type MemoryStores } from './kiroCrewAgentsPageRosterLabels'
 
 /** Roster layout. `cards` is the roomy grid, `list` the compact table. */
 export type CrewView = 'cards' | 'list'
@@ -135,7 +134,7 @@ function CrewCard({ agent, isDefault, shared, memoryStores, onOpen }: {
   memoryStores: MemoryStores | undefined
   onOpen: () => void
 }) {
-  const { label: builtFrom, error: builtFromError } = useRosterBuiltFrom(agent)
+  const { label: builtFrom } = rosterBuiltFrom(agent)
   const sharedNote = i18nT('pages.kiroCrewAgentsPage.shared_lower')
   const filesShared = shared === 'files' || shared === 'both'
   const memoryShared = shared === 'memory' || shared === 'both'
@@ -188,7 +187,6 @@ function CrewCard({ agent, isDefault, shared, memoryStores, onOpen }: {
       </div>
       <div className="grid grid-cols-2 gap-x-3 gap-y-2 border-t border-border pt-3">
         <Binding icon={<Boxes className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.built_from')} value={builtFrom} plain testId="crew-built-from" />
-        {builtFromError && <ErrorNotice message={builtFromError} variant="inline" askAgent testId="crew-built-from-error" />}
         <Binding icon={<FolderOpen className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.workspace_2')} value={agent.workspace} note={filesShared ? sharedNote : undefined} />
         <Binding icon={<Database className="lucide-inline" aria-hidden="true" />} label={i18nT('pages.kiroCrewAgentsPage.memory_store')} value={memoryStoreLabel(agent.name, agent.memory_store, memoryStores)} plain note={memoryShared ? sharedNote : undefined} />
         <Binding
@@ -229,7 +227,7 @@ function CrewRow({ agent, isDefault, shared, memoryStores, onOpen }: {
   memoryStores: MemoryStores | undefined
   onOpen: () => void
 }) {
-  const { label: builtFrom, error: builtFromError } = useRosterBuiltFrom(agent)
+  const { label: builtFrom } = rosterBuiltFrom(agent)
   const sharedNote = i18nT('pages.kiroCrewAgentsPage.shared_lower')
   const filesShared = shared === 'files' || shared === 'both'
   const memoryShared = shared === 'memory' || shared === 'both'
@@ -280,7 +278,7 @@ function CrewRow({ agent, isDefault, shared, memoryStores, onOpen }: {
         </div>
       </TableCell>
       <TableCell className="text-muted" data-testid="crew-built-from">
-        {builtFromError ? <ErrorNotice message={builtFromError} variant="inline" askAgent testId="crew-built-from-error" /> : builtFrom}
+        {builtFrom}
       </TableCell>
       <TableCell className="font-mono text-muted">
         {agent.workspace}

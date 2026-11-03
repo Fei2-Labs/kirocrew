@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react'
 import {
   PencilRuler, Image as ImageIcon, Upload, Plus, ChevronDown,
-  Check, ChevronRight, Maximize2, X, Sparkle,
+  Check, ChevronRight, Maximize2, Sparkle,
 } from 'lucide-react'
 
 import { sevOf, KIND_LABEL, HARD_CAP_MS, MAX_SCREENS, BLOCKED, SAMPLE_REPORT, SAMPLE_SCREENS } from './constants'
@@ -22,6 +22,7 @@ import WaitingScreen from './WaitingScreen'
 import Composer from './Composer'
 import ScopingPicker from './ScopingPicker'
 import AskLayer from './AskLayer'
+import ZoomLightbox from './ZoomLightbox'
 import type {
   Ask,
   Blocked,
@@ -137,6 +138,11 @@ export default function DesignCritiquePage() {
    */
   const [askPending, setAskPending] = useState(false)
   const threadRef = useRef<HTMLDivElement>(null)
+  /** The open thread, read when a turn fails after an await. The composer
+   *  draft is shared by every thread, so a failed question goes back into it
+   *  only while its own thread is still the one on screen. */
+  const openAskIdRef = useRef(openAskId)
+  openAskIdRef.current = openAskId
 
   const narrow = useNarrow(rootRef)
 
@@ -795,6 +801,9 @@ export default function DesignCritiquePage() {
       setAsks(prev => prev.map(a => a.id === askId
         ? { ...a, turns: a.turns.map(t => (t.t === stamp ? { ...t, a: msg, pending: false, failed: true } : t)) }
         : a))
+      // Hand the question back so a retry is one Enter, not a retype. Never
+      // over a draft the user has already started.
+      if (openAskIdRef.current === askId) setAskDraft(d => d || question)
     } finally {
       // Every exit path, including the early cancelled return above, or the next
       // follow-up would be refused for the rest of the session.
@@ -1304,22 +1313,9 @@ export default function DesignCritiquePage() {
   const canvas = <div style={S.canvas}>{canvasInner}</div>
 
   const lightbox = (zoom && thumbUrl) ? (
-    <div
-      style={S.lbOverlay}
-      role="presentation"
-      onClick={(e) => { if (e.target === e.currentTarget) setZoom(false) }}
-    >
-      <div style={S.lbInner} role="dialog" aria-modal="true" aria-label={i18nT('apps.designCritique.designCritiquePage.full_size_view')}>
-        <img src={thumbUrl} style={S.lbImg} alt={i18nT('apps.designCritique.designCritiquePage.full_size')} />
-        {buildMarkers(false)}
-      </div>
-      <button
-        style={S.lbClose}
-        onClick={() => setZoom(false)}
-        title={i18nT('apps.designCritique.designCritiquePage.close_esc')}
-        aria-label={i18nT('apps.designCritique.askLayer.close')}
-      ><X size={18} /></button>
-    </div>
+    <ZoomLightbox src={thumbUrl} onClose={() => setZoom(false)}>
+      {buildMarkers(false)}
+    </ZoomLightbox>
   ) : null
 
   return (

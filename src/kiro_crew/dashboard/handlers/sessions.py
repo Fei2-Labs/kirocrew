@@ -30,8 +30,7 @@ if TYPE_CHECKING:
         _MAX_BONUS_DAYS_LEFT,
         _MAX_BONUS_GRANTS,
         _MAX_BONUS_NAME_CHARS,
-        _WHOAMI_UNPROVEN,
-        USAGE_SCRAPE_ENGINE_PIN_MIN_VERSION,
+        USAGE_SCRAPE_ENGINE,
         _safe_float,
         _safe_int,
         _usage_scrape_argv,
@@ -60,10 +59,16 @@ if TYPE_CHECKING:
         _SHORT_SLOT_NAME_RE,
         _AppOwnedKeys,
         _app_search,
+        _has_user_content,
         _is_machine_only_session,
+        _is_user_listed_row,
+        _mark_open_sessions,
+        _open_row_test,
         _open_slot_transcript_keys,
+        _search_excluding_incognito,
         _session_meta_row,
         _sessions_named,
+        _wants_incognito_excluded,
         api_session_archive_list,
         api_session_archive_read,
         api_session_detail,
@@ -128,6 +133,7 @@ if TYPE_CHECKING:
         _clear_history_rows,
         _clearable_history_keys,
         _delete_claimed_session,
+        _user_only_query,
         api_session_delete,
         api_sessions_clear,
         api_sessions_clearable_count,
@@ -144,8 +150,9 @@ if TYPE_CHECKING:
         _TOOL_POLICY_MEMO,
         _UNREADABLE_SPEC_WARNED,
         _UNREADABLE_SPEC_WARNED_MAX,
+        EXCLUDE_SERVERS_KEY,
         HONOUR_TOOL_REFS_KEY,
-        INCLUDE_LIST_SERVER,
+        INCLUDE_LIST_SERVERS,
         POLICY_INCLUDE_KEY,
         ManagedToolPolicyUnreadable,
         _ambiguous_spec_reason,
@@ -191,21 +198,25 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.interaction_coordinator import _slot_decision  # noqa: F401
     from kiro_crew.dashboard.state import _normalize_slot_key  # noqa: F401
     from kiro_crew.history import ConversationLog  # noqa: F401
+    from kiro_crew.history import _SEARCH_SCAN_WINDOW  # noqa: F401
+    from kiro_crew.history import INCOGNITO_EXCLUDED_HEADER  # noqa: F401
     from kiro_crew.history import HistoryLockTimeout  # noqa: F401
     from kiro_crew.history import SEARCH_MIN_CHARS  # noqa: F401
     from kiro_crew.history import TranscriptBusy  # noqa: F401
     from kiro_crew.history import TranscriptWithheld  # noqa: F401
     from kiro_crew.history import _archive_dir  # noqa: F401
+    from kiro_crew.history import is_incognito_transcript  # noqa: F401
     from kiro_crew.history import transcript_lock_stems  # noqa: F401
     from kiro_crew.history import transcript_stem  # noqa: F401
     from kiro_crew.history import transcript_stems  # noqa: F401
     from kiro_crew.history import transcript_withholds_derivation  # noqa: F401
-    from kiro_crew.kiro_cli import kiro_cli_version_at  # noqa: F401
+    from kiro_crew.kiro_cli import chat_agent_engines_at  # noqa: F401
     from kiro_crew.kiro_cli import pin_kiro_cli  # noqa: F401
     from kiro_crew.label_guard import PROSE_OPENERS  # noqa: F401
     from kiro_crew.label_guard import is_verdict_reply  # noqa: F401
     from kiro_crew.label_guard import looks_like_prose  # noqa: F401
     from kiro_crew.llm_helpers import run_bg_oneliner  # noqa: F401
+    from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS  # noqa: F401
     from kiro_crew.mcp_discovery import sync_discovered_servers  # noqa: F401
     from kiro_crew.messaging.link import _in_namespace  # noqa: F401
     from kiro_crew.messaging.link import canonical_key  # noqa: F401
@@ -226,10 +237,15 @@ from kiro_crew.dashboard.handlers import kiro_usage_api
 from kiro_crew.dashboard.handlers._shared import (
     guard_owner_surface_routes,
 )
+from kiro_crew.dashboard.handlers.kiro_vault_identity import (
+    vault_identity,
+    vault_identity_snapshot,
+)
 from kiro_crew.dashboard.handlers.sessions_parts.usage_scrape import (
     _REASON_ACCOUNT_UNPROVEN,
     _WHOAMI_DIFFERENT,
     _WHOAMI_SAME,
+    _WHOAMI_UNPROVEN,
     _account_type_only,
     _fetch_whoami,
     _fetch_whoami_or_none,
@@ -380,6 +396,23 @@ async def api_sessions_health(request: web.Request) -> web.Response:
 
 _usage_cache: dict[str, object] = {}
 _usage_cache_ts: float = 0.0
+#: Fingerprint of the Crew sign-in identity that produced the cached reading
+#: (:func:`kiro_crew.auth.bridge.vault_identity_fingerprint`), or ``""`` when the
+#: cache came from the kiro-cli path. Kept beside the cache, never in it, so it
+#: is not served.
+_usage_cache_vault_fp = ""
+#: IdC userId of the kiro-cli sign-in the cached reading was published for
+#: (:attr:`kiro_usage_api.UsageResult.user_id`), or ``None`` when unknown. Kept
+#: beside the cache, never in it, so it is not served; :func:`_same_identity`
+#: compares it with the refresh's own so a failed refresh after a switch between
+#: two users of one Identity Center org keeps nothing of the previous user.
+_usage_cache_user_id: str | None = None
+#: The vault-path ``signin_required`` marker currently cached, paired with the
+#: vault's :meth:`~kiro_crew.auth.store.TokenStore.write_stamp` taken BEFORE the
+#: attempt that produced it. Held by reference (``is``), so a marker any other
+#: path publishes never inherits the stamp. ``None`` when the cache is not such a
+#: marker. See :func:`_signin_marker_is_stale`.
+_vault_signin_marker: tuple[dict[str, object], str] | None = None
 _USAGE_REFRESH_SECS = 600  # background refresh every 10 min
 # Ceiling on ONE whole refresh. Sized above the sum of the inner bounded steps
 # (whoami ≤30s + the /usage scrape ≤60s, plus the unbounded API read between
@@ -392,7 +425,8 @@ _usage_fetching = False
 # the same free GetUsageLimits API the primary path uses and prints the usage
 # table, so no prompt reaches a model and the read costs no credits. That holds
 # only on kiro-cli's V2 engine -- the V3 engine sends `/usage` to the model as a
-# prompt -- so the scrape pins V2 (see :func:`_usage_scrape_argv`). It is the
+# prompt -- so the scrape pins V2 while the installed kiro-cli offers it, and
+# does not run at all once V2 is retired (see :func:`_usage_scrape_argv`). It is the
 # automatic fallback whenever the API path returns no plan. What it does cost is
 # a subprocess (whoami + the scrape, up to a minute and a half) on every refresh
 # interval, so a scrape that keeps producing unparseable output (kiro-cli format
@@ -473,7 +507,11 @@ def _unavailable_reason(api_result: kiro_usage_api.UsageResult) -> str | None:
 
 
 def _cache_without_scrape(
-    api_usage: object, identity: dict[str, object] | None, reason: str | None = None
+    api_usage: object,
+    identity: dict[str, object] | None,
+    reason: str | None = None,
+    *,
+    user_id: str | None = None,
 ) -> None:
     """Cache the best available value when the parked scrape is not going to run.
 
@@ -497,16 +535,20 @@ def _cache_without_scrape(
     one read at the top of the refresh: the API attempt sits between the two,
     and a profile switch landing inside it must be judged against the account
     that is signed in now. ``None`` (kiro-cli never resolved) proves nothing, so
-    nothing is preserved.
+    nothing is preserved. ``user_id`` is this refresh's IdC userId
+    (:attr:`kiro_usage_api.UsageResult.user_id`), compared with the cached one.
     """
-    global _usage_cache, _usage_cache_ts
+    global _usage_cache, _usage_cache_ts, _usage_cache_user_id
     if (
         _usage_cache.get("credits_plan") is not None
         and identity is not None
-        and _same_identity(_usage_cache, identity)
+        and _same_identity(
+            _usage_cache, identity, cached_user_id=_usage_cache_user_id, user_id=user_id
+        )
     ):
         _usage_cache = {**_usage_cache, "stale": True}
     else:
+        _usage_cache_user_id = None
         partial = (
             {k: _redact_strings(v) for k, v in api_usage.items()}
             if (isinstance(api_usage, dict))
@@ -520,11 +562,282 @@ def _cache_without_scrape(
     _usage_cache_ts = time.time()
 
 
-def _publish_usage(payload: dict[str, object]) -> None:
-    """Atomically replace the cache served by ``/api/sessions/usage``."""
-    global _usage_cache, _usage_cache_ts
+def _publish_usage(
+    payload: dict[str, object], *, vault_fp: str = "", user_id: str | None = None
+) -> None:
+    """Atomically replace the cache served by ``/api/sessions/usage``.
+
+    ``vault_fp`` names the Crew sign-in identity the reading belongs to; every
+    kiro-cli-path publish leaves it empty, so a vault-path failure can never keep
+    a kiro-cli reading on screen as the vault account's. ``user_id`` is the IdC
+    userId of the kiro-cli sign-in the reading was read for, or ``None``.
+    """
+    global _usage_cache, _usage_cache_ts, _usage_cache_vault_fp, _vault_signin_marker
+    global _usage_cache_user_id
     _usage_cache = payload
     _usage_cache_ts = time.time()
+    _usage_cache_vault_fp = vault_fp
+    _usage_cache_user_id = user_id
+    _vault_signin_marker = None
+
+
+def _cache_vault_failure(
+    vault_fp: str, reason: str | None = None, *, stamp: str | None = None
+) -> None:
+    """Vault-path counterpart of :func:`_cache_transient_failure`.
+
+    Keeps a prior reading (dimmed ``stale``) only when it was published for this
+    same vault identity; anything else reports unavailable, with ``reason`` when
+    the failure is auth-class.
+
+    ``stamp`` is the vault's write stamp taken before the attempt. A
+    ``signin_required`` marker records it, so the poll can tell that the vault
+    has been rewritten since (a fresh sign-in) and refresh at once instead of
+    serving "sign in again" for the rest of the interval.
+    """
+    global _usage_cache, _usage_cache_ts, _vault_signin_marker
+    if (
+        vault_fp
+        and _usage_cache.get("credits_plan") is not None
+        and _usage_cache_vault_fp == vault_fp
+    ):
+        _usage_cache = {**_usage_cache, "stale": True}
+        _usage_cache_ts = time.time()
+        return
+    unavailable: dict[str, object] = {"available": False}
+    if reason is not None:
+        unavailable["reason"] = reason
+    _publish_usage(unavailable)
+    if reason == _REASON_SIGNIN_REQUIRED and stamp is not None:
+        _vault_signin_marker = (unavailable, stamp)
+
+
+async def _vault_write_stamp() -> str:
+    """The vault's :meth:`TokenStore.write_stamp`, off the event loop."""
+    # Deferred: see _vault_owns_usage_sync.
+    from kiro_crew.auth.bridge import default_token_store
+
+    return await asyncio.to_thread(lambda: default_token_store().write_stamp())
+
+
+async def _signin_marker_is_stale(payload: dict[str, object]) -> bool:
+    """True when ``payload`` says "sign in again" but the vault changed since.
+
+    Only consulted while the vault owns usage. The cached reading is otherwise
+    replaced only by the timed refresh, and an identity change is the only other
+    trigger; signing back in to the SAME account changes neither, so the pill
+    kept "sign in again" for up to ``_USAGE_REFRESH_SECS`` after a good sign-in.
+
+    A vault-path marker carries the write stamp taken before its attempt: any
+    later write (a sign-in, a sign-out) makes it stale. A ``signin_required``
+    marker with no stamp came from the kiro-cli path, which says nothing about
+    Crew's sign-in, so it is stale too. A sign-in that stays broken never
+    rewrites the vault, so the steady state costs one ``stat`` per poll and no
+    API call.
+    """
+    if payload.get("reason") != _REASON_SIGNIN_REQUIRED:
+        return False
+    marker = _vault_signin_marker
+    if marker is None or marker[0] is not payload:
+        return True
+    return await _vault_write_stamp() != marker[1]
+
+
+def _vault_owns_usage_sync() -> bool:
+    """True when Crew's sign-in vault is the credential the default harness runs on.
+
+    That is exactly when the session the user is chatting in draws its credential
+    from the vault, so the vault account IS the account whose credits the pill
+    must show and whose identity the dashboard names (:func:`fetch_local_identity`).
+    Two shapes, both on the KAS harness:
+
+    * the bundle route (``agent.kas_bundle``): the engine runs without kiro-cli
+      and its access-token callback reaches Crew alone, so the vault is the only
+      credential there is -- signed in or not. A signed-out vault then reports
+      ``signin_required`` from the vault path rather than consulting a kiro-cli
+      readiness gate that has nothing to say about this route;
+    * the relay route: the vault owns the spawn only when it holds a usable
+      identity (the KAS spawn asks the same :func:`vault_holds_identity`
+      question); otherwise kiro-cli owns the login and the kiro-cli path applies.
+
+    Any other harness -- the kiro-cli backend above all -- keeps the kiro-cli
+    path, so a leftover Crew sign-in never relabels another account's usage.
+    Blocking (a config read and a vault read); never raises.
+    """
+    try:
+        # Deferred: kiro_crew.auth pulls the ``cryptography`` wheel, which must
+        # not load on the handlers' import path (see kiro_crew.acp.kas_host_auth).
+        from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS
+        from kiro_crew.auth.bridge import vault_holds_identity
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        agent = KiroCrewConfig.load().agent
+        if agent.acp_backend == ACP_BACKEND_KAS:
+            if agent.kas_bundle:
+                return True
+            # The spawn's own predicate, with its diagnostics at DEBUG: an unusable
+            # entry is a spawn-time WARNING, and this runs on every 30s poll of
+            # every open tab.
+            return vault_holds_identity(warn=False)
+        return False
+    except Exception as exc:  # noqa: BLE001 - an unreadable answer keeps the gated kiro-cli path
+        logger.debug("Kiro usage: vault ownership probe failed (%s)", type(exc).__name__)
+        return False
+
+
+async def _vault_owns_usage() -> bool:
+    """:func:`_vault_owns_usage_sync` off the event loop."""
+    return await asyncio.to_thread(_vault_owns_usage_sync)
+
+
+async def _vault_fingerprint() -> str:
+    """The current Crew sign-in's identity fingerprint, read off the loop."""
+    # Deferred: see _vault_owns_usage_sync.
+    from kiro_crew.auth.bridge import vault_identity_fingerprint
+
+    return await asyncio.to_thread(vault_identity_fingerprint)
+
+
+async def _cached_reading_is_foreign(payload: dict[str, object], payload_fp: str) -> bool:
+    """True when ``payload`` is a reading NOT published for the current Crew sign-in.
+
+    The timed refresh would replace it within ``_USAGE_REFRESH_SECS``, but until
+    then a sign-in switch A -> B would serve A's credits under B. Only a cached
+    READING counts: an unavailable marker names no account, and treating it as
+    foreign would turn a persistent failure into an API call on every poll.
+
+    Judges the SNAPSHOT the caller is about to serve -- the payload and the
+    fingerprint it was published under, captured together before any await --
+    not the live globals: the fingerprint read below yields, and a refresh that
+    publishes B's reading in that window would otherwise make a check against
+    the globals pass while the caller still holds A's payload.
+
+    A reading published under NO fingerprint is the kiro-cli path's (every
+    publish there leaves ``vault_fp`` empty), so it is foreign here whatever the
+    vault holds -- including nothing: on the bundle route the vault owns usage
+    while signed out, and an empty current fingerprint must not match the empty
+    one a kiro-cli reading carries and keep kiro-cli's account on screen.
+    """
+    if payload.get("credits_plan") is None:
+        return False
+    if not payload_fp:
+        return True
+    return await _vault_fingerprint() != payload_fp
+
+
+async def _refresh_from_vault() -> None:
+    """Refresh the reading from Crew's own sign-in vault, never from kiro-cli.
+
+    Called only on a :func:`_vault_owns_usage` verdict, so the vault is
+    authoritative: every failure -- including the identity vanishing between that
+    verdict and this read -- reports unavailable (``signin_required`` when
+    auth-class) instead of falling back to kiro-cli, whose readiness gate was
+    skipped and whose login may be a different account.
+
+    Identity invariant, mirroring the whoami bracketing on the kiro-cli path: the
+    vault identity fingerprint is read immediately before the credential and
+    again after the API answers; the reading is published only when both agree.
+    A credential failure is judged the same way, against a fingerprint read
+    adjacent to the failure rather than the one from before the attempt: the
+    refresh waits on the identity's cross-process lock, so a sign-in that
+    replaces the account can land while it waits, and judging against ``before``
+    would then keep the previous account's reading on screen under the new one.
+
+    The reading is labelled with the account it belongs to (``account_type``,
+    in whoami's vocabulary) from the vault's own claims, taken in the SAME read
+    as the after-fingerprint (:func:`vault_identity_snapshot`): once that
+    fingerprint matches ``before``, the fields describe the account the
+    credential was read for, as the kiro-cli path labels its reading from the
+    whoami adjacent to the publish. Those fields are the ones ``kirocrew kas
+    whoami`` prints (``account_type``, and ``start_url`` when the sign-in recorded
+    its Identity Center portal). The vault stores no e-mail; the e-mail comes
+    from the same GetUsageLimits answer (``isEmailRequired``, as kiro-cli asks),
+    so it describes the credential the fingerprints bracket. The enterprise
+    profile name rides in from the usage API as it does for the kiro-cli path.
+    """
+    # Deferred: see _vault_owns_usage_sync.
+    from kiro_crew.auth.bridge import default_token_store
+    from kiro_crew.auth.provider import KasAuthProvider, NotAuthenticated
+    from kiro_crew.auth.refresh import RefreshBlocked, RefreshRejected
+
+    # Taken before anything is read: a sign-in landing at any point after this
+    # makes a "sign in again" marker from this attempt stale on the next poll.
+    stamp = await _vault_write_stamp()
+    before = await _vault_fingerprint()
+    if not before:
+        _cache_vault_failure("", _REASON_SIGNIN_REQUIRED, stamp=stamp)
+        return
+
+    async def _failed(reason: str | None) -> None:
+        """Record a credential failure against the identity signed in NOW.
+
+        ``reason`` describes the attempt made for ``before``; when the sign-in
+        changed underneath it the failure says nothing about the new account, so
+        only the plain unavailable marker is published and the next refresh reads
+        the new identity afresh.
+        """
+        after = await _vault_fingerprint()
+        if after != before:
+            logger.info(
+                "Kiro usage: the Crew sign-in changed during the credential refresh; "
+                "discarding the previous identity's reading"
+            )
+            _cache_vault_failure(after)
+            return
+        _cache_vault_failure(after, reason, stamp=stamp)
+
+    try:
+        cred = await KasAuthProvider(default_token_store(), allow_env_api_key=False).current()
+    except NotAuthenticated:
+        _cache_vault_failure("", _REASON_SIGNIN_REQUIRED, stamp=stamp)
+        return
+    except (RefreshRejected, RefreshBlocked) as exc:
+        # Permanent either way: the issuer refused the grant, or the entry lacks
+        # an input the refresh needs (``is_usable`` passed it on the refresh
+        # token alone). Nothing changes between polls, so only a new sign-in
+        # recovers it, and the pill must say so rather than show a reasonless
+        # dash on every poll. Type only: the message can carry response bytes.
+        logger.info("Kiro usage: Crew sign-in cannot be refreshed (%s)", type(exc).__name__)
+        await _failed(_REASON_SIGNIN_REQUIRED)
+        return
+    except Exception as exc:  # noqa: BLE001 - a failed refresh is a usage miss, not a crash
+        # Transient (issuer 5xx, network after wake): the grant may still be valid,
+        # so no sign-in prompt. Type only: a refresh error's message can carry
+        # response bytes.
+        logger.info("Kiro usage: Crew sign-in refresh failed (%s)", type(exc).__name__)
+        await _failed(None)
+        return
+    result = await asyncio.get_running_loop().run_in_executor(
+        subprocess_executor(),
+        functools.partial(
+            kiro_usage_api.fetch_usage_limits_with_credential,
+            cred.access_token,
+            cred.profile_arn,
+        ),
+    )
+    after, identity = await vault_identity_snapshot()
+    if after != before:
+        logger.info(
+            "Kiro usage: the Crew sign-in changed during the refresh; "
+            "discarding the reading fetched for the previous identity"
+        )
+        _cache_vault_failure(after)
+        return
+    usage = result.usage
+    if usage and usage.get("credits_plan") is not None:
+        usage = {k: _redact_strings(v) for k, v in usage.items()}
+        usage.pop("_profile_arn", None)
+        # Whose reading this is: the vault's own claims, from the read whose
+        # fingerprint just proved the account unchanged across the credential read.
+        usage.update({k: _redact_strings(v) for k, v in identity.items()})
+        _publish_usage(usage, vault_fp=before)
+        logger.info(
+            "Kiro usage refreshed (api, Crew sign-in): %s / %s credits",
+            usage.get("credits_used", "?"),
+            usage.get("credits_plan", "?"),
+        )
+        return
+    _cache_vault_failure(before, _unavailable_reason(result), stamp=stamp)
 
 
 def _publish_account_unproven(identity: dict[str, object], reason: str) -> None:
@@ -542,7 +855,12 @@ def _publish_account_unproven(identity: dict[str, object], reason: str) -> None:
     )
 
 
-def _cache_transient_failure(identity: dict[str, object] | None, reason: str | None = None) -> None:
+def _cache_transient_failure(
+    identity: dict[str, object] | None,
+    reason: str | None = None,
+    *,
+    user_id: str | None = None,
+) -> None:
     """Record a usage-fetch failure without blanking the pill for the same account.
 
     A timeout, an unexpected error, or a single unparseable scrape is transient.
@@ -567,16 +885,21 @@ def _cache_transient_failure(identity: dict[str, object] | None, reason: str | N
 
     ``reason`` rides the unavailable marker when the caller knows why the read
     ended empty (the API's auth-class verdict, see :func:`_unavailable_reason`),
-    so the pill can name the remedy instead of hiding.
+    so the pill can name the remedy instead of hiding. ``user_id`` is this
+    refresh's IdC userId, compared with the cached one as in
+    :func:`_cache_without_scrape`.
     """
-    global _usage_cache, _usage_cache_ts
+    global _usage_cache, _usage_cache_ts, _usage_cache_user_id
     if (
         _usage_cache.get("credits_plan") is not None
         and identity is not None
-        and _same_identity(_usage_cache, identity)
+        and _same_identity(
+            _usage_cache, identity, cached_user_id=_usage_cache_user_id, user_id=user_id
+        )
     ):
         _usage_cache = {**_usage_cache, "stale": True}
     else:
+        _usage_cache_user_id = None
         _usage_cache = {"available": False}
         if reason is not None:
             _usage_cache["reason"] = reason
@@ -586,16 +909,30 @@ def _cache_transient_failure(identity: dict[str, object] | None, reason: str | N
 async def fetch_local_identity() -> dict[str, object] | None:
     """Return this machine's signed-in Kiro identity, ``{}`` or ``None``.
 
-    The one dashboard-side door to ``kiro-cli whoami``: it resolves the same
-    binary chat spawns and runs :func:`_fetch_whoami_or_none` at the configured
-    sandbox tier. Other handlers (the Remote Crew launch form's identity
-    preselect) call this instead of reaching into the ACP layer themselves, so
-    the agent-backend boundary stays where this module already crosses it.
-    ``{}`` when kiro-cli is absent (non-Kiro provider) or whoami answered with
-    no identity -- this machine has no sign-in to inherit; ``None`` when whoami
-    could not answer -- the identity is unknown, and a caller must not present
-    the default as if it had been read.
+    The one dashboard-side door to the signed-in identity. Other handlers (the
+    Remote Crew launch form's identity preselect) call this instead of reaching
+    into the ACP layer themselves, so the agent-backend boundary stays where
+    this module already crosses it. Which credential it describes follows the
+    same verdict as the credit reading (:func:`_vault_owns_usage`):
+
+    * Crew's vault owns the harness's credential -- the KAS bundle route, or
+      the relay route with a usable Crew sign-in: the answer is the vault's own
+      identity fields (:func:`vault_identity`), with no kiro-cli spawned. On a
+      host without kiro-cli there is nothing else to ask, and on one with it,
+      ``kiro-cli whoami`` would name kiro-cli's login -- an account the
+      sessions here never run as. ``{}`` only when the vault was read and
+      proves itself empty: this machine has no sign-in to inherit. ``None``
+      for a vault that did not read or holds an entry that did not decrypt --
+      the same unknown as a whoami that could not answer, so the launch form
+      asks for an explicit choice instead of proposing the default.
+    * Otherwise ``kiro-cli whoami``: it resolves the same binary chat spawns and
+      runs :func:`_fetch_whoami_or_none` at the configured sandbox tier. ``{}``
+      when kiro-cli is absent (non-Kiro provider) or whoami answered with no
+      identity; ``None`` when whoami could not answer -- the identity is
+      unknown, and a caller must not present the default as if it had been read.
     """
+    if await _vault_owns_usage():
+        return await vault_identity()
     kiro_bin = await _resolve_kiro_bin_for_spawn()
     if not kiro_bin:
         return {}
@@ -632,9 +969,16 @@ def _identity_matches_account(api_arn: object, identity: dict[str, object]) -> b
 _SKIPPED_SCRAPE_PARKED = "scrape_parked"
 
 
-async def _fetch_usage_bg() -> str | None:
+async def _fetch_usage_bg(*, vault_owned: bool = False) -> str | None:
     """Fetch usage and update the cache: the free API first, then the ``/usage``
     scrape whenever the API returns no plan and the scrape is not parked.
+
+    ``vault_owned`` is the caller's :func:`_vault_owns_usage` verdict, taken in
+    place of the kiro-cli readiness gate. When true, the reading comes from
+    Crew's own sign-in alone (:func:`_refresh_from_vault`) and this refresh never
+    resolves or spawns kiro-cli -- not even when that sign-in disappears before
+    the refresh reads it, because the gate that would have stopped a signed-out
+    kiro-cli was skipped on the strength of this verdict.
 
     Single-flight through ``_usage_fetching``: a refresh already in progress
     makes this call return at once, so the timer and the account modal's
@@ -691,6 +1035,28 @@ async def _fetch_usage_bg() -> str | None:
     # timeout or error in that branch leaves that branch's marker (see the
     # handlers below) rather than the ordinary "no reading yet" one.
     type_only_identity: dict[str, object] | None = None
+    # The IdC userId this refresh's API read anchored on (UsageResult.user_id):
+    # what an API reading is tagged with. ``None`` until the API ran, and on an
+    # account whose store token carries none.
+    api_user_id: str | None = None
+
+    async def _adjacent_user_id() -> str | None:
+        """Re-read the signed-in IdC userId adjacent to a cache decision.
+
+        The userId counterpart of :func:`_adjacent_identity`: the API read's
+        userId can be stale by the time a later decision is made, since a switch
+        between two users of one org can land after it. Read again from
+        kiro-cli's own store, off the loop. Read whenever either this refresh's
+        API read or the cached reading carries a userId, so a refresh whose API
+        call never returned still compares with the cached one. ``None`` (and
+        nothing is read) when neither does: there is nothing to compare, so the
+        email and ``start_url`` rule decides alone (:func:`_same_identity`).
+        """
+        if api_user_id is None and _usage_cache_user_id is None:
+            return None
+        return await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), kiro_usage_api.signed_in_user_id
+        )
 
     async def _adjacent_identity() -> dict[str, object] | None:
         """Re-resolve whoami adjacent to a credential read or a cache decision.
@@ -733,8 +1099,14 @@ async def _fetch_usage_bg() -> str | None:
 
     async def _run_scrape(
         binary: str, before_spawn: Callable[[], Awaitable[None]] | None = None
-    ) -> str:
+    ) -> str | None:
         """Wrap, spawn and read the ``/usage`` scrape; marks the scrape attempted.
+
+        ``None`` when this kiro-cli has no engine that answers ``/usage`` locally
+        (V2 retired, see :func:`_usage_scrape_argv`): nothing is spawned, the
+        scrape is NOT marked attempted and feeds no back-off, and
+        ``before_spawn`` does not run. A scrape that cannot exist is not one
+        that failed.
 
         The wrap and the spawn stay in this one function so the spawn's argv
         is visibly the sandboxed, cgroup-scoped one. ``before_spawn`` runs
@@ -758,13 +1130,16 @@ async def _fetch_usage_bg() -> str | None:
         every interval. Same form and reason as `papyrus/backend/latex._run`.
         """
         nonlocal proc, sandbox_cleanup, scrape_attempted
-        scrape_attempted = True
-        argv, sandbox_cleanup = await asyncio.get_running_loop().run_in_executor(
+        prior_attempted, scrape_attempted = scrape_attempted, True
+        wrapped, sandbox_cleanup = await asyncio.get_running_loop().run_in_executor(
             subprocess_executor(),
             _wrap_argv_usage_scrape,
             binary,
         )
-        argv = cgroup_scope_argv(argv)  # cgroup DoS ceiling
+        if wrapped is None:
+            scrape_attempted = prior_attempted
+            return None
+        argv = cgroup_scope_argv(wrapped)  # cgroup DoS ceiling
         if before_spawn is not None:
             await before_spawn()
         proc = await spawn_supervised_oneshot(
@@ -805,11 +1180,15 @@ async def _fetch_usage_bg() -> str | None:
         if _scrape_in_backoff():
             return _REASON_SIGNIN_REQUIRED
         raw = await _run_scrape(binary)
+        if raw is None:
+            # No engine answers `/usage` (V2 retired): nothing corroborates the
+            # missing credential, and `no_credential` alone never decides.
+            return _REASON_ACCOUNT_UNPROVEN
         works = _parse_usage(raw).get("credits_plan") is not None
         _record_scrape_outcome(works)
         return _REASON_ACCOUNT_UNPROVEN if works else _REASON_SIGNIN_REQUIRED
 
-    def _cache_failure(adjacent: dict[str, object] | None) -> None:
+    def _cache_failure(adjacent: dict[str, object] | None, user_id: str | None) -> None:
         """Record a timed-out or failed refresh against the adjacent whoami.
 
         A refresh that took the account-type-only branch, whose adjacent whoami
@@ -821,12 +1200,15 @@ async def _fetch_usage_bg() -> str | None:
         if type_only_identity is not None and (not adjacent or _account_type_only(adjacent)):
             _publish_account_unproven(adjacent or type_only_identity, _REASON_ACCOUNT_UNPROVEN)
             return
-        _cache_transient_failure(adjacent)
+        _cache_transient_failure(adjacent, user_id=user_id)
 
     async def _refresh() -> str | None:
-        nonlocal kiro_bin, type_only_identity
+        nonlocal kiro_bin, type_only_identity, api_user_id
         global _usage_cache, _usage_cache_ts
 
+        if vault_owned:
+            await _refresh_from_vault()
+            return None
         kiro_bin = await _resolve_kiro_bin_for_spawn()
         if not kiro_bin:
             # kiro-cli absent (non-Kiro provider): cache an unavailable marker so
@@ -839,23 +1221,27 @@ async def _fetch_usage_bg() -> str | None:
         # credential from a signed-out profile supplying the numbers. Fetched
         # once here and reused by both the API and text branches below.
         identity = await _fetch_whoami(kiro_bin)
-        # Fail fast on API-key auth. kiro-cli's whoami reports the AuthMethod
-        # enum variant ``ApiKey``; the compare normalizes case and strips
-        # separators so an upstream respelling (``API_KEY``, ``Api-Key``)
-        # still fails fast instead of silently regressing to the slow path —
-        # such accounts hold no SSO/OIDC bearer token, so ``fetch_usage_limits``
-        # would spend its full timeout walking credential stores that cannot
-        # contain one, and the text scrape is no better a source. The
-        # ``reason`` rides the existing unavailable-marker shape so the
-        # frontend can say WHY, with a label specific to this auth type.
-        account_type = identity.get("account_type")
-        if (
-            isinstance(account_type, str)
-            and re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
-        ):
-            _publish_usage({"available": False, "reason": "api_key_auth"})
-            logger.info("Kiro usage: not available under API key auth; skipping fetch")
-            return None
+
+        # API-key auth: skip the GetUsageLimits API, go straight to the scrape.
+        # kiro-cli's whoami reports the AuthMethod enum variant ``ApiKey``; the
+        # compare normalizes case and strips separators so an upstream respelling
+        # (``API_KEY``, ``Api-Key``) is still recognized. Such accounts hold no
+        # SSO/OIDC bearer token, so ``fetch_usage_limits`` can only 403 after
+        # spending its timeout walking credential stores that cannot contain one
+        # -- but the `/usage` scrape DOES work for them: kiro-cli answers it
+        # locally from its own authenticated client, so the credit table prints
+        # under API-key auth exactly as it does for SSO. So rather than publish
+        # an unavailable marker, skip only the wasted API call and let execution
+        # fall through to the scrape below, which supplies the real number.
+        def _is_api_key(snapshot: dict[str, object]) -> bool:
+            account_type = snapshot.get("account_type")
+            return isinstance(account_type, str) and (
+                re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
+            )
+
+        skip_usage_api = _is_api_key(identity)
+        if skip_usage_api:
+            logger.info("Kiro usage: API-key auth; skipping the API path, using the /usage scrape")
         # The ExternalIdP type and nothing that names the user: no reading could
         # be tied to this user, so nothing the API returns is published and no
         # number is read from the `/usage` scrape (see _account_type_only). The
@@ -899,13 +1285,21 @@ async def _fetch_usage_bg() -> str | None:
         # handshake, so they are isolated from the maintenance/cron pools. Fails
         # closed (returns None) so we fall through to the text scrape rather than
         # showing a fabricated number.
-        api_result = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(),
-            functools.partial(kiro_usage_api.fetch_usage_limits, expected_arn=expected_arn),
-        )
+        if skip_usage_api:
+            # API-key auth has no bearer token the API can use, so the call can
+            # only 403. Synthesize a neutral result (``AUTH_OTHER`` -> no reason)
+            # so a later no-reading does not misadvise "sign in again" on an
+            # account that is signed in fine, and go straight to the scrape.
+            api_result = kiro_usage_api.UsageResult(None, kiro_usage_api.AUTH_OTHER)
+        else:
+            api_result = await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(),
+                functools.partial(kiro_usage_api.fetch_usage_limits, expected_arn=expected_arn),
+            )
         # ``usage`` is the number; ``auth_state`` is why it is missing when it is,
         # and is only ever consulted to pick the unavailable message below.
         api_usage = api_result.usage
+        api_user_id = api_result.user_id
         if api_usage and api_usage.get("credits_plan") is not None:
             # API output is untrusted too: redact every string leaf before caching.
             api_usage = {k: _redact_strings(v) for k, v in api_usage.items()}
@@ -918,7 +1312,13 @@ async def _fetch_usage_bg() -> str | None:
             # API used, so comparing the API's ARN with THAT identity passes by
             # construction and can prove nothing about who is signed in now.
             fresh_identity = (await _adjacent_identity()) or {}
+            fresh_user_id = await _adjacent_user_id()
             agreement = _whoami_agreement(identity, fresh_identity)
+            if api_user_id is not None and fresh_user_id != api_user_id:
+                # Two users of one org look the same to whoami; the userId in
+                # kiro-cli's store changed since the API read, so the reading
+                # may be the previous user's. Same outcome as a whoami switch.
+                agreement = _WHOAMI_DIFFERENT
             if agreement == _WHOAMI_DIFFERENT:
                 # The numbers belong to the account that was signed in a moment
                 # ago: nothing of it is published, and the failure path judges
@@ -928,7 +1328,7 @@ async def _fetch_usage_bg() -> str | None:
                     "Kiro usage: the signed-in account changed during the refresh; "
                     "discarding the reading fetched for the previous one"
                 )
-                _cache_transient_failure(fresh_identity)
+                _cache_transient_failure(fresh_identity, user_id=fresh_user_id)
                 return None
             if agreement == _WHOAMI_SAME:
                 # Attach the signed-in identity ONLY when it provably belongs to
@@ -945,7 +1345,7 @@ async def _fetch_usage_bg() -> str | None:
                             if not k.startswith("_")
                         }
                     )
-                _publish_usage(api_usage)
+                _publish_usage(api_usage, user_id=api_user_id)
                 logger.info(
                     "Kiro usage refreshed (api): %s / %s credits",
                     api_usage.get("credits_used", "?"),
@@ -983,7 +1383,10 @@ async def _fetch_usage_bg() -> str | None:
             if _whoami_agreement(identity, parked_identity) != _WHOAMI_SAME:
                 api_usage = None
             _cache_without_scrape(
-                api_usage, parked_identity, reason=_unavailable_reason(api_result)
+                api_usage,
+                parked_identity,
+                reason=_unavailable_reason(api_result),
+                user_id=await _adjacent_user_id(),
             )
             return _SKIPPED_SCRAPE_PARKED
         # The scrape reads whichever account kiro-cli has signed in WHEN IT
@@ -998,7 +1401,26 @@ async def _fetch_usage_bg() -> str | None:
             before.update((await _adjacent_identity()) or {})
 
         raw = await _run_scrape(kiro_bin, before_spawn=_read_before)
+        if raw is None:
+            # This kiro-cli offers no engine that answers `/usage` locally (V2
+            # retired), so the API was the only source and it gave no plan.
+            # Same outcome as a parked scrape, judged the same way against an
+            # adjacent whoami, but not reported as parked: nothing will lift it.
+            no_scrape_identity = (await _adjacent_identity()) or {}
+            if _whoami_agreement(identity, no_scrape_identity) != _WHOAMI_SAME:
+                api_usage = None
+            _cache_without_scrape(
+                api_usage,
+                no_scrape_identity,
+                reason=_unavailable_reason(api_result),
+                user_id=await _adjacent_user_id(),
+            )
+            return None
         after = (await _adjacent_identity()) or {}
+        # Read right after `after`, like it: the userId kiro-cli's store held
+        # when the scrape returned. It labels a published scrape and judges
+        # every keep-or-drop decision below.
+        after_user_id = await _adjacent_user_id()
         parsed = _parse_usage(raw)
         if parsed.get("credits_plan") is not None:
             # A parseable plan means the scrape itself works, so clear any
@@ -1007,20 +1429,38 @@ async def _fetch_usage_bg() -> str | None:
             # neither is the scrape being broken).
             _record_scrape_outcome(True)
             agreement = _whoami_agreement(before, after)
-            if agreement != _WHOAMI_SAME:
+            # An API-key sign-in carries no identity (no email / start URL /
+            # profile ARN), so its whoami pair is always `unproven`. That alone
+            # is not a reason to drop its reading: the scrape is kiro-cli's own
+            # `/usage` for the one signed-in key. But `unproven` is also what
+            # any other identity-less sign-in yields (ExternalIdP, a lapsed
+            # type-only sign-in, signed out), and the top-of-refresh whoami says
+            # nothing about who was signed in around the scrape. So `unproven`
+            # publishes only when the whoami on BOTH sides of the scrape is
+            # itself an API-key sign-in; anything else discards, as on the
+            # non-API-key path.
+            unproven_api_key = (
+                agreement == _WHOAMI_UNPROVEN and _is_api_key(before) and _is_api_key(after)
+            )
+            # The scrape prints no userId. One that differs from the API read's
+            # means kiro-cli switched user between the two reads, and email and
+            # start_url cannot show whose panel the child printed.
+            user_switched = api_user_id is not None and after_user_id != api_user_id
+            discard = (agreement != _WHOAMI_SAME and not unproven_api_key) or user_switched
+            if discard:
                 # `different`: the child ran across a switch, so its numbers
                 # belong to whoever was signed in at that instant -- unknowable,
-                # so unpublishable. `unproven`: no identity either side, so a
-                # switch between the two would be invisible; there is no source
-                # left to fall back to, so this refresh ends with no reading.
-                # Either way the cache is judged against the account signed in
-                # NOW, so nothing of a previous one is kept.
+                # so unpublishable. `unproven` (non-API-key): no identity either
+                # side, so a switch between the two would be invisible; there is
+                # no source left to fall back to, so this refresh ends with no
+                # reading. Either way the cache is judged against the account
+                # signed in NOW, so nothing of a previous one is kept.
                 logger.info(
                     "Kiro usage: the signed-in account could not be proven across "
                     "the /usage scrape (%s); discarding its reading",
-                    agreement,
+                    "user changed" if user_switched else agreement,
                 )
-                _cache_transient_failure(after)
+                _cache_transient_failure(after, user_id=after_user_id)
                 return None
             # Converge on the canonical shape (credits_used = total, explicit
             # credits_overage) so the dashboard never branches on source, then
@@ -1030,7 +1470,13 @@ async def _fetch_usage_bg() -> str | None:
             # `after` gates the preservation guard below AND labels the scrape if
             # we proceed -- both judge against the same adjacent identity, the
             # one proven to have been signed in throughout the read.
-            if _text_scrape_regresses_api_value(_usage_cache, parsed, after):
+            if _text_scrape_regresses_api_value(
+                _usage_cache,
+                parsed,
+                after,
+                prev_user_id=_usage_cache_user_id,
+                user_id=after_user_id,
+            ):
                 # The overage-blind text scrape reports less usage than a richer
                 # API value we already hold (the API call just transiently
                 # failed) that belongs to THIS account AND THIS billing cycle.
@@ -1058,7 +1504,7 @@ async def _fetch_usage_bg() -> str | None:
             parsed.update(
                 {k: _redact_strings(v) for k, v in after.items() if not k.startswith("_")}
             )
-            _publish_usage(parsed)
+            _publish_usage(parsed, user_id=after_user_id)
             logger.info(
                 "Kiro usage refreshed (text): %s credits used",
                 parsed.get("credits_used", "?"),
@@ -1073,7 +1519,9 @@ async def _fetch_usage_bg() -> str | None:
         # scrape failing too is the expected shape of a lapsed sign-in, so the
         # marker names that remedy.
         _record_scrape_outcome(False)
-        _cache_transient_failure(after, reason=_unavailable_reason(api_result))
+        _cache_transient_failure(
+            after, reason=_unavailable_reason(api_result), user_id=after_user_id
+        )
         return _parked_by_this_attempt()
 
     def _parked_by_this_attempt() -> str | None:
@@ -1107,14 +1555,14 @@ async def _fetch_usage_bg() -> str | None:
         await _reap_scrape_proc()
         if scrape_attempted:
             _record_scrape_outcome(False)
-        _cache_failure(await _adjacent_identity())
+        _cache_failure(await _adjacent_identity(), await _adjacent_user_id())
         return _parked_by_this_attempt() if scrape_attempted else None
     except Exception:
         logger.debug("Background usage fetch failed", exc_info=True)
         await _reap_scrape_proc()
         if scrape_attempted:
             _record_scrape_outcome(False)
-        _cache_failure(await _adjacent_identity())
+        _cache_failure(await _adjacent_identity(), await _adjacent_user_id())
         return _parked_by_this_attempt() if scrape_attempted else None
     finally:
         # Always reap the subprocess on any exit path (the handlers above did
@@ -1133,23 +1581,6 @@ async def _fetch_usage_bg() -> str | None:
 
 async def api_sessions_usage(request: web.Request) -> web.Response:
     """GET /api/sessions/usage — cached kiro credit usage (background refresh)."""
-    from kiro_crew.acp import backends as acp_backends
-    from kiro_crew.dashboard.state import active_acp_backend
-
-    state: DashboardState = request.app["state"]
-    # A harness that bills its own vendor account draws nothing down here, so the
-    # honest answer is "unavailable" and the scrape must not run at all: it costs a
-    # BILLED `kiro-cli chat ... /usage` turn on a 30s timer, and kiro-cli being
-    # INSTALLED is not evidence that it is what the operator is running. Answered
-    # ahead of the readiness check because kiro-cli's sign-in state is not a
-    # question about a harness that never touches it. Membership is asked of the
-    # gateway's own predicate (H5/H6, positive identity); an unreadable backend is
-    # UNKNOWN and keeps the existing behaviour rather than blanking a real balance.
-    # The cache is left untouched, so switching back to Kiro still serves the last
-    # good value while the first refresh runs.
-    backend = active_acp_backend(getattr(state, "sessions", None))
-    if backend is not None and not acp_backends.bills_kiro_credits(backend):
-        return web.json_response({"usage": {"available": False}})
     # Same browser-storm guard as api_models: the /usage scrape shells out to
     # `kiro-cli chat --no-interactive ... /usage`, which auto-opens a browser
     # login while signed out. This endpoint is polled every 30s by the top-bar
@@ -1161,11 +1592,42 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
     # read then waits seconds on the probe. The wider window authorizes many
     # polls between probes while still containing the only risk (a browser login
     # spawned on a stale ready=True).
-    blocked = await reject_if_kiro_unverified(request, max_age_secs=_POLL_GATE_MAX_AGE_SECS)
-    if blocked is not None:
-        return blocked
+    #
+    # A KAS session signed in through Crew reads usage over the direct API and
+    # spawns no kiro-cli, so the gate (whose only risk is that spawn) does not
+    # apply; the verdict travels into the refresh so it cannot fall back.
+    vault_owned = await _vault_owns_usage()
+    if not vault_owned:
+        blocked = await reject_if_kiro_unverified(request, max_age_secs=_POLL_GATE_MAX_AGE_SECS)
+        if blocked is not None:
+            return blocked
+    # Payload and the fingerprint it was published under, taken in one step (no
+    # await between them, and _publish_usage writes both without yielding), so
+    # the foreign check below judges exactly what this response serves.
+    served, served_fp = _usage_cache, _usage_cache_vault_fp
+    refresh_now = False
+    if vault_owned:
+        if await _cached_reading_is_foreign(served, served_fp):
+            # The cached reading belongs to another identity (an earlier Crew
+            # sign-in, or the kiro-cli path): never serve it, refresh now.
+            served = {"available": False}
+            refresh_now = True
+        elif await _signin_marker_is_stale(served):
+            # "Sign in again" from before the vault was last rewritten (or from
+            # the kiro-cli path): the user may have just signed in, so ask now.
+            # The marker stays on screen until the refresh replaces it.
+            refresh_now = True
+    elif _usage_cache.get("credits_plan") is not None and _usage_cache_vault_fp:
+        # The vault path published this reading, but the vault does not own
+        # usage now (signed out of Crew, or the harness is not KAS): it is not the
+        # kiro-cli account's reading, so never serve it, refresh now. Dropped,
+        # not just hidden, so the kiro-cli path's same-identity preserve can
+        # never keep it and re-trigger this refresh on every poll.
+        _publish_usage({"available": False})
+        served = _usage_cache
+        refresh_now = True
     now = time.time()
-    if now - _usage_cache_ts > _USAGE_REFRESH_SECS:
+    if refresh_now or now - _usage_cache_ts > _USAGE_REFRESH_SECS:
         # Timed refresh only — deliberately not triggered by the kiro-cli auth
         # store changing on disk. That store is shared: `data.sqlite3` holds
         # `conversations`, `history` and `state` alongside `auth_kv`, so ordinary
@@ -1173,10 +1635,11 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
         # would fire on nearly every poll, and each fire can reach the `/usage`
         # text scrape, a minute-scale kiro-cli subprocess. A faster readout is
         # not worth that churn; a profile switch is picked up on the next interval.
-        task = asyncio.create_task(_fetch_usage_bg())
+        state: DashboardState = request.app["state"]
+        task = asyncio.create_task(_fetch_usage_bg(vault_owned=vault_owned))
         state._background_tasks.add(task)
         task.add_done_callback(state._background_tasks.discard)
-    return web.json_response({"usage": _usage_cache})
+    return web.json_response({"usage": served})
 
 
 async def api_sessions_usage_refresh(request: web.Request) -> web.Response:
@@ -1191,6 +1654,8 @@ async def api_sessions_usage_refresh(request: web.Request) -> web.Response:
 
     * :func:`reject_if_kiro_unverified` -- the scrape shells out to ``kiro-cli
       chat``, which opens a browser login while signed out (same as the GET).
+      Skipped, as on the GET, when :func:`_vault_owns_usage` holds: that
+      refresh reads Crew's own sign-in and spawns no kiro-cli.
     * Single flight -- while a refresh is in progress (the timer's or another
       click's) a second POST is refused with 409 ``refresh_in_flight`` rather
       than started: a refresh is a whoami + scrape subprocess pair that can
@@ -1208,15 +1673,17 @@ async def api_sessions_usage_refresh(request: web.Request) -> web.Response:
       same-identity prior reading dimmed ``stale``, or an unavailable marker
       (see :func:`_cache_without_scrape` / :func:`_cache_transient_failure`).
     """
-    blocked = await reject_if_kiro_unverified(request)
-    if blocked is not None:
-        return blocked
+    vault_owned = await _vault_owns_usage()
+    if not vault_owned:
+        blocked = await reject_if_kiro_unverified(request)
+        if blocked is not None:
+            return blocked
     if _usage_fetching:
         return web.json_response(
             {"error": "A refresh is already running", "code": "refresh_in_flight"},
             status=409,
         )
-    outcome = await _fetch_usage_bg()
+    outcome = await _fetch_usage_bg(vault_owned=vault_owned)
     if outcome == _SKIPPED_SCRAPE_PARKED:
         parked_for = max(1, int(_usage_scrape_backoff_until - time.monotonic() + 0.999))
         return web.json_response(

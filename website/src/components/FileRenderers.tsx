@@ -1,16 +1,19 @@
-import { memo, useState, useMemo, useCallback, useEffect, useId, useRef } from 'react'
+import { memo, useState, useMemo, useCallback, useEffect, useId, useRef, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronLeft, ChevronRight, Download, ExternalLink, FileText, Film, Music, Sparkles } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Download, ExternalLink, FileText, Film, Moon, Music, Sparkles, Sun } from 'lucide-react'
 import DOMPurify from 'dompurify'
 
 import { i18nT } from '../i18n/t'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
 import ErrorNotice from './ErrorNotice'
+import FileDownloadLink from './FileDownloadLink'
 import { useCanOpenFile, useCopyAck } from './FilePathMenu'
-import { fileDownloadUrl, fileStreamUrl, fileOfficePreviewUrl, fileOfficeSlidesUrl, fileOfficeSlideUrl } from '../utils/fileReadUrl'
+import { fileStreamUrl, fileOfficePreviewUrl, fileOfficeSlidesUrl, fileOfficeSlideUrl } from '../utils/fileReadUrl'
 import { sendErrorToChat } from '../utils/errorReport'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+import { useIsDark } from '../hooks/useIsDark'
 import { pathBasename } from '../utils/pathBasename'
+import { AUDIO_EXTS, VIDEO_EXTS } from '../utils/mediaExts'
 import { guideUntrusted, stripGuideMarkers } from '../guide/untrustedContent'
 import {
   MD_EM_CLS,
@@ -25,13 +28,9 @@ import {
 /* ── extension helpers ── */
 const IMG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.avif', '.svg', '.ico'])
 const CSV_EXTS = new Set(['.csv', '.tsv'])
-// Media served through /api/file-stream (Range-capable). Split decides the
-// element: <video> renders a picture surface, <audio> a compact control bar.
-// .ogg goes to audio -- the extension is overwhelmingly audio in practice and
-// the .ogv variant exists for video. .opus is an audio-only Ogg mapping, so it
-// follows the same compact-player route.
-const VIDEO_EXTS = new Set(['.mp4', '.m4v', '.webm', '.mov', '.mkv', '.ogv'])
-const AUDIO_EXTS = new Set(['.mp3', '.wav', '.m4a', '.flac', '.ogg', '.oga', '.opus'])
+// Media served through /api/file-stream (Range-capable): VIDEO_EXTS and
+// AUDIO_EXTS (utils/mediaExts) decide the element. <video> renders a picture
+// surface, <audio> a compact control bar.
 const JSON_EXTS = new Set(['.json'])
 const JSONL_EXTS = new Set(['.jsonl'])
 const HTML_EXTS = new Set(['.html', '.htm'])
@@ -83,18 +82,65 @@ export function detectFileType(filePath: string): FileType {
 
 function extOf(fp: string) { const i = fp.lastIndexOf('.'); return i >= 0 ? fp.slice(i).toLowerCase() : '' }
 
+/* ── Light/dark backdrop for the image and SVG viewers (#25815) ──
+ * A diagram drawn in dark lines is hard to read on a dark theme, and a light
+ * one on a light theme. One button flips only this pane's backdrop to the
+ * opposite of the theme; the dashboard theme is never touched. The choice is
+ * kept in sessionStorage, so it holds for every image opened in this tab and
+ * starts fresh in a new one. The colours are fixed on purpose: the point is a
+ * plain white or near-black sheet behind the picture, whatever the theme. */
+export const VIEWER_BACKDROP_KEY = 'mc-viewer-backdrop-flipped'
+
+function readBackdropFlipped(): boolean {
+  try { return sessionStorage.getItem(VIEWER_BACKDROP_KEY) === '1' } catch { return false }
+}
+
+function ViewerBackdrop({ children, render }: {
+  children?: ReactNode
+  /** For a body that owns its own element (the sanitized SVG): gets the backdrop class. */
+  render?: (backdropCls: string) => ReactNode
+}) {
+  const isDark = useIsDark()
+  const [flipped, setFlipped] = useState(readBackdropFlipped)
+  const toggle = useCallback(() => {
+    const next = !flipped
+    setFlipped(next)
+    try { sessionStorage.setItem(VIEWER_BACKDROP_KEY, next ? '1' : '0') } catch { /* storage off: the flip still holds for this view */ }
+  }, [flipped])
+  const backdropCls = !flipped ? 'bg-bg-elevated' : isDark ? 'bg-white' : 'bg-[#1e1e1e]'
+  // The button names the backdrop it gives: on a dark theme it offers light, on a light theme dark.
+  const label = isDark ? i18nT('components.fileRenderers.light_background') : i18nT('components.fileRenderers.dark_background')
+  const Icon = isDark ? Sun : Moon
+  const body = `flex items-center justify-center h-full overflow-auto p-4 rounded-md border border-border ${backdropCls}`
+  return (
+    <div className="relative h-full">
+      {render ? render(body) : <div className={body} data-testid="viewer-backdrop">{children}</div>}
+      <button
+        type="button"
+        onClick={toggle}
+        aria-pressed={flipped}
+        aria-label={label}
+        title={label}
+        className={`absolute top-2 right-2 inline-flex items-center justify-center w-7 h-7 rounded-md border border-border bg-bg/80 hover:bg-bg-hover focus-ring-accent ${flipped ? 'text-accent' : 'text-muted hover:text-text'}`}
+      >
+        <Icon size={14} aria-hidden="true" />
+      </button>
+    </div>
+  )
+}
+
 /* ── Image viewer ── */
 export const ImageViewer = memo(function ImageViewer({ filePath }: { filePath: string }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   return (
-    <div className="flex items-center justify-center h-full overflow-auto p-4 bg-bg-elevated rounded-md border border-border">
+    <ViewerBackdrop>
       <img
         src={'/api/file-raw?path=' + encodeURIComponent(filePath)}
         alt={pathBasename(filePath)}
         className="max-w-full max-h-full object-contain"
         draggable={false}
       />
-    </div>
+    </ViewerBackdrop>
   )
 })
 
@@ -109,10 +155,15 @@ export const SvgViewer = memo(function SvgViewer({ content }: { content: string 
     [content],
   )
   return (
-    <div
-      className="flex items-center justify-center h-full overflow-auto p-4 bg-bg-elevated rounded-md border border-border"
-      {...guideUntrusted}
-      dangerouslySetInnerHTML={{ __html: safe }}
+    <ViewerBackdrop
+      render={cls => (
+        <div
+          className={cls}
+          data-testid="viewer-backdrop"
+          {...guideUntrusted}
+          dangerouslySetInnerHTML={{ __html: safe }}
+        />
+      )}
     />
   )
 })
@@ -405,50 +456,60 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
   // `BIN` fallback: the binary card is reached by a byte sniff, not by an
   // extension list, so `coredump` and `a.out` land here with nothing to show.
   const ext = extOf(filePath).replace('.', '').toUpperCase() || 'BIN'
-  const url = fileDownloadUrl(filePath)
   const sizeCls = showBigDownload ? 'px-3 py-1.5 text-sm' : 'px-2 py-1 text-xs'
   const iconSize = showBigDownload ? 16 : 14
   // The ONE gate for an Open-with-default-app surface, shared with the file
   // panel's ⋯ entry and MarkdownPanel's overflow: the browser must sit on the
-  // gateway host, or `/api/reveal` has no desktop to open on and the click looks
-  // broken. When it is false the card falls back to Download-as-primary, which
-  // is what a remote session actually needs — the bytes.
+  // gateway host and that host must be able to open the file, or `/api/reveal`
+  // has no desktop to open on and the click looks broken. When it is false the card
+  // falls back to Download-as-primary, which is what a remote session actually
+  // needs — the bytes.
   const canOpen = useCanOpenFile('file')
-  // A headless direct-local host has no desktop, so the backend degrades the
-  // `open` to a clipboard copy. Shared with the file-path menu (see useCopyAck)
-  // so the primary button acknowledges that degrade with the same inline swap
-  // instead of reading as a dead click.
-  const { copyStatus, revealOrOpenWithAck, revealError, clearRevealError } = useCopyAck(filePath)
-  const openLabel = copyStatus === 'copied'
-    ? i18nT('components.filePathMenu.path_copied')
-    : copyStatus === 'failed'
-      ? i18nT('components.filePathMenu.copy_failed')
-      : i18nT('components.markdownPanel.open_with_default_app')
+  // What the open reports — a failure, or a launcher that did not start and left
+  // only a copy of the path — is held by the same owner the file-path menu uses
+  // (see useCopyAck) and shown in the notice above the buttons, never as a
+  // relabelled Open button.
+  const { revealOrOpenWithAck, revealError, clearRevealError } = useCopyAck(filePath)
+  // A failed Download is reported here and shown beside the Open error, in a
+  // row of its own, so the Open / Download row keeps exactly two controls.
+  const [downloadError, setDownloadError] = useState<string | null>(null)
+  const downloadNotice = (
+    <ErrorNotice
+      variant="inline"
+      className="text-left whitespace-normal"
+      message={downloadError}
+      askAgent
+      onDismiss={() => setDownloadError(null)}
+      testId="office-card-download-error"
+    />
+  )
+  const openLabel = i18nT('components.markdownPanel.open_with_default_app')
   const actions = (
     <>
       {canOpen && (
         <button
           type="button"
           onClick={() => { void revealOrOpenWithAck('open') }}
-          className={`inline-flex items-center gap-2 rounded border-none cursor-pointer bg-accent text-white hover:opacity-90 ${sizeCls}`}
+          className={`inline-flex items-center gap-2 rounded border-none cursor-pointer bg-accent text-accent-fg hover:opacity-90 ${sizeCls}`}
         >
           <ExternalLink size={iconSize} aria-hidden="true" />
           {openLabel}
         </button>
       )}
-      <a
-        href={url}
+      <FileDownloadLink
+        filePath={filePath}
         download={filename}
         className={`inline-flex items-center gap-2 rounded no-underline ${sizeCls} ${canOpen
           ? 'border border-border bg-bg-hover text-text hover:bg-bg-elevated'
-          : 'bg-accent text-white hover:opacity-90'}`}
-        aria-label={i18nT('components.fileRenderers.download_file', { filename })}
+          : 'bg-accent text-accent-fg hover:opacity-90'}`}
+        ariaLabel={i18nT('components.fileRenderers.download_file', { filename })}
+        onError={setDownloadError}
       >
         <Download size={iconSize} aria-hidden="true" />
         {showBigDownload
           ? i18nT('components.fileRenderers.download')
           : i18nT('components.fileRenderers.office_download_original')}
-      </a>
+      </FileDownloadLink>
     </>
   )
   if (compact) {
@@ -465,6 +526,7 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
           onDismiss={clearRevealError}
           testId="office-card-open-error"
         />
+        {downloadNotice}
         <div className="flex items-center gap-2 flex-wrap justify-end">{actions}</div>
       </div>
     )
@@ -474,7 +536,7 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
       <div className="relative">
         <FileText size={showBigDownload ? 64 : 40} className="text-muted" strokeWidth={1.25} />
         <span
-          className={`absolute bottom-1 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded font-semibold bg-accent text-white text-[10px]`}
+          className={`absolute bottom-1 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded font-semibold bg-accent text-accent-fg text-[10px]`}
           aria-hidden="true"
         >{ext}</span>
       </div>
@@ -489,6 +551,7 @@ function OfficeCard({ filePath, showBigDownload, hideHint, compact }: {
         onDismiss={clearRevealError}
         testId="office-card-open-error"
       />
+      {downloadNotice}
       {showBigDownload && !hideHint && (
         <div className="text-xs text-muted">
           {/* The hint is the card's only instruction, so it must name the action
@@ -1136,15 +1199,15 @@ export const MediaPlayer = memo(function MediaPlayer({ filePath, kind }: { fileP
           <div className="text-xs text-muted">
             {i18nT('components.fileRenderers.media_preview_failed')}
           </div>
-          <a
-            href={fileDownloadUrl(filePath)}
+          <FileDownloadLink
+            filePath={filePath}
             download={filename}
-            className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-sm bg-accent text-white hover:opacity-90 no-underline"
-            aria-label={i18nT('components.fileRenderers.download_file', { filename })}
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-sm bg-accent text-accent-fg hover:opacity-90 no-underline"
+            ariaLabel={i18nT('components.fileRenderers.download_file', { filename })}
           >
             <Download size={16} aria-hidden="true" />
             {i18nT('components.fileRenderers.download')}
-          </a>
+          </FileDownloadLink>
         </div>
       </div>
     )
@@ -1273,9 +1336,9 @@ export const SheetViewer = memo(function SheetViewer({ filePath }: { filePath: s
         <div className="text-center text-muted text-[12px] py-1.5 border-b border-border bg-chrome shrink-0">
           {i18nT('components.fileRenderers.sheet_formulas_note')}
           {' · '}
-          <a href={fileDownloadUrl(filePath)} download className="text-accent no-underline hover:underline">
+          <FileDownloadLink filePath={filePath} className="text-accent no-underline hover:underline">
             {i18nT('components.fileRenderers.download')}
-          </a>
+          </FileDownloadLink>
         </div>
       )}
       <div className="flex-1 overflow-auto">
@@ -1324,9 +1387,9 @@ export const SheetViewer = memo(function SheetViewer({ filePath }: { filePath: s
           {(sheet.truncated_rows || sheet.truncated_cols || payload.truncated_sheets) && (
             <>
               {' · '}
-              <a href={fileDownloadUrl(filePath)} download className="text-accent no-underline hover:underline">
+              <FileDownloadLink filePath={filePath} className="text-accent no-underline hover:underline">
                 {i18nT('components.fileRenderers.download')}
-              </a>
+              </FileDownloadLink>
             </>
           )}
         </div>

@@ -22,7 +22,7 @@ import aiohttp
 from aiohttp import web
 
 from kiro_crew import __version__ as _local_version
-from kiro_crew import platform_compat
+from kiro_crew import fork_version, platform_compat
 from kiro_crew.changelog import release_of_build
 from kiro_crew.config.loader import KiroCrewConfig, overlay_pins
 from kiro_crew.dashboard.handlers._update_feed import fetch_feed_bytes
@@ -40,6 +40,7 @@ from kiro_crew.dashboard.handlers.updates_verdict import (
     _update_info,
     remediation_command,
 )
+from kiro_crew.fork_version import is_fork_build
 from kiro_crew.git_divergence import DivergenceUnreadable, count_divergence
 from kiro_crew.platform import feed_trust
 from kiro_crew.platform.update_capability import (
@@ -62,7 +63,13 @@ from kiro_crew.platform.update_capability import (
     bundled_by_desktop_app,
     derive_capability,
 )
-from kiro_crew.platform.update_governance import min_version
+from kiro_crew.platform.update_fetch import fetch_and_pin_upstream
+from kiro_crew.platform.update_governance import (
+    git_command_env,
+    min_version,
+    repo_exec_config_reason,
+    upstream_remote_and_branch,
+)
 from kiro_crew.platform.update_layout import cdn_bases as _cdn_bases
 from kiro_crew.platform.update_layout import release_channel as _release_channel
 from kiro_crew.platform.update_provider import CommandProvider, resolve_provider
@@ -118,6 +125,7 @@ def status_update_fields() -> dict[str, object]:
     available = _update_info.get("update_available")
     ahead = _update_info.get("commits_ahead")
     behind = _update_info.get("commits_behind")
+    revision = fork_version.peek_revision()
     return {
         "update_available": available if isinstance(available, bool) else None,
         "update_can_apply": bool(_update_info.get("can_apply")),
@@ -203,6 +211,10 @@ def status_update_fields() -> dict[str, object]:
         # catch. Falls back to the raw version until a check has resolved the
         # channel (`_display_local_version` keys on it; only stable folds).
         "version_display": _display_local_version(),
+        "upstream_base_version": fork_version.base_version(),
+        "fork_revision": revision[0] if revision else "",
+        "fork_dirty": revision[1] if revision else False,
+        "update_fork_suppressed": bool(_update_info.get("fork_suppressed")),
     }
 
 
@@ -384,6 +396,7 @@ async def _run_update_check() -> None:
     # is RIGHT NOW, and a switch mid-flight makes that verdict describe a lane the
     # install has left.
     generation = _check_generation
+    await asyncio.to_thread(fork_version.warm)
 
     # A no-I/O seed, so the except path below always has something to report even
     # when the derivation itself is what failed.
@@ -467,43 +480,65 @@ async def _run_update_check() -> None:
 
 
 async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
-    """Compare a git checkout in *proj* against its tracked remote."""
+    """Compare a git checkout in *proj* against its tracked remote.
+
+    *proj* is a tree an agent can write, and this runs on the host at boot, on
+    the 12-hourly poll and on the dashboard's Check button. So every git call
+    here goes through the same guards as the unattended apply: ``git`` resolved
+    off ``PATH``, :func:`git_command_env` pinning every fixed-key exec vector
+    (``core.sshCommand``, ``core.fsmonitor``, ``core.hooksPath``,
+    ``diff.external`` ...), and a :func:`repo_exec_config_reason` refusal for
+    the repo-NAMED ones (``diff.<driver>.textconv``, ``filter.<name>.*``) that
+    no pin can reach. The changelog diff also runs ``--no-textconv
+    --no-ext-diff``, so no attribute can route it to a program.
+    """
     base: dict[str, object] = _capability_fields(capability)
 
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "fetch",
-        "--quiet",
-        cwd=proj,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=platform_compat.IS_POSIX,
-        creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-    )
-    try:
-        _, fetch_err = await asyncio.wait_for(proc.communicate(), timeout=30)
-    except asyncio.CancelledError:
-        await platform_compat.kill_and_reap(proc)
-        raise
-    except asyncio.TimeoutError:
-        await platform_compat.kill_and_reap(proc)
-        logger.warning("git fetch timed out")
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_FETCH_FAILED)
+    git = platform_compat.trusted_git_bin()
+    if git is None:
+        logger.warning("Update check skipped: no trustworthy git outside PATH")
+        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
         return
-    if proc.returncode != 0:
+    exec_config = await asyncio.to_thread(repo_exec_config_reason, proj)
+    if exec_config:
         logger.warning(
-            "git fetch failed (rc=%s): %s",
-            proc.returncode,
-            (fetch_err or b"").decode(errors="replace").strip(),
+            "Update check skipped: %s, which git would run during the check", exec_config
         )
+        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
+        return
+    # Carries the shared guards (trusted PATH, built-in transports only, no git
+    # proxy, every fixed-key exec vector pinned, location vars stripped).
+    env = git_command_env()
+
+    # The tracked upstream to compare against, read from config (not the
+    # `origin/<name>` short form). None for a detached HEAD or a branch with no
+    # upstream: nothing to compare against, a failed check -- exactly what the
+    # old bare `git fetch` + `rev-parse @{u}` reported.
+    upstream = await asyncio.to_thread(upstream_remote_and_branch, proj)
+    if upstream is None:
+        logger.warning("Could not resolve the tracked upstream in %s", proj)
+        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
+        return
+    remote_name, remote_branch = upstream
+
+    # The fetch runs through the shared isolated helper: a repo-defined hook
+    # cannot fire on the fetch's ref write (it happens in a git dir the gateway
+    # owns), while the fetched objects land in this checkout's object store. The
+    # tip comes back as a commit id the reads below use directly; no ref in this
+    # checkout is written. The same helper fetches for the unattended apply.
+    remote_sha = await fetch_and_pin_upstream(
+        proj, remote_name, remote_branch, git=git, env=env, timeout=30
+    )
+    if remote_sha is None:
         _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_FETCH_FAILED)
         return
 
     local = await asyncio.create_subprocess_exec(
-        "git",
+        git,
         "rev-parse",
         "HEAD",
         cwd=proj,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         start_new_session=platform_compat.IS_POSIX,
@@ -518,33 +553,10 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
         await platform_compat.kill_and_reap(local)
         _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
         return
-    remote = await asyncio.create_subprocess_exec(
-        "git",
-        "rev-parse",
-        "@{u}",
-        cwd=proj,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-        start_new_session=platform_compat.IS_POSIX,
-        creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-    )
-    try:
-        remote_out, _ = await asyncio.wait_for(remote.communicate(), timeout=10)
-    except asyncio.CancelledError:
-        await platform_compat.kill_and_reap(remote)
-        raise
-    except asyncio.TimeoutError:
-        await platform_compat.kill_and_reap(remote)
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
-        return
 
     local_sha = local_out.decode(errors="replace").strip()
-    remote_sha = remote_out.decode(errors="replace").strip()
-    if not local_sha or not remote_sha:
-        # No upstream (detached HEAD, untracked branch) or an unreadable HEAD.
-        # There is nothing to compare against, which is a failed check and not
-        # "you are on the latest version".
-        logger.warning("Could not resolve HEAD and/or upstream in %s", proj)
+    if not local_sha:
+        logger.warning("Could not resolve HEAD in %s", proj)
         _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
         return
 
@@ -562,7 +574,7 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
     # and the second is precisely the case with commits to lose. Only a checkout
     # that is behind and NOT ahead can be fast-forwarded, so only that one is
     # offered an update.
-    counts = await count_divergence(proj, "@{u}")
+    counts = await count_divergence(proj, remote_sha, git=git, env=env)
     if isinstance(counts, DivergenceUnreadable):
         # A check that could not count must not answer "you are on the latest
         # version" — the unattended auto-apply reads this verdict.
@@ -576,10 +588,12 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
     # Compare the remote's version (or the on-disk one when already pulled).
     target_sha = remote_sha if local_sha != remote_sha else local_sha
     show = await asyncio.create_subprocess_exec(
-        "git",
+        git,
         "show",
+        "--no-textconv",
         f"{target_sha}:src/kiro_crew/__init__.py",
         cwd=proj,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         start_new_session=platform_compat.IS_POSIX,
@@ -642,12 +656,17 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
     if available:
         diff_base = f"v{_local_version}" if local_sha == remote_sha else local_sha
         diff = await asyncio.create_subprocess_exec(
-            "git",
+            git,
             "diff",
+            # A tracked `.gitattributes` can name a diff driver for CHANGELOG.md;
+            # these keep git's own text diff whatever the attributes say.
+            "--no-textconv",
+            "--no-ext-diff",
             f"{diff_base}..{target_sha}",
             "--",
             "CHANGELOG.md",
             cwd=proj,
+            env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=platform_compat.IS_POSIX,
@@ -759,6 +778,7 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
     prompt, never toward coercion.
     """
     channel = _release_channel()
+    forked = await asyncio.to_thread(is_fork_build)
     feed_base, _artifact_base = _cdn_bases()
     # `for_channel` keeps the pair honest: the channel reported here and the command
     # offered alongside it are read at different moments, and a switch landing in
@@ -841,7 +861,7 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
     # every failure degrades to the ordinary dismissible prompt. Offloaded —
     # verification shells out to openssl.
     floor = manifest.get("min_version")
-    if isinstance(floor, str) and _MIN_VERSION_RE.match(floor):
+    if not forked and isinstance(floor, str) and _MIN_VERSION_RE.match(floor):
         if _is_newer(floor, _display_version(remote_version, channel)) is True:
             # A floor above the very version the feed offers demands an update
             # the feed cannot satisfy — inconsistent, so ignore it. The offered
@@ -867,7 +887,7 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
                     _local_version,
                     floor,
                 )
-    elif floor is not None:
+    elif not forked and floor is not None:
         logger.warning("Release feed %s carries an unusable min_version", url)
     # No ``changes``: the manifest carries no changelog, and the CHANGELOG.md
     # bundled into the wheel describes the version already INSTALLED, not the new
@@ -875,12 +895,13 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
     # rather than this function inventing a diff it cannot see.
     _set_update_info(
         **base,
-        update_available=available,
+        update_available=False if forked else available,
         latest_version=remote_version,
         # For a feed-checkable install the verdict IS the version comparison, so
         # the two agree by construction. Reported anyway so the field means the
         # same thing on every layout and no consumer has to special-case one.
-        version_newer=available,
+        version_newer=False if forked else available,
+        fork_suppressed=forked,
         # The other direction of the same comparison, and the only place it can
         # honestly be computed: the running build is ahead of everything this
         # lane publishes, so the lane never shipped it. Written from the same

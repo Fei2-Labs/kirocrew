@@ -261,8 +261,18 @@ during synthesis, and malformed requests.
 Read aloud request. This replaces a prior synthesis even during model loading,
 before any audio has started. `useVoiceInput` also dispatches it when an actual
 batch or streaming recording starts, before microphone acquisition, so the
-recognizer does not capture ongoing synthesized speech. Hover prewarming does
-not interrupt playback. Clicking Read aloud while audio plays stops it.
+recognizer does not capture ongoing synthesized speech. That covers every
+surface built on the hook: the chat composer and the document comment boxes'
+`CommentVoiceButton` (selection comment, image-box comment and thread reply;
+`stt-streaming.md` § "Comment-box dictation"), so pressing a comment box's mic
+stops a reply being read aloud. Hover prewarming does
+not interrupt playback. Clicking Read aloud while audio plays stops it, on
+whichever reply it is clicked, so while `voicePlaying` is set the More menu
+item reads "Stop reading" with a stop glyph (`SpeakMenuItem`). While audio
+is still being prepared a click starts that reply instead, so the item keeps
+reading "Read aloud" until playback begins. The item reads the store only
+under a react-redux Provider, because the app SDK's `ChatEmbed` renders
+`AssistantMessage` with no store.
 The playback owner (`website/src/hooks/websocket/voicePlayback.ts`) maps the
 event to `stopVoice()`, which stops scheduled PCM sources,
 pauses an active media element, revokes queued blob URLs, invalidates pending
@@ -309,6 +319,7 @@ running a value the file does not hold. A failed write answers non-2xx with a
 | `voice_id`, `engine`, `pitch` | Polly synthesis settings. The dashboard synthesis endpoint accepts per-request overrides on the Polly path only, as body fields `voice` (not `voice_id`), `engine`, `rate` and `pitch`. |
 | `rate` | Speech rate as a percentage. Shared by Polly and the built-in engine, which converts it to words per minute or to SAPI's `-10..10`. |
 | `system_voice` | The built-in engine's own voice selector; empty means the OS default voice. |
+| `language_code` | BCP-47 tag for spoken replies (`en-US`, `zh-CN`), checked by `voice_reply.validated_language_code()`; empty means each provider's own default language. Handed to edition providers as `voice_config["language_code"]`; Polly and the built-in engine ignore it and speak the language of the selected voice. A malformed stored value reads as empty; the PUT refuses one with 400 `voice_language_invalid`. The GET also serves `language_codes`, the picker's choices: `""`, `speech_languages.COMMON_LANGUAGE_CODES` (the list the STT picker offers), then a stored code outside it. |
 | `aws_profile`, `region` | Passed to the AWS CLI by the Polly provider. |
 
 `dashboard.routes.sessions.register()` registers:

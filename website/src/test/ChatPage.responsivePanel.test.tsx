@@ -18,6 +18,7 @@ import { ThemeProvider } from '../hooks/useTheme'
 import { __resetPanelTabs, usePanelTabs } from '../hooks/usePanelTabs'
 import { setSidePanelDock } from '../hooks/useSidePanelDock'
 import { switchSlot, toggleActivity } from '../store/chatSlice'
+import { paneCovered } from '../hooks/paneVisibility'
 
 // --- Stub child components (same scaffold as ChatPage.embedded test) ---
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
@@ -306,6 +307,22 @@ describe('ChatPage — session-header activity toggle (relocated from the top ba
     expect(screen.getByRole('tooltip')).toHaveTextContent('Open activity panel')
   })
 
+  it('the toggle\'s tip does not come back stale after a click opens the panel and the panel closes again', async () => {
+    const { store } = renderWithSlot()
+    const btn = await screen.findByLabelText('Open activity panel')
+    fireEvent.mouseEnter(btn)
+    await screen.findByRole('tooltip')
+    // The click opens the panel, which takes the toggle away under the
+    // pointer: no mouseleave ever reaches it.
+    fireEvent.click(btn)
+    expect(store.getState().chat.activityOpen).toBe(true)
+    await waitFor(() => expect(screen.queryByLabelText('Open activity panel')).toBeNull())
+    // The side-panel chord closes it; the toggle returns with no tip up.
+    act(() => { window.dispatchEvent(new CustomEvent('toggle-activity-panel')) })
+    await screen.findByLabelText('Open activity panel')
+    expect(screen.queryByRole('tooltip')).toBeNull()
+  })
+
   it('stays live in the 768-880 band that used to disable it, and opens beside the chat', async () => {
     const { store } = renderWithSlot()
     await screen.findByLabelText('Open activity panel')
@@ -329,6 +346,8 @@ describe('ChatPage — session-header activity toggle (relocated from the top ba
     renderWithSlot()
     fireEvent.click(await screen.findByLabelText('Open activity panel'))
     expect(await screen.findByTestId('side-panel')).toHaveAttribute('data-fill-width', '')
+    // #23564: beside the chat, the transcript stays on screen.
+    expect(paneCovered(document)).toBe(false)
   })
 
   it('opens FILLING the chat column when the rail + sidebar leave too little', async () => {
@@ -336,6 +355,10 @@ describe('ChatPage — session-header activity toggle (relocated from the top ba
     resizeTo(800) // 800 - 236 - 260 = 304 < 640
     fireEvent.click(await screen.findByLabelText('Open activity panel'))
     expect(await screen.findByTestId('side-panel')).toHaveAttribute('data-fill-width', '320')
+    // #23564: filling needs no mark. It squeezes the transcript to zero width,
+    // which the on-screen backstop sees (its matrix covers that box), and a
+    // bottom-docked panel leaves the transcript on screen.
+    expect(paneCovered(document)).toBe(false)
   })
 
   it('switches an already-open panel from beside to fill on resize, without remounting it', async () => {
@@ -381,6 +404,9 @@ describe('ChatPage — activity toggle on mobile', () => {
     expect(store.getState().chat.activityOpen).toBe(true)
     // Mobile has no actbar grid column, so the panel renders inline.
     expect(await screen.findByTestId('side-panel')).toBeInTheDocument()
+    // #23564: open, it is an opaque overlay over the whole content area, so
+    // the transcript under it does not count as on screen.
+    await waitFor(() => expect(paneCovered(document)).toBe(true))
   })
 
   it('does not disable the toggle at widths below the desktop space threshold', async () => {
@@ -432,7 +458,7 @@ describe('ChatPage — message scroller contains its scroll', () => {
  */
 describe('ChatPage — focus-mode caption reserve on the title row', () => {
   beforeEach(() => { setWindowWidth(1400); localStorage.clear(); setSidePanelDock('right') })
-  afterEach(() => { document.getElementById('activity-bar-slot')?.remove(); setSidePanelDock('right') })
+  afterEach(() => { document.getElementById('activity-bar-slot')?.remove(); act(() => { setSidePanelDock('right') }) })
 
   function renderWithSlot() {
     const store = createTestStore()

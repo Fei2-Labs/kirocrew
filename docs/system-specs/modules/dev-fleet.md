@@ -46,7 +46,16 @@ behind that facade is split by state and lifecycle ownership:
   - `live_plan.py`: a cutover's dry-run plan, operator-facing text, and the Switch-back
     undo-binding check (`_undo_binding_holds`).
 - `fleet_state.py` owns PR/context/resource caches, fleet projections and tombstones, and
-  provision reattachment state.
+  provision reattachment state. PR status is cached for `_PR_TTL` (300 s); the context
+  `git log` is reused while the row's git facts key holds (`_CTX_LOG_CACHE`), and a log
+  over `_CTX_LOG_MAX_CHARS` (64 Ki chars) is used once and never kept.
+- `git_facts.py` owns the fleet view's per-worktree git facts cache (`_GIT_FACTS_CACHE`),
+  the shared base snapshot (`_BASE_SNAPSHOT`, one `for-each-ref` per base move) and
+  `_DIRTY_TTL`. The key is plain reads and stats of HEAD, the branch ref, the index and
+  `<remote>/<base>`: bounded `O_NOFOLLOW|O_NONBLOCK` regular-file reads, inside the
+  managed repo's `.git` layout only. Any refusal skips the cache and runs sandboxed git.
+  Display only: a row's `dirty` may lag an unstaged edit or untracked file by up to
+  300 s; removal and discard read git fresh.
 - `worktree_ops.py` owns rebase and prune orchestration and the background task handles.
   Its owners hold the rest:
   - `worktree_ops_pods.py`: pod actions and the per-worktree lock `_wt_lock`;
@@ -266,7 +275,7 @@ verification. Route names below are relative to that prefix.
 | `/apps/dev-fleet/api/prune-run` | `{names[], force_names?, discard_untracked_paths?}` | Batch-remove eligible worktrees. `force_names` is a list of names to force-remove (`400 invalid_force_names` otherwise); `discard_untracked_paths` maps a worktree name to its list of paths (`400 invalid_discard_paths` otherwise). The main checkout and the live or staged worktree are never forced |
 | `/apps/dev-fleet/api/pod/up` | `{name}` | Start isolated pod instance (re-verifies the unit is active). Boots with `--no-token`: this backend is sandboxed, so the pod would refuse its mint; the Open button gets the token from the gateway's `pod-token` route |
 | `/apps/dev-fleet/api/pod/down` | `{name}` | Stop pod instance (re-verifies the unit is gone before reporting success) |
-| `/apps/dev-fleet/api/pod/restart` | `{name}` | Stop then start pod (same `--no-token` boot as `pod/up`) |
+| `/apps/dev-fleet/api/pod/restart` | `{name}` | Restart the pod in place through `kirocrew pod restart`, keeping its isolated HOME. On Windows, where `pod restart` refuses, it stops then starts the pod and the HOME is reclaimed |
 | `/apps/dev-fleet/api/pod/token` | `{name}` | Refused with `code=wrong_process`: the mint moved to the gateway's `POST /api/apps/dev-fleet/pod-token` |
 | `/apps/dev-fleet/api/pod/provision` | `{name}` | Start async venv+dist build (returns `{run_id}`) |
 | `/apps/dev-fleet/api/pod/provision/dismiss` | `{name, run_id}` | Forget a terminal provision failure when the run id still matches |
@@ -312,10 +321,11 @@ internal-secret caller there would expose the app's whole backend surface.
 
 | Method | Route | Input | Description |
 |--------|-------|-------|-------------|
-| POST | `/api/apps/dev-fleet/pod/up` | `{worktree}` | Boot a pod; answers the CLI's `--json` handle (`base_url`, `token`, `port`, `ttl`). The token is minted **in the gateway process** when pod config is available (see *Token mint runs in the gateway*); otherwise the CLI mints it. Provisioning is NOT reachable here: a cold venv + SPA build is minutes of work, and one blocking request for that dies to any timeout with no way to learn the outcome. An unbuilt worktree is refused with the CLI's own remedy; the dashboard's Provision button streams the same work under a run id |
+| POST | `/api/apps/dev-fleet/pod/up` | `{worktree, memory?, cpu?}` | Boot a pod, passing `memory` / `cpu` to the CLI as `--memory` / `--cpu`; answers the CLI's `--json` handle (`base_url`, `token`, `port`, `ttl`). The token is minted **in the gateway process** when pod config is available (see *Token mint runs in the gateway*); otherwise the CLI mints it. Provisioning is NOT reachable here: a cold venv + SPA build is minutes of work, and one blocking request for that dies to any timeout with no way to learn the outcome. An unbuilt worktree is refused with the CLI's own remedy; the dashboard's Provision button streams the same work under a run id |
+| POST | `/api/apps/dev-fleet/pod/restart` | `{worktree, memory?, cpu?}` | Restart the pod in place through `kirocrew pod restart`, keeping its isolated HOME, and answer the same handle as `pod/up`. `memory` / `cpu` record new ceilings first |
 | POST | `/api/apps/dev-fleet/pod/down` | `{worktree}` | Stop the pod and reclaim its isolated HOME |
-| GET | `/api/apps/dev-fleet/pod/status?worktree=` | — | `{name, status, port, health}`, as `pod status --json` reports it |
-| GET | `/api/apps/dev-fleet/pod/list` | — | `{pods: [{name, port, health}]}` for every pod active on the host, unfiltered by repo |
+| GET | `/api/apps/dev-fleet/pod/status?worktree=` | — | `{name, status, port, health, memory, cpu}`, as `pod status --json` reports it |
+| GET | `/api/apps/dev-fleet/pod/list` | — | `{pods: [{name, port, health, memory, cpu}]}` for every pod active on the host, unfiltered by repo |
 
 Contract:
 
@@ -389,19 +399,20 @@ Contract:
   boots with `--no-token` but skips the mint, and `_pod_token` refuses with
   `code=wrong_process`. The Open button mints through the gateway's owner-only
   `POST /api/apps/dev-fleet/pod-token` instead.
-- **Refusals are 409 with a literal `code`** (`pod_up_failed`, `pod_down_failed`,
-  `pod_status_failed`, `pod_list_failed`); malformed input is 400
-  (`invalid_worktree`, `invalid_body`). A refused lifecycle op is a host-state
+- **Refusals are 409 with a literal `code`** (`pod_up_failed`, `pod_restart_failed`,
+  `pod_down_failed`, `pod_status_failed`, `pod_list_failed`); malformed input is 400
+  (`invalid_worktree`, `invalid_body`, `invalid_limit`). A refused lifecycle op is a host-state
   answer, not a gateway bug. `repository._repo()` raises when no main checkout is
   configured, and the read verbs catch that rather than letting a setup problem
   surface as a 500.
 - **Every lifecycle CHANGE and every guard denial is written to the Security Event
-  Log** under `dev_fleet.agent.*` (`pod_up`, `pod_down`, `machine_guard`): the caller
+  Log** under `dev_fleet.agent.*` (`pod_up`, `pod_restart`, `pod_down`, `machine_guard`): the caller
   is unattended, so the trail is what makes the run reviewable. The read verbs are
   not audited there — they change nothing, and the framework-level tool log already
   records the call.
 
-The model-facing half is the `pod_up` / `pod_down` / `pod_status` / `pod_ls` tools on
+The model-facing half is the `pod_up` / `pod_restart` / `pod_down` / `pod_status` /
+`pod_ls` tools on
 `kirocrew-core` (`mcp_tools/apps.py`). The pod token is returned to the agent
 verbatim — redacting it would hand back an unusable handle — which is safe because it
 is a credential scoped to that pod's own gateway, minted server-side from the
@@ -1276,6 +1287,23 @@ sentence names neither a single filesystem nor a single budget: the install writ
 both the scratch and the package cache, which need not share a filesystem, and
 each can exhaust bytes or file slots while the other looks healthy.
 
+**A fallback pass discloses that it rehearsed the wrong filesystem.** A pass
+earned in `TMPDIR` measured a room budget the real `npm ci` is not charged
+against, so a bare pass would be the silent twin of the loud out-of-room refusal
+this step exists to remove — the sync proceeds and the real install fails for room
+after the merge. So `_make_scratch` returns a third value, the fallback reason or
+`None`, and `probe` surfaces it on the pass `preflight:` line, which LEADS with
+the same `incoming lockfile is installable` affirmation a faithful pass gets and
+then appends the disclosure
+(`incoming lockfile is installable; rehearsed in TMPDIR rather than the checkout's filesystem (<reason>)`)
+— so the line still reads as a pass — without changing the verdict. The reasons are named apart because they merit different
+attention: the checkout path does not exist, the checkout is not writable, the
+checkout path could not be read (an `OSError` resolving it), the
+checkout's git does not yet hide the scratch name (the ignore rule ships
+separately from the probe code, so a checkout on an older ref has none — the one
+reason that self-heals when the checkout advances), and the checkout refused the
+directory with a non-out-of-room error. A repo-hosted pass keeps the generic line.
+
 **Abandoned scratch directories are swept before a new one is created.** `probe`
 removes its own in a `finally`, so what survives is a run that never reached it —
 SIGKILL, an OOM kill, a reboot. `/tmp` was age-cleaned by the host; the checkout
@@ -1938,7 +1966,8 @@ Two different jobs live in that one dict, and they are worth keeping apart:
 - **What git writes on a read.** `GIT_OPTIONAL_LOCKS=0` is also not a config key.
   `git status` refreshes the index's stat cache and saves it back under
   `index.lock`, so a command that is a read to its caller is a **write** to the
-  repository. Every fleet render runs one per row, so without this the fleet
+  repository. The fleet render runs one per row whose cached `dirty` is older than
+  `_DIRTY_TTL` (300 s), and one per row whose git facts key moved, so without this the fleet
   contends with the operator's own git for the lock on the ordinary path. Pinned on
   the env chokepoint rather than as `--no-optional-locks` per call site, so the argv
   this module builds keeps naming just its subcommand and a read added later

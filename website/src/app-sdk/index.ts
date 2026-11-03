@@ -28,6 +28,7 @@ import { AppQueryClientProvider } from './appQueryClient'
 // The scoped-API layer, kept in its own module so it is NOT published on this
 // barrel -- see the header of ./scopedApi for why.
 import { useCtx, AppScopedApiProvider, type AppApi, type AppInfo, type AppUpdate } from './scopedApi'
+import type { SlotPush } from './slotPush'
 // Re-exported as TYPES: the barrel<->vendor-stub parity gate counts value
 // exports, and a type vanishes at runtime, so an app author keeps these names
 // without the stub needing an entry it could not provide.
@@ -92,7 +93,7 @@ const WS_SLOT_SCOPED_EVENTS = new Set([
   // Voice
   'voice_chunk', 'voice_complete', 'voice_error',
   // Approvals and question cards
-  'approval', 'approval_resolved', 'question_card',
+  'approval', 'approval_resolved', 'question_card', 'elicitation_resolved',
   // Subagent lifecycle
   'subagent_spawn', 'subagent_done', 'subagent_tool', 'subagent_chunk',
   'subagent_snapshot', 'subagent_status', 'subagent_queued',
@@ -410,6 +411,7 @@ export function AppApiProvider({
   navigateFn,
   notifyFn,
   sessionKey,
+  slotPush,
   origin = 'external',
   children,
 }: {
@@ -445,6 +447,8 @@ export function AppApiProvider({
    * provide the real key so the backend's restricted-session guard can run.
    */
   sessionKey?: string
+  /** The host's per-slot change signal; forwarded to the scoped layer. */
+  slotPush?: SlotPush
   origin?: AppOrigin
   children: ReactNode
 }) {
@@ -461,6 +465,7 @@ export function AppApiProvider({
     navigateFn,
     notifyFn,
     sessionKey,
+    slotPush,
     children,
   })
   if (existing) return scoped

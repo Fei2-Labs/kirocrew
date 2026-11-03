@@ -1,8 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { useProvider } from '../providers'
-import { lastKnownBackend, servesAutoModel } from '../providers/adapters/acp'
-import { modelListRefetchInterval, modelListScope, useModelsDegraded } from '../providers/modelListHealth'
+import { modelHealthKey, modelListRefetchInterval, useModelsDegraded } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
 
@@ -12,12 +11,6 @@ import type { ModelInfo } from '../providers/types'
  *  is a catalog key resolved where it renders, not an English literal living in
  *  a data module. */
 const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
-
-/** Nothing known yet. A separate frozen constant rather than a fresh `[]` per
- *  call: the return value is a hook result read into render paths and effect
- *  deps, so a new array identity on every render is a re-render loop waiting to
- *  happen. */
-const EMPTY: ModelInfo[] = []
 
 /**
  * THE model list. Every picker reads it through here.
@@ -50,47 +43,40 @@ const EMPTY: ModelInfo[] = []
  * kiro-cli. Other mounted observers still fetch normally — `enabled` gates who
  * *triggers* a fetch, not what lands in the cache.
  *
- * `slot` / `backend` scope the cache entry. A live chat — including
- * ChatSidebar's bulk switcher — passes the session's harness so the picker
- * does not list the *next* default after a backend save, and does not flash
- * Auto on a harness that does not serve it. Settings and other new-session
- * pickers pass the configured backend (or omit both, which is the kiro /
- * unknown-config key).
+ * `backend` is the `models_backend` the server names for a session or crew on
+ * another harness than the configured one: that harness's list gets its own key,
+ * so it never replaces the configured list the other pickers read.
  */
-type AvailableModelsOptions = {
-  enabled?: boolean
-  slot?: string
-  backend?: string | null
+type AvailableModelsOptions = { enabled?: boolean; backend?: string }
+
+/** The cache key of the configured list, or of `backend`'s own list. */
+export function modelsQueryKey(providerId: string, backend?: string): readonly unknown[] {
+  return backend === undefined ? ['available-models', providerId] : ['available-models', providerId, backend]
 }
 
-export function useAvailableModelsQuery({ enabled, slot, backend }: AvailableModelsOptions = {}) {
+export function useAvailableModelsQuery({ enabled, backend }: AvailableModelsOptions = {}) {
   const provider = useProvider()
-  const intendedBackend = backend ?? ''
-  const scope = modelListScope(slot, intendedBackend)
-  // Read the flag for THIS scope: the adapter stamps a config-namespace failure
-  // on the scoped key only, so the unscoped flag would stay green for Settings.
-  const isDegraded = useModelsDegraded(provider.id, scope)
+  const isDegraded = useModelsDegraded(modelHealthKey(provider.id, backend))
   const query = useQuery({
-    queryKey: ['available-models', provider.id, scope],
-    queryFn: async () =>
-      withAutoFirst(
-        await provider.fetchAvailableModels(slot ? { slot, scope } : { scope }),
-      ),
+    queryKey: modelsQueryKey(provider.id, backend),
+    queryFn: async () => withAutoFirst(await provider.fetchAvailableModels(backend)),
     refetchInterval: modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })
-  // `query.data` is undefined only before the first fetch resolves for this key.
-  // The placeholder is a SYNTHETIC Auto row, so it may only be offered on a
-  // backend that serves `auto` — otherwise the picker's very first paint shows
-  // one row, it is the only thing to pick, and the id is rejected at the wire.
-  // After a default-harness switch the last-known cache is still the previous
-  // namespace, so showing Auto (or that namespace's rows) for the new key is
-  // the flash this placeholder exists to prevent.
-  let data: ModelInfo[]
-  if (query.data) data = query.data
-  else if (intendedBackend && intendedBackend !== (lastKnownBackend() ?? '')) data = EMPTY
-  else data = servesAutoModel() ? PLACEHOLDER : EMPTY
-  return { ...query, data, isDegraded }
+  return {
+    // Getters, not a `...query` spread. React Query re-renders an observer
+    // only for the result fields it read, and a spread reads every field, so
+    // each fetch's `isFetching`/`fetchStatus`/`dataUpdatedAt` flips re-rendered
+    // ChatPage and every split pane even when the model list was unchanged.
+    // A getter reads its field only when the caller does.
+    get data() { return query.data ?? PLACEHOLDER },
+    get error() { return query.error },
+    get isError() { return query.isError },
+    get isFetching() { return query.isFetching },
+    get isSuccess() { return query.isSuccess },
+    refetch: query.refetch,
+    isDegraded,
+  }
 }
 
 export function useAvailableModels(options: AvailableModelsOptions = {}): ModelInfo[] {

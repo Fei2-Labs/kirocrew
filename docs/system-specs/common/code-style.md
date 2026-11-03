@@ -127,7 +127,7 @@ recorded in `.github/black-baseline.txt` and exempted; every other file must be
 clean, and a file that *becomes* clean must be pruned from the list, so it only
 ever shrinks. Prune with `python3 scripts/check_black_formatting.py
 --update-baseline`; it refuses unless the installed black equals the
-`pyproject.toml` pin (`black==26.3.1`). The read-only check does not need the pin. Format what you touched with
+`pyproject.toml` pin (`black==26.10.1`). The read-only check does not need the pin. Format what you touched with
 `black --target-version py310 <paths>`, never the whole tree.
 
 **On macOS, run `mypy --platform linux src/kiro_crew`.** CI type-checks on Linux, and
@@ -191,8 +191,8 @@ that were each green can together push a file over the cap.
 | A listed file that grew past its row | Reported, not failed. It must not grow; split it. |
 | A malformed or unsorted baseline | Fails. |
 
-Backend Lint and Frontend Lint run the script on the full history and enforce
-the scoped verdict, and the main ratchet audit judges the whole tree, so main
+CI's `backend-ratchets` and `frontend-ratchets` jobs run the script on the full
+history and enforce the scoped verdict, and the main ratchet audit judges the whole tree, so main
 drift turns red there. The test runs on the backend shards' shallow checkout,
 which cannot tell which files a change touched, so there it reports violations
 without failing.
@@ -249,7 +249,12 @@ family keeps two rules:
 that imports its facade or rebinds a shared global, fails a facade no test patches through,
 and executes only a few patches per facade. Each facade also gets a patch-reach test that
 executes every name the test trees patch through it (read with `test/facade_mirror_scan.py`)
-and proves the scan finds known seams (`test/test_session_pid_facade.py`).
+and proves the scan finds known seams (`test/test_session_pid_facade.py`). A check whose
+body is the same for every facade (the known-seam scan, the corpus-gate derivation, the
+layering, manifest and logger scans) is written once in `test/test_facade_shared_checks.py`
+and parametrized per module: a facade test file names the ones it needs in a module-level
+`SHARED_FACADE_CHECKS` tuple instead of copying their bodies, and keeps only the checks
+particular to its facade.
 
 **A large class keeps one class body**, in the facade or in one home module that sets
 `__module__` to the facade when a pickle, repr or test reads it. Members move to owners as
@@ -258,8 +263,9 @@ functions taking `self`, and the body binds each as a one-line attribute
 with no new mixin or base class (`src/kiro_crew/acp/session_handle_class.py`). A member
 that uses zero-argument `super()`, `__class__` or a name-mangled attribute stays in the
 body. Keep `__module__` and `__qualname__` wherever anything reads them: moved exception
-classes keep the facade's name because error text renders it, and a family-scoped helper
-(`_own_methods` there) renames each bound function `<Class>.<name>`. An owner logs under
+classes keep the facade's name because error text renders it, and the shared helper
+`kiro_crew._facade_bindings.own_methods(cls, owners)` renames each function the class binds
+from a module in its explicit owner set `<Class>.<name>`. An owner logs under
 the original module's logger, `logging.getLogger("kiro_crew.<original>")`: the log format
 prints the logger name, and `caplog` tests filter on it.
 

@@ -75,6 +75,12 @@ def add_kas_parser(parser: argparse.ArgumentParser) -> None:
         "--version", default=None, help="Delete only this version (default: every version)"
     )
     remove.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    # The sign-in verbs (login / whoami / logout / route) live beside the engine
+    # verbs because they share the route: on the bundle route the vault is the
+    # engine's only credential. Their wording and flow are cli_kas_login's.
+    from kiro_crew.cli_kas_login import add_kas_login_parsers
+
+    add_kas_login_parsers(sub)
 
 
 def _progress_printer():
@@ -156,7 +162,7 @@ def _install(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            # Asked before any fetch, so re-running `install.sh --kas` on a machine
+            # Asked before any fetch, so re-running an installer on a machine
             # that already has the engine succeeds offline too.
             present = _already_installed(version, args.force)
             if present is not None:
@@ -244,20 +250,35 @@ def _status(_args: argparse.Namespace) -> int:
 
 def _remove(args: argparse.Namespace) -> int:
     root = kas_bundle.kas_engines_root()
-    if args.version:
+    # Removing every version is the flag left OUT, never a blank one. A blank
+    # --version (an unset "$VAR") is refused before anything is read or deleted:
+    # read as falsy it would widen a one-version delete to the whole engines root.
+    if args.version is not None and not args.version.strip():
+        print("❌ --version is blank; omit it to remove every version", file=sys.stderr)
+        return 2
+    if args.version is not None:
         if args.version not in kas_bundle.installed_versions(root=root):
-            print(f"KAS {args.version} is not installed")
-            return 0
+            print(f"❌ KAS {args.version} is not installed", file=sys.stderr)
+            return 1
         root = root / args.version
     if not root.exists():
         print("nothing installed")
         return 0
     if not args.yes:
-        answer = input(f"Delete {root} and every engine under it? [y/N] ").strip().lower()
+        try:
+            answer = input(f"Delete {root} and every engine under it? [y/N] ").strip().lower()
+        except EOFError:
+            # No terminal to answer on (piped or closed stdin) reads as "no".
+            print("\naborted: no answer on stdin; pass --yes to remove without asking")
+            return 1
         if answer not in ("y", "yes"):
             print("aborted")
             return 1
-    shutil.rmtree(root)
+    try:
+        shutil.rmtree(root)
+    except OSError as exc:
+        print(f"❌ could not remove {root}: {exc}", file=sys.stderr)
+        return 1
     print(f"removed {root}")
     return 0
 
@@ -270,5 +291,10 @@ def kas_cmd(args: argparse.Namespace) -> int:
         return _status(args)
     if action == "remove":
         return _remove(args)
-    print("usage: kirocrew kas {install,status,remove}", file=sys.stderr)
+    from kiro_crew.cli_kas_login import kas_login_cmd
+
+    handled = kas_login_cmd(args)
+    if handled is not None:
+        return handled
+    print("usage: kirocrew kas {install,status,remove,login,whoami,logout,route}", file=sys.stderr)
     return 2

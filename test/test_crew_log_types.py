@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from crew_log_drain import assert_drained
 
 from kiro_crew.crew_log import (
     CODE_BAD_DATA_FIELD,
@@ -109,6 +110,19 @@ CANONICAL: dict[str, dict] = {
         "chars": 4000,
         "tokens": 1000,
         "tokens_estimated": True,
+    },
+    "context/measured": {
+        "turn": 3,
+        "turn_id": "e-01",
+        "breakdown": {
+            "schema": 1,
+            "categories": {"history": 4000, "toolSpecs": 2865},
+            "model_calls": 1,
+            "total_chars": 6865,
+            "compacted": True,
+            "history": {"user": 3990, "assistant": 5, "thinking": 5, "compaction_summary": 0},
+        },
+        "ttft": {"total_ms": 2870, "setup_ms": 59, "model_ms": 1534},
     },
     "step/started": {"turn": 3, "step": 1},
     "step/completed": {"turn": 3, "step": 1, "ms": 900},
@@ -239,6 +253,14 @@ CANONICAL: dict[str, dict] = {
         "event": "progress: scoped tests green",
         "event_kind": "report",
     },
+    "work/charged": {
+        "slot": "dashboard:3",
+        "by": "dashboard:9",
+        "source": "turn",
+        "closer": "acp-worker:41",
+        "credits": 0.25,
+        "duration_ms": 1200,
+    },
     "panel/published": {
         "template": "default",
         "data": {"cycle": 47, "waiting_on_you": 1, "holding": 6},
@@ -314,6 +336,19 @@ CANONICAL: dict[str, dict] = {
                 "asked_at": "2026-10-18T18:40:00+00:00",
             }
         ]
+    },
+    "dashboard/custom_value": {
+        "type": "stock_check",
+        "data": {"symbol": "AMZN", "price": 187.4, "checked_at": "2026-10-26T18:00:00+00:00"},
+        "writer": "cron:stock-poll",
+        "member": "trader",
+        "crew_key": "9f2c" + "0" * 60,
+    },
+    "dashboard/custom_failed": {
+        "writer": "cron:stock-poll",
+        "error": "crew_log_append() failed: quota_exceeded",
+        "member": "trader",
+        "crew_key": "9f2c" + "0" * 60,
     },
     "guide/finished": {"guide_id": "g_0a1b2c3d4e5f", "status": "completed"},
     # A whole working set lost at once: of sixteen listed tabs none comes back, and
@@ -404,7 +439,17 @@ def test_every_type_written_today_is_declared_and_nothing_else_is():
     # The two past that are a crewmate's own record for its Dashboard page:
     # ``dashboard/goal_recorded`` and ``dashboard/waiting_changed``, snapshots the gateway
     # appends when the goal record or the "waiting on you" list changes.
-    assert len(SESSION_ENTRY_TYPES) == 47
+    #
+    # The one past those is ``context/measured``: the agent engine's own measurement of
+    # a turn's context, which the ``usage`` fold attaches to that turn's composition row.
+    #
+    # The one past that is ``dashboard/custom_value``: a record a script cron appends
+    # for its crewmate through the record door, which the ``custom`` fold keeps the
+    # latest of per type.
+    #
+    # The one past that is ``dashboard/custom_failed``: a member-bound script cron's
+    # failed run, which the same fold marks on that writer's records.
+    assert len(SESSION_ENTRY_TYPES) == 51
     # Nine types the vocabulary owns that nothing writes. Declaring one would state
     # a shape no writer produces, and the first emitter to land would have to
     # satisfy a contract written without it. They pass through undeclared instead.
@@ -473,6 +518,9 @@ def test_only_a_vocabulary_the_writer_clamps_is_enforced():
         ("radar/recorded", "phase"),
         ("radar/recorded", "scope"),
         ("radar/recorded", "event_kind"),
+        # The relay sets ``source`` from its own closer-type table, so no other value
+        # can reach the entry.
+        ("work/charged", "source"),
         # The work ledger clamps every one of these before it builds the entry:
         # the vocabularies are declared beside the type and the writer imports
         # them, so the closed enum and the writer's refusal are one set.
@@ -595,11 +643,13 @@ def _types_the_writers_append() -> dict[str, bool]:
 
 def _writer_files():
     """The writers' source files: the emitter facade with its ``emit_*.py`` owners, its
-    durable writer, and the store facade with its ``store_*.py`` owners, where the
-    crash-repair closer lives."""
-    emit_files = sorted(Path(emit.__file__).parent.glob("emit*.py"))
+    durable writer, the work relay that appends copies into a board's log, and the store
+    facade with its ``store_*.py`` owners, where the crash-repair closer lives."""
+    crew_log_dir = Path(emit.__file__).parent
+    emit_files = sorted(crew_log_dir.glob("emit*.py"))
     store_files = sorted(Path(store_mod.__file__).parent.glob("store*.py"))
-    return [*emit_files, Path(writer_mod.__file__), *store_files]
+    relay = crew_log_dir / "work_relay.py"
+    return [*emit_files, Path(writer_mod.__file__), relay, *store_files]
 
 
 def _walk(fields):
@@ -1059,7 +1109,7 @@ def test_every_entry_a_real_turn_produces_validates():
         context_window=200_000,
     )
     emit.on_session_closed(SESSION, "reset")
-    assert emit.flush(timeout=5.0)
+    assert_drained()
     assert emit.dropped_writes() == 0
     body = _entries()[1:]
     assert body, "the emitter wrote nothing"
@@ -1089,7 +1139,7 @@ def test_every_entry_a_real_turn_produces_validates():
 def test_an_oversize_body_and_its_chunk_group_validate():
     emit.on_session_opened(SESSION, agent="kirocrew", owner="default")
     emit.on_message_sent(SESSION, 1, step=1, text="x" * 200_000)
-    assert emit.flush(timeout=5.0)
+    assert_drained()
     body = _entries()[1:]
     kinds = [entry["type"] for entry in body]
     assert "message/chunk" in kinds and "message/sent" in kinds
@@ -1128,7 +1178,7 @@ def test_the_failed_turn_closer_validates_without_credits_or_tokens():
     emit.on_session_opened(SESSION, agent="kirocrew", owner="default")
     emit.on_turn_started(SESSION, 1, "user")
     emit.on_turn_failed(SESSION, 1, error="AcpError", duration_ms=12, model="c", provider="kiro")
-    assert emit.flush(timeout=5.0)
+    assert_drained()
     closer = [e for e in _entries()[1:] if e["type"] == "turn/completed"][-1]
     assert "credits" not in closer["data"] and "tokens" not in closer["data"]
     validate_data("session", "turn/completed", closer["data"])
@@ -1153,7 +1203,7 @@ def test_the_measured_turn_closer_validates_with_credits_and_no_tokens():
         model="c",
         provider="kiro",
     )
-    assert emit.flush(timeout=5.0)
+    assert_drained()
     closer = [e for e in _entries()[1:] if e["type"] == "turn/completed"][-1]
     assert closer["data"]["credits"] == 0.42
     assert "tokens" not in closer["data"]

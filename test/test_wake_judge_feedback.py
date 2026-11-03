@@ -183,12 +183,11 @@ class TestMutatingToolReading:
         """There is no read-only MCP tier, and this is the pin that keeps it that way.
 
         Read-shaped and write-shaped names, first-party servers and third-party ones: all
-        mutating. Some read-shaped tools lazily build what they serve on ordinary
-        cold-cache paths, and a name-based allowlist cannot establish that a tool
-        cannot write. No
-        authority exists to check such a claim for MCP, unlike the built-in tier which
-        derives from the approval gate's own scope table, so the tier was removed rather
-        than corrected a fourth time.
+        mutating. A tool whose name reads can still lazily BUILD what it serves, on an
+        ordinary cold-cache path, and a list of read-only names is a set of unchecked
+        claims that a tool cannot write. No authority exists to check such a claim for
+        MCP, unlike the built-in tier which derives from the approval gate's own scope
+        table.
         """
         assert judge.tool_changed_something(name, server, identity_trusted=True) is True
 

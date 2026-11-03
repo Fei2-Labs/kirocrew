@@ -100,6 +100,14 @@ async def api_chat_slots(request: web.Request) -> web.Response:
             for p in payloads
             if member_owns_slot(state, state._slots.get(str(p.get("key") or "")), caller_key)
         ]
+    # A person's list leaves Crew Mode workers out; an agent's read keeps them
+    # (``crew_mode.list_view``). Imported here: this body is re-bound into the
+    # ``chat_handlers`` facade's namespace, so it may name only what it imports.
+    from kiro_crew import crew_mode
+
+    payloads = crew_mode.list_view(
+        payloads, request.query.get("crew", ""), agent=request.get("internal_auth") is True
+    )
     if include_check_status:
         # Only the OWNER's GET drives provider work. Both the visibility probe
         # and the status refresh run the operator's `gh`/`glab` credentials, so
@@ -341,7 +349,7 @@ def _same_persisted_body(
 
 
 def _is_answered_permission(m: dict) -> bool:
-    """True for a ``permission`` row whose approval has already been answered.
+    """True for a ``permission`` or ``elicitation`` row that has already been answered.
 
     A permission row is never persisted, so it is always owed and therefore always
     lands in the tail — i.e. after every row that DID reach disk. For a pending
@@ -357,7 +365,7 @@ def _is_answered_permission(m: dict) -> bool:
     ``!meta.resolved`` test (``store/chat/selectors.ts`` ``selectSlotPendingApproval``), so an
     empty decision still counts as pending and an actionable approval is never lost.
     """
-    if m.get("role") != "permission":
+    if m.get("role") not in ("permission", "elicitation"):
         return False
     meta = parse_cls_meta(m.get("cls", "")) or {}
     return bool(meta.get("resolved"))
@@ -1258,6 +1266,9 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     turn_running = slot.turn_running
     verdict_key = slot_history_key(slot)
     running = slot.running
+    from kiro_crew.shared_crew.admission_entry import admission_pending
+
+    admission_queued = admission_pending(key)
     # A turn another path runs on this slot's linked session (the Slack thread a
     # channel-born tab is bound to) has no task here but IS in flight: the same
     # read the slots summary makes, so the open pane and the sidebar agree and
@@ -1372,7 +1383,12 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                 # LLM-generated or set by a rename, so they are content, not
                 # configuration.
                 "title": _redact_for_display(display_title),
+                # A turn waiting in fair admission is still the accepted,
+                # in-flight turn: ``running`` stays true so the composer keeps
+                # its Stop control, and ``admission_queued`` says it has not
+                # started yet (``shared_crew.admission_entry.admission_pending``).
                 "running": running,
+                "admission_queued": admission_queued,
                 **turn_identity,
                 "stopping": stopping,
                 "stop_state": stop_state,

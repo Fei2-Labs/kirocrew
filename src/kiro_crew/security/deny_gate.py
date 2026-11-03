@@ -34,6 +34,7 @@ from kiro_crew.executors import maintenance_executor
 from kiro_crew.security import _submodule, logger
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
 
+from .shell_commands import sharing_views
 from .text_redaction import redact_and_truncate
 
 if TYPE_CHECKING:
@@ -273,6 +274,8 @@ def _deny_segment_views(segment: str, emit_self: bool = True) -> tuple[str, ...]
             payloads = _shell_normalizer._nested_shell_payloads(
                 tokens, allow_join=allow_join, joined_out=joined_here
             )
+            # A redirect before the ``-c`` operand hides the script from the payloads.
+            payloads = [*payloads, *_submodule("shell_commands").redirect_hidden_payloads(source)]
             programs = _shell_normalizer._argv_programs(tokens) if payloads else []
             # Both values below read ONLY ``tokens``, which is fixed for this
             # whole walk, so they are charged ONCE here instead of once per
@@ -416,29 +419,7 @@ def _inline_interpreter_bindings(text: str) -> str:
     return _INTERP_IDENT_RE.sub(lambda m: bindings.get(m.group(0), m.group(0)), text)
 
 
-def _git_publication_floor_applies() -> bool:
-    """Whether the verb-anchored git-publication floor should deny at all.
-
-    Reads the keystone ``workflow_policy.json`` (see ``workflow_policy.py``),
-    which the agent can neither read nor write, so this is an operator decision
-    and not a value a prompt-injected shell can reach. Fails to ``True`` -- the
-    floor APPLIES -- on any error: an unreadable ceiling must not be read as
-    permission, and this predicate is the only thing standing between the agent
-    and an unparsed push target.
-
-    The ``workflow_policy`` import stays function-local for the same reason the
-    ``config.loader`` one does elsewhere: it keeps this module's import graph
-    independent of the loader's.
-    """
-    try:
-        from kiro_crew import workflow_policy
-
-        return workflow_policy.git_publication_floor_applies()
-    except Exception:
-        logger.debug("workflow policy read failed; git-publication floor applies", exc_info=True)
-        return True
-
-
+@sharing_views
 def is_denied(
     tool_name: str,
     extra_patterns: list[str] | None = None,
@@ -561,11 +542,13 @@ def is_denied(
 
     glob_patterns = list(extra_patterns or [])
     if denied_regexes is None:
-        regex_patterns = _rules.compute_effective_denied(
+        denied_regexes = _rules.compute_effective_denied(
             _rules.BUILTIN_DENIED_RULES, (), False, (), ()
         )
-    else:
-        regex_patterns = list(denied_regexes)
+    # Which entries are shipped-only, as the resolver recorded it. A list that
+    # did not come from ``compute_effective_denied`` carries none and narrows none.
+    shipped: frozenset[str] = getattr(denied_regexes, "shipped", frozenset())
+    regex_patterns = list(denied_regexes)
     # Capture which git-publish rules are still ENABLED *before* the strip below
     # removes their patterns from the regex tier. Computing this afterwards would
     # always yield the empty set and the floor would never fire — a silent, total
@@ -575,6 +558,13 @@ def is_denied(
     # under backtracking and are already enforced by the ``_is_git_publish`` floor
     # below (see ``_GIT_PUBLISH_RULE_PATTERNS``).
     regex_patterns = [p for p in regex_patterns if p not in _rules._GIT_PUBLISH_RULE_PATTERNS]
+    # The chmod/chown rows are matched on argv (``argv_rules``), not as regexes: run
+    # across a whole compound command, their text matched words of OTHER commands
+    # (``chmod +x a && ls /usr/lib`` read as a chmod on /usr). Same capture-then-strip
+    # as git-publish, so a disabled row stays disabled.
+    _argv_rules = _submodule("argv_rules")
+    argv_enabled = {p for p in regex_patterns if p in _argv_rules.ARGV_RULE_PATTERNS}
+    regex_patterns = [p for p in regex_patterns if p not in _argv_rules.ARGV_RULE_PATTERNS]
     # The two self-protection rules get an ADDITIONAL argv-structural floor
     # below, for the reason documented on ``_SELF_PROTECTION_FLOOR_PATTERNS``:
     # only a tokenized view can tell ``kirocrew "token"`` from
@@ -651,16 +641,7 @@ def is_denied(
     # keeps the per-rule opt-out semantics exactly as written -- a rule an operator
     # disabled stays disabled at whatever depth it fires.
     publish_sources = [source for source in payload_sources if _argv._is_git_publish(source)]
-    if publish_sources and not _git_publication_floor_applies():
-        # REPOSITORY-GOVERNED mode: the operator has declared the remote host's
-        # controls (rulesets, branch protection, required reviews and checks)
-        # authoritative for publication, so Kiro Crew stops parsing branch names.
-        # The push still falls through to every other tier below -- credential
-        # exfiltration, self-protection, sensitive paths, the destructive-command
-        # rules -- and ``push_allow_pending`` keeps the ALLOW audit, so the event
-        # log records the push either way. Only the branch-name floor stands down.
-        push_allow_pending = True
-    elif publish_sources:
+    if publish_sources:
         floor_tags: frozenset[str] = frozenset()
         for publish_source in publish_sources:
             floor_tags |= _argv._git_publish_floor_tags(publish_source)
@@ -775,7 +756,6 @@ def is_denied(
     for rule_id, predicate in (
         ("self-protection-restart", _argv._is_self_restart),
         ("self-protection-update", _argv._is_self_update),
-        ("self-protection-file-delivery", _argv._is_self_file_delivery),
         ("self-protection-gateway-restart", _argv._is_self_gateway_restart),
         ("self-protection-cloud", _argv._is_self_cloud_destructive),
         ("self-protection-skills-authority-retire", _argv._is_self_skills_authority_retire),
@@ -790,7 +770,7 @@ def is_denied(
             )
 
     # ── Pattern passes (shared with the synthesized tier's ``segments=True``) ──
-    pattern_denial = _deny_pattern_passes(tool_name, lower, all_patterns, _reason)
+    pattern_denial = _deny_pattern_passes(tool_name, lower, all_patterns, _reason, shipped)
     if pattern_denial is not None:
         return pattern_denial
     # ── Recursive-force rm floor (argv-structural, UNION with the regex) ──
@@ -806,16 +786,31 @@ def is_denied(
     if rm_enabled and _rm._can_fire(tool_name):
         note = _rm._RM_FLOOR_NOTE
         try:
-            rm_targets = _rm._rm_wipe_targets(tool_name)
-        except Exception as exc:  # incl. RecursionError and the depth cap
-            # Fail closed: a command the floor cannot read may hide a wipe.
-            logger.warning("rm floor could not read the command, refusing: %r", exc)
-            rm_targets, note = set(rm_enabled), _rm._RM_FLOOR_UNREAD_NOTE
+            rm_targets = _rm._rm_wipe_targets_nested(tool_name)
+        except Exception as exc:  # incl. RecursionError
+            # Fail closed for a command naming rm as a word; letters inside
+            # another word (``--format``) are not a command the floor reads.
+            logger.warning("rm floor could not read the command: %r", exc)
+            rm_targets = set(rm_enabled) if _rm._names_rm_word(tool_name) else set()
+            note = _rm._RM_FLOOR_UNREAD_NOTE
         for kind in sorted(rm_targets & rm_enabled.keys()):
             rule_id, pattern = rm_enabled[kind]
             # The raw input, not ``lower``: see the audit note below.
             _emit_deny_event(tool_name, pattern, tool_name)
             return _reason(pattern, note, rule=rule_id, component="argv-floor")
+    # ── Argv rules (chmod/chown: mode 777, system dirs) ──
+    # Read from the raw input: paths and modes are case-sensitive.
+    if argv_enabled:
+        argv_rule_id = _argv_rules.argv_rule_hit(tool_name, argv_enabled)
+        if argv_rule_id is not None:
+            pattern = _argv_rules.ARGV_RULE_BY_ID[argv_rule_id]
+            _emit_deny_event(tool_name, pattern, tool_name)
+            return _reason(
+                pattern,
+                _argv_rules.ARGV_RULE_NOTE,
+                rule=argv_rule_id,
+                component="argv-floor",
+            )
     # All windows cleared the deny passes — the input is allowed.  If it was a
     # feature-branch push, emit the deferred allow audit now (final outcome).
     #
@@ -840,17 +835,19 @@ def _deny_pattern_passes(
     lower: str,
     all_patterns: list[tuple[str, bool]],
     reason: "Callable[[str], str]",
+    shipped: frozenset[str] = frozenset(),
 ) -> str | None:
     """Run :func:`is_denied`'s whole-string and per-segment passes over *all_patterns*.
 
-    Exceptions and the perm-verb narrowing apply as there; no floor runs here.
+    Exceptions and the s3 download narrowing apply as there; no floor runs here.
+    *shipped* gates the s3 download narrowing to shipped-only patterns.
     """
     _rules = _submodule("denied_rules")
     _shell = _submodule("shell_normalizer")
 
-    # Memoizes the argv-structural mention walk per view: the same view is asked
-    # about once per matching pattern, and every opted-in pattern can match.
-    mention_cache: dict[str, bool] = {}
+    # Memoizes the s3 download reading per command: the same command is asked
+    # about once per matching segment.
+    narrow_cache: dict[str, bool] = {}
 
     # ── Pass 1: whole-string deny ──
     # If any pattern matches the full input AND no exception matches the
@@ -867,16 +864,14 @@ def _deny_pattern_passes(
             whole_string_exception_match = _rules._exception_applies(
                 lower, _rules._DENY_EXCEPTIONS.get(pattern, [])
             )
-            if not whole_string_exception_match and _perm_verb_mention_narrows(
-                pattern, lower, mention_cache
+            if not whole_string_exception_match and _s3_download_narrows(
+                pattern, lower, narrow_cache, tool_name, shipped
             ):
                 # Same shape as the glob exception above: a whole-string carve-out
                 # only DEFERS to Pass 2, which re-judges each segment on its own,
                 # so an embedded real invocation is still denied there.  The audit
-                # is emitted here (and GATES the carve-out) because for a search
-                # whose verb and path land in different segments Pass 2 never
-                # matches, so this is the only place the decision is recorded.
-                if _emit_deny_exception_event(tool_name, pattern, _PERM_VERB_MENTION_MECHANISM):
+                # is emitted here and GATES the carve-out.
+                if _emit_deny_exception_event(tool_name, pattern, _S3_DOWNLOAD_MECHANISM):
                     whole_string_exception_match = True
             if not whole_string_exception_match:
                 _emit_deny_event(tool_name, pattern, lower)
@@ -937,28 +932,11 @@ def _deny_pattern_passes(
                 if _rules._deny_pattern_matches(pattern, view, is_regex):
                     if _rules._exception_applies(
                         view, _rules._DENY_EXCEPTIONS.get(pattern, [])
-                    ) or _perm_verb_mention_narrows(pattern, lower, mention_cache):
-                        # ``lower``, not ``view``: the mention reading is a
-                        # WHOLE-COMMAND judgement and a Pass 2 segment is not
-                        # always a command.  ``_split_segments`` is deliberately
-                        # quote-unaware, so a quoted alternation is severed
-                        # mid-literal and the tail arrives looking like an
-                        # invocation -- ``rg -n 'chmod|chown' /etc/profile.d``
-                        # yields the fragment ``chown' /etc/profile.d``, whose
-                        # first word IS the verb.  Judging that fragment refuses
-                        # a search that runs nothing.  Nothing is lost by asking
-                        # about the whole command instead: the predicate demands
-                        # that EVERY occurrence, in the command and in every
-                        # nested payload, sit at an argument position, and a
-                        # chained real invocation is exactly an occurrence in
-                        # program position -- ``_ends_argv`` cuts the argv at
-                        # ``;`` ``&&`` ``||`` ``|`` and at a subshell or brace
-                        # opener, so the embedded command's own verb leads its
-                        # own argv and refuses the whole exemption.  A newline
-                        # separator, which ``shlex`` would swallow as
-                        # whitespace, is refused outright by the predicate.
+                    ) or _s3_download_narrows(pattern, lower, narrow_cache, tool_name, shipped):
+                        # ``lower``, not ``view``: the s3 reading judges the WHOLE
+                        # command, since a Pass 2 segment is not always a command.
                         if not _emit_deny_exception_event(
-                            tool_name, pattern, _perm_verb_mechanism_for(pattern)
+                            tool_name, pattern, _deny_exception_mechanism_for(pattern)
                         ):
                             _emit_deny_event(tool_name, pattern, view, raw_segment=seg_lower)
                             return reason(pattern)
@@ -1145,49 +1123,47 @@ def _emit_deny_event(
         )
 
 
-#: SEL ``mechanism`` value for the argv-structural inert-mention narrowing.
-#: Distinct from the glob carve-out map's ``_DENY_EXCEPTIONS`` so the audit trail
-#: can tell the two apart -- they share one emitter and nothing else.
-_PERM_VERB_MENTION_MECHANISM = "_PERM_VERB_MENTION"
+#: SEL ``mechanism`` value for the s3 download narrowing. Distinct from the glob
+#: carve-out map's ``_DENY_EXCEPTIONS`` so the audit trail can tell the two apart.
+_S3_DOWNLOAD_MECHANISM = "_S3_DOWNLOAD"
 
 
-def _perm_verb_mechanism_for(pattern: str) -> str:
+def _deny_exception_mechanism_for(pattern: str) -> str:
     """The SEL mechanism name for the exception about to be granted.
 
-    Pass 2 reaches the emitter from a condition that is an OR of the glob
-    carve-out and the mention reading, so the branch alone cannot say which one
-    fired.  The mention reading is the narrower of the two -- it applies only to
-    the opted-in patterns -- so membership in that set decides the label.
+    Pass 2 reaches the emitter from an OR of the glob carve-out and the s3
+    download reading, so the branch alone cannot say which one fired. The s3
+    reading applies only to its three rows, so membership decides the label.
     """
-    if pattern in _submodule("denied_rules")._PERM_VERB_MENTION_PATTERNS:
-        return _PERM_VERB_MENTION_MECHANISM
+    if pattern in _submodule("s3_direction")._S3_TRANSFER_PATTERNS:
+        return _S3_DOWNLOAD_MECHANISM
     return "_DENY_EXCEPTIONS"
 
 
-def _perm_verb_mention_narrows(
+def _s3_download_narrows(
     pattern: str,
     view: str,
     cache: dict[str, bool],
+    raw: str = "",
+    shipped: frozenset[str] = frozenset(),
 ) -> bool:
-    """Whether *pattern* is narrowed away on *view* by an inert-mention reading.
+    """Whether an ``aws s3 cp|mv|sync`` row is narrowed away on *view*.
 
-    A thin adapter over :func:`~.perm_verb_mention._perm_verb_mention_only`: it confines
-    the narrowing to the catalog patterns that opt into it, and memoizes the
-    argv walk per view.  The walk descends every nested payload, so it is the
-    expensive half of this check while the membership test is a set lookup --
-    and ``is_denied`` asks the same question once per matching pattern.
-
-    Returns False for every other pattern, which is what keeps this from
-    touching any rule outside the derived set.  The set's size is deliberately
-    not written down here: it is derived from the catalog, so a count in prose
-    goes stale the next time a row is added or renamed.
+    True only for one plain download command :func:`~.s3_direction._s3_download_only`
+    read in full, so a command it cannot read stays denied. It gets *raw*, the
+    command before case folding, to refuse any non-ASCII, and narrows only a
+    pattern in *shipped*, so an operator's own copy stays denied. Returns False
+    for every other pattern. The verdict is cached per command: every matching
+    segment would otherwise re-read the whole command.
     """
-    if pattern not in _submodule("denied_rules")._PERM_VERB_MENTION_PATTERNS:
+    s3 = _submodule("s3_direction")
+    if pattern not in s3._S3_TRANSFER_PATTERNS or pattern not in shipped:
         return False
-    verdict = cache.get(view)
+    key = f"{view}\0{raw}"
+    verdict = cache.get(key)
     if verdict is None:
-        verdict = _submodule("perm_verb_mention")._perm_verb_mention_only(view)
-        cache[view] = verdict
+        verdict = s3._s3_download_only(view, raw)
+        cache[key] = verdict
     return verdict
 
 
@@ -1281,3 +1257,26 @@ def audit_injection_dropped(
             surface,
             exc_info=True,
         )
+
+
+def _git_publication_floor_applies() -> bool:
+    """Whether the verb-anchored git-publication floor should deny at all.
+
+    Reads the keystone ``workflow_policy.json`` (see ``workflow_policy.py``),
+    which the agent can neither read nor write, so this is an operator decision
+    and not a value a prompt-injected shell can reach. Fails to ``True`` -- the
+    floor APPLIES -- on any error: an unreadable ceiling must not be read as
+    permission, and this predicate is the only thing standing between the agent
+    and an unparsed push target.
+
+    The ``workflow_policy`` import stays function-local for the same reason the
+    ``config.loader`` one does elsewhere: it keeps this module's import graph
+    independent of the loader's.
+    """
+    try:
+        from kiro_crew import workflow_policy
+
+        return workflow_policy.git_publication_floor_applies()
+    except Exception:
+        logger.debug("workflow policy read failed; git-publication floor applies", exc_info=True)
+        return True

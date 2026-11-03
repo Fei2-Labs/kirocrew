@@ -26,7 +26,9 @@ if TYPE_CHECKING:
         logger,
         read_config_text,
         resolve_configured_provider,
+        track_background_task,
         validated_config_string,
+        validated_language_code,
     )
 
 
@@ -64,7 +66,6 @@ def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     restores persisted voice settings — every restart silently resets TTS to
     disabled while the dashboard's settings PUT keeps reporting success.
     """
-    # Load voice_reply defaults from config
     _vr: dict = cfg.raw.get("voice_reply", {}) if (cfg is not None and hasattr(cfg, "raw")) else {}
     if not _vr:
         try:
@@ -95,6 +96,8 @@ def load_voice_reply_config(cfg: "KiroCrewConfig | None" = None) -> None:
     # the dashboard cannot drift apart on them.
     _vc.provider = resolve_configured_provider(_vr)
     _vc.system_voice = _str_or_default(_vr.get("system_voice"))
+    # A malformed tag reads as no preference, like any other hand-edited typo here.
+    _vc.language_code = validated_language_code(_vr.get("language_code")) or ""
 
 
 async def _safe_voice_reply(
@@ -122,6 +125,7 @@ async def _safe_voice_reply(
             aws_profile=_vc.aws_profile,
             region=_vc.region,
             system_voice=_vc.system_voice,
+            language_code=_vc.language_code,
         )
     except Exception:
         logger.debug("Voice reply failed", exc_info=True)
@@ -195,15 +199,17 @@ async def _reply_by_voice(
                 _eng = _vc.engines.get(session_key, _vc.default_engine)
                 _rate = _vc.rates.get(session_key, _vc.default_rate)
                 _pitch = _vc.pitches.get(session_key, _vc.default_pitch)
-                asyncio.create_task(
-                    _safe_voice_reply(
-                        slack,
-                        channel,
-                        reply_ts,
-                        final_text,
-                        voice_id=_vid,
-                        engine=_eng,
-                        rate=_rate,
-                        pitch=_pitch,
+                track_background_task(
+                    asyncio.create_task(
+                        _safe_voice_reply(
+                            slack,
+                            channel,
+                            reply_ts,
+                            final_text,
+                            voice_id=_vid,
+                            engine=_eng,
+                            rate=_rate,
+                            pitch=_pitch,
+                        )
                     )
                 )

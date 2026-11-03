@@ -28,8 +28,9 @@ from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Collection
 
+from kiro_crew import mediated_request_capability
 from kiro_crew import sel as sel_module
-from kiro_crew.acp import pi_steer_turn, transport_framing
+from kiro_crew.acp import launch_tuning, pi_steer_turn, transport_framing
 from kiro_crew.acp.client_claude_session import (
     CLAUDE_ACP_STEERING_MIN_VERSION,
     _adapter_version_at_least,
@@ -72,9 +73,12 @@ from kiro_crew.acp.types import (
     AcpEvent,
     JsonRpcMessage,
     steering_outcome,
+    wrap_user_message,
 )
+from kiro_crew.agent_sdk.backend_cards import LINE_MID_TURN_STEER, card_for
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_NODE_ADAPTER_PACKAGES,
 )
@@ -106,18 +110,6 @@ class _ConcurrentSteerTurn:
 
 # Named by the path callers import it from, as it was before the split.
 _ConcurrentSteerTurn.__module__ = "kiro_crew.acp.client"
-
-
-def steering_advertised(init_resp: object) -> bool:
-    """Whether an ``initialize`` result advertises the ``_session/steering`` request.
-
-    The extension is advertised at the TOP level of the result, as
-    ``_meta.steering.supported``, a sibling of ``agentCapabilities``. Only a
-    literal ``true`` counts.
-    """
-    meta = init_resp.get("_meta") if isinstance(init_resp, dict) else None
-    steering = meta.get("steering") if isinstance(meta, dict) else None
-    return isinstance(steering, dict) and steering.get("supported") is True
 
 
 #: The oldest goose that serves ``_goose/unstable/session/steer`` as Crew sends it:
@@ -159,6 +151,92 @@ def steer_version_issue(backend: str, agent_version: str) -> str:
         f"{backend} {agent_version} is older than {minimum}, so a message you send "
         f"while it works waits until it finishes. "
         f"Update it: run '{fix}', then start a new chat."
+    )
+
+
+#: The goose release Crew's goose contract was recorded on: the goose capture README
+#: (``test/fixtures/acp_frames/goose/README.md``) names 1.50.1 for every capture but
+#: ``effort-live.jsonl`` (1.54.0, effort only), ``handshake-live.jsonl`` reports it,
+#: and ``agent_sdk/backends.py`` declares the VERIFIED RANGE 1.50.x (the range
+#: ``GOOSE_VERIFIED_VERSION_PREFIX`` logs against). Steer and effort were also measured
+#: on 1.54.0, but the routing contract was not. Lower bound inclusive, upper
+#: exclusive. goose is not in the real-adapter lane, so nothing measures another line.
+GOOSE_TESTED_VERSION = "1.50.1"
+GOOSE_TESTED_RANGE = ((1, 50, 0), (1, 51, 0))
+
+#: The codex-acp release the Real Adapter Contract lane runs: ``test/real_adapters/
+#: package.json`` pins it, and every live codex capture's ``agentInfo.version`` reports
+#: it. codex-acp numbers its releases by semver, so the tested range is its major.
+CODEX_ACP_TESTED_VERSION = "2.3.0"
+CODEX_ACP_TESTED_RANGE = ((2, 0, 0), (3, 0, 0))
+
+#: Per backend: the tested range and the command that installs the tested release.
+#: Opt-in by membership, as :data:`_STEER_MIN_VERSIONS`.
+_TESTED_VERSION_RANGES: dict[str, tuple[tuple[tuple[int, int, int], tuple[int, int, int]], str]] = {
+    ACP_BACKEND_GOOSE: (
+        GOOSE_TESTED_RANGE,
+        ACP_BACKEND_LAUNCH[ACP_BACKEND_GOOSE].install_command.replace(
+            "| bash", f"| GOOSE_VERSION={GOOSE_TESTED_VERSION} bash"
+        ),
+    ),
+    ACP_BACKEND_CODEX: (
+        CODEX_ACP_TESTED_RANGE,
+        f"npm i -g {ACP_BACKEND_NODE_ADAPTER_PACKAGES[ACP_BACKEND_CODEX]}"
+        f"@{CODEX_ACP_TESTED_RANGE[0][0]}",
+    ),
+}
+
+
+def _tested_range_label(low: tuple[int, int, int], high: tuple[int, int, int]) -> str:
+    """``2.x`` for a whole major, else ``1.50.x`` for a minor line."""
+    if low[1:] == (0, 0) and high == (low[0] + 1, 0, 0):
+        return f"{low[0]}.x"
+    return f"{low[0]}.{low[1]}.x"
+
+
+def untested_version_issue(backend: str, agent_version: str) -> str:
+    """The notice for an *agent_version* outside *backend*'s tested range, else ``""``.
+
+    A warning only: the session still runs. A backend with no tested range, and an
+    absent or unreadable version, gets none. Parsed by :func:`_adapter_version_at_least`,
+    the reader the goose steer floor uses, so the two notices read one version alike.
+    """
+    range_and_fix = _TESTED_VERSION_RANGES.get(backend)
+    if range_and_fix is None or not _adapter_version_at_least(agent_version, (0, 0, 0)):
+        return ""
+    (low, high), fix = range_and_fix
+    if _adapter_version_at_least(agent_version, low) and not _adapter_version_at_least(
+        agent_version, high
+    ):
+        return ""
+    tested = _tested_range_label(low, high)
+    return (
+        f"{backend} {agent_version} is outside the tested range {tested}, so parts of "
+        f"it may behave in ways Crew has not checked. To install the tested release, "
+        f"run '{fix}', then start a new chat."
+    )
+
+
+def steer_unadvertised_issue(backend: str, init: object) -> str:
+    """The notice for a session whose handshake withdrew the card's steer line, else ``""``.
+
+    The membership card (:func:`~kiro_crew.agent_sdk.backend_cards.card_for` with no
+    handshake) says *backend* steers; the same card given this session's ``initialize``
+    result *init* says it does not, because the adapter left out the field its steer
+    is gated on. The runtime then queues every mid-turn message, so the chat says so
+    once. No notice before the handshake (*init* empty or not an object).
+    """
+    if not isinstance(init, dict) or not init:
+        return ""
+
+    def _steers(card) -> bool:
+        return any(line.available for line in card.capabilities if line.id == LINE_MID_TURN_STEER)
+
+    if not _steers(card_for(backend)) or _steers(card_for(backend, init=init)):
+        return ""
+    return (
+        f"This {backend} build does not offer mid-turn steering, so a message you "
+        f"send while it works waits until it finishes."
     )
 
 
@@ -233,7 +311,8 @@ async def command_result(
     it reaches an external surface. The TuiCommand object form is required:
     current kiro-cli can exit without a response for the legacy string form.
     """
-    await self.ensure_ready()
+    async with launch_tuning.switch_barrier(self):
+        await self.ensure_ready()
     cmd_name, cmd_args = parse_slash_command(command)
     payload: dict[str, Any] = {
         "sessionId": self._session_id,
@@ -256,7 +335,8 @@ async def send_command(self: AcpClient, command: str, args: dict | None = None) 
     Otherwise the plain-string form is kept for backward compat with
     older kiro-cli.
     """
-    await self.ensure_ready()
+    async with launch_tuning.switch_barrier(self):
+        await self.ensure_ready()
     if args:
         cmd_name = command.strip().split(None, 1)[0].lstrip("/")
         payload: dict = {
@@ -292,7 +372,8 @@ async def stream_command(
     """
     timeout = await _effective_prompt_timeout_async(timeout)
     self._cancelled = False
-    await self.ensure_ready()
+    async with launch_tuning.switch_barrier(self):
+        await self.ensure_ready()
 
     cmd_name, cmd_args = parse_slash_command(command)
     req_id = await self._send_request(
@@ -320,6 +401,9 @@ async def cancel_session(self: AcpClient, grace_secs: float = 0.0) -> None:
     above the 10s floor genuinely extends the window instead of the loop
     bailing early and forcing a session-losing hard kill.
     """
+    # A cancelled turn's approved mediated-secret calls must not run later on
+    # their delivered grants: revoke them first, whatever happens to the cancel.
+    mediated_request_capability.invalidate_session(getattr(self, "_session_key", "") or "")
     if not self._session_id:
         logger.debug("cancel_session: no session_id, skip")
         return
@@ -369,6 +453,9 @@ async def cancel_session(self: AcpClient, grace_secs: float = 0.0) -> None:
     # their entry, and a new turn clears the map. An ``approve_tool`` call with
     # an explicit ``option_id`` leaves its entry behind; no caller passes one to
     # this client.
+    # The same holds for an MCP elicitation still waiting on a person: the
+    # engine keeps its tool call open until the ask is answered.
+    await self.cancel_pending_elicitations()
     open_requests = list(self._permission_options)
     self._permission_options.clear()
     if not open_requests:
@@ -458,7 +545,7 @@ async def steer(self: AcpClient, message: str) -> bool:
         return await self._steer_via_steering_request(text)
     if self.backend in ACP_BACKENDS_STEER_CONCURRENT_PROMPT:
         return await self._steer_via_concurrent_prompt(text)
-    wrapped = f"<user_message>\n{text}\n</user_message>"
+    wrapped = wrap_user_message(text)
     await self._send_request("_session/steer", {"sessionId": self._session_id, "message": wrapped})
     # See AcpSessionHandle.steer for why the stamp is taken at the write.
     self._last_steer_monotonic = time.monotonic()
@@ -490,6 +577,16 @@ def _steering_waiters(self: AcpClient) -> dict[int, "asyncio.Future[Any]"]:
         waiters = {}
         self._steering_waiter_map = waiters
     return waiters
+
+
+def _unanswered_steering_ids(self: AcpClient) -> set[int]:
+    """Ids of steering requests whose answer has not been read yet. Created on
+    first use so a client built without ``__init__`` (test doubles) has one."""
+    ids = getattr(self, "_unanswered_steering_id_set", None)
+    if ids is None:
+        ids = set()
+        self._unanswered_steering_id_set = ids
+    return ids
 
 
 def _settle_steering_answer(self: AcpClient, msg: JsonRpcMessage) -> bool:
@@ -558,10 +655,12 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
         return False
     answer: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
     sent: list[int] = []
+    unanswered = self._unanswered_steering_ids()
 
     def _register(request_id: int) -> None:
         sent.append(request_id)
         waiters[request_id] = answer
+        unanswered.add(request_id)
 
     turn_done = self._turn_done
     try:
@@ -587,6 +686,8 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
         # Every exit stops waiting, so a late answer is skipped as stray.
         if sent:
             waiters.pop(sent[0], None)
+            if answer.done():
+                unanswered.discard(sent[0])
     if not answer.done() or answer.cancelled() or answer.exception() is not None:
         return False
     outcome = steering_outcome(answer.result())
@@ -597,7 +698,7 @@ async def _steer_via_steering_request(self: AcpClient, text: str) -> bool:
         # Injected, but its turn is already over: nothing will report it
         # consumed, so the caller queues the text.
         return False
-    self._steers_accepted.append((aimed_at, f"<user_message>\n{text}\n</user_message>"))
+    self._steers_accepted.append((aimed_at, wrap_user_message(text)))
     self._last_steer_monotonic = time.monotonic()
     return True
 
@@ -689,7 +790,7 @@ async def _steer_via_request(self: AcpClient, method: str, text: str) -> bool:
     if len(held) + len(answers) >= MAX_STEERING_ANSWERS:
         return False
     answer: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-    wrapped = f"<user_message>\n{text}\n</user_message>"
+    wrapped = wrap_user_message(text)
     req_ids: list[int] = []
 
     def _register(req_id: int) -> None:
@@ -765,7 +866,7 @@ async def _steer_via_concurrent_prompt(self: AcpClient, text: str) -> bool:
         return False
     if len(text) > _MAX_CONCURRENT_STEER_CHARS or len(turn.steers) >= _MAX_CONCURRENT_STEERS:
         return False
-    wrapped = f"<user_message>\n{text}\n</user_message>"
+    wrapped = wrap_user_message(text)
     sent: list[int] = []
     steers = turn.steers
 

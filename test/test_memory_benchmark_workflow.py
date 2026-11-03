@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from git_maintenance_helpers import GIT_MAINTENANCE_OFF_CONFIG
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "memory-benchmark.yml"
 
@@ -55,7 +56,7 @@ def _run(script: str, cwd: Path, env: dict[str, str]) -> subprocess.CompletedPro
         cwd=cwd,
         env=full,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
 
 
@@ -202,6 +203,10 @@ def _git_repo(tmp_path: Path) -> Path:
     # git instead would exercise the stub rather than the script.
     bare = tmp_path / "remote.git"
     _git(tmp_path, "init", "-q", "--bare", str(bare))
+    # The step's push starts receive-pack here with no env config and no global
+    # file, so only the remote's own config keeps auto maintenance off.
+    for key, value in GIT_MAINTENANCE_OFF_CONFIG:
+        _git(bare, "config", key, value)
     _git(repo, "remote", "add", "origin", str(bare))
     return repo
 
@@ -244,7 +249,7 @@ def test_a_brand_new_baseline_tree_is_detected_and_committed(tmp_path: Path) -> 
         cwd=repo,
         env=_git_env(),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         check=True,
     ).stdout
     assert "bench_baselines/accepted/locomo10_now.json" in committed

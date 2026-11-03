@@ -21,7 +21,8 @@ did". A literal copy in this file would be a fourth copy, free to drift with
 the thing it is supposed to pin.
 
 One mirror is deliberately NOT verbatim. `sanitize.ts` omits the two-segment
-alternative's leading lookbehind because the browser cannot afford it. Vite
+alternative's leading boundary (its lookbehind and the start guard after `.`)
+because the browser cannot afford the lookbehind. Vite
 declares no `build.target`, so the default `'modules'` floor is `safari14`, and
 at that target esbuild rewrites an unsupported lookbehind literal into a
 `new RegExp(...)` call. That defers the error from parse time to run time, but
@@ -86,18 +87,21 @@ def _jwt_alternatives() -> tuple[str, str]:
     """
     alts = [alt for alt in _CREDENTIAL_PATTERNS.pattern.split("|") if "eyJ" in alt]
     assert len(alts) == 2, f"expected 2 JWT alternatives in _CREDENTIAL_PATTERNS, found {len(alts)}: {alts}"
-    three = [a for a in alts if "(?:" in a]
-    two = [a for a in alts if "(?:" not in a]
+    three = [a for a in alts if "){2,4}" in a]
+    two = [a for a in alts if "){2,4}" not in a]
     assert len(two) == 1 and len(three) == 1, f"cannot tell the alternatives apart: {alts}"
     return three[0], two[0]
 
 
 _LEADING_LOOKBEHIND_RE = re.compile(r"^\(\?<[=!][^)]*\)")
 _ANY_LOOKBEHIND_RE = re.compile(r"\(\?<[=!]")
+#: Where the two-segment body starts: the payload floor. Everything before it is
+#: the start boundary (the lookbehind and the guard after a `.`).
+_TWO_SEGMENT_BODY_START = "eyJ[A-Za-z0-9_-]{"
 
 
 def _two_segment_split() -> tuple[str, str]:
-    """Return (leading_lookbehind, body) of the backend two-segment alternative.
+    """Return (leading_boundary, body) of the backend two-segment alternative.
 
     Both halves are sliced off the enforcing regex rather than restated, so the
     frontend's body assertion tracks a backend edit to the bounds automatically
@@ -110,7 +114,8 @@ def _two_segment_split() -> tuple[str, str]:
         "If the backend dropped it too, the mirrors are back to plain parity and "
         f"the frontend exemption below should be deleted.\ngot: {two_segment}"
     )
-    return match.group(0), two_segment[match.end() :]
+    start = two_segment.index(_TWO_SEGMENT_BODY_START)
+    return two_segment[:start], two_segment[start:]
 
 
 class TestMirrorsMatchTheBackend:
@@ -306,3 +311,30 @@ class TestPrefilledIssueCarveOutParity:
             "the dashboard no longer renders its own anchor from the structured "
             "field — the trusted issue-link channel moved"
         )
+
+
+def test_blocked_link_card_offers_allow_only_for_hosts_the_server_accepts() -> None:
+    """The card's Allow gate mirrors the server's allowed-host shape exactly.
+
+    `RedactionCards.tsx` hides "Allow for this host" with its own copy of the
+    host regex because the browser cannot import Python. If the two drift, the
+    card offers an Allow the server always refuses, or hides one it would
+    accept. The expectation is derived from the backend regex at run time.
+    """
+    from kiro_crew.security import redaction_allow
+
+    backend = redaction_allow._HOST_RE.pattern
+    assert backend.startswith("\\A") and backend.endswith("\\Z")
+    expected = "^" + backend[2:-2].replace("\\Z", "$") + "$"
+    cards = (ROOT / "website" / "src" / "components" / "RedactionCards.tsx").read_text(encoding="utf-8")
+    match = re.search(r"^const ALLOWABLE_HOST_RE = /(.+)/$", cards, re.MULTILINE)
+    assert match, "ALLOWABLE_HOST_RE is no longer a one-line regex literal in RedactionCards.tsx"
+    assert match.group(1) == expected
+    # The loopback-name refusal sits beside the regex on both sides.
+    assert not redaction_allow.valid_host("foo.localhost")
+    suffix = re.search(r"^const LOOPBACK_SUFFIX = '([^']+)'$", cards, re.MULTILINE)
+    assert suffix and suffix.group(1) == redaction_allow.LOOPBACK_SUFFIX
+    assert "!h.endsWith(LOOPBACK_SUFFIX)" in cards
+    tld_cap = re.search(r"^const MAX_TLD_LEN = (\d+)$", cards, re.MULTILINE)
+    assert tld_cap and int(tld_cap.group(1)) == redaction_allow.MAX_TLD_LEN
+    assert "tld.length <= MAX_TLD_LEN" in cards

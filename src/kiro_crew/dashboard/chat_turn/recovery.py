@@ -8,40 +8,44 @@ import inspect
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
+from kiro_crew.dashboard.chat_utils import (
+    _COMPACTION_CONTINUE_MSG,
+    _PROMISE_ONLY_CONTINUE_MSG,
+    _SYNTHETIC_RECOVERY_MSGS,
+    APP_AGENT_REFUSED_KIND,
+    AUTH_REQUIRED_KIND,
+    CONTEXT_OVERFLOW_KIND,
+    FALSE_TOOL_BLOCKER_REPLAY_KIND,
+    IMAGE_REPAIR_KIND,
+    KIRO_CLI_MISSING_KIND,
+    MODEL_UNENTITLED_KIND,
+    SESSION_START_FAILED_KIND,
+    TRANSIENT_RETRY_KIND,
+    USAGE_LIMIT_KIND,
+    ResetCause,
+    _remove_queued_by_id,
+    build_recovery_requeue,
+    is_synthetic_payload_item,
+)
+from kiro_crew.dashboard.poisoned_escalation import PoisonedConversationEscalation
+from kiro_crew.dashboard.state import SUBAGENT_SYNTHESIS_PROMPT
+from kiro_crew.llm_helpers import acp_error_is_throttle
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
-        _COMPACTION_CONTINUE_MSG,
-        _PROMISE_ONLY_CONTINUE_MSG,
-        _SYNTHETIC_RECOVERY_MSGS,
-        APP_AGENT_REFUSED_KIND,
-        AUTH_REQUIRED_KIND,
-        CONTEXT_OVERFLOW_KIND,
-        FALSE_TOOL_BLOCKER_REPLAY_KIND,
-        KIRO_CLI_MISSING_KIND,
-        MODEL_UNENTITLED_KIND,
-        SESSION_START_FAILED_KIND,
         SUBAGENT_COMPLETION_KIND,
-        SUBAGENT_SYNTHESIS_PROMPT,
         SYNTHETIC_RECOVERY_KIND,
-        TRANSIENT_RETRY_KIND,
-        USAGE_LIMIT_KIND,
         DashboardState,
         KiroCrewConfig,
-        PoisonedConversationEscalation,
         RefusalInfo,
-        ResetCause,
         _ChatSlot,
-        _emit_recovery_outcome,
         _has_user_queued_followup,
-        _remove_queued_by_id,
-        acp_error_is_throttle,
         append_and_surface,
-        build_recovery_requeue,
         effective_session_key,
-        is_synthetic_payload_item,
         logger,
         model_is_unusable,
     )
+    from kiro_crew.dashboard.chat_turn.turn_stats import _emit_recovery_outcome
     from kiro_crew.dashboard.recovery_replays import ConsumePhase, LiveSlot, ReplayFamily
 
 
@@ -131,13 +135,15 @@ def _note_cycle_start_failure(slot_key: str, exc: BaseException, *, self_wake: b
     spend its stand-down budget, or a human turn that happened to be starved on a
     slot that also carries a loop would stop one the human never drove.
 
-    This does not ask whose failure the death was, so a shared runtime dying
-    during a session start advances the streak of every loop on that process.
-    Asking requires the runtime the allocation was attempting, and nothing in
-    scope at a start failure names it: the provider does not exist yet -- that is
-    what failed -- and the exception carrying the tag carries no runtime identity.
-    Closing it belongs at the raise sites, which would have to carry that
-    identity.
+    Only a start that TIMED OUT or whose reply was dropped as oversize carries the
+    tag: the ``session/new`` and ``session/load`` arms in ``acp/runtime`` and the
+    dedicated client's awaited-request timeout set it, and nothing else does. A
+    shared runtime dying during a session start takes neither arm -- ``_mark_dead``
+    fails the pending request with an untagged ``AcpRuntimeDead``, and the
+    ``AcpProcessDied`` the provider translates it to is untagged too -- so a death
+    is charged to no loop's streak: not the loop whose start it interrupted, and
+    not a sibling loop on the same process. There is nothing to attribute, because
+    the tag that would be attributed is absent.
 
     The tag is read with ``getattr`` because the two ACP exception families carry
     it independently and share no base -- which is also why this is a helper
@@ -253,23 +259,28 @@ async def _note_cycle_failure(
 def _terminal_error_meta(exc: BaseException) -> dict[str, object] | None:
     """Row-level kind for a terminal ACP error, or None for a plain error row.
 
-    Seven structural tags, read here without looking at the prose. Four are set
+    Eight structural tags, read here without looking at the prose. Four are set
     by ``_raise_acp_error`` from the raw frame: a model-entitlement rejection
     (``rejected_model`` / ``advertised``), a sign-in failure (``auth_required``),
     a spent plan allowance (``usage_limit``) and a context overflow
     (``context_overflow``, whose fix is a fresh conversation, not a retry on
     any model). The entitlement verdict wins
     when it is set, because its fix (pick a served model) is the one the prose
-    describes; the other two are exclusive at raise time. The fourth,
+    describes; the other two are exclusive at raise time. A fifth,
+    ``image_dimension_wedge``, is set from the raw frame when an image already in
+    native history exceeds the provider's 2000px many-image cap; it ranks ABOVE
+    ``context_overflow`` because its fix is more specific and loses no turns
+    (downscale the oversized images in place rather than reset), and the two are
+    mutually exclusive at raise time. The sixth,
     ``session_start_failed``, is set at the ACP session-start timeout raise
     sites on BOTH exception families (``AcpError`` on the dedicated client,
     ``AcpRequestTimeout`` on the shared runtime, which share no base -- hence
     ``getattr``) and ranks below them: a start that failed because the process is
-    signed out has a fix, and that fix is what the card should show. The sixth,
+    signed out has a fix, and that fix is what the card should show. The seventh,
     ``agent_unavailable``, is set by the session start that finds no definition
     for its agent (``AcpAgentUnavailable``); its row is the app-agent refusal,
     because a retry finds the same missing definition and the prose names the fix.
-    The seventh, ``kiro_cli_missing``, is set where the kiro-cli binary is not
+    The eighth, ``kiro_cli_missing``, is set where the kiro-cli binary is not
     found at spawn (``AcpKiroCliMissing`` on the runtime path, ``AcpError`` on the
     dedicated client); its row lets a feature-request chat offer the form.
     """
@@ -280,6 +291,8 @@ def _terminal_error_meta(exc: BaseException) -> dict[str, object] | None:
         return {"kind": AUTH_REQUIRED_KIND}
     if getattr(exc, "usage_limit", False):
         return {"kind": USAGE_LIMIT_KIND}
+    if getattr(exc, "image_dimension_wedge", False) is True:
+        return {"kind": IMAGE_REPAIR_KIND}
     if getattr(exc, "context_overflow", False) is True:
         return {"kind": CONTEXT_OVERFLOW_KIND}
     if getattr(exc, "session_start_failed", False) is True:
@@ -500,6 +513,7 @@ async def _drop_revoked_replays(state: DashboardState, slot: _ChatSlot) -> bool:
         ENTRY_FAMILIES,
         POLICIES,
         cancel_notice,
+        cancel_notice_meta,
         log_args,
         replays_of,
     )
@@ -523,7 +537,12 @@ async def _drop_revoked_replays(state: DashboardState, slot: _ChatSlot) -> bool:
         _rearm_allowances(
             slot, policy.drain_refunds, discard_one_shot=policy.refunds_discard_one_shot
         )
-        slot.append("notice", cancel_notice(family, revocation), "msg msg-info")
+        slot.append(
+            "notice",
+            cancel_notice(family, revocation),
+            "msg msg-info",
+            meta=cancel_notice_meta(family, revocation),
+        )
         logger.info(policy.drain_log, slot.key, *log_args(family, revocation))
         if not slot._queue:
             return True
@@ -548,6 +567,7 @@ async def _replay_vetoed_at_consume(
     from kiro_crew.dashboard.recovery_replays import (
         POLICIES,
         cancel_notice,
+        cancel_notice_meta,
         consumed_in,
         log_args,
         replays_of,
@@ -565,7 +585,12 @@ async def _replay_vetoed_at_consume(
             _rearm_allowances(
                 slot, policy.consume_refunds, discard_one_shot=policy.refunds_discard_one_shot
             )
-            slot.append("notice", cancel_notice(family, revocation), "msg msg-info")
+            slot.append(
+                "notice",
+                cancel_notice(family, revocation),
+                "msg msg-info",
+                meta=cancel_notice_meta(family, revocation),
+            )
             logger.info(policy.consume_log, slot.key, *log_args(family, revocation))
             return True
     return False
@@ -655,6 +680,7 @@ async def _purge_superseded_continuations(state: DashboardState, slot: _ChatSlot
         POLICIES,
         ReplayFamily,
         cancel_notice,
+        cancel_notice_meta,
         replays_of,
     )
 
@@ -697,7 +723,10 @@ async def _purge_superseded_continuations(state: DashboardState, slot: _ChatSlot
             # automatically" detail now stand uncorrected; append a one-line
             # correction so the transcript matches what actually ran.
             slot.append(
-                "notice", cancel_notice(ReplayFamily.CONTINUATION, revocation), "msg msg-info"
+                "notice",
+                cancel_notice(ReplayFamily.CONTINUATION, revocation),
+                "msg msg-info",
+                meta=cancel_notice_meta(ReplayFamily.CONTINUATION, revocation),
             )
             logger.info(
                 "Purged %d superseded promise-only continuation(s) before dispatch "
@@ -786,14 +815,23 @@ async def _requeue_after_prompt_busy(
     ``_queue_recovery`` takes no Stop snapshot of its own, so this gate is the
     only place it can veto the replay (the same pairing as the other arms).
     """
+    from kiro_crew.dashboard import gateway_notice as gn
+
     if _should_suppress_requeue(slot) or _stop_pressed():
         pass
     elif _prompt_depth == 0 and slot._prompt_busy_retries <= 3:
         # Single emit: slot.append persists + broadcasts one chat_message
         # via _on_message (see the note in ``_on_process_died``); no explicit
         # broadcast_ws or the UI shows a duplicate card.
-        _retry_msg = "⟳ Session busy — retrying…"
-        slot.append("error", _retry_msg, "msg msg-err", meta={"kind": TRANSIENT_RETRY_KIND})
+        slot.append(
+            "error",
+            gn.GATEWAY_SESSION_BUSY_RETRYING_TEXT,
+            "msg msg-err",
+            meta={
+                "kind": TRANSIENT_RETRY_KIND,
+                **gn.gateway_notice_meta(gn.GATEWAY_NOTICE_SESSION_BUSY_RETRYING),
+            },
+        )
         _requeue_text, _requeue_payload = build_recovery_requeue(
             message,
             _turn_emitted,
@@ -807,11 +845,21 @@ async def _requeue_after_prompt_busy(
             payload=_requeue_payload,
         )
     elif slot._prompt_busy_retries > 3:
-        slot.append("error", "Session stuck — please start a new chat.", "msg msg-err")
+        slot.append(
+            "error",
+            gn.GATEWAY_SESSION_STUCK_TEXT,
+            "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_SESSION_STUCK),
+        )
     else:
         # depth>0 with budget remaining: no re-queue (mirrors AcpProcessDied),
         # but still surface feedback so the nested turn doesn't fail silently.
-        slot.append("error", "⟳ Session busy — please retry.", "msg msg-err")
+        slot.append(
+            "error",
+            gn.GATEWAY_SESSION_BUSY_GIVE_UP_TEXT,
+            "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_SESSION_BUSY_GIVE_UP),
+        )
 
 
 _REFUSAL_CARD_LEAD = "Response declined by the model."
@@ -842,6 +890,11 @@ def refusal_card_text(
     *fallback_off* is ``True`` when ``agent.refusal_fallback_model`` is not
     configured. The card then appends one sentence naming the setting so the
     user can discover the automatic-recovery feature at the moment they need it.
+
+    The same-model case (a fallback configured but equal to the refusing
+    model, the swap-skip case) is NOT handled here: it is a separate ``notice``
+    row carrying the ``refusal_fallback_same_model`` gateway-notice token, so
+    that sentence is localized without tokenizing the rest of this card.
     """
     lines = [_REFUSAL_CARD_LEAD]
     if refusal is not None and refusal.category:
@@ -965,4 +1018,13 @@ _COMPACT_FAIL_REASON_MAX_CHARS = 300
 # compaction status to wait for.
 COMPACT_REPLAY_PENDING_NOTICE = (
     "Nothing to compact yet: the restored history is delivered with your next message."
+)
+
+# The answer to a /compact that reached a fresh provider session no ordinary
+# prompt has reached yet (a brand-new chat, or a session restarted under an
+# existing one): the session holds no conversation, so the backend reports no
+# compaction status to wait for. The chat's own history, if any, rides the next
+# prompt, so the notice speaks of the agent's session, not the chat.
+COMPACT_FRESH_SESSION_NOTICE = (
+    "Nothing to compact yet: the agent's session starts with your next message."
 )

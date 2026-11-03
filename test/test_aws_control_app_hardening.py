@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import AsyncMock
@@ -681,10 +682,11 @@ class TestRound22Hardening:
             hooks.backup_mod.JOB_PARAM_REGION: "us-west-2",
         }
 
-    def test_a_refused_claim_does_not_crash_the_loop(self):
+    def test_a_refused_claim_does_not_crash_the_loop(self, caplog):
         from kiro_crew.apps.builtins.aws_control import hooks
         from kiro_crew.apps.job_sdk import JobError
 
+        caplog.set_level(logging.INFO, logger=hooks.logger.name)
         sdk = mock.Mock(start_async=AsyncMock(side_effect=JobError("shutting down")))
         with (
             mock.patch.object(
@@ -704,6 +706,9 @@ class TestRound22Hardening:
         ):
             asyncio.run(hooks._run_once(sdk))  # swallowed, not raised
 
+        assert [r.getMessage() for r in caplog.records if r.name == hooks.logger.name] == [
+            f"aws-control nightly: could not claim {hooks.backup_mod.KIND_SNAPSHOT} run"
+        ]
         sdk.start_async.assert_awaited_once()
 
 
@@ -1096,15 +1101,16 @@ class TestRound36Hardening:
 
         from kiro_crew.apps.builtins.aws_control.backend import backup
 
-        # flake-ok: pre-existing UTC wall-clock read, moved verbatim; the product reads the same clock and the due window is about a day
-        recent = _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None).isoformat()
+        # A pinned instant, so the stamp sits one hour before it on every host.
+        now = _dt.datetime(2026, 1, 1, 12, 0, tzinfo=_dt.timezone.utc)
+        recent = (now - _dt.timedelta(hours=1)).replace(tzinfo=None).isoformat()
         with (
             mock.patch.object(backup, "nightly_enabled", return_value=True),
             mock.patch.object(
                 backup, "last_runs", return_value={backup.KIND_SNAPSHOT: {"at": recent}}
             ),
         ):
-            assert backup.due_for_nightly(ACCOUNT) is False
+            assert backup.due_for_nightly(ACCOUNT, now=now) is False
 
     def test_a_non_string_last_run_reads_as_due(self):
         from kiro_crew.apps.builtins.aws_control.backend import backup

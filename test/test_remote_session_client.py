@@ -21,6 +21,24 @@ from kiro_crew.testing.wait import async_wait_until, wait_until
 
 pytestmark = pytest.mark.skipif(not hasattr(os, "getuid"), reason="POSIX guest paths")
 
+
+@pytest.fixture(autouse=True)
+def _drain_asyncio_transports():
+    """Collect asyncio transport cycles after each test in this module.
+
+    Tests here spawn asyncio subprocesses via asyncio.run(); a
+    BaseSubprocessTransport whose subprocess is not awaited before the loop
+    closes forms a reference cycle with its protocol.  Collecting after each
+    test keeps such a cycle from surfacing inside the next test, in this file
+    or in a later module on the same worker.
+    """
+    import gc
+
+    yield
+    gc.collect()
+    gc.collect()
+
+
 SID = "sess-1"
 _ENDED = (link_mod.REFUSED, link_mod.LOST, link_mod.FINISHED)
 ECHO = [
@@ -97,9 +115,21 @@ def test_link_through_a_worker_attach_dial_delivers_and_finishes():
     attach = [sys.executable, "-m", "kiro_crew.remote_session.worker", "attach"]
 
     async def run(port: int) -> tuple[bytes, str]:
-        link = link_mod.RemoteLink(
-            SID, secret, client_mod.command_dial(attach + ["--port", str(port)])
-        )
+        # Wrap the dial so we can capture the attach subprocess and await its
+        # exit before asyncio.run() closes the loop.  Without this, the
+        # _UnixSubprocessTransport for the attach child remains unclosed when
+        # the loop shuts down, so its __del__ fires with "Event loop is closed"
+        # during the GC pass of a later test — blaming an innocent victim.
+        attach_proc: list[asyncio.subprocess.Process] = []
+        base_dial = client_mod.command_dial(attach + ["--port", str(port)])
+
+        async def tracked_dial():
+            reader, writer = await base_dial()
+            if hasattr(writer, "_process"):
+                attach_proc.append(writer._process)
+            return reader, writer
+
+        link = link_mod.RemoteLink(SID, secret, tracked_dial)
         link.start()
         try:
             await link.write(b"one\ntwo\n")
@@ -107,6 +137,12 @@ def test_link_through_a_worker_attach_dial_delivers_and_finishes():
             return await asyncio.wait_for(link.stdout.read(), 30), link.state
         finally:
             await link.aclose()
+            # Wait for the attach subprocess to exit so its asyncio transport
+            # is properly closed before the event loop shuts down.
+            for proc in attach_proc:
+                if proc.returncode is None:
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(proc.wait(), 30.0)
 
     with _worker(secret) as (port, box):
         got, state = asyncio.run(run(port))
@@ -152,6 +188,43 @@ def test_main_pipe_proves_the_token_and_moves_bytes(tmp_path, monkeypatch):
     assert os.path.exists(token)
     with pytest.raises(SystemExit):
         client_mod.main(["--pipe", "127.0.0.1:x", "--token-file", token])
+
+
+def _main_with_fake_pipe(monkeypatch, pipe_arg, *, refuse=False):
+    """Run ``main`` up to the dial; return the (host, port) it would dial."""
+    dialed = []
+
+    def read_token(_path):
+        if refuse:
+            pytest.fail(f"read the token instead of refusing {pipe_arg!r}")
+        return b"tok"
+
+    async def fake_pipe(host, port, *_rest):
+        dialed.append((host, port))
+        return client_mod.EXIT_FINISHED
+
+    monkeypatch.setattr(client_mod, "_read_token", read_token)
+    monkeypatch.setattr(client_mod, "pipe", fake_pipe)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(fileno=lambda: 0))
+    assert client_mod.main(["--pipe", pipe_arg, "--token-file", "t"]) == client_mod.EXIT_FINISHED
+    return dialed
+
+
+@pytest.mark.parametrize(
+    "port_text", ["²", "0", "65536", "-1", pytest.param("9" * 5000, id="5000-digits")]
+)
+def test_main_refuses_a_bad_pipe_port_with_a_cli_error(monkeypatch, port_text):
+    # Refused before the token is read, as a CLI message, never a traceback.
+    with pytest.raises(SystemExit) as exc:
+        _main_with_fake_pipe(monkeypatch, f"h:{port_text}", refuse=True)
+    assert isinstance(exc.value.code, str) and exc.value.code.startswith("--pipe")
+
+
+@pytest.mark.parametrize(
+    "pipe_arg,want", [("h:8080", ("h", 8080)), ("h:65535", ("h", 65535)), ("::1:1", ("::1", 1))]
+)
+def test_main_dials_a_pipe_port_in_range(monkeypatch, pipe_arg, want):
+    assert _main_with_fake_pipe(monkeypatch, pipe_arg) == [want]
 
 
 def test_pipe_refusals(tmp_path):

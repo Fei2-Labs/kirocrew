@@ -202,7 +202,7 @@ export function preserveSettledMcpOauth(existing: ChatMessage[], merged: ChatMes
  *     captured while it was still live reverts a finished card to "running".
  *   - a steer row (`role: "user"`, `meta.steer`): `steer_queue`'s
  *     `_mark_steer_row_state` -> `slot.update_message` advances
- *     `meta.steerState` `written` -> `consumed`/`requeued`. A snapshot captured
+ *     `meta.steerState` `written` -> `consumed`/`requeued`/`retracted`. A snapshot captured
  *     while it was still `written` revives the "pending steer" badge on a steer
  *     the turn already took.
  *
@@ -259,7 +259,7 @@ export function preserveSettledUpsertRows(existing: ChatMessage[], merged: ChatM
   // A steer row advances `written` -> `consumed`/`requeued` and never back
   // (`steer_queue.py`: the only two transitions; a requeued steer runs later as
   // its own NEW row, not a rewrite of this one), so both are safe anchors.
-  const STEER_SETTLED = new Set(['consumed', 'requeued'])
+  const STEER_SETTLED = new Set(['consumed', 'requeued', 'retracted'])
 
   // The `(role, mid, ts)` upsert key for a covered row, or undefined if the row
   // is not one this pass guards. Steer rows ride the `user` role, so they are
@@ -801,8 +801,9 @@ export function olderHeadAbovePage(
   return { cutIdx, olderHead: cutIdx > 0 ? prior.slice(0, cutIdx) : [] }
 }
 
-/** Roles the server never writes to history. `permission` is in the backend's own
- *  `_TRANSIENT_ROLES`; `queued`/`streaming`/`thinking` exist only in this client.
+/** Roles the server never writes to history. `permission` and `elicitation` are in
+ *  the backend's own `_TRANSIENT_ROLES`; `queued`/`streaming`/`thinking` exist only
+ *  in this client.
  *  `error`/`mcp_oauth` are deliberately absent -- those ARE persisted.
  *
  *  One set, because two consumers ask the same question for opposite reasons and a
@@ -810,7 +811,7 @@ export function olderHeadAbovePage(
  *  a paging OFFSET, and `hasUnidentifiedDurableRow` looks for a durable row the
  *  bound cannot see. A role missing from one copy would silently mis-shift a cursor
  *  in the first and silently drop scrollback in the second. */
-const CLIENT_ONLY_ROLES: ReadonlySet<string> = new Set(['queued', 'streaming', 'thinking', 'permission'])
+const CLIENT_ONLY_ROLES: ReadonlySet<string> = new Set(['queued', 'streaming', 'thinking', 'permission', 'elicitation'])
 
 /** Does this row survive in the server's transcript?
  *

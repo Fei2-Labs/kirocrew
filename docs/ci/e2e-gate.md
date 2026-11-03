@@ -8,8 +8,10 @@ One command is the whole offline browser gate. It boots a real gateway wired to 
 packaged fake model backend, then shells the in-tree Playwright suite at it. No
 model, no credentials, no network, no cost.
 
-The main browser job is Linux-only: it uses the CodeBuild fleet where eligible
-and otherwise falls back to `ubuntu-latest`. It cannot rely on an unprivileged
+The main browser job is Linux-only: it uses the CodeBuild fleet where eligible,
+otherwise the `kirocrew-runners` larger-runner group when the run executes in
+this repository, and `ubuntu-latest` in a fork running its own CI. It cannot
+rely on an unprivileged
 user namespace (CodeBuild refuses `unshare(CLONE_NEWUSER)`, and this job does not
 alter the hosted runner's namespace policy). Its disposable fake-backend gateway
 alone seeds `agent.sandbox_allow_unsandboxed_exec=true`; authenticated browser setup
@@ -116,7 +118,7 @@ Config facts worth knowing before you touch a spec:
 | `workers` | 1 under `CI` | The harness sets `CI=1`, so the browser leg is serial. |
 | `retries` | 2 under `CI` | A detector, not a fix. A spec that passes only on a retry is counted under `flaky` in the JSON report (the HTML report lists it too), and `MAX_FLAKY_SPECS` then fails the run: fix the spec, never raise `retries`. |
 | `timeout` | 30s per test | Assertion (`expect`/`poll`) timeout stays at Playwright's 5s default so a genuine slowdown surfaces instead of passing inside a wide window. |
-| `grepInvert` | excludes `@needs-agent` unless `PLAYWRIGHT_RUN_AGENT_SPECS` | The default run is the credential-less green set. The harness wires the fake backend, so it opts the agent specs back in. `@needs-live-agent` stays excluded either way and currently tags nothing. |
+| `grepInvert` | excludes `@needs-agent` unless `PLAYWRIGHT_RUN_AGENT_SPECS` | The default run is the credential-less green set. The harness wires the fake backend, so it opts the agent specs back in. `@needs-live-agent` stays excluded either way and currently tags nothing. `@shared-crew` (two verified principals) is excluded unless `PLAYWRIGHT_RUN_SHARED_CREW`. |
 | browser | Playwright's own bundled Chromium | This fork vends no browser binary; CI installs it with `npx playwright install chromium`, restored from an `actions/cache` entry keyed on the exact `@playwright/test` version. `--with-deps` is deliberately NOT used — see [what CI does](#what-ci-does-around-the-command). |
 
 ### Auth flow
@@ -485,7 +487,7 @@ Two legs cover it, and neither costs a PR any minutes: both live in
 | Leg | Job | Script | What only a real install shows |
 | --- | --- | --- | --- |
 | Linux | `build-desktop.yml` -> `Smoke-install Linux packages (deb + rpm)` | `scripts/smoke-linux-packages.sh` | dependency names resolve in Ubuntu 24.04 and Amazon Linux 2023, the `.desktop` entry's `StartupWMClass` equals Electron's app_id, the maintainer scripts place and remove `/usr/bin/<exe>`, and the beacon stamp names THIS format |
-| Windows | `build-windows.yml` -> `Smoke-install Windows installer (x64)` | `scripts/smoke-windows-install.ps1` | the uninstall registration and the `InstallLocation` in its paired install-info key (`<hive>\Software\<GUID>`, where electron-builder writes it), the install-root ownership boundary, where the Start Menu shortcut POINTS, that the bundled CLI runs, that the installed gateway answers `/api/health`, and that a silent uninstall removes the registration, the install-info key and the tree |
+| Windows | `build-windows.yml` -> `Smoke-install Windows installer (x64)` | `scripts/smoke-windows-install.ps1` | the uninstall registration and the `InstallLocation` in its paired install-info key (`<hive>\Software\<GUID>`, where electron-builder writes it), the install-root ownership boundary, where the Start Menu shortcut POINTS, that the bundled CLI runs, that the staged KAS engine root is in the installed tree and the installed `kirocrew kas status` reports it `(built into the app)` when `KIROCREW_BUNDLED_KAS_DIR` names it, that the installed gateway answers `/api/health`, and that a silent uninstall removes the registration, the install-info key and the tree |
 
 The Windows leg is gated on the build job's `artifact_uploaded` output rather
 than on `needs` alone: publish runs build Windows under `continue-on-error`

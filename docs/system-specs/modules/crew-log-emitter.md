@@ -27,7 +27,7 @@ the child-origin loss counters or `_child_liveness` belongs in `emit_runtime`, b
 |---|---|
 | `crew_log/emit_state.py` | `enabled`; the boot-path import gates `_crew_log` (storage) and `_note_eager` (the eager fold's wake); the session kind and the two sources; `session_id_of`; the process-wide maps and `_lock`, which guards them |
 | `crew_log/emit_tree.py` | a slot's lineage (`slot_previous_store`, `_durable_previous`, `_candidate_is_same_slot`, `_parent_citation`); the `_record_session_tree_*` folds that advance the in-memory session tree after a commit; the settled signal `_TreeSettle` and `awaiting_commit` |
-| `crew_log/emit_runtime.py` | the installed writer, turn tracker and warning budget and every function that rebinds or reads them: `reset_caches`; the handle cache that is the writer's `open_unit` adapter; `_write`, `_submit`, `_hand_over` and the settlement of a job the writer rejected at its ceiling; the supersede repair; `flush`, `drain_for_shutdown` and the loss counters; `live_turn`; the child-origin pins; `on_session_closed` |
+| `crew_log/emit_runtime.py` | the installed writer, turn tracker and warning budget and every function that rebinds or reads them: `reset_caches`; the handle cache that is the writer's `open_unit` adapter; `_write`, `_submit`, `_hand_over` and the settlement of a job the writer rejected at its ceiling; the supersede repair; `flush`, `drain_for_shutdown` and the loss counters; `live_turn` and `asking_turn`; the child-origin pins and `child_origin_attempt`; `on_session_closed` |
 | `crew_log/emit_text.py` | `_safe_text` and `safe_work_fields` (redaction), `_clip`, the one-line fit checks, `_append_body_entry`'s `message/chunk` slicing, `_payload_digest` |
 | `crew_log/emit_session.py` | `on_session_opened`, `on_session_adopted`, `on_session_released`, `on_session_spawned`, `on_class_observed` and `on_open_tab_unrestored` |
 | `crew_log/emit_turn.py` | a turn's start and end; messages, request configuration, the composed context, steps, tool calls, approvals, the plan, model selection and compaction; `close_open_tool_calls`; `background/completed` |
@@ -228,6 +228,7 @@ unset here -- see "Reconnect is not resume" below for what it is for.
 | `message/chunk` | the overflow split ONLY | turn, step, one slice of an already-redacted body |
 | `request/configured` | `_turn_dispatch_gates` (`chat_turn/turn_dispatch_gates.py`), on change only | turn, model, provider, `context_window` |
 | `context/composed` | `_turn_dispatch_gates` (`chat_turn/turn_dispatch_gates.py`), from `slot_ctx_blocks` | turn, per-block `sources`, chars, estimated tokens, `phase` (`session_start` or `per_turn`) when known, and `omitted` (the budget cuts `context_omissions.collect` gathered around the build) when anything was cut |
+| `context/measured` | `_turn_close_crew_log` (`chat_turn/crew_log_attribution.py`), from `AcpPromptStats.kas_profile`, taken once and only when the per-turn stats object is not the one the turn started with (so a turn that sent no prompt never takes an earlier turn's), just before the turn's closers; nothing is written when the engine measured nothing | turn, the engine's `turn_id`, `breakdown` (`schema`, category -> characters for the turn's LAST model request, `model_calls`, `total_chars`, `compacted`, the `history` split), `ttft` (`total_ms`, `setup_ms`, `model_ms`) |
 | `step/started` | the stream opening, and each tool-group-to-text transition | turn, step |
 | `step/completed` | the next transition, and `EVENT_COMPLETE` | turn, step, ms |
 | `message/queued` | `chat_delivery.queue_for_next_turn` | source, bytes, queue id -- no turn |
@@ -237,7 +238,7 @@ unset here -- see "Reconnect is not resume" below for what it is for.
 | `approval/requested` / `approval/decided` (a running child's tool prompt) | `subagent_manager/run.py`, when a child asks for a tool | in the PARENT's log under the turn that asked (`child_origin`): approval id `<child_id>:<request_id>` |
 | `plan/updated` | `EVENT_TODO_UPDATE`, inside `slot.set_todo`'s own change gate | turn, the whole task list as `{id, text, state}` |
 | `background/completed` | `run_bg_oneliner` and `background_turn`, at the point they record usage, against an owner pinned BEFORE the call | kind, served model, provider, the billed token dimensions, credits, ms -- no turn |
-| `subagent/spawned` | `_log_spawned`, the one site every started run passes and no rejection does | the turn that ASKED, read from the pin taken at acceptance; child id, agent, model, the task text redacted and clipped, the three context-scope flags |
+| `subagent/spawned` | `_log_spawned`, the one site every started run passes and no rejection does | the turn that ASKED and its attempt when observed, read from the pin taken at acceptance; child id, agent, model, the task text redacted and clipped, the three context-scope flags |
 | `subagent/steered` | `steer_run` after the provider accepted, `follow_up_run` after the queue accepted | child id, `interrupt` or `follow_up` |
 | `subagent/completed` | the exclusive terminal report, for outcome `completed` | child id, elapsed ms, credits when billed |
 | `subagent/failed` | the same report, for outcome `failed` or `stopped` | child id, reason, which outcome it was, elapsed ms, credits when billed |
@@ -441,6 +442,16 @@ gate returns before the request is composed, the same as every other refusal gat
 so it records the same pair rather than nothing -- the accepted input a reader most
 needs to see beside the refusal is still there.
 
+### The engine's measurement lands inside its turn
+
+`context/measured` is written after `turn/started` (so after every `context/composed`
+of the turn) and before the turn's `tool/completed` sweep, `step/completed` and
+`turn/completed`. The `usage` fold attaches it to the TAIL row of its context window
+and nowhere else, and a closer seals the rows it closes, so written after
+`turn/completed` it would find its row sealed and attach to nothing. It is written on
+both closer paths, measured and failed: a cancelled or failed turn whose engine footer
+arrived still has a real measurement.
+
 ### `session/closed` is a teardown, not the end of the file
 
 A forced reset -- the model-switch route called with `skip_running` false -- tears a
@@ -510,13 +521,16 @@ handle-holding caller. The static pin cannot see that case; a retention test cov
 ### A dying turn still records what it produced
 
 The recovery handlers -- cancellation, a signed-out CLI, a dead backend process, an
-exhausted prompt-busy retry, and branches of the generic `AcpError` arm --
-persist the turn's partial reply straight through `slot.append` rather than
-`_flush_segment`, because they purge the chunk rows first and must not broadcast a
-segment. They go through one helper, `_persist_partial_reply`, which writes the body to
-the log as well, marked `interrupted`, BEFORE the turn's closers run, and then writes the
-turn's abnormal-end usage row (`_record_abnormal_turn_usage`) whether or not there was
-partial text. One helper rather than the block inline in each handler, for the reason
+exhausted prompt-busy retry, branches of the generic `AcpError` arm, the generic
+`Exception` arm, and the four arms that complete a turn and return before the
+end-of-turn flush to queue a recovery (a stale turn, a tool stall, a failed
+compaction, a retryable `error:` failure) -- persist the turn's partial reply
+straight through `slot.append` rather than `_flush_segment`, because they purge the
+chunk rows first and must not broadcast a segment. They go through one helper,
+`_persist_partial_reply`, which writes the body to the log as well, marked
+`interrupted`, BEFORE the turn's closers run, then gives the reply its footer, and
+then writes the turn's abnormal-end usage row (`_record_abnormal_turn_usage`)
+whether or not there was partial text. One helper rather than the block inline in each handler, for the reason
 redaction lives at the emitter's boundary: a new handler cannot forget it, and a test asserts that structurally
 rather than per branch, since each branch needs its own error class, retry counter and
 depth to reach. Without the log copy the transcript holds text the user
@@ -938,7 +952,13 @@ Two different moments, and conflating them produces two different defects.
 The **asking turn** is knowable only at acceptance: a spawn arrives as a tool call inside the
 parent's turn, while the child's own entries are produced long afterwards, usually while the parent
 is on a different turn. So `(session id, turn)` is pinned there and every later entry about that
-child reads it back.
+child reads it back. The pin also carries that turn's **attempt**, because a regenerate or rewind
+reruns the same ordinal and `turn/started` is identified by `(turn, attempt)`. The attempt is
+derived on the writer thread by the start's own job and stamped on the record that start opened,
+so a child dispatched before that job runs is pinned with the attempt unobserved, and the entry
+omits it rather than claiming attempt 1. The asking turn is read with `asking_turn`, not
+`live_turn`: a turn whose closer is already handed to the writer has ended and asks for nothing,
+though the tail repair still counts it as running.
 
 The **entry** may not be written there, because acceptance is not a start. Registration is followed
 by the spawn approval gate, and a decline returns through the finalize claim and the announce
@@ -964,6 +984,12 @@ on an unrelated one. Its asking ordinal is pinned where the follow-up was REQUES
 is itself a tool call inside the asking turn -- and carried to the dispatch on the run record, the
 same way `_preassigned_id` and the inherited context groups already ride that call. Without it the
 continuation would be filed under a turn that did not ask for it.
+
+Every other spawn reads its origin, `(unit, turn, attempt)`, once on its first pass and carries it
+on the queued row as `_crew_log_asked`. A row the durable queue replays after a restart has no pin
+in the new process and the parent has moved to a new unit, so the replay pins to the unit that
+asked, from the row. A unit id over the emitter's session-id cap is left off the row. A row written
+before the origin was stored falls back to the parent's current unit with the turn unobserved.
 
 Several follow-ups queued across several turns are delivered as ONE continuation, so that entry can
 name only one turn, and the pin it carries is the most recent ask's. That is a choice rather than a
@@ -1162,7 +1188,6 @@ the finding: an unnamed site records `user`.
 | `slack/gateway` cron branch | a cron notification | `cron` |
 | `slack/gateway._fire_dashboard_nudge` | a nudge/monitor wake (`_directive_self_wake`) | `autonudge` |
 | `slack/gateway` sub-agent injection | a sub-agent completion | `subagent` |
-| `slack/gateway._retrigger_recovery` | re-injected sub-agent completions | `subagent` |
 | `chat_runner` synthesis dispatch | the sub-agent synthesis prompt | `subagent` |
 | `issue_radar.crew_runtime_session` | a crew-composed prompt | `crew` |
 | `handlers/taskrunner` (plan, result) | a task-runner summary | `gateway` |

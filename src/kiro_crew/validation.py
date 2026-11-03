@@ -136,7 +136,23 @@ for _owner in _OWNERS:
     _importlib.import_module(_owner)
 #: Name the facade serves but does not bind -> the owner that answers a read of it.
 _EXPORTS: dict[str, str] = {}
-_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+# SESSION_HANDOFF_SCHEMA names two different tools in two owners:
+# ``core_turn_schemas`` carries the fork's external-agent handoff (origin/prompt/project),
+# ``messaging_session_schemas`` the dashboard's hand-a-session-over (target/to).
+# The facade serves the former (the control-plane tool's schema, which its driver
+# imports); the dashboard registry imports the latter from its owner directly.
+_EXPORTS.update(
+    _facade_mirror.install(
+        _sys.modules[__name__], _OWNERS, excluded=("SESSION_HANDOFF_SCHEMA",)
+    ).served
+)
+# Excluded from the mirror, so bind the control-plane (external-agent) handoff
+# schema at runtime: the dashboard's same-named move-a-session schema is a
+# different tool, imported from ``messaging_session_schemas`` by its registry.
+SESSION_HANDOFF_SCHEMA = _importlib.import_module(
+    "kiro_crew.validation_parts.core_turn_schemas"
+).SESSION_HANDOFF_SCHEMA
+_EXPORTS["SESSION_HANDOFF_SCHEMA"] = "kiro_crew.validation_parts.core_turn_schemas"
 _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 #: What a star import binds: every public name of the unsplit module's namespace.
 __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
@@ -157,6 +173,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _OMC_API_PATHS,
         _OMC_MAX_BODY,
         _OMC_QUERY_RE,
+        _POD_LIMIT_MAX_LEN,
         _POD_WORKTREE_MAX_LEN,
         DESIGN_TWEAK_UPDATE_THREAD_SCHEMA,
         ISSUE_RADAR_CREW_READ_SCHEMA,
@@ -166,6 +183,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         OPS_MISSION_CONTROL_API_SCHEMA,
         POD_DOWN_SCHEMA,
         POD_LS_SCHEMA,
+        POD_RESTART_SCHEMA,
         POD_STATUS_SCHEMA,
         POD_UP_SCHEMA,
         _validate_crew_record_couples_phase_to_an_event,
@@ -312,6 +330,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         MAX_FOLLOWUP_PROMPT,
         MAX_FOLLOWUP_TITLE,
         NOTHING_TO_DO_SCHEMA,
+        REQUEST_SERVER_SCHEMA,
         RESET_CONVERSATION_SCHEMA,
         SESSION_HANDOFF_SCHEMA,
         SET_PROJECT_SCHEMA,
@@ -373,6 +392,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _MODEL_NAME_RE,
         _MODEL_SEGMENT,
         _QUALIFIED_MODEL_MAX_CHARS,
+        AGENT_NAME_HINT,
         ALLOWED_HOOK_EVENTS,
         ALLOWED_LESSON_APPLIES,
         ALLOWED_LESSON_CATEGORIES,
@@ -402,11 +422,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         MAX_SKILL_KEY_CHARS,
         MAX_TOOL_NAME_LEN,
         MODEL_ID_RE,
+        MODEL_NAME_HINT,
         MODEL_PICKER_HIDDEN_MODEL_ID_RE,
         MODEL_PICKER_HIDDEN_MODELS_MAX,
         QUALIFIED_MODEL_PATTERN,
         REGISTERED_AGENT_NAME_RE,
         SLACK_THREAD_TS_RE,
+        TEMPLATE_NAME_HINT,
         TEMPLATE_NAME_RE,
         THEME_CONSENT_SHA_RE,
         USER_ID_RE,
@@ -430,6 +452,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _PATTERN_VALUE_MAX_LEN,
         _SUPPORTED_SCHEMA_KEYWORDS,
         _bounded_pattern_search,
+        _integral_float_as_int,
         _json_equal,
         _json_type_ok,
         _reject_malformed_keyword_shapes,
@@ -438,6 +461,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.validation_parts.messaging_session_schemas import (  # noqa: F401
         _CHANNEL_TARGET_INCOMPATIBLE,
+        _CREW_RE,
         _EMOJI_NAME_RE,
         _ISO_DATE_RE,
         _SEND_MESSAGE_SESSION_RE,
@@ -459,12 +483,15 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         SESSION_ADOPT_SCHEMA,
         SESSION_BROADCAST_SCHEMA,
         SESSION_CLOSE_SCHEMA,
+        SESSION_COLOR_CHOICES,
         SESSION_CONTINUE_SCHEMA,
         SESSION_CREATE_SCHEMA,
         SESSION_END_WAIT_SCHEMA,
         SESSION_FORK_SCHEMA,
         SESSION_GENERATE_TITLE_SCHEMA,
+        SESSION_HANDOFF_SCHEMA as SESSION_HANDOFF_TARGET_SCHEMA,
         SESSION_HISTORY_LIST_SCHEMA,
+        SESSION_PALETTE_SIZE,
         SESSION_READ_MESSAGE_SCHEMA,
         SESSION_RELEASE_SCHEMA,
         SESSION_RELOAD_SCHEMA,
@@ -472,11 +499,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         SESSION_RETRY_SCHEMA,
         SESSION_REVIVE_SCHEMA,
         SESSION_SEND_SCHEMA,
+        SESSION_SET_COLOR_SCHEMA,
         SESSION_SET_MODEL_SCHEMA,
         SESSION_STATUS_SCHEMA,
         SESSION_STOP_SCHEMA,
         SESSION_SUMMARY_SCHEMA,
         WAIT_SCHEMA,
+        WORK_DISPATCH_SCHEMA,
         _validate_channel_routing,
         _validate_session_set_model,
     )
@@ -499,6 +528,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         DASHBOARD_PREVIEW_SCHEMA,
         DASHBOARD_ROLLBACK_SCHEMA,
         DASHBOARD_SAVE_SCHEMA,
+        DASHBOARD_SNAPSHOT_SCHEMA,
         DASHBOARD_TEMPLATES_SCHEMA,
         DASHBOARD_TYPES_SCHEMA,
         DASHBOARD_WRITE_NO_VALUE,
@@ -525,6 +555,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         WORK_LEDGER_READ_SCHEMA,
         WORK_LEDGER_REBUILD_SCHEMA,
         WORK_LEDGER_RECORD_SCHEMA,
+        WORK_REPORT_REMOTE_DISPATCH_SCHEMA,
         WORK_REPORT_SCHEMA,
         _validate_dashboard_write_tool,
         _validate_work_artifacts,

@@ -304,7 +304,8 @@ FACADE_LOGGER = "kiro_crew.context"
 #: composition, so the set is spelled out rather than globbed.
 OWNER_MODULES = frozenset(
     """agent_spec budget delivery_records inclusion markers member member_gates
-    output_contract replay sections session_start store_admission turn turn_message""".split()
+    output_contract replay sections session_start store_admission tool_names turn
+    turn_message""".split()
 )
 
 
@@ -971,5 +972,9 @@ def _guidance(session_key: str) -> list[str]:
     from kiro_crew.context_assembly import turn
 
     return turn.interactive_guidance(
-        interactive=True, session_key=session_key, agent=None, minimal_context=False
+        interactive=True,
+        session_key=session_key,
+        agent=None,
+        minimal_context=False,
+        producer_is_user_facing=True,
     )

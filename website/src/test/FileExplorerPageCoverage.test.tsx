@@ -54,15 +54,17 @@ vi.mock('../components/MarkdownRenderer', async () => {
 
 vi.mock('../utils/clipboard', () => ({ copyToClipboard: vi.fn() }))
 
-// FileViewer's overflow gates Open/Reveal on directLocal (the browser is on the
-// gateway machine). Mock it true so the reveal-menu tests can see those items;
-// the remote-hidden case is covered in FilePathMenu.test.tsx.
+// FileViewer's overflow gates Open/Reveal on the shared reveal gate (the browser
+// is on the gateway machine, and that machine has a launcher). Mock both true so
+// the reveal-menu tests can see those items; the hidden cases are covered in
+// FilePathMenu.test.tsx.
 vi.mock('../hooks/useBranding', () => ({
-  useBranding: () => ({ botName: 'Kiro Crew', avatar: '/logo.png', directLocal: true }),
+  useBranding: () => ({ botName: 'Kiro Crew', avatar: '/logo.png', directLocal: true, desktopLauncher: true }),
 }))
 
 import { fileExplorerApi } from '../apps/file-explorer/api'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
 import { copyToClipboard } from '../utils/clipboard'
 import { i18nT } from '../i18n/t'
 import { STORAGE_KEY } from '../apps/file-explorer/constants'
@@ -408,17 +410,21 @@ describe('FileExplorerPage reveal', () => {
     expect(reveal).toHaveBeenCalledExactlyOnceWith('/home/user/notes.txt', 'reveal')
   })
 
-  it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
+  it('says the path was copied, in place, when the backend resolves with a copy fallback', async () => {
     // The copy fallback is centralized in revealOrOpen (FilePathMenu.tsx),
-    // which calls api.revealPath and then copyToClipboard itself without an
-    // alert, so this call site must not add one once the real client resolves.
+    // which calls api.revealPath, then copyToClipboard, and reports the copy
+    // through the caller's notice: no alert, and no silent copy either.
     const reveal = spyReveal({ ok: true, copy: '/home/user/notes.txt' })
+    vi.mocked(copyToClipboard).mockResolvedValueOnce(true)
     const alerted = captureAlert()
     renderPage()
     await ready()
     await openFromTree('notes.txt')
     await pickFromOverflow('Show in file manager')
     await waitFor(() => expect(reveal).toHaveBeenCalled())
+    expect(copyToClipboard).toHaveBeenCalledWith('/home/user/notes.txt')
+    const notice = await screen.findByTestId('file-viewer-reveal-error')
+    expect(notice).toHaveTextContent(i18nT('components.filePathMenu.reveal_copied_instead'))
     expect(alerted).not.toHaveBeenCalled()
   })
 
@@ -658,6 +664,65 @@ describe('FileExplorerPage tree and root navigation', () => {
     const labels = screen.getAllByRole('menuitem').map((r) => r.textContent)
     expect(labels.some((l) => l?.includes('Chat about this folder'))).toBe(true)
     expect(labels.some((l) => l?.trim() === 'Open')).toBe(false)
+  })
+})
+
+// ─── refresh ────────────────────────────────────────────────────────────────
+
+describe('FileExplorerPage refresh', () => {
+  // The app's QueryClient holds queries fresh forever (staleTime: Infinity), so
+  // nothing but an explicit re-read brings in what changed on disk.
+  function renderCached() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } })
+    render(
+      <Provider store={createTestStore()}>
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={['/file-explorer']}>
+            <FileExplorerPage />
+          </MemoryRouter>
+        </QueryClientProvider>
+      </Provider>,
+    )
+  }
+
+  const refreshLabel = () => i18nT('apps.fileExplorer.pathBar.refresh_folder')
+
+  it('shows a folder created on disk after the tree loaded', async () => {
+    renderCached()
+    await ready()
+    expect(treeBox().queryByText('cloned-repo')).not.toBeInTheDocument()
+    vi.mocked(fileExplorerApi.tree).mockResolvedValue({ entries: [
+      ...ENTRIES,
+      { name: 'cloned-repo', path: '/home/user/cloned-repo', type: 'dir' },
+    ] })
+    await userEvent.click(screen.getByRole('button', { name: refreshLabel() }))
+    await waitFor(() => expect(treeBox().getByText('cloned-repo')).toBeInTheDocument())
+  })
+
+  it('re-reads an expanded, lazily loaded folder too', async () => {
+    let lazy: TreeEntry[] = [{ name: 'a.txt', path: '/home/user/lazy/a.txt', type: 'file' }]
+    vi.mocked(fileExplorerApi.tree).mockImplementation((p: string) => Promise.resolve(
+      p === ROOT
+        ? { entries: [{ name: 'lazy', path: '/home/user/lazy', type: 'dir' }] }
+        : { entries: lazy },
+    ))
+    renderCached()
+    await ready()
+    await userEvent.click(treeBox().getByText('lazy'))
+    await waitFor(() => expect(treeBox().getByText('a.txt')).toBeInTheDocument())
+    lazy = [...lazy, { name: 'written-by-agent.md', path: '/home/user/lazy/written-by-agent.md', type: 'file' }]
+    await userEvent.click(screen.getByRole('button', { name: refreshLabel() }))
+    await waitFor(() => expect(treeBox().getByText('written-by-agent.md')).toBeInTheDocument())
+  })
+
+  it('re-reads git status so the branch badge follows the disk', async () => {
+    vi.mocked(fileExplorerApi.gitStatus).mockResolvedValue({ repoRoot: ROOT, branch: 'main', statuses: {} })
+    renderCached()
+    await ready()
+    await waitFor(() => expect(document.querySelector('.mc-fe-branch')?.textContent).toContain('main'))
+    vi.mocked(fileExplorerApi.gitStatus).mockResolvedValue({ repoRoot: ROOT, branch: 'feature', statuses: {} })
+    await userEvent.click(screen.getByRole('button', { name: refreshLabel() }))
+    await waitFor(() => expect(document.querySelector('.mc-fe-branch')?.textContent).toContain('feature'))
   })
 })
 
@@ -903,6 +968,32 @@ describe('FileExplorerPage backend banner', () => {
     expect(screen.getByText(/connection refused/)).toBeInTheDocument()
   })
 
+  it('shows the banner, not an endless skeleton, when the first health call is refused (app disabled)', async () => {
+    vi.mocked(fileExplorerApi.health).mockRejectedValue(
+      new ApiError(
+        403,
+        "app 'file-explorer' is not enabled",
+        '{"code":"app_not_enabled","error":"app \'file-explorer\' is not enabled"}',
+      ),
+    )
+    renderPage()
+    await waitFor(() => expect(fileExplorerApi.health).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByText(/This app is disabled/)).toBeInTheDocument())
+    expect(screen.queryByText(/Backend not reachable/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Apps$/ })).toBeInTheDocument()
+    expect(document.querySelector('[data-slot="skeleton"]')).not.toBeInTheDocument()
+  })
+
+  it('keeps "Backend not reachable", not a skeleton, when the first health call fails to connect', async () => {
+    vi.mocked(fileExplorerApi.health).mockRejectedValue(new Error('connection refused'))
+    renderPage()
+    await waitFor(() => expect(fileExplorerApi.health).toHaveBeenCalled())
+    await waitFor(() => expect(screen.getByText(/Backend not reachable/)).toBeInTheDocument())
+    expect(screen.getByText(/connection refused/)).toBeInTheDocument()
+    expect(screen.queryByText(/This app is disabled/)).not.toBeInTheDocument()
+    expect(document.querySelector('[data-slot="skeleton"]')).not.toBeInTheDocument()
+  })
+
   it('surfaces a folder-open (tree) failure instead of a silent blank pane', async () => {
     const { qc } = renderPage()
     await ready()
@@ -931,5 +1022,59 @@ describe('FileExplorerPage backend banner', () => {
     expect(document.querySelector('.mc-fe-tree')).not.toBeInTheDocument()
     // A recovery action sits beside the empty state so the user is not stuck.
     expect(screen.getByText(/Go to parent folder/)).toBeInTheDocument()
+  })
+})
+
+// ─── Windows gateway parents (#27791) ───────────────────────────────────────
+
+describe('FileExplorerPage parent navigation on a Windows gateway', () => {
+  const WIN_ROOT = 'C:\\Users\\me'
+  const WIN_ENTRIES: TreeEntry[] = [
+    { name: 'src', path: 'C:\\Users\\me\\src', type: 'dir', children: [
+      { name: 'index.ts', path: 'C:\\Users\\me\\src\\index.ts', type: 'file' },
+    ] },
+    { name: 'notes.txt', path: 'C:\\Users\\me\\notes.txt', type: 'file', size: 12, mtime: 1700000000 },
+  ]
+
+  beforeEach(() => {
+    vi.mocked(fileExplorerApi.health).mockResolvedValue({ allowedRoots: [WIN_ROOT], home: WIN_ROOT })
+    vi.mocked(fileExplorerApi.tree).mockResolvedValue({ entries: WIN_ENTRIES })
+  })
+
+  it('"Reveal parent" re-roots to the Windows parent, not /', async () => {
+    renderPage()
+    await ready()
+    await userEvent.click(treeBox().getByText('src'))
+    await waitFor(() => expect(treeBox().getByText('index.ts')).toBeInTheDocument())
+    await openMenuOn('index.ts')
+    await clickMenuItem('Reveal parent')
+    await waitFor(() => expect(fileExplorerApi.tree).toHaveBeenCalledWith('C:\\Users\\me\\src', 2))
+    expect(fileExplorerApi.tree).not.toHaveBeenCalledWith('/', 2)
+  })
+
+  it('"Go to parent folder" re-roots an unavailable folder to its Windows parent', async () => {
+    const gone = 'C:\\Users\\me\\gone'
+    vi.mocked(fileExplorerApi.tree).mockImplementation((p: string) =>
+      p === gone ? Promise.reject(new Error('path not allowed')) : Promise.resolve({ entries: WIN_ENTRIES }))
+    seedSaved({ folderTabs: [{ id: 'ft-w', rootPath: gone, label: '', expanded: { [gone]: true } }] })
+    renderPage()
+    await waitFor(() => expect(screen.getByText(/This folder is unavailable/)).toBeInTheDocument())
+    await userEvent.click(screen.getByText(/Go to parent folder/))
+    await waitFor(() => expect(fileExplorerApi.tree).toHaveBeenCalledWith(WIN_ROOT, 2))
+    expect(fileExplorerApi.tree).not.toHaveBeenCalledWith('/', 2)
+  })
+
+  it('opening a file by path keeps the root when the file sits in it', async () => {
+    renderPage()
+    await ready()
+    vi.mocked(fileExplorerApi.resolve).mockResolvedValue({ exists: true, type: 'file' })
+    const calls = vi.mocked(fileExplorerApi.tree).mock.calls.length
+    await userEvent.click(screen.getByTitle('Click to edit path'))
+    const input = screen.getByLabelText('Folder path')
+    await userEvent.clear(input)
+    await userEvent.type(input, 'C:\\Users\\me\\notes.txt{Enter}')
+    await waitFor(() => expect(viewerName()).toBe('notes.txt'))
+    expect(vi.mocked(fileExplorerApi.tree).mock.calls.length).toBe(calls)
+    expect(fileExplorerApi.tree).not.toHaveBeenCalledWith('/', 2)
   })
 })

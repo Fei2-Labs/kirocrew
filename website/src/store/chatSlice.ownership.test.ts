@@ -101,7 +101,7 @@ describe('store/chat owners', () => {
 
 /** Reducers the facade wires inline next to the families: small UI flags and the live frame reducer. */
 const INLINE_REDUCERS = [
-  'setPendingInput', 'stageToMainComposer', 'setAgentSwitchNotice', 'setVoicePlaying', 'setVoicePreparing', 'setVoiceAudio',
+  'setPendingInput', 'stagePendingSend', 'stageToMainComposer', 'setAgentSwitchNotice', 'setVoicePlaying', 'setVoicePreparing', 'setVoiceAudio',
   'requestSlotReveal', 'requestSlotFolderOpen', 'clearSlotReveal', 'requestFolderReveal', 'sseChatMessage', 'setCloseRefused',
 ]
 
@@ -156,7 +156,7 @@ describe('reducer families', () => {
 
 /** owner module -> the names the facade re-exports from it. */
 const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
-  ['wire', wire, ['clampToolOutput', 'TOOL_OUTPUT_MAX_CHARS', 'normalizeQueueEntries', 'queueEntryAttachments', 'queueEntryQuote']],
+  ['wire', wire, ['clampToolOutput', 'TOOL_OUTPUT_MAX_CHARS', 'normalizeQueueEntries', 'queueEntryAttachments', 'queueEntryPastes', 'queueEntryQuote']],
   ['queue', queue, ['hydrateQueuedBubbles']],
   ['transcript', transcript, ['floorForGen', 'hasUnidentifiedDurableRow', 'raiseChunkSeq', 'snapshotChunkGen', 'snapshotChunkSeq', 'transcriptTsMs']],
   ['paging', paging, [
@@ -171,7 +171,7 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
   ]],
   ['workflows', workflows, ['WORKFLOW_TERMINAL_STATUSES', 'isTerminalWorkflowStatus', 'selectSidebarWorkflowActive', 'selectSidebarWorkflowActiveKeys']],
   ['automations', automations, ['selectAutomationForSlot', 'selectSidebarAutomationRunningKeys']],
-  ['side', side, ['queueEditBroadcastAt']],
+  ['side', side, ['beginSideQueueEdit', 'finishSideQueueEdit', 'forgetSideSteerSubmittedText', 'noteSideQueueDroppedByClose', 'queueEditBroadcastAt', 'readSideSteerSubmittedText', 'recordSideSteerSubmittedText', 'setSideQueueEditDraft', 'takeSideQueueDroppedByClose', 'takeSideQueueDroppedByResyncThenClose', 'takeSideSteerDroppedByClose', 'takeSideQueueEditForClose']],
   ['selectors', selectors, [
     'selectActiveSlotProject', 'selectComposerBusy', 'selectContinuable', 'selectProjectChipLocked', 'selectSendAccepted', 'selectSendConfirmed', 'selectSlotMessages',
     'selectSlotPendingApproval', 'selectSlotRunEpoch', 'selectSlotStreamState', 'selectSlotToolLog', 'selectTrailingSendUnconfirmed',
@@ -181,12 +181,12 @@ const REEXPORTS: Array<[string, Record<string, unknown>, string[]]> = [
   ['slotRefresh', slotRefresh, ['refreshSlot', 'warmSlotCache']],
   ['runState', runState, ['wireTurnIdentity']],
   ['windowWalk', windowWalk, ['WINDOW_WALK_MAX_PAGES']],
-  ['lifecycle', lifecycle, ['captureForkOrigin', 'clearHistorySessions', 'createSlot', 'deleteHistorySession', 'fetchHistory', 'forkMayOpen', 'forkSlot', 'listForkedSlot', 'resumeFromHistory']],
+  ['lifecycle', lifecycle, ['PENDING_OPEN_LEASE_MS', 'captureForkOrigin', 'clearHistorySessions', 'createSlot', 'deleteHistorySession', 'fetchHistory', 'forkMayOpen', 'forkSlot', 'listForkedSlot', 'resumeFromHistory', 'resumeStillOpening']],
   ['openCreatedSlot', openCreatedSlot, ['openCreatedSlot']],
 ]
 
 /** Names the facade itself defines rather than re-exports. */
-const FACADE_OWN = ['batchedTextAboveFloor', 'default', 'deleteSlot', 'loadOlderMessages', 'loadOlderSlotMessages', 'missedChunkMarker', 'reconcileGoneSubagent', 'requestStop', 'restoreSideConversation']
+const FACADE_OWN = ['awaitSideRestore', 'batchedTextAboveFloor', 'default', 'deleteSlot', 'loadOlderMessages', 'loadOlderSlotMessages', 'missedChunkMarker', 'reconcileGoneSubagent', 'requestStop', 'restoreSideConversation', 'resyncWaitingSideConversations']
 
 describe('facade re-exports', () => {
   const surface = facade as unknown as Record<string, unknown>

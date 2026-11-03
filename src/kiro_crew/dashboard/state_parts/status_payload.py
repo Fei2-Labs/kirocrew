@@ -146,6 +146,10 @@ def status_snapshot(
     update_can_arm: bool = False,
     update_auto_effect: str = "unknown",
     update_bundled_by_app: bool = False,
+    upstream_base_version: str = "",
+    fork_revision: str = "",
+    fork_dirty: bool = False,
+    update_fork_suppressed: bool = False,
     version_display: str = "",
     bundle_id: str = "",
 ) -> dict[str, Any]:
@@ -243,6 +247,10 @@ def status_snapshot(
         # Whether the desktop app bundles this gateway; see
         # ``update_capability.bundled_by_desktop_app``.
         "update_bundled_by_app": update_bundled_by_app,
+        "upstream_base_version": upstream_base_version,
+        "fork_revision": fork_revision,
+        "fork_dirty": fork_dirty,
+        "update_fork_suppressed": update_fork_suppressed,
         "update_last_checked_at": update_last_checked_at,
         "update_check_interval_secs": update_check_interval_secs,
         # Mandatory-update verdict (enterprise governance pin OR the release
@@ -304,7 +312,7 @@ def status_snapshot(
         # fail-closed trip, integrity mismatch, or unverified policy this
         # session), or "unknown" (policy not yet loaded).  Pure in-memory read.
         "governance": _governance_status(),
-        # FIX 2: cap / in-flight / queued counts for unattended app-owned
+        # Cap / in-flight / queued counts for unattended app-owned
         # turns. Published so a fleet parked behind the cap is visibly
         # throttled rather than looking like a set of hung workers.
         "background_turns": self.background_turn_stats(),

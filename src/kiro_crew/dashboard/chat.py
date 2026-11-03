@@ -7,7 +7,7 @@ continue to work without changes.
 The actual implementation lives in:
 - chat_utils.py       — shared helpers, redaction, model normalization
 - chat_persistence.py — session save/restore, history
-- chat_runner.py      — _run_chat, streaming, prompt expansion
+- chat_runner.py      — _run_chat and its stream loop; its owners live in chat_turn/
 - chat_handlers.py    — HTTP API endpoints
 - chat_title.py       — title generation
 - chat_regenerate.py  — regenerate, variant switch, edit-resend
@@ -75,11 +75,13 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slot_queue_reorder,
     api_chat_slot_reasoning_effort,
     api_chat_slot_reload,
+    api_chat_slot_repair_images,
     api_chat_slot_reset_conversation,
     api_chat_slot_resume,
     api_chat_slot_selection_capabilities,
     api_chat_slot_source_link_unlink,
     api_chat_slot_source_links,
+    api_chat_slot_steer_retract,
     api_chat_slot_stop,
     api_chat_slot_summary,
     api_chat_slot_summary_generate,

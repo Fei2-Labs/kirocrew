@@ -381,6 +381,33 @@ def _safe_sounds(value: object) -> dict:
     return out
 
 
+def safe_imported(value: object) -> dict:
+    """A crew's provenance stamp from a ``.crewmate`` import, or ``{}`` on junk.
+
+    ``{"format_version": int, "sender_label": str, "sha256": str, "imported_at": str}``
+    (rfc-crewmate-share.md §5.4 step 5). A stamp, not a parent: nothing reads it to
+    reach the sender. The label is self-declared and capped like the card's.
+    """
+    if not isinstance(value, dict) or set(value) != {
+        "format_version",
+        "sender_label",
+        "sha256",
+        "imported_at",
+    }:
+        return {}
+    version, label = value["format_version"], value["sender_label"]
+    sha, at = value["sha256"], value["imported_at"]
+    if type(version) is not int or not 1 <= version <= 1000:
+        return {}
+    if not isinstance(label, str) or len(label) > 64:
+        return {}
+    if not isinstance(sha, str) or not _re.fullmatch(r"(?:[0-9a-f]{64})?", sha):
+        return {}
+    if not isinstance(at, str) or not _re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", at):
+        return {}
+    return {"format_version": version, "sender_label": label, "sha256": sha, "imported_at": at}
+
+
 def _safe_avatar(value: object) -> dict:
     """Return a validated per-crew avatar override, or ``{}`` on junk.
 
@@ -740,3 +767,65 @@ def _normalize_acp_backend(value: object) -> str:
     module) that the old local import of ``acp.types`` existed to dodge.
     """
     return resolve_selected_backend(value)
+
+
+def _unselectable_failover_names(chain: tuple[str, ...]) -> list[str]:
+    """The chain names, in config spelling, that are not selectable right now."""
+    # Imported here, not at module top: a module-level import would make the
+    # ``config.sections`` facade serve this name too.
+    from kiro_crew.acp_backends import backend_from_stored, selectable_backend_values
+
+    selectable = set(selectable_backend_values())
+    return [name for name in chain if backend_from_stored(name) not in selectable]
+
+
+def normalize_acp_failover(value: object) -> dict:
+    """``agent.acp_failover`` as the loaded config holds it. Never raises.
+
+    Whether a chain name is selectable depends on the live registry, which an
+    enterprise ceiling or this host can narrow after the block was written, so a
+    load must not fail on it: a member that is not selectable is dropped from the
+    loaded value with a warning, the way ``_read_backend_choice`` treats a backend
+    pick. A block with an invalid shape is logged and loaded as off (``{}``).
+    ``config.json`` keeps what the operator wrote either way: the key is one of
+    ``loader_builders._HARNESS_CHOICE_KEYS``, which a full-document save writes
+    back from disk. The hard refusal is on the write path,
+    :func:`validate_acp_failover`.
+    """
+    from kiro_crew.acp_failover import AcpFailoverConfig
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        logger.warning("agent.acp_failover ignored: expected an object")
+        return {}
+    try:
+        parsed = AcpFailoverConfig.from_raw(value)
+    except ValueError as exc:
+        logger.warning("agent.acp_failover ignored: %s", exc)
+        return {}
+    dropped = _unselectable_failover_names(parsed.chain)
+    if not dropped:
+        return dict(value)
+    logger.warning("agent.acp_failover.chain: ignoring %s, which cannot be selected here", dropped)
+    return {**value, "chain": [name for name in parsed.chain if name not in dropped]}
+
+
+def validate_acp_failover(value: object) -> dict:
+    """An ``agent.acp_failover`` value a write may store, else ``ValueError`` naming why.
+
+    The write path's refusal (``kirocrew config set``): stricter than the load
+    path, because the write is the last point where the mistake is still
+    attributable to the command that made it. Refuses a bad shape, a repeated
+    name, a trigger this phase does not consume, and a chain name that is not
+    selectable now.
+    """
+    from kiro_crew.acp_failover import AcpFailoverConfig
+
+    if not isinstance(value, dict):
+        raise ValueError("must be an object with 'enabled', 'chain' and optional 'triggers'")
+    parsed = AcpFailoverConfig.from_raw(value)
+    unusable = _unselectable_failover_names(parsed.chain)
+    if unusable:
+        raise ValueError(f"chain names {unusable}, which cannot be selected here")
+    return dict(value)

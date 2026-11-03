@@ -1007,8 +1007,9 @@ function recordingEmitter(label, log) {
   };
 }
 
-function dashboardWindowHarness({ platform, frameless = false } = {}) {
+function dashboardWindowHarness({ platform, frameless = false, downloadExpectations = null } = {}) {
   const log = [];
+  const sessionListeners = new Map();
   const firstLine = (text) => String(text).split("\n").map((line) => line.trim()).find(Boolean);
   const viewEvents = recordingEmitter("view", log);
   const viewContents = {
@@ -1018,7 +1019,11 @@ function dashboardWindowHarness({ platform, frameless = false } = {}) {
       webRequest: {
         onBeforeSendHeaders() { log.push("view.session.onBeforeSendHeaders"); },
       },
-      on(event) { log.push(`view.session.on:${event}`); return this; },
+      on(event, listener) {
+        log.push(`view.session.on:${event}`);
+        sessionListeners.set(event, listener);
+        return this;
+      },
     },
     setWindowOpenHandler(handler) {
       log.push("view.setWindowOpenHandler");
@@ -1090,8 +1095,9 @@ function dashboardWindowHarness({ platform, frameless = false } = {}) {
     store: { get: (key) => (key === "linuxFrameless" ? frameless : null) },
     platform,
     env: {},
+    downloadExpectations,
   }));
-  return { lifecycle, win, viewContents, log, panelViews, openedExternally };
+  return { lifecycle, win, viewContents, log, panelViews, openedExternally, sessionListeners };
 }
 
 async function wireDashboardWindow(t, options) {
@@ -1120,6 +1126,7 @@ describe("dashboard window wiring order", () => {
     assert.deepEqual(events, [
       "view.on:did-finish-load",
       "win.on:swipe",
+      "view.on:input-event",
       "win.on:closed",
       "win.on:resize",
       "win.on:closed",
@@ -1143,6 +1150,8 @@ describe("dashboard window wiring order", () => {
       "win.on:focus",
       "win.on:focus",
       "view.setWindowOpenHandler",
+      "view.on:will-navigate",
+      "view.on:will-redirect",
       "view.on:did-create-window",
       "view.session.onBeforeSendHeaders",
       "view.session.on:will-download",
@@ -1211,6 +1220,54 @@ describe("dashboard window wiring order", () => {
     assert.deepEqual(openedExternally, ["https://example.com/docs", "https://example.com/docs"]);
   });
 
+  it("refuses a top-level navigation off the app origin, in the dashboard and its pop-outs", async (t) => {
+    const { viewContents, openedExternally } = await wireDashboardWindow(t, { platform: "darwin" });
+    const popout = { webContents: { ...recordingEmitter("child", []), setWindowOpenHandler() {} } };
+    viewContents.emit("did-create-window", popout);
+    const navigate = (contents, url) => {
+      let prevented = false;
+      contents.emit("will-navigate", { preventDefault: () => { prevented = true; } }, url);
+      return prevented;
+    };
+    for (const contents of [viewContents, popout.webContents]) {
+      // A pane on another loopback port promoting itself to the top frame.
+      assert.equal(navigate(contents, "http://localhost:5477/"), true);
+      assert.equal(navigate(contents, "http://127.0.0.1:5476/"), true);
+      assert.equal(navigate(contents, "https://example.com/"), true);
+      assert.equal(navigate(contents, "file:///etc/passwd"), true);
+      assert.equal(navigate(contents, "blob:http://localhost:5476/x"), true);
+      assert.equal(navigate(contents, "not a url"), true);
+      // The dashboard's own routes, and the token prompt's hand-off, still work.
+      assert.equal(navigate(contents, "http://localhost:5476/chat?x=1"), false);
+      assert.equal(navigate(contents, "http://localhost:5476/?token=t"), false);
+    }
+    assert.deepEqual(openedExternally, [], "a refused navigation opens nothing");
+  });
+
+  it("refuses a main-frame redirect off the app origin, in the dashboard and its pop-outs", async (t) => {
+    const { viewContents } = await wireDashboardWindow(t, { platform: "darwin" });
+    const popout = { webContents: { ...recordingEmitter("child", []), setWindowOpenHandler() {} } };
+    viewContents.emit("did-create-window", popout);
+    const redirect = (contents, url, isMainFrame = true) => {
+      let prevented = false;
+      contents.emit("will-redirect", { url, isMainFrame, preventDefault: () => { prevented = true; } });
+      return prevented;
+    };
+    for (const contents of [viewContents, popout.webContents]) {
+      assert.equal(redirect(contents, "https://sso.example/login"), true);
+      assert.equal(redirect(contents, "http://127.0.0.1:5476/"), true);
+      assert.equal(redirect(contents, "http://localhost:54760/"), true);
+      assert.equal(redirect(contents, "http://localhost:5476.evil.test/"), true);
+      // A pane iframe redirecting inside its own origin is not the dashboard's.
+      assert.equal(redirect(contents, "http://kirocrew.localhost:6000/x", false), false);
+      assert.equal(redirect(contents, "http://localhost:5476/chat?token=t"), false);
+      // No isMainFrame on the event: an unknown frame counts as main, so refused.
+      let unknownFrameRefused = false;
+      contents.emit("will-redirect", { url: "https://sso.example/login", preventDefault: () => { unknownFrameRefused = true; } });
+      assert.equal(unknownFrameRefused, true);
+    }
+  });
+
   it("a framed window injects neither the drag band nor caption controls", async (t) => {
     const { onLoad } = await wireDashboardWindow(t, { platform: "linux", frameless: false });
     assert.deepEqual(onLoad, [
@@ -1234,6 +1291,37 @@ describe("dashboard window wiring order", () => {
     assert.equal(win._mcGetCustomName(), null);
     win._mcSetCustomName("Work");
     assert.equal(win._mcGetCustomName(), "Work");
+  });
+});
+
+describe("dashboard download handler platform", () => {
+  // Two in-flight downloads whose names differ only in case collide on a
+  // case-insensitive volume (darwin, win32) and not on Linux. Running both
+  // platforms means one of them differs from whatever host runs the suite.
+  async function savePathsFor(t, platform) {
+    const harness = await wireDashboardWindow(t, {
+      platform,
+      downloadExpectations: { claim: () => true },
+    });
+    const onWillDownload = harness.sessionListeners.get("will-download");
+    return ["Report.zip", "report.zip"].map((name) => {
+      let savePath = null;
+      onWillDownload({}, {
+        getURLChain: () => ["http://localhost:5476/export"],
+        getFilename: () => name,
+        setSavePath(p) { savePath = p; },
+        once() {},
+      }, harness.viewContents);
+      return path.basename(savePath);
+    });
+  }
+
+  it("folds case on the injected darwin platform", async (t) => {
+    assert.deepEqual(await savePathsFor(t, "darwin"), ["Report.zip", "report (1).zip"]);
+  });
+
+  it("keeps case on the injected linux platform", async (t) => {
+    assert.deepEqual(await savePathsFor(t, "linux"), ["Report.zip", "report.zip"]);
   });
 });
 
@@ -1669,5 +1757,82 @@ describe("gateway port prompt", () => {
       await settle();
       assert.deepEqual(ports, expected, `answer ${JSON.stringify(answer)}`);
     }
+  });
+});
+
+// ── Close button: background vs quit (#12204) ───────────────────────────────
+
+describe("main window close action", () => {
+  function closeHandlerBody() {
+    const start = SOURCE.indexOf('mainWindow.on("close", createCloseHandler({');
+    assert.notEqual(start, -1, "main window close handler must be built by createCloseHandler");
+    return SOURCE.slice(start, SOURCE.indexOf("\n    }));\n", start));
+  }
+
+  it("wires the close listener to the store, the tray hide, requestQuit and persist", () => {
+    // The sequence itself is exercised behaviourally in close-action.test.js;
+    // this pins that the main window feeds it the real effects.
+    const body = closeHandlerBody();
+    assert.match(body, /getAction: \(\) => getCloseAction\(store\)/);
+    assert.match(body, /cancelPendingTrayHide\(mainWindow\)/);
+    assert.match(body, /^\s*requestQuit,$/m);
+    assert.match(body, /hideToTray\(mainWindow, \{/);
+    assert.match(body, /persist\(\);/);
+  });
+
+  function facadeHarness(stored = {}) {
+    const data = { ...stored };
+    const writes = [];
+    const store = {
+      get: (key) => data[key],
+      set: (key, value) => { writes.push([key, value]); data[key] = value; },
+    };
+    const lifecycle = createWindowLifecycle(validOptions({ store }));
+    return { lifecycle, data, writes };
+  }
+
+  it("the facade reads and writes the stored choice, canonicalized", () => {
+    const h = facadeHarness();
+    assert.equal(h.lifecycle.closeAction.get(), "background", "an untouched install keeps running");
+    assert.equal(h.lifecycle.closeAction.set("quit"), "quit");
+    assert.equal(h.data.closeAction, "quit");
+    assert.equal(h.lifecycle.closeAction.get(), "quit");
+    assert.equal(h.lifecycle.closeAction.set("nonsense"), "background");
+    assert.equal(h.data.closeAction, "background");
+  });
+
+  it("the facade skips a write that changes nothing", () => {
+    const h = facadeHarness({ closeAction: "quit" });
+    h.lifecycle.closeAction.set("quit");
+    assert.deepEqual(h.writes, []);
+    h.lifecycle.closeAction.set("background");
+    assert.deepEqual(h.writes, [["closeAction", "background"]]);
+  });
+
+  it("the tray menu is unchanged: the setting lives only in Settings", () => {
+    const menus = [];
+    const lifecycle = createWindowLifecycle(validOptions({
+      electron: {
+        app: { name: "Kiro Crew", getVersion: () => "0.8.0", getPath: () => "/virtual/logs" },
+        Tray: class {
+          setToolTip() {}
+          setContextMenu() {}
+          on() {}
+        },
+        Menu: { buildFromTemplate: (template) => { menus.push(template); return { template }; } },
+        nativeImage: {
+          createFromPath: () => ({ resize: () => ({ fake: "icon" }), setTemplateImage() {} }),
+        },
+        shell: {},
+      },
+      store: { path: "/virtual/config.json", get: () => undefined, set() {} },
+      platform: "linux",
+      env: {},
+    }));
+    lifecycle.createTray();
+    assert.deepEqual(
+      menus[0].map((item) => item.label || item.type),
+      ["Show Kiro Crew", "separator", "New Connection Window…", "separator", "Open Config File", "separator", "Quit"],
+    );
   });
 });

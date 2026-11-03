@@ -27,7 +27,8 @@ import { NavigationLeaveGuardProvider, NavigationBackGuard } from './components/
 import { RouteHistoryTracker } from './components/NavHistoryArrows'
 import { initRum } from './rum'
 import { isEmbeddedPane } from './lib/embedded'
-import { routerBasename } from './lib/basePath'
+import { BASE_PATH } from './lib/basePath'
+import { appPopoutRouterBasename } from './utils/appPopoutRoute'
 // i18n must initialize before the first render — a component rendering ahead of
 // init would emit its bare translation key instead of text. The `/lazy` entry
 // fetches a non-English catalog on demand; plain `./i18n` has no loader, so
@@ -41,6 +42,8 @@ import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
 import { installPageZoomSuppression } from './utils/pageZoom'
 import { installStaleShellHeal } from './lib/staleShellHeal'
+import { installScrollReveal } from './lib/scrollReveal'
+import { installSwConnectedProbe } from './lib/swConnectedProbe'
 import { captureSafeReload, reloadKeepingSafe } from './lib/safeReload'
 import {
   hasUnreconciledKeys,
@@ -88,6 +91,13 @@ const catalogReady = ensureCatalog(i18next.language).then(async (loaded) => {
 installPageZoomSuppression()
 // Detect and break out of a stale service-worker shell (see the module doc).
 installStaleShellHeal()
+// Scrollbars show only while a box is scrolling: the reveal rules in index.css
+// key on the attribute this sets. Before render, so the first scroll counts.
+installScrollReveal()
+
+// Answer the service worker's push probe from the live connection state, so a
+// push is shown as an OS banner unless this tab is actually receiving notes.
+installSwConnectedProbe(() => store.getState().dashboard.connected)
 // A crash-recovery reload must not reopen the chat that crashed it. Read (and
 // strip) `?safe=1` before the router sees the URL. See lib/safeReload.ts.
 captureSafeReload()
@@ -198,7 +208,11 @@ const appTree = (
               <UIModeProvider>
                 <ThemeExperienceLayer />
                 <NavigationLeaveGuardProvider>
-                  <BrowserRouter basename={routerBasename()}>
+                  {/* The build base, plus `/popout/app` when this document is an
+                      app pop-out window: the apps inside then see their own
+                      dashboard paths (see utils/appPopoutRoute.ts). Read once
+                      at load, like the shell's own popout-ness. */}
+                  <BrowserRouter basename={appPopoutRouterBasename(window.location.pathname, BASE_PATH)}>
                     {/* Inside the router (it navigates) and outside the routes
                         (it must survive every route change). Renders nothing,
                         and stays out of the history stack entirely until a page

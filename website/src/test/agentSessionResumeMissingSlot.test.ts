@@ -34,7 +34,7 @@
  * the Issue Radar flow.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { renderHook } from '@testing-library/react'
+import { act, renderHook } from '@testing-library/react'
 
 const { dispatch, apiMock, sendTurn, saveInvestigation, getInvestigation } = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -53,6 +53,7 @@ vi.mock('../store/chatSlice', () => ({
   createSlot: (arg: unknown) => ({ type: 'createSlot', arg }),
   switchSlot: (arg: unknown) => ({ type: 'switchSlot', arg }),
   deleteSlot: (arg: unknown) => ({ type: 'deleteSlot', arg }),
+  requestSlotFolderOpen: (arg: unknown) => ({ type: 'requestSlotFolderOpen', arg }),
 }))
 vi.mock('react-router-dom', () => ({ useNavigate: () => vi.fn() }))
 vi.mock('../api/client', () => ({ api: apiMock }))
@@ -90,13 +91,17 @@ function harness(rejection: unknown) {
 
 const open = async () => {
   const { result } = renderHook(() => useAgentSession())
-  return result.current.openSession({
-    repoRef: { host: 'github.com', owner: 'acme', repo: 'demo-repo' } as never,
-    number: 6014,
-    title: '#6014 · closed session',
-    prompt: 'seed',
-    existing: { slot_key: 'slot-closed' } as never,
+  let record: unknown
+  await act(async () => {
+    record = await result.current.openSession({
+      repoRef: { host: 'github.com', owner: 'acme', repo: 'demo-repo' } as never,
+      number: 6014,
+      title: '#6014 · closed session',
+      prompt: 'seed',
+      existing: { slot_key: 'slot-closed' } as never,
+    })
   })
+  return record as Awaited<ReturnType<ReturnType<typeof useAgentSession>['openSession']>>
 }
 
 const createdSlot = () =>

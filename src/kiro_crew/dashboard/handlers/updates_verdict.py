@@ -497,6 +497,7 @@ def _set_update_info(**fields: object) -> None:
             "remediation": None,
             "can_arm": False,
             "channel_move_pending": False,
+            "fork_suppressed": False,
         }
     )
     _update_info.update(fields)

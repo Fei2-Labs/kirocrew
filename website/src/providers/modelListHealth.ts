@@ -6,14 +6,13 @@
 // degraded fallback, and would stop polling the moment a
 // possibly-stale cached multi-entry list is served.
 //
-// Keyed by provider id plus the useAvailableModels scope (`slot:…` /
-// `config:…`) so a Settings config-namespace 503 cannot restart the live
-// chat's 8s poll. Default is "not degraded" (undefined → false): a provider
-// whose adapter never marks itself only ever stops polling, so this can never
-// regress an unmarked provider into perpetual polling.
+// Keyed by provider id (read from the ['available-models', <providerId>] query
+// key) so it is provider-safe. Default is "not degraded" (undefined → false):
+// a provider whose adapter never marks itself only ever stops polling, so this
+// can never regress an unmarked provider into perpetual polling.
 import { useSyncExternalStore } from 'react'
 
-const degradedByProvider = new Map<string, Map<string | undefined, boolean>>()
+const degradedByProvider = new Map<string, boolean>()
 // Set when a provider's model list is degraded SPECIFICALLY because kiro-cli's
 // login expired or is signed out (GET /api/models answered 503 with
 // `code: kiro_prerequisite_required`). Separate from `degradedByProvider`
@@ -25,22 +24,9 @@ const degradedByProvider = new Map<string, Map<string | undefined, boolean>>()
 const authRequiredByProvider = new Map<string, boolean>()
 const subscribers = new Set<() => void>()
 
-export function modelListScope(slot?: string, backend?: string | null): string {
-  return slot ? `slot:${slot}` : `config:${backend ?? ''}`
-}
-
-function scopedHealth(providerId: string): Map<string | undefined, boolean> {
-  let health = degradedByProvider.get(providerId)
-  if (!health) {
-    health = new Map()
-    degradedByProvider.set(providerId, health)
-  }
-  return health
-}
-
 /** Record whether the last fetch for a provider was degraded (fallback) or
  *  live. The adapter calls this on every fetch outcome. */
-export function markModelsDegraded(providerId: string, degraded: boolean, scope?: string): void {
+export function markModelsDegraded(providerId: string, degraded: boolean): void {
   // A live success is the one event that clears the auth-required flag: the
   // list loaded, so whatever sign-in wall there was is gone. A degraded fetch
   // leaves the flag to `markModelsAuthRequired`, which the adapter calls with
@@ -50,9 +36,8 @@ export function markModelsDegraded(providerId: string, degraded: boolean, scope?
     authRequiredByProvider.set(providerId, false)
     changed = true
   }
-  const health = scopedHealth(providerId)
-  if (health.get(scope) !== degraded) {
-    health.set(scope, degraded)
+  if (degradedByProvider.get(providerId) !== degraded) {
+    degradedByProvider.set(providerId, degraded)
     changed = true
   }
   if (changed) for (const cb of subscribers) cb()
@@ -89,10 +74,10 @@ function subscribe(cb: () => void): () => void {
   }
 }
 
-/** True only when the provider+scope's last served list is known to be a
- *  degraded fallback. Unknown/never-fetched keys report false (not degraded). */
-export function modelsDegraded(providerId: string, scope?: string): boolean {
-  return degradedByProvider.get(providerId)?.get(scope) === true
+/** True only when the provider's last served list is known to be a degraded
+ *  fallback. Unknown/never-fetched providers report false (not degraded). */
+export function modelsDegraded(providerId: string): boolean {
+  return degradedByProvider.get(providerId) === true
 }
 
 /**
@@ -106,25 +91,31 @@ export function modelsDegraded(providerId: string, scope?: string): boolean {
  * component keeps rendering the previous decision until something unrelated
  * happens to re-render it.
  */
-export function useModelsDegraded(providerId: string, scope?: string): boolean {
+export function useModelsDegraded(providerId: string): boolean {
   return useSyncExternalStore(
     subscribe,
-    () => modelsDegraded(providerId, scope),
+    () => modelsDegraded(providerId),
     () => false,
   )
 }
 
 /**
- * refetch cadence for the ['available-models', <providerId>, <scope>] query:
- * poll every 8s WHILE the served list is a degraded fallback, then stop the
- * instant a LIVE fetch succeeds. Reads provider id (index 1) and scope
- * (index 2) from the query key so a config-namespace 503 cannot flap a
- * live-slot poll. RQ v5 passes the Query instance.
+ * refetch cadence for the ['available-models', <providerId>] query: poll every
+ * 8s WHILE the served list is a degraded fallback, then stop the instant a LIVE
+ * fetch succeeds. Reads the provider id from the query key (index 1), so it is
+ * decoupled from the list shape and safe across providers. RQ v5 passes the
+ * Query instance.
  */
 export function modelListRefetchInterval(
   query: { queryKey: readonly unknown[] },
 ): number | false {
   const providerId = typeof query.queryKey[1] === 'string' ? query.queryKey[1] : ''
-  const scope = typeof query.queryKey[2] === 'string' ? query.queryKey[2] : undefined
-  return modelsDegraded(providerId, scope) ? 8_000 : false
+  // Another backend's list (`['available-models', <providerId>, <backend>]`) heals on its own flag.
+  const backend = typeof query.queryKey[2] === 'string' ? query.queryKey[2] : undefined
+  return modelsDegraded(modelHealthKey(providerId, backend)) ? 8_000 : false
+}
+
+/** The degraded-flag key for the configured list, or for one backend's own list. */
+export function modelHealthKey(providerId: string, backend?: string): string {
+  return backend === undefined ? providerId : `${providerId}:${backend}`
 }

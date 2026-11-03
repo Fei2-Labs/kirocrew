@@ -272,6 +272,34 @@ describe('Design Critique — the built-in example', () => {
     expect(screen.queryByRole('dialog', { name: 'Full size view' })).toBeNull()
   })
 
+  // The lightbox is aria-modal: focus left on the report behind it, or a Tab
+  // that walks out of it, reaches controls the overlay hides.
+  it('moves focus onto the lightbox Close, keeps Tab inside, and returns it to Enlarge', () => {
+    openExample()
+
+    const enlarge = screen.getByTitle('Enlarge')
+    enlarge.focus()
+    fireEvent.click(enlarge)
+    const box = screen.getByRole('dialog', { name: 'Full size view' })
+    const close = within(box).getByRole('button', { name: 'Close' })
+    expect(document.activeElement).toBe(close)
+
+    // A browser gives a `position: fixed` element a null offsetParent, which
+    // the trap reads as hidden; the corner pin belongs on a wrapper instead.
+    expect(close.style.position).not.toBe('fixed')
+    // jsdom has no layout, so give the button an offsetParent for the trap's visibility filter.
+    Object.defineProperty(close, 'offsetParent', { configurable: true, get: () => box })
+    enlarge.focus()
+    fireEvent.keyDown(enlarge, { key: 'Tab' })
+    expect(document.activeElement).toBe(close)
+    fireEvent.keyDown(close, { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toBe(close)
+
+    fireEvent.click(close)
+    expect(screen.queryByRole('dialog', { name: 'Full size view' })).toBeNull()
+    expect(document.activeElement).toBe(enlarge)
+  })
+
   it('returns to the composer from the report', () => {
     openExample()
     expect(screen.queryByText('What should I critique?')).toBeNull()
@@ -401,8 +429,29 @@ describe('Design Critique — annotations saved with a critique', () => {
 
     // The failure renders through ErrorNotice, not as red answer text.
     expect(screen.getByRole('alert')).toHaveTextContent('the critic is gone')
-    // The gate is released, so a second question is still possible.
-    expect(screen.getByPlaceholderText('Ask a follow-up…')).not.toBeDisabled()
+    // The gate is released, so a second question is still possible, and the
+    // composer says it is the retry and holds the question, so nothing is retyped.
+    const retry = screen.getByPlaceholderText('Ask again…')
+    expect(retry).not.toBeDisabled()
+    expect(retry).toHaveValue('Still there?')
+  })
+
+  it('does not drop a failed question into a thread the user has left', async () => {
+    let fail: (e: Error) => void = () => {}
+    mockApi.send.mockReturnValue(new Promise((_, reject) => { fail = reject }))
+    openAnnotated()
+    fireEvent.click(screen.getByTitle('Your question — click to see the answer'))
+    fireEvent.change(screen.getByPlaceholderText('Ask a follow-up…'), {
+      target: { value: 'Still there?' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Ask' }))
+    // Leave the thread while the question is in flight, then let it fail.
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    fail(new Error('the critic is gone'))
+    await tick()
+
+    fireEvent.click(screen.getByTitle('Your question — click to see the answer'))
+    expect(screen.getByPlaceholderText('Ask again…')).toHaveValue('')
   })
 
   it('removes an annotation and unmarks the text', () => {

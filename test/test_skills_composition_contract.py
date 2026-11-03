@@ -133,7 +133,7 @@ _LOADER_MEMBERS = {
         _scoped_entries _served_key_by_realpath _snapshot_admitted_roots
         _trusted_project_key _usage_fields _user_first _validate_and_redact_candidate
         _versions_root _vet_unconfined_path
-        approve_pending_skill_checked
+        approve_pending_as_read approve_pending_skill_checked
         approve_pending_update_checked archive_auto_skill catalog_project_skills
         catalog_status close confined_triggered create_auto_skill create_skill credit_skill_reads
         delete_skill dismiss_all_pending dismiss_pending_skill dismiss_pending_slugs
@@ -187,7 +187,7 @@ _LOADER_SIGNATURES = {
     "_confined_frontmatter_and_size": "(self, path: 'Path', within: 'str') -> 'tuple[dict[str, str], int]'",
     "_create_skill_pinned": "(self, name: 'str', content: 'str', skill_dir: 'Path', parent_fd: 'int') -> 'bool'",
     "_cron_referenced_skills": "() -> 'set[str]'",
-    "_emit_lazy_load_metric": "(t0: 'float', *, hit: 'bool') -> 'None'",
+    "_emit_lazy_load_metric": "(t0: 'float', *, hit: 'bool', skill: 'str | None' = None) -> 'None'",
     "_exact_read_while_building": "(self, key: 'str', only: 'list[str] | None', project_dir: 'str | Path | None', max_bytes: 'int', refusal_reasons: 'list[str] | None' = None) -> 'str | None'",
     "_get_disabled_app_names": "(self) -> 'frozenset[str]'",
     "_invalidate_iter_cache": "(self) -> 'None'",
@@ -215,7 +215,7 @@ _LOADER_SIGNATURES = {
     "_read_exact_key": "(self, key: 'str', *, only: 'list[str] | None', project_dir: 'str | Path | None', max_bytes: 'int') -> '_ExactRead'",
     "_read_global_skill_text": "(self, path: 'Path', max_bytes: 'int | None', *, canonical_root: 'str | None' = None, refusal_reasons: 'list[str] | None' = None) -> 'str | None'",
     "_readable_frontmatter": "(self, path: 'Path', *, within: 'str | None', mtime: 'float | None' = None, canonical_root: 'str | None' = None) -> 'dict[str, str] | None'",
-    "_read_pending_meta": "(self, slug: 'str') -> 'dict'",
+    "_read_pending_meta": "(self, slug: 'str', pdir: 'Path | None' = None) -> 'dict'",
     "_recency_boost": "(self, path_str: 'str', fingerprint: 'str' = '') -> 'float'",
     "_record_use": "(self, key: 'str') -> 'None'",
     "_redact_deep": "(self, obj: 'object') -> 'object'",
@@ -242,8 +242,9 @@ _LOADER_SIGNATURES = {
     "_vet_unconfined_path": "(self, path: 'Path') -> 'bool'",
     "_versions_root": "(self, target_slug: 'str') -> 'Path'",
     "_write_skill_md": "(skill_file: 'Path', content: 'str', *, dir_fd: 'int | None') -> 'bool'",
-    "approve_pending_skill_checked": "(self, slug: 'str') -> 'str'",
-    "approve_pending_update_checked": "(self, slug: 'str') -> 'str'",
+    "approve_pending_as_read": "(self, slug: 'str', content_sha256: 'str') -> 'str'",
+    "approve_pending_skill_checked": "(self, slug: 'str', *, src: 'Path | None' = None) -> 'str'",
+    "approve_pending_update_checked": "(self, slug: 'str', *, src: 'Path | None' = None) -> 'str'",
     "archive_auto_skill": "(self, name: 'str') -> 'bool'",
     "catalog_project_skills": "(self, project_dir: 'str | Path') -> 'list[dict]'",
     "catalog_status": "(self, project_dir: 'str | Path | None' = None) -> 'str'",
@@ -270,7 +271,7 @@ _LOADER_SIGNATURES = {
     "list_skills": "(self, project_dir: 'str | Path | None' = None, *, _entries: 'list[_ScopedSkillEntry] | None' = None) -> 'list[dict]'",
     "load_skill": "(self, name: 'str', project_dir: 'str | Path | None' = None, *, max_bytes: 'int | None' = None, refusal_reasons: 'list[str] | None' = None) -> 'str | None'",
     "pending_candidate_is_staged": "(self, slug: 'str') -> 'bool'",
-    "preview_pending_update": "(self, slug: 'str') -> 'dict | None'",
+    "preview_pending_update": "(self, slug: 'str', *, candidate: 'tuple[str, dict] | None' = None) -> 'dict | None'",
     "prune_pending": "(self, ttl_days: 'int', *, now: 'float | None' = None) -> 'int'",
     "read_auto_skill_body": "(self, name: 'str') -> 'str | None'",
     "read_scoped_skill": "(self, key: 'str', *, only: 'list[str] | None' = None, project_dir: 'str | Path | None' = None, max_bytes: 'int' = 99000) -> 'str | None'",
@@ -287,7 +288,7 @@ _LOADER_SIGNATURES = {
     "set_inject_on_trigger": "(self, name: 'str', inject: 'bool') -> 'bool'",
     "set_pinned": "(self, name: 'str', pinned: 'bool') -> 'bool'",
     "split_triggered": "(self, names: 'list[str]', project_dir: 'str | Path | None' = None) -> 'tuple[list[str], list[str]]'",
-    "stage_skill_candidate": "(self, slug: 'str', *, description: 'str', triggers: 'str', procedure_md: 'str', provenance: 'AutoSkillProvenance', scripts: 'list[dict] | None' = None, source: 'str' = 'consolidation', kind: 'str' = 'new', target: 'str | None' = None, base_version: 'int | None' = None, refusal: 'ClaimRefusal | None' = None) -> 'str | None'",
+    "stage_skill_candidate": "(self, slug: 'str', *, description: 'str', triggers: 'str', procedure_md: 'str', provenance: 'AutoSkillProvenance', scripts: 'list[dict] | None' = None, source: 'str' = 'consolidation', kind: 'str' = 'new', target: 'str | None' = None, base_version: 'int | None' = None, refusal: 'ClaimRefusal | None' = None, missing_scripts: 'list[str] | None' = None, rejected_scripts: 'dict[str, list[str]] | None' = None) -> 'str | None'",
     "strip_frontmatter": "(content: 'str') -> 'str'",
     "sync_builtins": "(self) -> 'None'",
     "trigger_hint": "(self, names: 'list[str]', project_dir: 'str | Path | None' = None) -> 'str'",

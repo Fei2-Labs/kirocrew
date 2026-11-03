@@ -120,7 +120,7 @@ async def _await_cron_fire_time_gate(
     except CronQueueTimeout as exc:
         # Scoped exactly as _run_job_isolated's own result-less clear
         # (close_run, cron_service/execution.py). For an agent/message job ``last_result`` is the
-        # cross-run dedup context build_cron_session_context prepends as "do
+        # cross-run dedup context cron_prior_result_context carries as "do
         # NOT repeat", and a run starved here produced no result to replace it
         # -- clearing it would make the NEXT run repeat content it had already
         # sent. Command and script jobs still clear: the prompt built for them is
@@ -479,7 +479,12 @@ _annotate_model_fallback = annotate_model_fallback
 
 
 async def _cron_stream_with_posttoken_resume(
-    client: Any, message: str, *, job_name: str, **stream_kwargs: Any
+    client: Any,
+    message: str,
+    *,
+    job_name: str,
+    on_resume: Callable[[], None] | None = None,
+    **stream_kwargs: Any,
 ) -> tuple[str, float | None]:
     """Run a cron agent turn, resuming ONCE after a post-token transient error.
 
@@ -589,5 +594,11 @@ async def _cron_stream_with_posttoken_resume(
                 _delay,
                 exc,
             )
+            # The continuation is a second turn inside this claim. The
+            # interrupted prompt's attempt ends here, before the backoff, so
+            # what it received inline from a spawn_sub_agents call is revoked
+            # and delivered, never confirmed by the continuation's landing.
+            if on_resume is not None:
+                on_resume()
             await asyncio.sleep(_delay)
             msg = _CRON_POSTTOKEN_CONTINUE_MSG

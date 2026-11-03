@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, render, screen, fireEvent, waitFor, within, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { MemberRosterRow } from '../../api/client'
 import { createTestStore } from '../../test/helpers'
 
@@ -27,8 +27,10 @@ const mockApi = vi.hoisted(() => ({
   chatSlotModel: vi.fn(),
   chatSlotReasoningEffort: vi.fn(),
   agentResolvedModel: vi.fn(),
+  harnessModels: vi.fn(),
   memberDashboard: vi.fn(),
   memberDashboardLock: vi.fn(),
+  kirocrewConfig: vi.fn(),
 }))
 vi.mock('../../api/client', () => ({ api: mockApi }))
 const modelsState = vi.hoisted(() => ({ isDegraded: false }))
@@ -42,6 +44,7 @@ import { isTrustRootTarget } from '../../guide/findTargetPolicy'
 import { ApiError } from '../../api/apiError'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../../api/membersQuery'
 import { MEMBER_DASHBOARD_QUERY_PREFIX } from '../../hooks/useWebSocket'
+import { PREVIEW_CREWMATE_HARNESS } from '../../utils/previewFlags'
 
 let lastQc: QueryClient
 let hosts: [HTMLDivElement, HTMLDivElement]
@@ -101,8 +104,11 @@ beforeEach(() => {
   mockApi.chatSlotModel.mockResolvedValue({ ok: true })
   mockApi.chatSlotReasoningEffort.mockResolvedValue({ ok: true })
   mockApi.agentResolvedModel.mockResolvedValue({ model: 'claude-opus-5' })
+  mockApi.kirocrewConfig.mockResolvedValue({ dashboard: {} })
+  mockApi.harnessModels.mockResolvedValue([{ model_name: 'auto' }, { model_name: 'sonnet-cc' }])
+  localStorage.removeItem(PREVIEW_CREWMATE_HARNESS)
 })
-afterEach(() => { cleanup(); hosts?.forEach((h) => h.remove()) })
+afterEach(() => { cleanup(); hosts?.forEach((h) => h.remove()); localStorage.removeItem(PREVIEW_CREWMATE_HARNESS) })
 
 describe('CrewProfileSettings row and group', () => {
   it('shows one Settings row on the card, reading the ceiling and the model', () => {
@@ -346,6 +352,18 @@ describe('CrewProfileSettings permission', () => {
 })
 
 describe('CrewProfileSettings model and effort', () => {
+  it.each([
+    ['model', 'claude-opus-5'],
+    ['reasoning_effort', 'High'],
+  ])('touches no thread when saving %s fails', async (key, label) => {
+    mockApi.updateKirocrewAgent.mockRejectedValueOnce(new Error('record save failed'))
+    setup(member({ model: 'claude-haiku-4', reasoning_effort: 'low' }))
+    pick(key, label)
+    await waitFor(() => expect(within(page(key)).getByTestId('crew-profile-settings-error')).toHaveTextContent('record save failed'))
+    expect(mockApi.chatSlotModel).not.toHaveBeenCalled()
+    expect(mockApi.chatSlotReasoningEffort).not.toHaveBeenCalled()
+  })
+
   it('pins a model on the record and the thread', async () => {
     setup(member())
     pick('model', 'claude-opus-5')
@@ -596,5 +614,193 @@ describe('CrewProfileSettings dashboard lock', () => {
     // but the caption is still shown so the row is not context-free.
     expect(screen.queryByRole('switch', { name: SWITCH })).toBeNull()
     expect(group()).toHaveTextContent("can't replace")
+  })
+})
+
+/** Renders the card from the cached roster row, as the profile page does. */
+function RosterBacked({ initial }: { initial: MemberRosterRow }) {
+  const qc = useQueryClient()
+  const rows = useQuery({
+    queryKey: MEMBERS_ROSTER_QUERY_KEY,
+    // A refetch answers what the server holds: the last value written to the row.
+    queryFn: () => qc.getQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY) ?? [initial],
+    initialData: [initial],
+    staleTime: Infinity,
+  })
+  const m = rows.data?.find((r) => r.name === initial.name) ?? initial
+  return <CrewProfileSettings member={m} slotKey="member-oncall" />
+}
+
+function setupRosterBacked(m: MemberRosterRow) {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  lastQc = qc
+  render(
+    <QueryClientProvider client={qc}>
+      <Provider store={createTestStore()}>
+        <RosterBacked initial={m} />
+      </Provider>
+    </QueryClientProvider>,
+  )
+}
+
+describe('CrewProfileSettings Dynamic capabilities preview', () => {
+  const sw = () => within(screen.getByTestId('crew-profile-dynamic-capabilities')).getByRole('switch')
+
+  it('follows a later change to the stored flag after its own save', async () => {
+    setupRosterBacked(member())
+    await screen.findByTestId('crew-profile-dynamic-capabilities')
+    fireEvent.click(sw())
+    await waitFor(() => expect(sw().getAttribute('aria-checked')).toBe('true'))
+    // An undo from elsewhere writes the roster row back to off.
+    act(() => {
+      lastQc.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
+        rows?.map((r) => ({ ...r, dynamic_capabilities: false })))
+    })
+    await waitFor(() => expect(sw().getAttribute('aria-checked')).toBe('false'))
+  })
+
+  it('is off for a new crewmate and carries a Preview tag', async () => {
+    setup(member())
+    await screen.findByTestId('crew-profile-dynamic-capabilities')
+    expect(sw().getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByTestId('crew-profile-dynamic-capabilities-preview')).toHaveTextContent('Preview')
+  })
+
+  it('writes only this crewmate\'s record', async () => {
+    setupRosterBacked(member())
+    await screen.findByTestId('crew-profile-dynamic-capabilities')
+    fireEvent.click(sw())
+    await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith('oncall', { dynamic_capabilities: true }))
+    expect(mockApi.updateKirocrewAgent).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(sw().getAttribute('aria-checked')).toBe('true'))
+  })
+
+  it('turns an on crewmate back off', async () => {
+    setupRosterBacked(member({ dynamic_capabilities: true }))
+    await screen.findByTestId('crew-profile-dynamic-capabilities')
+    fireEvent.click(sw())
+    await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith('oncall', { dynamic_capabilities: false }))
+    await waitFor(() => expect(sw().getAttribute('aria-checked')).toBe('false'))
+  })
+
+  it('shows a crewmate\'s stored flag', async () => {
+    setup(member({ dynamic_capabilities: true }))
+    await screen.findByTestId('crew-profile-dynamic-capabilities')
+    expect(sw().getAttribute('aria-checked')).toBe('true')
+  })
+})
+
+/* The crewmate's own harness (`agents.<name>.acp_backend`): a developer preview row.
+ * Its stored value and the harnesses on offer come from the owner-only readout,
+ * never the roster row; the model list follows the picked harness. */
+describe('CrewProfileSettings harness', () => {
+  const readout = (over: Record<string, unknown> = {}) => mockApi.agentResolvedModel.mockResolvedValue({
+    model: 'claude-opus-5', acp_backend: '', harness: 'kas', inherited_harness: 'kas',
+    harnesses: ['claude', 'kas', 'kiro'], worker_harnesses: ['claude', 'kas'], ...over,
+  })
+
+  it('is not offered while the preview is off', async () => {
+    readout()
+    setup(member())
+    await waitFor(() => expect(mockApi.agentResolvedModel).toHaveBeenCalled())
+    expect(within(group()).queryByTestId('crew-profile-setting-acp_backend')).toBeNull()
+  })
+
+  it('reads Inherited and names what that runs on, with the preview on', async () => {
+    localStorage.setItem(PREVIEW_CREWMATE_HARNESS, '1')
+    readout()
+    setup(member())
+    // The row itself says what it controls, and Inherited names what runs.
+    await waitFor(() => expect(rowValue('acp_backend')).toHaveTextContent(/^Inherited \(Kiro Agent\)$/))
+    expect(within(group()).getByTestId('crew-profile-setting-acp_backend')).toHaveTextContent('The AI coding tool oncall runs on')
+    const options = open('acp_backend')
+    // Inherited follows the crew default, so it never reads as the same choice
+    // as the harness it resolves to today.
+    expect(within(options).getByRole('radio', { name: /Inherited/ })).toHaveTextContent('Follows the crew default (now Kiro Agent).')
+    // A harness the worker cannot start on says so before it is picked.
+    expect(within(options).getByRole('radio', { name: /Kiro CLI/ })).toHaveTextContent('workers cannot start')
+    // The caption names the two settings a pick resets.
+    expect(options).toHaveTextContent('puts Model and Worker model back to Inherited.')
+  })
+
+  it.each([
+    ['a live thread', 'member-oncall'],
+    ['no thread', null],
+  ])('saves a harness pick on the record alone, with %s', async (_label, slotKey) => {
+    // The server reloads the live thread onto the new harness and clears its
+    // own model and effort picks, so the card posts nothing to the thread.
+    localStorage.setItem(PREVIEW_CREWMATE_HARNESS, '1')
+    readout({ acp_backend: 'kas' })
+    setup(member({ model: 'claude-opus-5', reasoning_effort: 'high', worker_model: 'claude-haiku-4' }), slotKey)
+    await waitFor(() => expect(rowValue('acp_backend')).toHaveTextContent('Kiro Agent'))
+    pick('acp_backend', /Kiro CLI/)
+    const saved = await screen.findByTestId('crew-profile-settings-saved')
+    expect(saved).toHaveTextContent("Saved. oncall's next message starts on this harness.")
+    // A success is a status line, not an alert.
+    expect(saved).toHaveAttribute('role', 'status')
+    expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith('oncall', { acp_backend: 'kiro', model: '', worker_model: '' })
+    expect(mockApi.chatSlotModel).not.toHaveBeenCalled()
+    expect(mockApi.chatSlotReasoningEffort).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('crew-profile-settings-error')).toBeNull()
+    expect(rowValue('model')).toHaveTextContent('Inherited')
+    expect(rowValue('worker_model')).toHaveTextContent('Same as oncall')
+    expect(lastQc.getQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY)?.[0]).toMatchObject({ model: '', reasoning_effort: 'high', worker_model: '' })
+  })
+
+  it('shows a refused harness change and puts the stored harness back', async () => {
+    localStorage.setItem(PREVIEW_CREWMATE_HARNESS, '1')
+    readout({ acp_backend: 'kas' })
+    const message = 'oncall is in the middle of a reply. Wait for it to finish, or stop it, then change the agent harness.'
+    mockApi.updateKirocrewAgent.mockRejectedValueOnce(
+      new ApiError(409, message, JSON.stringify({ error: message, code: 'crewmate_harness_busy' })),
+    )
+    setup(member({ model: 'claude-opus-5' }))
+    await waitFor(() => expect(rowValue('acp_backend')).toHaveTextContent('Kiro Agent'))
+    pick('acp_backend', /Kiro CLI/)
+    await waitFor(() => expect(within(page('acp_backend')).getByTestId('crew-profile-settings-error')).toHaveTextContent(message))
+    expect(checked('acp_backend')).toHaveTextContent('Kiro Agent')
+    expect(rowValue('acp_backend')).toHaveTextContent('Kiro Agent')
+    expect(rowValue('model')).toHaveTextContent('claude-opus-5')
+    expect(screen.queryByTestId('crew-profile-settings-saved')).toBeNull()
+    expect(mockApi.chatSlotModel).not.toHaveBeenCalled()
+    expect(mockApi.chatSlotReasoningEffort).not.toHaveBeenCalled()
+  })
+
+  it('names what Inherited runs on while a harness is pinned', async () => {
+    localStorage.setItem(PREVIEW_CREWMATE_HARNESS, '1')
+    readout({ acp_backend: 'claude', harness: 'claude', inherited_harness: 'kas' })
+    setup(member())
+    // A pinned harness reads by its own name alone, never as Inherited.
+    await waitFor(() => expect(rowValue('acp_backend')).toHaveTextContent(/^Claude Code$/))
+    const options = open('acp_backend')
+    expect(within(options).getByRole('radio', { name: /Inherited/ })).toHaveTextContent('Follows the crew default (now Kiro Agent).')
+  })
+
+  it('lists the pinned harness models, not the install list', async () => {
+    readout({ acp_backend: 'claude', harness: 'claude' })
+    setup(member())
+    await waitFor(() => expect(mockApi.harnessModels).toHaveBeenCalledWith('claude'))
+    const options = open('model')
+    await within(options).findByRole('radio', { name: 'sonnet-cc' })
+    expect(within(options).queryByRole('radio', { name: 'claude-haiku-4' })).toBeNull()
+  })
+
+  it('says so when the pinned harness cannot start, naming it', async () => {
+    localStorage.setItem(PREVIEW_CREWMATE_HARNESS, '1')
+    readout({ acp_backend: 'codex', harness: '', harness_error: 'crewmate_harness_unavailable: oncall cannot start' })
+    setup(member())
+    const notice = await screen.findByTestId('crew-profile-settings-harness-error')
+    // The harness is named, never its raw id.
+    expect(notice).toHaveTextContent('oncall is set to run on OpenAI Codex')
+    expect(notice).not.toHaveTextContent('codex,')
+    expect(rowValue('acp_backend')).toHaveTextContent('OpenAI Codex')
+    // The way out sits beside the notice: it opens the harness picker.
+    fireEvent.click(screen.getByTestId('crew-profile-settings-harness-fix'))
+    expect(page('acp_backend')).toBeInTheDocument()
+    // The pinned option agrees with the notice: it can't start here, and never
+    // says it can chat (codex is not a worker harness either).
+    const pinned = within(page('acp_backend')).getByRole('radio', { name: /OpenAI Codex/ })
+    expect(pinned).toHaveTextContent("Can't start here.")
+    expect(pinned).not.toHaveTextContent('can chat')
   })
 })

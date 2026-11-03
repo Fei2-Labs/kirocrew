@@ -76,7 +76,7 @@ class TestOperatorConfigIsNotOurs:
         pkg = Path(install.__file__).parent
         writes = []
         for source in sorted(pkg.glob("*.py")):
-            for lineno, line in enumerate(source.read_text().splitlines(), 1):
+            for lineno, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
                 if any(
                     call in line
                     for call in (
@@ -1064,7 +1064,6 @@ class TestViewSubprocessesReceiveNodeEnv:
         # stop() issues no subprocess.run call at all (no global --kill).
         mock_run.assert_not_called()
 
-        # Cleanup.
         view_mod._child = None
 
 

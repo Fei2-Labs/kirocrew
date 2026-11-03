@@ -24,9 +24,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type React from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { useAppDispatch } from '../../store'
-import { createSlot } from '../../store/chatSlice'
 import { api, type WebhookTokenEntry } from '../../api/client'
+import { acpBackendName } from '../../api/acpBackend'
 import { i18nT } from '../../i18n/t'
 import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
 import {
@@ -55,16 +54,11 @@ import {
 import { ApiError } from '../../api/apiError'
 import type { CronJob } from '../../types'
 import { type KiroCrewAgent } from '../AgentSelector'
-import { errMessage } from '../../utils/thunkError'
 import { modelSupportsEffort } from '../../lib/effort'
 import { type TemplateProvenance } from '../../lib/templateSource'
+import { INHERIT_MODEL } from './crewFields'
 
-/** The stored spelling for "no per-agent pin, inherit the next tier down". The
- *  select shows this as a real option; the backend normalizes it back to ''.
- *  Same value as KiroCrewAgentsPage's export; defined here so the hook (and the
- *  dialog that consumes it) never import back into the page — that would close
- *  a cycle (page -> CrewEditorNextDialog -> useCrewEditor -> page). */
-export const INHERIT_MODEL = 'auto'
+export { INHERIT_MODEL }
 
 /** How long a schedule-draft discard confirm stays fully locked while the
  *  create request is in flight. The lock exists because discarding cannot
@@ -187,11 +181,26 @@ export interface CrewEditorController {
    *  cached list after a transport failure rather than rejecting). Surfaced as a
    *  warn-toned status beside the Model field, NOT as an options-load error. */
   modelsDegraded: boolean
+  /** Refetch that list, and whether the refetch is in flight. */
+  retryModels: () => void
+  retryingModels: boolean
+  /** The name of the harness whose list the Model field offers and whose build takes the effort pin. */
+  pinHarness: string
 
   // Derived model/effort readout.
-  resolved: { model?: string; pinned?: boolean; reasoning_effort?: string; effort_pinned?: boolean } | undefined
+  resolved: {
+    model?: string; pinned?: boolean; reasoning_effort?: string; effort_pinned?: boolean
+    /** The pair-id harness build's effort verdict; null until known, absent elsewhere. */
+    effort_supported?: boolean | null
+    /** Present when the pin's list is another harness's than the configured backend's. */
+    models_backend?: string
+    /** The id that harness serves the stored pin as, `''` for none; absent until a live session says. */
+    pin_served_as?: string
+  } | undefined
   resolvedError: unknown
   effortCapable: boolean
+  /** The pin backend's own levels, when it reported them. */
+  effortLevels: string[] | undefined
   effortModel: string
 
   // Sharing collisions.
@@ -278,11 +287,10 @@ export interface CrewEditorController {
   sheetHint: string
   save: () => void
   requestClose: () => void
-  requestChat: () => void
 
   // Discard confirm dialog.
-  discardAsk: CrewPaneKey | 'close' | 'chat' | 'collapse' | null
-  setDiscardAsk: (v: CrewPaneKey | 'close' | 'chat' | 'collapse' | null) => void
+  discardAsk: CrewPaneKey | 'close' | 'collapse' | null
+  setDiscardAsk: (v: CrewPaneKey | 'close' | 'collapse' | null) => void
   discardTakesSheet: boolean
   askSchedOnly: boolean
   schedSaving: boolean
@@ -313,7 +321,6 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     leave = (perform) => { void perform() },
   } = args
 
-  const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
 
@@ -368,6 +375,12 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     enabled: open,
   })
 
+  const { data: resolved, error: resolvedError } = useQuery({
+    queryKey: ['agent-resolved-model', editing],
+    queryFn: () => api.agentResolvedModel(editing),
+    enabled: !!editing,
+  })
+
   // The model list surfaces a transport failure as `isDegraded` (the adapter
   // resolves with an auto-only/cached list rather than rejecting). A genuine
   // query ERROR (the fetch rejected) belongs in the shared options-load notice;
@@ -378,12 +391,15 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   // field instead (see `modelsDegraded` below), not as an options-load error.
   const modelsQuery = useAvailableModelsQuery({ enabled: open })
   const availableModels = modelsQuery.data
-  const modelsDegraded = !modelsQuery.error && modelsQuery.isDegraded
-  const editorOptionsError = installedError ?? workspacesError ?? cfgError ?? modelsQuery.error
+  // The pin's list is the harness's that judges it, when that is not the configured one. The
+  // template pane keeps the configured list: other crews run the same template file.
+  const pinModelsQuery = useAvailableModelsQuery({ enabled: open, backend: resolved?.models_backend })
+  const modelsDegraded = !pinModelsQuery.error && pinModelsQuery.isDegraded
+  const editorOptionsError = installedError ?? workspacesError ?? cfgError ?? modelsQuery.error ?? pinModelsQuery.error
 
   const modelOptions = [
     INHERIT_MODEL,
-    ...(availableModels || []).map((m: { name: string }) => m.name).filter((n: string) => n && n !== INHERIT_MODEL),
+    ...(pinModelsQuery.data || []).map((m: { name: string }) => m.name).filter((n: string) => n && n !== INHERIT_MODEL),
   ]
 
   // ── Edit field state (own copies, seeded from the record on open) ──
@@ -569,16 +585,13 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   }, [queryClient, editing])
 
   // ── Resolved model + effort ──
-  const { data: resolved, error: resolvedError } = useQuery({
-    queryKey: ['agent-resolved-model', editing],
-    queryFn: () => api.agentResolvedModel(editing),
-    enabled: !!editing,
-  })
   const modelPinPendingClear = editModel === INHERIT_MODEL && !!editingAgent?.model
   const effortModel = editModel !== INHERIT_MODEL
     ? editModel
     : modelPinPendingClear ? '' : (resolved?.model || '')
-  const effortCapable = modelSupportsEffort(effortModel)
+  // The server answers only for a harness build (codex), which holds for any pick.
+  const effortCapable = resolved?.effort_supported ?? modelSupportsEffort(effortModel)
+  const effortLevels: string[] | undefined = resolved?.effort_levels?.length ? resolved.effort_levels : undefined
 
   // ── Mutations ──
   const settleFor = useCallback((epoch: number, err?: string) => {
@@ -751,33 +764,6 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     deleteMut.mutate({ name: editing, epoch: sheetEpoch.current })
   }, [deleteMut, editing])
 
-  // ── Chat with this crew ──
-  const chatWith = useCallback((crew: string) => {
-    setError('')
-    // Everything — slot creation, closing the editor, navigating — happens
-    // INSIDE the guard's perform callback. `useGuardedLeave` skips `perform`
-    // on a veto ("stay"), so a `createSlot` run before `leave` would mint a
-    // durable slot the user never reaches when they choose to stay, orphaning
-    // it; and closing before the veto would unmount the editor while they
-    // stayed, leaving neither chat nor editor. The whole side-effecting path
-    // runs only once the leave is confirmed.
-    leave(async () => {
-      const epoch = sheetEpoch.current
-      try {
-        await dispatch(createSlot(crew)).unwrap()
-      } catch (e) {
-        const msg = errMessage(e)
-        settleFor(epoch, msg || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent'))
-        return
-      }
-      if (epoch !== sheetEpoch.current) return
-      closeSheetRef.current()
-      navigate('/chat')
-    }, '/chat')
-  }, [dispatch, navigate, settleFor, leave])
-  const chatWithRef = useRef(chatWith)
-  chatWithRef.current = chatWith
-
   // ── Sharing collisions (read off the IN-FLIGHT selection, not persisted) ──
   const sharingWorkspace = editing
     ? agents.filter(a => a.name !== editing && a.workspace === workspace).map(a => a.name)
@@ -796,7 +782,7 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   const [pane, setPane] = useState<CrewPaneKey>('overview')
   const [schedDraft, setSchedDraft] = useState(false)
   const [schedSaving, setSchedSaving] = useState(false)
-  const [discardAsk, setDiscardAsk] = useState<CrewPaneKey | 'close' | 'chat' | 'collapse' | null>(null)
+  const [discardAsk, setDiscardAsk] = useState<CrewPaneKey | 'close' | 'collapse' | null>(null)
   const [discardForce, setDiscardForce] = useState(false)
   useEffect(() => {
     if (discardAsk === null || !schedSaving) { setDiscardForce(false); return }
@@ -910,15 +896,6 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   const requestCloseRef = useRef<() => void>(() => {})
   useEffect(() => { requestCloseRef.current = requestClose }, [requestClose])
 
-  const requestChat = useCallback(() => {
-    if (capabilityBusy) return
-    // Any unsaved pane, not just a schedule/capability draft: chatWith closes
-    // the editor unconditionally, so an ordinary identity/model/place edit would
-    // be lost with no prompt otherwise.
-    if (dirtyPanes.size > 0) { setDiscardAsk('chat'); return }
-    void chatWithRef.current(editing)
-  }, [dirtyPanes, editing, capabilityBusy])
-
   const requestCancelDraft = useCallback((proceed: () => void) => {
     collapseProceed.current = proceed
     setDiscardAsk('collapse')
@@ -929,17 +906,16 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     setDiscardAsk(null)
     settleDiscardAnswer(true)
     if (target === 'close') closeSheet()
-    else if (target === 'chat') void chatWithRef.current(editing)
     else if (target === 'collapse') { collapseProceed.current?.(); collapseProceed.current = null }
     else if (target) setPane(target)
-  }, [discardAsk, closeSheet, editing, settleDiscardAnswer])
+  }, [discardAsk, closeSheet, settleDiscardAnswer])
 
   useEffect(() => {
     if (discardAsk === null) settleDiscardAnswer(false)
   }, [discardAsk, settleDiscardAnswer])
 
   const discardTakesSheet =
-    (discardAsk === 'close' || discardAsk === 'chat')
+    discardAsk === 'close'
     && [...dirtyPanes].some(k => k !== 'schedules')
   const askSchedOnly = schedDraft && !discardTakesSheet
 
@@ -1070,9 +1046,13 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     kirocrewCfg,
     editorOptionsError,
     modelsDegraded,
+    retryModels: () => { void pinModelsQuery.refetch() },
+    retryingModels: pinModelsQuery.isFetching,
+    pinHarness: acpBackendName({ id: resolved?.models_backend ?? kirocrewCfg?.agent?.acp_backend ?? '' }),
     resolved,
     resolvedError,
     effortCapable,
+    effortLevels,
     effortModel,
     collidingCrews,
     sharingWorkspace,
@@ -1122,7 +1102,6 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     sheetHint,
     save,
     requestClose,
-    requestChat,
     discardAsk, setDiscardAsk,
     discardTakesSheet,
     askSchedOnly,

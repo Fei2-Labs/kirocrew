@@ -15,7 +15,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
-import { createTestStore } from './helpers'
+import { createTestStore, expectWheelToScrollRow } from './helpers'
 
 // Polyfill ResizeObserver for jsdom (TabStrip uses it for scroll fade detection)
 globalThis.ResizeObserver = class {
@@ -230,6 +230,21 @@ describe('TreeNode', () => {
     expect(screen.getByText('index.ts')).toBeInTheDocument()
   })
 
+  it('tells assistive tech whether a folder row is open, and gives a file row no expanded state', () => {
+    const closed = renderWithQuery(
+      <TreeNode node={dirNode} depth={0} expanded={{}} toggleExpand={vi.fn()} selectedPath="" onSelect={vi.fn()} gitMap={new Map()} />,
+    )
+    expect(screen.getByRole('button', { name: 'src' })).toHaveAttribute('aria-expanded', 'false')
+    closed.unmount()
+
+    renderWithQuery(
+      <TreeNode node={dirNode} depth={0} expanded={{ '/home/user/src': true }} toggleExpand={vi.fn()} selectedPath="" onSelect={vi.fn()} gitMap={new Map()} />,
+    )
+    expect(screen.getByRole('button', { name: 'src' })).toHaveAttribute('aria-expanded', 'true')
+    // The child file row inside the open folder only selects.
+    expect(screen.getByRole('button', { name: 'index.ts' })).not.toHaveAttribute('aria-expanded')
+  })
+
   it('surfaces the error, not a perpetual loading label, when a child folder fails to load', async () => {
     // A childless dir lazy-loads on expand; when that fetch rejects (e.g. a
     // symlink resolving outside the allow-list) the row must surface the error
@@ -346,6 +361,15 @@ describe('TabStrip', () => {
     )
     await userEvent.click(screen.getByText('tmp'))
     expect(activate).toHaveBeenCalledWith('ft-2')
+  })
+
+  it('scrolls sideways on a vertical wheel only while the tabs are clipped', () => {
+    const { container } = render(
+      <TabStrip folderTabs={folders} fileTabs={[]} activeFolderId="ft-1" activeFileId={null}
+        onActivateFolder={vi.fn()} onActivateFile={vi.fn()} onCloseFolder={vi.fn()}
+        onCloseFile={vi.fn()} onNewFolder={vi.fn()} onRenameFolder={vi.fn()} />,
+    )
+    expectWheelToScrollRow(container.querySelector('.mc-fe-tabs') as HTMLElement)
   })
 
   it('calls onNewFolder when + button clicked', async () => {

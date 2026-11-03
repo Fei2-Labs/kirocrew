@@ -32,6 +32,7 @@ import kiro_crew  # noqa: F401
 from kiro_crew import _facade_mirror
 from kiro_crew.apps.version import versions_compatible  # noqa: F401
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.body_numbers import body_int
 from kiro_crew.dashboard.chat_persistence import (  # noqa: F401
     cap_effort_capability_levels,
     register_reasoning_effort_values,
@@ -67,6 +68,7 @@ from kiro_crew.dashboard.session_transfer import (
     release_bundle_files,
     write_bundle_file,
 )
+from kiro_crew.dashboard.slot_ownership import app_owns_slot_session
 from kiro_crew.dashboard.state import MAX_LIVE_SLOTS  # noqa: F401
 from kiro_crew.history import SEARCH_MIN_CHARS
 from kiro_crew.instances.constants import (  # noqa: F401
@@ -130,6 +132,7 @@ async def api_instances_list(request: web.Request) -> web.Response:
     # connection order. Registered crews cannot race, and the count rises by
     # itself when a crew is added.
     eligible = len(items)
+    instances_cfg = KiroCrewConfig.load().instances
     _audit("list", "success")
     return web.json_response(
         {
@@ -140,9 +143,10 @@ async def api_instances_list(request: web.Request) -> web.Response:
             # active, the UI shows a "restart the gateway to activate" hint.
             "active": getattr(state, "instances_manager", None) is not None,
             "instances": items,
-            "warm_set_cap": resolve_warm_set_cap(
-                KiroCrewConfig.load().instances.warm_set_cap, eligible
-            ),
+            "warm_set_cap": resolve_warm_set_cap(instances_cfg.warm_set_cap, eligible),
+            # Served as stored: the menu resolves it against ``instances`` above,
+            # so an id naming no registered crew simply marks nothing.
+            "default_destination": instances_cfg.default_destination,
         }
     )
 
@@ -228,7 +232,7 @@ async def api_instances_add(request: web.Request) -> web.Response:
                 reg.add,
                 name=str(body.get("name", "")),
                 ssh_host=str(body.get("ssh_host", "")),
-                remote_port=int(body.get("remote_port", DEFAULT_REMOTE_PORT)),
+                remote_port=body_int(body.get("remote_port", DEFAULT_REMOTE_PORT)),
                 ttl=str(body.get("ttl", "20h")),
                 remote_bin=str(body.get("remote_bin", "")),
                 connection_method=str(body.get("connection_method", "ssh")),
@@ -237,7 +241,7 @@ async def api_instances_add(request: web.Request) -> web.Response:
                 aws_profile=str(body.get("aws_profile", "")),
                 aws_region=str(body.get("aws_region", "")),
                 via_instance_id=via_instance_id,
-                via_remote_port=int(body.get("via_remote_port", 0)),
+                via_remote_port=body_int(body.get("via_remote_port", 0)),
                 via_remote_id=via_remote_id,
                 instance_id=body.get("id"),
             )
@@ -1196,6 +1200,11 @@ async def api_instances_search_sessions(request: web.Request) -> web.Response:
                 if isinstance(value, str) and value:
                     row[field] = redact(value)
             redacted_local.append(row)
+        # Local rows only: a peer row is rebuilt by ``_clean`` from an allowlist
+        # without ``open``, so another gateway's tabs never rank as open here.
+        from kiro_crew.dashboard.handlers.sessions import _mark_open_sessions
+
+        _mark_open_sessions(redacted_local, state)
         sources.append(redacted_local)
     for iid, result in zip(connected, results[1:]):
         if isinstance(result, BaseException):
@@ -1292,13 +1301,19 @@ async def api_instances_send_session(request: web.Request) -> web.Response:
     # indistinguishable from one that does not exist, or the error code itself
     # enumerates slots across the isolation boundary (CWE-204). The real reason is
     # recorded server-side in the audit event.
+    #
+    # Owning the slot is not owning the conversation it carries: a slot linked to
+    # a channel thread, or an unbound channel-origin slot, runs on or writes a
+    # transcript the app has no claim on. ``app_owns_slot_session`` is the same
+    # three-part test the per-slot checkpoint applies to every
+    # ``/api/chat/slots/{slot}`` route, and the refusal keeps the one 404 body.
     request_app = request.get("app", "")
-    if request_app and (not getattr(slot, "_app", "") or slot._app != request_app):
+    if request_app and not app_owns_slot_session(request_app, slot):
         _audit(
             "send_session",
             "denied",
             request_id=instance_id,
-            error=f"app {request_app!r} does not own this slot",
+            error=f"app {request_app!r} does not own this slot or its conversation",
         )
         return web.json_response(
             {"error": "session not found", "code": "transfer_slot_not_found"}, status=404
@@ -1462,11 +1477,13 @@ async def api_instances_send_session(request: web.Request) -> web.Response:
 #
 #   ``handlers_instances_gate`` -- the owner gate, audit, registry access, chain policy
 #   ``handlers_instances_peer`` -- the routes that read a peer, and the proxy to it
+#   ``handlers_instances_crew_reads`` -- the MCP-only crew-scoped session reads
 # --------------------------------------------------------------------------- #
 #: Owner modules, lowest layer first: the first holder of a name answers its reads.
 _OWNERS = (
     "kiro_crew.dashboard.handlers_instances_gate",
     "kiro_crew.dashboard.handlers_instances_peer",
+    "kiro_crew.dashboard.handlers_instances_crew_reads",
 )
 for _owner in _OWNERS:
     _importlib.import_module(_owner)
@@ -1477,6 +1494,32 @@ _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 #: What a star import binds: every public name of the unsplit module's namespace.
 __all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
 if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.dashboard.handlers_instances_crew_reads import (  # noqa: F401
+        _CREW_PROXY_TIMEOUT,
+        _FIELD_MAX_RAW_CHARS,
+        _FIELD_TOO_LONG,
+        _OFF_LOOP_BYTES,
+        _PEER_MESSAGE_MAX_CHARS,
+        _T,
+        CREW_AMBIGUOUS_CODE,
+        CREW_READS_DISABLED_CODE,
+        _audit_crew,
+        _authorize_crew_read,
+        _cap_field,
+        _crew_proxy_json,
+        _crew_refusal,
+        _decode_and_shape,
+        _peer_row_is_restricted,
+        _peer_status_error,
+        _resolve_crew_id,
+        _shape_list_rows,
+        _shape_read_messages,
+        _shape_search_rows,
+        _slot_refusal,
+        api_crew_sessions_list,
+        api_crew_sessions_read,
+        api_crew_sessions_search,
+    )
     from kiro_crew.dashboard.handlers_instances_gate import (  # noqa: F401
         MANAGER_UNAVAILABLE_CODE,
         MANAGER_UNAVAILABLE_MESSAGE,

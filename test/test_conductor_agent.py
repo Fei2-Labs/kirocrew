@@ -555,7 +555,8 @@ class TestConductorInstaller:
     def test_back_to_back_rounds_keep_a_spend_bound(self, tmp_path, monkeypatch):
         """Without a pause between rounds, a default concurrency cap and a no-progress
         back-off are the only hard spend gates when the user set no bound; the item
-        total is a line the conductor reports, not a refusal it asks about.
+        total is the conductor's to manage, said to the user once when it is passed,
+        never a running meter in every report.
         """
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
@@ -564,8 +565,44 @@ class TestConductorInstaller:
             assert "two rounds in a row" in text
             assert "goal_concurrency_cap_reached" in text
             assert "concurrency_cap=<N>" in text
-            assert "items used: N of <item_cap>" in text
             assert "cap_exceeded" in text
+            # The count stays out of routine reports and surfaces once, at the cap.
+            assert "keep it out of round reports" in text
+            assert "first report after `cap_exceeded` turns true" in text
+            # "Once" survives the per-round reset only through a persisted marker
+            # that records delivery, not cap state: items are created at dispatch,
+            # after the report, so the round-close read usually already shows
+            # cap_exceeded true before any notice was given. Re-recorded at every
+            # round close, the marker cannot age out of the ledger's bounded
+            # artifacts map. A statement (not a question) never holds that reset up.
+            assert "every round-close `session_ledger_record`" in text
+            assert "re-record `item_cap_notice` in `artifacts` so it never ages out" in text
+            assert (
+                "Record `none` if a fresh `work_ledger_read` shows `cap_exceeded` false"
+            ) in text
+            assert ("`told the user at N` only if this turn's report gave the notice") in text
+            assert "otherwise the stored value, carried forward unchanged" in text
+            # A notice given in a turn that pauses instead of closing the round
+            # (no progress, a question to the user) must still be recorded.
+            assert (
+                "The turn whose report gives the notice records `item_cap_notice` as "
+                "`told the user at N` with `session_ledger_record` in that same turn, "
+                "whether or not it closes a round"
+            ) in text
+            assert "does not start with `told`" in text
+            # The old cap-state rule wrote `told` with no notice given.
+            assert "while `cap_exceeded` is true, include" not in text
+            # A replaced goal or changed cap can pass the cap before the next round
+            # close, so the goal write itself clears the marker.
+            assert (
+                "A `goal` write that sets `new_goal=true` or changes `item_cap` also "
+                "records `item_cap_notice` as `none`, in that same turn and before "
+                "any dispatch"
+            ) in text
+            assert "set `item_cap_notice` to `none`" not in text
+            assert "keep going?" not in text.lower()
+            assert "items used: N of" not in text
+            assert "in every round report" not in text
             # The old refusal is gone from both, so neither tells the conductor to
             # stop and ask when the total is passed.
             assert "goal_item_cap_reached" not in text
@@ -634,7 +671,7 @@ class TestConductorInstaller:
         ``action=close`` so ending the item and ending its session are one step.
         """
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
-        assert "`session_close` (close a child once its item is terminal)" in prompt
+        assert "`session_close` (close a child once its item is terminal;" in prompt
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "Closing the item and closing its session happen together" in body
         assert "`session_close` archives (reopenable); it never deletes" in body
@@ -1063,10 +1100,10 @@ class TestConductorInstaller:
     def test_pr_checks_seed_may_name_the_prepare_pr_skill_by_path(self):
         """A ``pr_checks`` seed can point the worker at kirocrew-prepare-pr's SKILL.md.
 
-        ``kirocrew-worker`` is a custom agent: ``_skills_injection_plan`` gives it
-        no catalog and no trigger matching, so however a seed is worded nothing
-        auto-loads ``kirocrew-prepare-pr`` in the worker session. The conductor naming the
-        file is the only route. Pinned as an OPTIONAL hint, not a mandate: a user
+        ``kirocrew-worker`` gets no per-message trigger matching (``build_message`` gates
+        it on ``not is_custom``), so however a seed is worded nothing auto-loads
+        ``kirocrew-prepare-pr`` in the worker session. The conductor naming the file is
+        what makes the worker follow it. Pinned as an OPTIONAL hint, not a mandate: a user
         who does not want kirocrew-prepare-pr must not have it forced on every worker.
         """
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
@@ -1107,11 +1144,10 @@ def _load_evaluator():
 class TestAcceptEvaluatorInvariant:
     """No model-authored argv may reach subprocess.
 
-    This is the property three review rounds converged on: constraining a
-    spec-supplied argv (allowlist, basename check) never closes the class,
-    because the script runs as an approved wrapper and Kiro Crew's
-    denied-command floor cannot see the argv it receives on stdin. The fix was
-    to stop accepting one at all.
+    Constraining a spec-supplied argv (allowlist, basename check) never closes
+    the class, because the script runs as an approved wrapper and Kiro Crew's
+    denied-command floor cannot see the argv it receives on stdin. So the
+    evaluator accepts no argv at all.
     """
 
     def test_pr_checks_builds_its_own_argv(self):
@@ -1165,7 +1201,7 @@ class TestAcceptEvaluatorInvariant:
         verdict, evidence = mod._run(["git", "--version"])
         assert verdict == "refused"
         assert "not a command this script builds" in evidence
-        assert mod._SELF_BUILT_COMMANDS == {"gh"}
+        assert mod._SELF_BUILT_COMMANDS == {"gh", "kirocrew"}
 
     def test_the_draft_probe_refuses_a_command_it_did_not_build(self):
         """Same guard, reached through the probe's own seam."""

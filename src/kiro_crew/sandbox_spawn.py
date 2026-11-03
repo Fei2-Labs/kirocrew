@@ -19,11 +19,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew import platform_compat
-from kiro_crew.config.paths import (  # noqa: F401 -- mirrored facade compatibility names
-    CONFIG_DIR_NAME,
-    RUN_COORDINATOR_DIR_NAME,
-    config_dir,
-)
 from kiro_crew.constants import (
     KIROCREW_SANDBOX_TOOL_ENV,
     KIROCREW_SANDBOX_TOOL_VALUE,
@@ -53,7 +48,7 @@ from kiro_crew.sandbox_unavailable import (
     launcher_refusal,
 )
 from kiro_crew.sandbox_wrap import (
-    _run_coordinator_hidden_dir,
+    _set_inherited_userns_failure,
     detect_backend,
     wrap_argv,
 )
@@ -457,9 +452,6 @@ async def wrap_argv_async(
 # at the parent level too means the guarantee holds even on the opted-in
 # ``sandbox_allow_unsandboxed_exec`` fail-open path where no launcher runs.
 # Prefix match via ``startswith`` (mirrors the launcher's env_prefixes check).
-_SPAWN_SCRUB_ENV_PREFIXES: list[str] = list(_SENSITIVE_ENV_PREFIXES) + list(_AGENT_DENIED_ENV_KEYS)
-
-
 def _sensitive_env_prefixes() -> list[str]:
     """Sensitive prefixes the generic agent environment must remove now.
 
@@ -488,7 +480,8 @@ def scrub_env(
     """Return a copy of *env* (default ``os.environ``) with credential-bearing
     keys removed.
 
-    Drops every key whose name starts with one of ``_SPAWN_SCRUB_ENV_PREFIXES``
+    Drops every key whose name starts with one of the prefixes
+    :func:`_spawn_scrub_env_prefixes` composes
     (AWS secret/session vars, SSH_AUTH_SOCK, GNUPGHOME, GIT_ASKPASS, and the
     Slack/owner tokens seeded into ``os.environ`` for trusted children). Callers use it to
     build the environment for agent-influenced spawns so a spawned process
@@ -659,7 +652,8 @@ def sandboxed_spawn_argv(
             spawn gets). ``None`` keeps ``wrap_argv``'s own classification.
         first_party_fixed_argv: Threaded to :func:`wrap_argv`. True ONLY for
             spawns whose full argv is derived inside this package with zero
-            agent/repo/user-config influence; every passing site must be
+            agent/repo/user-config influence, or that run the ACP kiro-cli
+            (``kiro_cli.find_kiro_cli_candidates``) with a fixed argv; every passing site must be
             allowlisted in ``test/test_spawn_audit.py::FIRST_PARTY_SPAWNS``.
             See :func:`wrap_argv` for the no-backend carve-out it gates.
 
@@ -668,6 +662,8 @@ def sandboxed_spawn_argv(
         pass *scrubbed_env* as the subprocess ``env=`` and unlink *cleanup_path*
         (a temp launcher/profile) after the child exits.
     """
+    from kiro_crew.sandbox_wrap import _run_coordinator_hidden_dir
+
     extra_hidden_dirs = tuple(dict.fromkeys((*extra_hidden_dirs, _run_coordinator_hidden_dir())))
     if extra_hidden_dirs or extra_visible_dirs or extra_private_dirs or extra_writable_dirs:
         wrapped, cleanup = wrap_argv(
@@ -751,6 +747,7 @@ def sandboxed_spawn_argv(
     # -- see ``runtime_reconcile.RuntimeReconciler._unowned``. Stamping it here is
     # therefore safe for any argv: it never decides an exclusion on its own.
     scrubbed[KIROCREW_SANDBOX_TOOL_ENV] = KIROCREW_SANDBOX_TOOL_VALUE
+    _set_inherited_userns_failure(scrubbed)
     return wrapped, scrubbed, cleanup
 
 
@@ -831,28 +828,6 @@ async def shielded_prepare_off_loop(
                     exc_info=True,
                 )
         raise
-
-
-async def sandboxed_spawn_argv_off_loop(
-    argv: list[str],
-    mode: str = "standard",
-    *,
-    env: dict[str, str] | None = None,
-    strip_python_env: bool = False,
-    extra_hidden_dirs: tuple[str, ...] = (),
-    extra_visible_dirs: tuple[str, ...] = (),
-    first_party_fixed_argv: bool = False,
-) -> tuple[list[str], dict[str, str], str | None]:
-    """Compatibility entry point for the shielded sandbox preparation path."""
-    return await sandboxed_spawn_argv_async(
-        argv,
-        mode,
-        env=env,
-        strip_python_env=strip_python_env,
-        extra_hidden_dirs=extra_hidden_dirs,
-        extra_visible_dirs=extra_visible_dirs,
-        first_party_fixed_argv=first_party_fixed_argv,
-    )
 
 
 async def sandboxed_spawn_argv_async(
@@ -950,3 +925,25 @@ def cgroup_scope_bus_env(env: dict[str, str]) -> tuple[dict[str, str], tuple[str
             patched[key] = value
             injected.append(key)
     return patched, tuple(injected)
+
+
+async def sandboxed_spawn_argv_off_loop(
+    argv: list[str],
+    mode: str = "standard",
+    *,
+    env: dict[str, str] | None = None,
+    strip_python_env: bool = False,
+    extra_hidden_dirs: tuple[str, ...] = (),
+    extra_visible_dirs: tuple[str, ...] = (),
+    first_party_fixed_argv: bool = False,
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Compatibility entry point for the shielded sandbox preparation path."""
+    return await sandboxed_spawn_argv_async(
+        argv,
+        mode,
+        env=env,
+        strip_python_env=strip_python_env,
+        extra_hidden_dirs=extra_hidden_dirs,
+        extra_visible_dirs=extra_visible_dirs,
+        first_party_fixed_argv=first_party_fixed_argv,
+    )

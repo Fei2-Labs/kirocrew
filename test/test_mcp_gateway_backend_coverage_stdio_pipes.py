@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -384,11 +385,15 @@ class TestFailOversizeRequest:
 class TestWriteJsonLine:
     @pytest.mark.asyncio
     async def test_serialises_one_newline_terminated_frame(self) -> None:
-        writer = MagicMock()
-        writer.drain = AsyncMock()
-        await _write_json_line(cast(Any, writer), {"a": 1})
-        assert writer.write.call_args.args[0] == b'{"a":1}\n'
-        writer.drain.assert_awaited_once()
+        near, far = socket.socketpair()
+        _, writer = await asyncio.open_connection(sock=near)
+        peer, peer_writer = await asyncio.open_connection(sock=far)
+        try:
+            await _write_json_line(writer, {"a": 1})
+            writer.close()
+            assert await finished(peer.read(), "serialized frame EOF") == b'{"a":1}\n'
+        finally:
+            peer_writer.close()
 
     @pytest.mark.asyncio
     async def test_per_backend_lock_is_used_when_present(self) -> None:
@@ -433,6 +438,8 @@ class TestPumpStderr:
         reader = MagicMock()
         reader.readline = AsyncMock(side_effect=RuntimeError("closed"))
         await _pump_stderr(cast(Any, reader), "label")
+        # One read, then return: a pump that retried a closed reader would spin.
+        assert reader.readline.await_count == 1
 
 
 # --- One stray stdout line costs that line, never the shared pump ------------
@@ -836,3 +843,30 @@ class TestStrayStdoutLines:
         )
         assert await send_initialize(backend, timeout=5) == {"capabilities": {}}
         assert backend.supports_caller_identity is False
+
+    @pytest.mark.asyncio
+    async def test_send_initialize_offers_the_newest_version_and_steps_down_once(self) -> None:
+        refusal = {"code": -32602, "message": "Unsupported", "data": {"supported": ["2024-11-05"]}}
+        result: dict[str, Any] = {"protocolVersion": "2024-11-05", "capabilities": {}}
+        backend = _make_backend()
+        backend.stdout = cast(
+            Any,
+            _reader(
+                _line({"id": backend_mod._GATEWAY_INIT_ID, "error": refusal}),
+                _line({"id": backend_mod._GATEWAY_INIT_ID, "result": result}),
+            ),
+        )
+        assert await send_initialize(backend, timeout=5) == result
+        offered = [f["params"]["protocolVersion"] for f in _frames(backend)]
+        assert offered == ["2025-06-18", "2024-11-05"]
+
+    @pytest.mark.asyncio
+    async def test_send_initialize_does_not_retry_an_unknown_error(self) -> None:
+        backend = _make_backend()
+        backend.stdout = cast(
+            Any,
+            _reader(_line({"id": backend_mod._GATEWAY_INIT_ID, "error": {"code": -32000}})),
+        )
+        with pytest.raises(ValueError, match="initialize error"):
+            await send_initialize(backend, timeout=5)
+        assert [f["params"]["protocolVersion"] for f in _frames(backend)] == ["2025-06-18"]

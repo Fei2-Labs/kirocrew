@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import os
 from dataclasses import replace
 
 import pytest
@@ -425,18 +424,11 @@ def _workspace_policy(monkeypatch, **policy):
     monkeypatch.setattr(gp, "resolve_active_scope", lambda *args, **kw: None)
 
 
-#: Governance resolves a path with the gateway's own OS rules, and a guest path is
-#: POSIX, so a guest path meets a filesystem rule only on a POSIX gateway.
-posix_gateway = pytest.mark.skipif(
-    os.name == "nt",
-    reason="a Windows gateway refuses remote workspaces (REMOTE_NEEDS_POSIX_GATEWAY)",
-)
-
-
-@posix_gateway
 @pytest.mark.parametrize("tool", ["run_command", "write_file", "edit_file", "read_file"])
-def test_workspace_scopes_reach_the_gateway_policy(monkeypatch, tmp_path, tool):
-    path = str(tmp_path / "target")
+def test_workspace_scopes_reach_the_gateway_policy(monkeypatch, tool):
+    # A guest path, matched as the guest's POSIX path on every gateway OS
+    # (platform/guest_paths.py), so this runs on the Windows shards too.
+    path = "/workspace/app/private/target"
     _workspace_policy(
         monkeypatch,
         commands={"mode": "deny", "deny": ["rm -rf *"]},
@@ -492,7 +484,7 @@ search_chat_history select_crew send_message send_notification session_ledger_re
 session_ledger_record skill_discover skill_fetch skill_search spawn_continue spawn_list
 spawn_release spawn_run spawn_status spawn_steer spawn_sub_agents suggest_followup
 update_message wait workflow_author workflow_cancel workflow_library_list workflow_list
-workflow_result workflow_status
+workflow_result workflow_status request_server
 """.split())
 
 
@@ -640,7 +632,6 @@ def test_a_workspace_path_is_anchored_at_the_guest_workdir(tool, key, stated, ju
     assert event.raw_tool_params[key] == judged
 
 
-@posix_gateway
 def test_a_relative_path_meets_an_absolute_filesystem_deny(monkeypatch):
     """GPT 6.1 on 49519e2b85: with the guest root ``/workspace/app`` and a deny on
     ``/workspace/app/private/**``, ``private/record.txt`` must be refused, not judged
@@ -663,7 +654,6 @@ def _deferred(tool, server="workspace", **arguments):
     return {"tool_id": f"{server}::{tool}", "arguments": arguments}
 
 
-@posix_gateway
 def test_a_deferred_call_is_judged_by_the_arguments_the_guest_receives(monkeypatch):
     """GPT 6.1 on 507390cf02: a deferred ``read_file`` wraps its arguments in
     ``{"tool_id", "arguments"}``; the nested relative path must still meet the deny."""

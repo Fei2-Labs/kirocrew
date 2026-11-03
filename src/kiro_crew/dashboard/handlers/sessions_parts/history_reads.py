@@ -39,11 +39,17 @@ from kiro_crew.dashboard.handlers.sessions_parts.app_scope import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import (
+    _SEARCH_SCAN_WINDOW,
+    INCOGNITO_EXCLUDED_HEADER,
     SEARCH_MIN_CHARS,
     ConversationLog,
     HistoryLockTimeout,
+    TranscriptBusy,
+    TranscriptWithheld,
     _archive_dir,
+    is_incognito_transcript,
     transcript_stems,
+    transcript_withholds_derivation,
 )
 from kiro_crew.messaging.link import _in_namespace
 from kiro_crew.security import redact
@@ -87,6 +93,36 @@ def _open_slot_transcript_keys(state: DashboardState) -> set[str]:
             keys.add(candidate)
             keys.update(transcript_stems(candidate))
     return keys
+
+
+def _open_row_test(state: DashboardState) -> Callable[[str], bool]:
+    """Whether a session row's ``key`` names a transcript an open tab owns.
+
+    The one answer for every reader: the Older-sessions list hides these rows and
+    the session search marks them ``open``, so a session counts as open in both
+    places or in neither. Folded through ``_canonical_key`` as well:
+    ``list_sessions`` and ``search_sessions`` deduplicate by canonical name but
+    report the RAW stem of whichever file won on mtime, so a resume round-trip's
+    ``dashboard_dashboard_<name>`` file arrives under a name no slot produces.
+    """
+    open_keys = _open_slot_transcript_keys(state)
+    log = getattr(state, "conversation_log", None)
+    canon = getattr(log, "_canonical_key", None) or (lambda key: key)
+    return lambda key: key in open_keys or canon(key) in open_keys
+
+
+def _mark_open_sessions(rows: list[dict], state: DashboardState) -> None:
+    """Set ``open: True`` on each local search row :func:`_open_row_test` accepts.
+
+    Only ``True`` is ever written. A state with no slot registry (a test double)
+    marks nothing.
+    """
+    if getattr(state, "_slots", None) is None:
+        return
+    is_open = _open_row_test(state)
+    for row in rows:
+        if is_open(row.get("key", "")):
+            row["open"] = True
 
 
 #: Session namespaces whose transcripts are a machine run rather than a conversation
@@ -145,6 +181,34 @@ def _is_machine_only_session(key: str) -> bool:
     return any(_in_namespace(key, ns) for ns in _MACHINE_NAMESPACES)
 
 
+def _has_user_content(log: object, row: dict) -> bool:
+    """True when *row* has something a reader could resume: a title or a message.
+
+    ``list_sessions`` titles a session from its metadata or its first user
+    message, and falls back to the key itself. A titled row is kept without a
+    read, even when it has no messages: a title is a user signal. Only a row
+    whose title IS its key pays for a file read.
+    """
+    key = row.get("key", "")
+    if row.get("title", key) != key:
+        return True
+    try:
+        return bool(log.has_messages(key))  # type: ignore[attr-defined]
+    except OSError:
+        # Unreadable is not empty: never hide what could not be read.
+        return True
+
+
+def _is_user_listed_row(log: object, row: dict) -> bool:
+    """True when the ``user_only`` listing shows *row*.
+
+    ONE predicate, shared by ``GET /api/sessions?user_only=1`` and the
+    ``user_only`` bulk clear, so the Older Sessions "Delete all" removes only
+    rows the reader could see in that pane.
+    """
+    return not _is_machine_only_session(row.get("key", "")) and _has_user_content(log, row)
+
+
 _SHORT_SLOT_NAME_RE = re.compile(r"chat-\d+")
 _DASHBOARD_SLOT_STEM_RE = re.compile(r"dashboard_(chat-\d+)-(\d+)")
 
@@ -201,29 +265,51 @@ async def api_sessions(request: web.Request) -> web.Response:
         gateway generations, so one name can match several sessions. Any other
         value matches nothing. This is how a ``/chat?sid=chat-7`` link finds
         the session it names.
+      - ``exclude_incognito``: when truthy, drop every incognito/temporary
+        session, judged BEFORE paging on each row's mode and AGAIN on the page
+        against each row's on-disk line under its transcript lock, in the same
+        hold as its preview read, so a line tightened after the scan cannot
+        ship a row or a preview. The reply then carries
+        ``INCOGNITO_EXCLUDED_HEADER`` as proof the parameter was understood;
+        the crew-scoped reads on a hub require it. Opt-in, like the others:
+        the dashboard's own History browser must still list a restricted
+        session, since keeping it is the point.
 
     Returns ``{sessions, total, has_more}`` for pagination.
     """
     state: DashboardState = request.app["state"]
     if not state.conversation_log:
         return web.json_response({"sessions": [], "total": 0, "has_more": False})
+    # Both bounds are floored, not just capped: the page below is a Python list
+    # slice, where a negative bound counts from the END: ``offset=-3`` would read
+    # the far end of the list, and ``limit=-5`` would return every row but five,
+    # past the 200-row cap.
     try:
-        limit = min(int(request.query.get("limit", "50")), 200)
+        limit = max(1, min(int(request.query.get("limit", "50")), 200))
     except (TypeError, ValueError):
         limit = 50
     try:
-        offset = int(request.query.get("offset", "0"))
+        offset = max(0, int(request.query.get("offset", "0")))
     except (TypeError, ValueError):
         offset = 0
     want_preview = (request.query.get("preview") or "").lower() in ("1", "true", "yes")
     exclude_open = (request.query.get("exclude_open") or "").lower() in ("1", "true", "yes")
     user_only = (request.query.get("user_only") or "").lower() in ("1", "true", "yes")
+    exclude_incognito = _wants_incognito_excluded(request)
     # list_sessions() globs, stats, and reads the first line of EVERY session file
     # in the history dir — O(all sessions). At 2000 sessions, that's ~200 ms of
     # blocking IO (measured: 208 ms / 2000 files on a dev host). Running that on
     # the event loop freezes chat, heartbeat, and every other coroutine for the
     # full duration. Offload to a worker thread.
     all_sessions = await asyncio.to_thread(state.conversation_log.list_sessions)
+    if exclude_incognito:
+        # BEFORE paging, so ``limit`` counts eligible rows and a restricted
+        # session at the head of the list cannot hide an eligible one behind it.
+        # This is the cheap half (the row's own mode); the page below re-judges
+        # each row's ON-DISK line under its lock, beside the preview read.
+        all_sessions = [
+            s for s in all_sessions if not is_incognito_transcript(s.get("memory_mode"))
+        ]
     if "name" in request.query:
         # Before the app filter, which reads each row's transcript under its lock.
         all_sessions = _sessions_named(
@@ -238,34 +324,10 @@ async def api_sessions(request: web.Request) -> web.Response:
         )
         _audit_app_allow(request_app, "session_list", f"sessions={len(all_sessions)}")
     if exclude_open:
-        open_keys = _open_slot_transcript_keys(state)
-        # Fold through ``_canonical_key`` as well: ``list_sessions`` deduplicates
-        # by canonical name but reports the RAW stem of whichever file won on
-        # mtime, so a resume round-trip's ``dashboard_dashboard_<name>`` file
-        # reaches here under a name no slot ever produces. Without the fold that
-        # session is listed as a second, separate conversation.
-        canon = state.conversation_log._canonical_key
-        all_sessions = [
-            s
-            for s in all_sessions
-            if s.get("key", "") not in open_keys and canon(s.get("key", "")) not in open_keys
-        ]
+        is_open = _open_row_test(state)
+        all_sessions = [s for s in all_sessions if not is_open(s.get("key", ""))]
     if user_only:
         log = state.conversation_log
-
-        def _has_content(row: dict) -> bool:
-            # ``list_sessions`` titles a session from its metadata or its first
-            # user message, and falls back to the key itself. A titled row is kept
-            # without a read, even when it has no messages: a title is a user
-            # signal. Only a row whose title IS its key pays for a file read.
-            key = row.get("key", "")
-            if row.get("title", key) != key:
-                return True
-            try:
-                return log.has_messages(key)
-            except OSError:
-                # Unreadable is not empty: never hide what could not be read.
-                return True
 
         def _user_rows(sessions: list[dict]) -> list[dict]:
             if request_app:
@@ -276,16 +338,14 @@ async def api_sessions(request: web.Request) -> web.Response:
                         continue
                     try:
                         with log._locked(key):
-                            if _app_owns_transcript(log, request_app, key) and _has_content(row):
+                            if _app_owns_transcript(log, request_app, key) and _has_user_content(
+                                log, row
+                            ):
                                 owned.append(row)
                     except HistoryLockTimeout:
                         continue
                 return owned
-            return [
-                s
-                for s in sessions
-                if not _is_machine_only_session(s.get("key", "")) and _has_content(s)
-            ]
+            return [s for s in sessions if _is_user_listed_row(log, s)]
 
         all_sessions = await asyncio.to_thread(_user_rows, all_sessions)
     # Count AFTER the exclusion so the page, ``total`` and ``has_more`` describe
@@ -326,6 +386,26 @@ async def api_sessions(request: web.Request) -> web.Response:
                         continue
                 sessions[:] = owned
                 return
+            if exclude_incognito:
+                # The verdict and the preview come from ONE incarnation of the
+                # file: a writer tightening the line after the metadata scan
+                # above cannot land between this check and this read, and a
+                # line that cannot be read withholds the row (fails closed).
+                kept: list[dict] = []
+                for row in sessions:
+                    key = row.get("key", "")
+                    try:
+                        with log._locked(key):
+                            if transcript_withholds_derivation(log, key):
+                                continue
+                            preview = log.last_message_preview(key, sanitize=_sanitize)
+                    except HistoryLockTimeout:
+                        continue
+                    if preview:
+                        row["preview"] = preview
+                    kept.append(row)
+                sessions[:] = kept
+                return
             for s in sessions:
                 preview = log.last_message_preview(s.get("key", ""), sanitize=_sanitize)
                 if preview:
@@ -334,14 +414,39 @@ async def api_sessions(request: web.Request) -> web.Response:
         # Tail reads are sync file IO — keep them off the event loop.
         page_size = len(page)
         await asyncio.get_running_loop().run_in_executor(None, _attach_previews, page)
-        if request_app:
+        if request_app or exclude_incognito:
             total -= page_size - len(page)
+    elif exclude_incognito:
+        # No preview was asked for, so no content leaves with the row; the
+        # lock-held re-judge still runs so the LIST itself does not name a
+        # session whose line tightened after the scan above.
+        log = state.conversation_log
+
+        def _rejudge(sessions: list[dict]) -> None:
+            kept: list[dict] = []
+            for row in sessions:
+                key = row.get("key", "")
+                try:
+                    with log._locked(key):
+                        if transcript_withholds_derivation(log, key):
+                            continue
+                except HistoryLockTimeout:
+                    continue
+                kept.append(row)
+            sessions[:] = kept
+
+        page_size = len(page)
+        await asyncio.to_thread(_rejudge, page)
+        total -= page_size - len(page)
+    headers = {INCOGNITO_EXCLUDED_HEADER: "1"} if exclude_incognito else None
     return web.json_response(
         {
             "sessions": page,
             "total": total,
-            "has_more": offset + (len(page) if request_app else limit) < total,
-        }
+            "has_more": offset + (len(page) if (request_app or exclude_incognito) else limit)
+            < total,
+        },
+        headers=headers,
     )
 
 
@@ -371,6 +476,12 @@ async def api_sessions_search(request: web.Request) -> web.Response:
     Query params:
       - ``q``: search string (min 2 chars; empty returns no results)
       - ``limit``: max results (default 50, max 200)
+      - ``exclude_incognito``: when truthy, drop every incognito/temporary
+        match, each surviving row re-judged against its on-disk line and its
+        snippet re-read under one transcript lock hold
+        (:func:`_search_excluding_incognito`); the reply carries
+        ``INCOGNITO_EXCLUDED_HEADER``. Opt-in: the dashboard's own search is
+        unchanged.
 
     Returns ``{sessions}`` — same metadata shape as:func:`api_sessions`.
     Session titles may be LLM-generated and are redacted before return.
@@ -386,26 +497,121 @@ async def api_sessions_search(request: web.Request) -> web.Response:
     except (TypeError, ValueError):
         limit = 50
     request_app = str(request.get("app") or "")
+    exclude_incognito = not request_app and _wants_incognito_excluded(request)
     if request_app:
         # The ownership filter runs inside the ranking, before the limit cap, so
         # other sessions' matches cannot crowd the app's off the page.
         log = state.conversation_log
         sessions = await asyncio.to_thread(_app_search, log, request_app, q, limit)
         _audit_app_allow(request_app, "session_search", f"sessions={len(sessions)}")
+    elif exclude_incognito:
+        sessions = await asyncio.to_thread(
+            _search_excluding_incognito, state.conversation_log, q, limit
+        )
     else:
         sessions = await asyncio.get_running_loop().run_in_executor(
             None, state.conversation_log.search_sessions, q, limit
         )
+        # The dashboard's own search ranks open tabs first. Only this arm marks
+        # them: an app caller and a remote crew read get the rows unchanged.
+        _mark_open_sessions(sessions, state)
     for s in sessions:
         for field in SESSION_SEARCH_TEXT_FIELDS:
             value = s.get(field)
             if value:
                 s[field] = redact(value)
-    return web.json_response({"sessions": sessions})
+    headers = {INCOGNITO_EXCLUDED_HEADER: "1"} if exclude_incognito else None
+    return web.json_response({"sessions": sessions}, headers=headers)
+
+
+def _wants_incognito_excluded(request: web.Request) -> bool:
+    """Whether the caller opted into the incognito/temporary exclusion.
+
+    The opt-in a remote reader sends: the crew-scoped session reads set it on
+    every peer leg so a marked session is excluded by the peer under its own
+    locks, and every 200 the guarded arms answer carries
+    ``INCOGNITO_EXCLUDED_HEADER`` as proof the parameter was understood. The
+    dashboard's own reads never set it, so their behavior is unchanged.
+    """
+    return request.query.get("exclude_incognito") in ("1", "true", "yes")
+
+
+def _search_excluding_incognito(log: ConversationLog, q: str, limit: int) -> list[dict]:
+    """Ranked search rows with every restricted session excluded, judged under lock.
+
+    The ranking's own snippet is read OUTSIDE the transcript lock, so a line
+    tightened between the metadata snapshot and that read could ship a restricted
+    session's excerpt. Here each returned row is re-judged against its ON-DISK
+    line and its snippet re-read under ONE ``_locked`` hold, so the privacy
+    contract and the content are one incarnation; a restricted or unreadable line
+    drops the row (fails closed), and a busy lock drops it too ("cannot vouch").
+    Restricted rows are excluded BEFORE the limit is applied, so a restricted
+    match cannot hide an eligible one behind it: the ranking is asked for its
+    WHOLE bounded scan window (``_SEARCH_SCAN_WINDOW``, the same pull the local
+    ``search_chat_history`` tool makes before it filters), not a multiple of the
+    caller's limit, because any smaller window is a number of restricted matches
+    above which an eligible one goes silently missing. The ranking slices to that
+    window before any row here is seen, so the exclusion cannot be pushed into it
+    without a mode filter inside the ranking. Blocking file IO; call it off the loop.
+    """
+    from kiro_crew.history_search import split_title_scope
+
+    candidates = log.search_sessions(q, _SEARCH_SCAN_WINDOW)
+    # The snippet looks for what the ranking searched: a leading ``title:`` term
+    # only narrows the window (``search_sessions``), so it is not a content needle.
+    scope = split_title_scope(q)
+    snippet_q = scope.rest if scope is not None else q
+    out: list[dict] = []
+    for row in candidates:
+        if len(out) >= limit:
+            break
+        key = row.get("key", "")
+        if is_incognito_transcript(row.get("memory_mode")):
+            continue
+        try:
+            with log._locked(key):
+                if transcript_withholds_derivation(log, key):
+                    continue
+                snippet = log._content_snippet(key, snippet_q) if row.get("snippet") else ""
+        except HistoryLockTimeout:
+            continue
+        if snippet:
+            row["snippet"] = snippet
+        else:
+            row.pop("snippet", None)
+        out.append(row)
+    return out
 
 
 async def api_session_detail(request: web.Request) -> web.Response:
-    """GET /api/sessions/{key} — return messages for a session."""
+    """GET /api/sessions/{key} — return messages for a session.
+
+    ``?exclude_incognito=1`` (opt-in) refuses an incognito/temporary transcript,
+    returning ``[]``. The crew-scoped read proxy (``crew=`` on get_chat_session)
+    sets it so a remote agent cannot read a marked session that the local
+    get_chat_session also refuses (EB-7b). The dashboard's own click-through does
+    NOT set it, so its behavior is unchanged.
+
+    That arm reads through the DERIVATION seam (``derive_messages``), like the
+    local get_chat_session: the on-disk line is validated with the rows under one
+    lock hold, so a writer tightening the line cannot land between the check and
+    the read, and a restricted line answers ``[]``. A busy transcript lock, and a
+    line that cannot be READ (nothing about its privacy was measured, so the
+    seam raises ``TranscriptBusy`` for it), are "cannot vouch right now",
+    answered 503 rather than ``[]`` so the caller does not mistake a retryable
+    state for an empty conversation; both fail closed, neither ships rows.
+    It sits AFTER the app-scope gate so an app caller keeps its own ownership
+    answer, and the ``exclude_incognito`` arm applies to the owner's read alone.
+
+    Every 200 the arm answers carries ``INCOGNITO_EXCLUDED_HEADER``. That header is
+    the peer's proof that it UNDERSTOOD the parameter: a gateway from before this
+    arm existed ignores an unknown query parameter and serves the marked transcript
+    through the plain read below, with no header. The crew read on the hub
+    (``handlers_instances_crew_reads``) refuses a reply without it, so the exclusion
+    is enforced by the reader and not merely honored by the peer. The body
+    shape is unchanged (a bare message array), so the dashboard's own click-through
+    and every existing reader of this route are unaffected.
+    """
     state: DashboardState = request.app["state"]
     key = request.match_info["key"]
     refusal = await _app_transcript_refusal(request, state, key, "session_detail")
@@ -415,6 +621,24 @@ async def api_session_detail(request: web.Request) -> web.Response:
         return web.json_response([])
     log = state.conversation_log
     request_app = str(request.get("app") or "")
+    if not request_app and _wants_incognito_excluded(request):
+        # Off the loop for the same reason as the read_messages call below: the
+        # seam stats the transcript, parses its first line and reads the rows,
+        # all blocking file IO, and every other conversation_log read in this
+        # module is already wrapped. Doing it inline stalled every other request
+        # for the duration — on the one path a remote agent can reach.
+        try:
+            guarded = await asyncio.to_thread(log.derive_messages, key)
+        except TranscriptBusy:
+            # Before TranscriptWithheld: Busy is its subclass, and a busy lock is
+            # "cannot vouch right now", not a refusal.
+            return web.json_response(
+                {"error": "transcript is being written; retry", "code": "transcript_busy"},
+                status=503,
+            )
+        except TranscriptWithheld:
+            return web.json_response([], headers={INCOGNITO_EXCLUDED_HEADER: "1"})
+        return web.json_response(guarded, headers={INCOGNITO_EXCLUDED_HEADER: "1"})
     if request_app:
         # Re-judged with the read under one lock hold: the check above is a
         # snapshot a same-key delete and recreate can outlive.
@@ -516,7 +740,7 @@ async def api_session_archive_list(request: web.Request) -> web.Response:
 
     key = request.query.get("key", "").strip()
     adir = _archive_dir()
-    if not adir.exists():
+    if not await asyncio.to_thread(adir.exists):
         return web.json_response({"archives": []})
     prefix = f"{_safe_key(key)}__" if key else ""
 
@@ -553,9 +777,9 @@ async def api_session_archive_read(request: web.Request) -> web.Response:
     name = request.match_info.get("name", "")
     if not name.endswith(".jsonl"):
         return web.json_response({"error": "invalid archive name"}, status=400)
-    adir = _archive_dir().resolve()
+    adir = await asyncio.to_thread(_archive_dir().resolve)
     try:
-        resolved = (adir / name).resolve()
+        resolved = await asyncio.to_thread((adir / name).resolve)
     except (OSError, RuntimeError, ValueError):
         return web.json_response({"error": "invalid archive name"}, status=400)
     # Canonical path check: file must be a direct child of the archive dir.

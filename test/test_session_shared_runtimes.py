@@ -60,7 +60,6 @@ class TestRecycleBackground:
         await mgr._ensure_background()
 
         old_provider = mgr._sessions[BACKGROUND_KEY].provider
-        # Simulate high context
         old_provider.context_usage_pct = lambda: 75.0
 
         await mgr.recycle_background()
@@ -103,7 +102,6 @@ class TestRecycleBackground:
 
         await mgr.recycle_background()
 
-        # Should NOT have been shut down
         old_provider.shutdown.assert_not_awaited()
         assert mgr._sessions[BACKGROUND_KEY].provider is old_provider
         await mgr.close_all()
@@ -112,8 +110,8 @@ class TestRecycleBackground:
     async def test_recycle_no_background_session(self, cfg):
         """recycle_background() is no-op when no background session exists."""
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
-        # Don't start pool — no background session
-        await mgr.recycle_background()  # should not raise
+        await mgr.recycle_background()
+        assert not mgr.has_session(BACKGROUND_KEY), "recycling must not create one"
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -356,6 +354,7 @@ class TestReloadProviderFactory:
             await mgr.reload_provider_factory()
 
         provider.shutdown.assert_awaited_once()
+        assert not mgr.has_session("k1")
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -370,8 +369,10 @@ class TestReloadProviderFactory:
             patch.object(KiroCrewConfig, "load", return_value=cfg),
             patch.object(cfg, "create_provider_factory", return_value=_mock_provider_factory()),
         ):
-            await mgr.reload_provider_factory()  # should not raise
+            await mgr.reload_provider_factory()
 
+        provider.shutdown.assert_awaited_once()
+        assert not mgr.has_session("k1"), "the stale session is dropped despite the failure"
         await mgr.close_all()
 
 
@@ -393,7 +394,6 @@ class TestBackgroundSession:
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
         await mgr._ensure_background()
         await mgr._ensure_background()
-        # Should still only have one background session
         assert mgr.count == 1
         await mgr.close_all()
 
@@ -737,17 +737,23 @@ class TestRetireStaleBackendBgRuntime:
         """refresh_defaults() re-reads config, so any invocation of it (and any
         future agent.acp_backend edit surface routed through it) must also run
         the retirement check."""
+        cfg.agent.acp_backend = ACP_BACKEND_KAS
         mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        rt = self._runtime(backend=ACP_BACKEND_KIRO, busy=False)
+        mgr._bg_runtime = rt
 
         with (
             patch.object(mgr, "start_pool", AsyncMock()),
-            patch.object(mgr, "_retire_stale_backend_bg_runtime", AsyncMock()) as retire,
+            patch.object(
+                mgr, "_retire_stale_backend_bg_runtime", wraps=mgr._retire_stale_backend_bg_runtime
+            ) as retire,
             patch("kiro_crew.session.build_provider_factory", return_value=MagicMock()),
             patch("kiro_crew.session.KiroCrewConfig.load", return_value=cfg),
         ):
             await mgr.refresh_defaults()
 
         retire.assert_awaited_once()
+        assert mgr._bg_runtime is None, "the stale-backend runtime was retired"
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -999,6 +1005,26 @@ class TestOpenTaskSession:
         await mgr.release_subagent_runtime(parent)
         runtime.kill.assert_awaited_once()
         assert parent not in mgr._subagent_runtimes
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("delay", [0, 1800])
+    async def test_a_step_session_carries_the_configured_delete_delay(self, cfg, delay):
+        """The handle is what ``destroy`` reads, so the delay must reach it. The later
+        delete is a cleanup-loop hook that this path would not otherwise start."""
+        cfg.session.kas_delete_delay_secs = delay
+        created: list = []
+        mgr = SessionManager(cfg, provider_factory=_run_runtime_factory(created))
+        parent = "taskrunner:run3:runtime"
+
+        provider, _is_new, _resumed = await mgr.open_task_session(
+            parent, "taskrunner:run3:task0", agent="kirocrew"
+        )
+
+        assert provider._handle.delete_delay_secs == float(delay)
+        assert (mgr._cleanup_task is not None) is (delay > 0)
+        mgr.release("taskrunner:run3:task0")
+        await mgr.release_subagent_runtime(parent)
         await mgr.close_all()
 
     @pytest.mark.asyncio

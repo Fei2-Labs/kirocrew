@@ -145,7 +145,7 @@ function TreeRow({
           {isOpen ? <FolderOpen size={14} className="shrink-0 text-muted" /> : <Folder size={14} className="shrink-0 text-muted" />}
           <span className="truncate">{node.name || i18nT('components.skillDirectoryBrowser.root')}</span>
           {node.children.length > 0 && (
-            <span className="ml-auto text-[10px] text-muted/60 mr-2">{node.children.length}</span>
+            <span className="ml-auto text-[10px] text-muted mr-2">{node.children.length}</span>
           )}
         </button>
         {isOpen && node.children.map(c => (
@@ -173,7 +173,7 @@ function TreeRow({
       <span className="w-3 shrink-0" aria-hidden />
       <FileText size={14} className="shrink-0 text-muted" />
       <span className="truncate">{node.name}</span>
-      <span className="ml-auto text-[10px] text-muted/60 mr-2">{humanSize(node.size)}</span>
+      <span className="ml-auto text-[10px] text-muted mr-2">{humanSize(node.size)}</span>
     </button>
   )
 }
@@ -275,7 +275,7 @@ export default function SkillDirectoryBrowser({
        *
        * `overscroll-contain` stops a swipe that reaches the end of either pane
        * from chaining into the page scroll behind it. */}
-      <div className={`${isMobile ? 'w-full order-last max-h-32' : 'w-[200px]'} shrink-0 overflow-y-auto overscroll-contain scrollbar-overlay border border-border rounded-md bg-bg-elevated/50 p-1`}>
+      <div className={`${isMobile ? 'w-full order-last max-h-32' : 'w-[200px]'} shrink-0 overflow-y-auto overscroll-contain border border-border rounded-md bg-bg-elevated/50 p-1`}>
         {treeLoading && <div className="text-muted text-[12px] p-2 animate-pulse">{i18nT('components.skillDirectoryBrowser.loading_tree')}</div>}
         {treeErr && <div className="text-danger text-[12px] p-2 flex items-start gap-1.5"><AlertCircle size={14} className="shrink-0" />{i18nT('components.skillDirectoryBrowser.failed_to_load_tree')}</div>}
         {!treeLoading && !treeErr && root.children.length === 0 && (
@@ -291,7 +291,7 @@ export default function SkillDirectoryBrowser({
       </div>
 
       {/* File viewer pane */}
-      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain scrollbar-overlay border border-border rounded-md bg-card p-3">
+      <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain border border-border rounded-md bg-card p-3">
         <SkillMetaStrip
           description={stripDescription}
           triggers={stripTriggers}

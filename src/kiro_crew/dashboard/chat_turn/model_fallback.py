@@ -8,14 +8,29 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.dashboard.chat_utils import (
+    _REFUSAL_FALLBACK_RESUME_MSG,
+    _SYNTHETIC_RECOVERY_MSGS,
+    TRANSIENT_RETRY_KIND,
+    payload_for_replay,
+)
+from kiro_crew.dashboard.recovery_replays import replays_of
+from kiro_crew.llm_helpers import (
+    TURN_FALLBACK_ATTR,
+    FallbackState,
+    configured_fallback_chain,
+    pick_epoch_host,
+    provider_active_model,
+    provider_advertised_ids,
+    provider_raw_model,
+    resolve_substitute_set_model,
+)
+from kiro_crew.security import redact
+
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
-        _REFUSAL_FALLBACK_RESUME_MSG,
-        _SYNTHETIC_RECOVERY_MSGS,
         SYNTHETIC_RECOVERY_KIND,
-        TRANSIENT_RETRY_KIND,
-        TURN_FALLBACK_ATTR,
-        FallbackState,
         KiroCrewConfig,
         RefusalInfo,
         ReplayFamily,
@@ -23,24 +38,14 @@ if TYPE_CHECKING:
         advance_fallback_candidate,
         advertised_model_ids,
         capabilities_of,
-        configured_fallback_chain,
         effective_session_key,
-        is_claude_code,
         logger,
         model_is_unusable,
         model_registry,
-        payload_for_replay,
-        pick_epoch_host,
         probe_fallback_restore,
-        provider_active_model,
-        provider_advertised_ids,
-        provider_raw_model,
-        redact,
         redact_credentials,
         redact_exfiltration_urls,
-        replays_of,
         resolve_pin_spelling,
-        resolve_substitute_set_model,
         slot_switch_session_lock,
     )
     from kiro_crew.dashboard.chat_turn.recovery import (
@@ -377,6 +382,31 @@ def _resolve_refusal_fallback_target(refusal: "RefusalInfo | None") -> str:
     if cfg == "auto":
         return (refusal.recommended_model or "").strip() if refusal else ""
     return cfg
+
+
+def _refusal_fallback_is_same_model(client: Any, refusal: "RefusalInfo | None") -> bool:
+    """True when a refusal fallback IS configured but resolves to the model
+    that just refused — the case :func:`_refusal_fallback_swap` skips.
+
+    When ``agent.refusal_fallback_model`` equals ``agent.model`` the retry is
+    silently disabled even though a fallback looks set. It reads disabled, not
+    misconfigured, so a separate ``notice`` row (the
+    ``refusal_fallback_same_model`` gateway-notice token) can explain WHY no
+    retry ran and what to change. The equality mirrors the
+    swap's own guard exactly (``strip().lower()`` on the resolved candidate
+    and the active/refusing model) so the card never claims a same-model skip
+    the swap would not have made. An unresolvable candidate (empty, or
+    ``auto`` with no recommendation) or an unknown active model is not this
+    case — those are handled by the ``fallback_off`` hint or by the swap's
+    own unprovable-primary branch.
+    """
+    cand = _resolve_refusal_fallback_target(refusal)
+    if not cand:
+        return False
+    primary = provider_active_model(client)
+    if not primary:
+        return False
+    return cand.strip().lower() == primary.strip().lower()
 
 
 async def _refusal_fallback_swap(
@@ -807,6 +837,8 @@ async def _settle_session_model(
         # styling for the same reason the empty-response notices use it — a
         # plan change is not a crash. slot.append persists AND broadcasts one
         # chat_message, so it needs no companion broadcast_ws.
+        from kiro_crew.dashboard import gateway_notice as gn
+
         slot.append(
             "notice",
             f"{slot.model} isn't offered right now — "
@@ -814,6 +846,7 @@ async def _settle_session_model(
             f"from the composer, or leave it: your model choice is kept and "
             f"will be used automatically once it's offered again.",
             "msg msg-info",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_MODEL_UNAVAILABLE, model=str(slot.model)),
         )
     return withheld_pin
 
@@ -1185,7 +1218,7 @@ async def _on_acp_model_access(turn: _ChatTurn, exc, _rejected_id, _access_fb_ca
         # does (visible error card, structural meta so the frontend
         # offers the picker) and end the turn. A bare re-raise here would
         # escape _run_chat to a log-only callback and dead-end the turn
-        # with no card — the exact silent failure this PR fixes.
+        # with no card, a silent failure.
         logger.info(
             "model access fallback: slot %s provider exposes no set_model; "
             "surfacing entitlement error for %r",
@@ -1336,11 +1369,18 @@ async def _on_acp_model_access(turn: _ChatTurn, exc, _rejected_id, _access_fb_ca
                     # user, forced the model change, so it must be said out
                     # loud and survive a reload the way the throttle notice
                     # does).
+                    from kiro_crew.dashboard import gateway_notice as gn
+
                     slot.append(
                         "notice",
                         f"⚠️ Your account cannot use model '{_rejected_safe}' — "
                         f"running on '{_cand_safe}' instead.",
                         "msg msg-info",
+                        meta=gn.gateway_notice_meta(
+                            gn.GATEWAY_NOTICE_MODEL_ACCESS_FALLBACK,
+                            rejected=_rejected_safe,
+                            model=_cand_safe,
+                        ),
                     )
                     logger.warning(
                         "model access fallback: slot %s model %r not entitled; "

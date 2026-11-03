@@ -21,6 +21,8 @@ export interface CronJob {
    * skips its memory, lessons, steering and skills injection; member V2 retains
    * its complete essential guidance and protected identity. Default false. */
   minimal_context?: boolean
+  /** Whole-run time limit in seconds (the cron service's `timeout_secs`). */
+  timeout_secs?: number
   last_run_ts?: number; next_run_ts?: number | null; has_result?: boolean; has_slot?: boolean
   /** Retry telemetry for the LAST completed run: how many transient-backend
    *  retries it took (0 = none needed) and when that run finished. Absent on
@@ -72,6 +74,9 @@ export interface CronJob {
    *  pauses; a job at 0 or above 5 backs off from its 5th failure instead.
    *  Absent on an older gateway. */
   auto_pause_after_failures?: number
+  /** Consecutive failed runs before the failure message is sent (1..10000);
+   *  earlier failures only ring the dashboard bell. Absent on an older gateway. */
+  alert_after_failures?: number
   /** Chat session that owns this job — ownership decides chat-side reachability
    * (cron_list only lists a session its own jobs). Null for an ownerless job,
    * which is invisible to every chat session and manageable only from the

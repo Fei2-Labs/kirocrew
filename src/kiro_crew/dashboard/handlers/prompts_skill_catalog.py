@@ -25,6 +25,7 @@ from kiro_crew.agent_discovery import (
     served_provider_label,
     session_skill_globs,
 )
+from kiro_crew.dashboard.body_numbers import body_int
 from kiro_crew.dashboard.handlers.prompts_caller_gates import (
     _deny_foreign_app_skill_slot,
     _deny_non_owner_skill_operation,
@@ -58,6 +59,7 @@ from ._shared import (
     read_bounded_json,
     read_skill_file,
     requesting_slot_project,
+    skill_rows_for_globs,
 )
 
 # Concurrent readers of the catalog share ONE scan. Nothing is stored and nothing
@@ -284,19 +286,19 @@ async def api_skills(request: web.Request) -> web.Response:
                 status=400,
             )
         try:
-            offset = max(0, int(params.get("offset", "0")))
+            offset = max(0, body_int(params.get("offset", "0")))
             # A read pages in LINES and only when asked: the whole-or-refuse contract
             # holds for a call that names neither parameter, and ``limit`` here is
             # lines rather than the result count search and list bound at 50.
             paging = action == "read" and ("offset" in params or "limit" in params)
-            page_limit = max(1, int(params["limit"])) if paging and "limit" in params else None
+            page_limit = max(1, body_int(params["limit"])) if paging and "limit" in params else None
             # The caller may SHRINK the capacity to what its own response framing
             # leaves for the body; the ceiling itself is not the caller's to move.
             capacity = max(
-                1, min(SKILL_READ_CAPACITY, int(params.get("capacity", SKILL_READ_CAPACITY)))
+                1, min(SKILL_READ_CAPACITY, body_int(params.get("capacity", SKILL_READ_CAPACITY)))
             )
-            limit = 1 if action == "read" else max(1, min(50, int(params.get("limit", "20"))))
-        except (ValueError, TypeError, OverflowError):
+            limit = 1 if action == "read" else max(1, min(50, body_int(params.get("limit", "20"))))
+        except (ValueError, TypeError):
             return web.json_response(
                 {"error": "Invalid search limit.", "code": "invalid_limit"}, status=400
             )
@@ -401,16 +403,32 @@ async def api_skills(request: web.Request) -> web.Response:
     result = await _assemble_skills_catalog(skills, project_dir)
     agent = request.query.get("agent") or None
     if agent:
-        # Resolved from the parsed-specs snapshot in agent_discovery (the
-        # annotation pass inside the catalog assembly warms it), so the warm
-        # path costs one scandir signature check instead of re-parsing every
-        # agent JSON. Still off-loop: the cold path walks and parses
-        # ~/.kiro/agents.
+        # Resolve the agent's skill globs against the SAME project the catalog
+        # was assembled for. ``agent_skill_globs`` reads the winning spec
+        # ``list_agents(project_dir=…)`` picks (project scope shadows user), so
+        # a custom agent's workspace-relative ``skill://`` glob anchors at the
+        # project exactly as ``session_skill_globs`` does on the runtime path.
+        # Off-loop either way: the warm path costs one scandir signature check,
+        # the cold path walks and parses ~/.kiro/agents.
         globs = await asyncio.get_running_loop().run_in_executor(
-            discovery_executor(), agent_skill_globs, agent
+            discovery_executor(),
+            functools.partial(agent_skill_globs, agent, project_dir=project_dir),
         )
         if globs:
-            result = [s for s in result if agent in (s.get("loaded_by_agents") or [])]
+            # Filter by the agent's OWN resolved globs, not the catalog's
+            # ``loaded_by_agents`` field: that field is annotated from the
+            # user-level specs, so for a project spec that shadows a user one it
+            # would disagree with the winner ``agent_skill_globs`` just resolved.
+            # Matching the rows against these globs keeps ``list_agents`` the
+            # single owner of which spec wins. Off-loop: ``skill_rows_for_globs``
+            # delegates to ``_agents_loading_skill`` (the annotation's own
+            # matcher), whose resolved-path retry and alias fallback touch the
+            # filesystem per non-matching row, so on a large network-backed
+            # catalog it must not run on the event loop.
+            result = await asyncio.get_running_loop().run_in_executor(
+                discovery_executor(),
+                functools.partial(skill_rows_for_globs, result, globs, project_dir=project_dir),
+            )
             return web.json_response({"skills": result, "agent_scoped": True, "agent": agent})
     return web.json_response(result)
 
@@ -625,7 +643,7 @@ async def api_skill_tree(request: web.Request) -> web.Response:
     # against the *resolved* home too; otherwise a symlinked home (e.g. macOS
     # ``/var`` → ``/private/var``) would mismatch and leak the real path.
     display_root = str(root)
-    for home in {str(Path.home()), str(Path.home().resolve())}:
+    for home in {str(Path.home()), str(await asyncio.to_thread(Path.home().resolve))}:
         display_root = display_root.replace(home, "~")
     _sel().log_tool_invocation(
         session_key="",

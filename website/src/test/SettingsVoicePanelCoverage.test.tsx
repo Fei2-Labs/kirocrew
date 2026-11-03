@@ -16,6 +16,7 @@
  *  - `renderWithProviders` supplies a QueryClient with `retry: false`, so a
  *    rejected query surfaces on the first attempt.
  */
+import { Profiler } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, waitFor } from '@testing-library/react'
 
@@ -35,11 +36,16 @@ vi.mock('../pages/settings/SttSettings', () => ({
 // environment down and throw "window is not defined" as an UNHANDLED error —
 // every test passing and the run still exiting non-zero. `shouldAdvanceTime`
 // keeps the clock moving so `findBy*` behaves as it does with real timers.
+// Testing Library ticks a fake clock inside act() for every `findBy*` and `waitFor` only when it sees a
+// `jest` global, and vitest's `vi` has the same API: the panel's chained reads (config, then the chosen
+// provider's voice list) and the Radix selects they mount all commit inside that act().
 beforeEach(async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true })
+  vi.stubGlobal('jest', vi)
   await initI18n('en')
 })
 afterEach(() => {
+  vi.unstubAllGlobals()
   vi.clearAllTimers()
   vi.useRealTimers()
   vi.restoreAllMocks()
@@ -94,6 +100,8 @@ interface SeedOpts {
   systemUnavailable?: boolean
   /** Reject the host-voice probe, driving the inline notice + retry. */
   systemVoicesFail?: boolean
+  /** Called once per commit of the panel, after the DOM is written. */
+  onCommit?: () => void
 }
 
 function seed(over: Record<string, unknown> = {}, opts: SeedOpts = {}) {
@@ -118,7 +126,13 @@ function seed(over: Record<string, unknown> = {}, opts: SeedOpts = {}) {
   if (opts.saveFails) save.mockRejectedValue(new Error('write refused'))
   else save.mockImplementation(async (patch: object) => ({ ...cfg, ...patch }) as VoiceConfig)
 
-  const view = renderWithProviders(<VoicePanel />)
+  // `onRender` runs in the commit phase, after the DOM is written and before
+  // passive effects, so a probe there sees exactly what one commit shows.
+  const view = renderWithProviders(
+    <Profiler id="voice" onRender={() => opts.onCommit?.()}>
+      <VoicePanel />
+    </Profiler>,
+  )
   return { ...view, cfg, load, voices, systemVoices, save }
 }
 
@@ -326,6 +340,23 @@ describe('VoicePanel polly fields', () => {
     await waitFor(() => expect(voices).toHaveBeenCalled())
   })
 
+  it('shows the stored profile and region in the first commit that has the rows', async () => {
+    // The rows are seeded from the served config in the render that first has
+    // it, not latched by a later effect: a commit showing the rows empty is a
+    // frame a user can see and a test can land on.
+    const commits: { rows: boolean; profile: string | null; region: string | null }[] = []
+    seed({ provider: 'polly', aws_profile: 'voice-prod', region: 'eu-west-1' }, {
+      onCommit: () => {
+        const profile = screen.queryByLabelText('AWS Profile (Amazon Polly)') as HTMLInputElement | null
+        const region = screen.queryByLabelText('AWS Region (Amazon Polly)') as HTMLInputElement | null
+        commits.push({ rows: profile !== null, profile: profile?.value ?? null, region: region?.value ?? null })
+      },
+    })
+    await field('AWS Profile (Amazon Polly)')
+    const first = commits.find(c => c.rows)
+    expect(first).toEqual({ rows: true, profile: 'voice-prod', region: 'eu-west-1' })
+  })
+
   it('labels catalogue voices as name (locale gender-initial)', async () => {
     seed({ provider: 'polly' })
     await field('AWS Profile (Amazon Polly)')
@@ -471,5 +502,49 @@ describe('VoicePanel save failure', () => {
     expect(banner).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /dismiss/i }))
     await waitFor(() => expect(screen.queryByText('Failed to save voice config')).toBeNull())
+  })
+})
+
+/* ── Language (edition providers) ────────────────────────────────────────── */
+
+/** A registered edition provider: the only kind that reads `language_code`. */
+const EDITION_PROVIDERS = [
+  { name: 'system', label: 'system', builtin: true, available: true, reason: null, action: null },
+  { name: 'polly', label: 'polly', builtin: true, available: true, reason: null, action: null },
+  { name: 'acme', label: 'Acme Speech', builtin: false, available: true, reason: null, action: null },
+]
+const LANGUAGE_CODES = ['', 'en-US', 'ja-JP', 'zh-CN']
+
+describe('VoicePanel language picker', () => {
+  it('offers the served codes with the provider default first, and saves the pick', async () => {
+    const { save } = seed({ provider: 'acme', providers: EDITION_PROVIDERS, language_code: '', language_codes: LANGUAGE_CODES })
+    const language = await screen.findByRole('combobox', { name: /^Language$/ }, { timeout: 5_000 })
+    expect(language).toHaveTextContent('Provider default')
+
+    await pick(/^Language$/, 'Japanese (ja-JP)')
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ language_code: 'ja-JP' }))
+  })
+
+  it('carries its own setting id, so search highlights it and not the STT Language row', async () => {
+    seed({ provider: 'acme', providers: EDITION_PROVIDERS, language_code: '', language_codes: LANGUAGE_CODES })
+    const language = await screen.findByRole('combobox', { name: /^Language$/ }, { timeout: 5_000 })
+    expect(language.closest('[data-setting-id]')?.getAttribute('data-setting-id')).toBe('voice.language-2')
+  })
+
+  it('shows a stored code as the selection', async () => {
+    seed({ provider: 'acme', providers: EDITION_PROVIDERS, language_code: 'zh-CN', language_codes: LANGUAGE_CODES })
+    const language = await screen.findByRole('combobox', { name: /^Language$/ }, { timeout: 5_000 })
+    expect(language).toHaveTextContent('Chinese (zh-CN)')
+  })
+
+  it('leaves when a built-in provider is picked, since those speak the voice\'s own language', async () => {
+    const { cfg, load } = seed({ provider: 'acme', providers: EDITION_PROVIDERS, language_code: '', language_codes: LANGUAGE_CODES })
+    await screen.findByRole('combobox', { name: /^Language$/ }, { timeout: 5_000 })
+
+    // The refetch after the save must read the saved provider, as the gateway would.
+    load.mockResolvedValue({ ...cfg, provider: 'system' })
+    await pick(/^Provider$/, 'System (built-in)')
+    await screen.findByRole('combobox', { name: /^Voice$/ }, { timeout: 5_000 })
+    expect(screen.queryByRole('combobox', { name: /^Language$/ })).toBeNull()
   })
 })

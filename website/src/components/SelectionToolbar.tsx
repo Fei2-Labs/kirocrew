@@ -9,6 +9,8 @@ import { codePassagePosition, plainCodeFenceAtRangeStart, shadowSelectionRange }
 import { useImeGuard } from '../hooks/useImeGuard'
 import { measureAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 import ErrorNotice from './ErrorNotice'
+import { CommentVoiceButton } from './CommentVoiceButton'
+import { spliceDictationText } from '../lib/dictationText'
 import { i18nT } from '../i18n/t'
 import { isEditableTarget } from '../utils/editableTarget'
 
@@ -418,6 +420,16 @@ interface SelectionToolbarProps {
    * until it opts in.
    */
   codeSelection?: boolean
+  /**
+   * Copy on select: when a MOUSE drag opens the row, run its own Copy action
+   * at once, so the selection is on the clipboard without a second click (the
+   * checkmark and a refused write show exactly as they do for a click). The
+   * row still opens, so the other actions stay one click away. Keyboard and
+   * touch selections are left alone: a Shift+Arrow walk would copy every
+   * intermediate step, and the touch platform has its own Copy callout. A row
+   * with no `copy` action copies nothing.
+   */
+  copyOnSelect?: boolean
 }
 
 /** Gap between the docked row and whatever it sits on (composer or screen edge). */
@@ -456,7 +468,7 @@ function safeAreaBottomPx(): number {
 
 /** Generic floating toolbar that appears when user selects text within a container.
  *  Extensible — pass any actions (quote, copy, etc.) via the `actions` prop. */
-export default function SelectionToolbar({ containerRef, actions, externalSelection, composer, suspended: suspendedProp = false, externalOnly = false, dock: dockProp = false, codeSelection = false }: SelectionToolbarProps) {
+export default function SelectionToolbar({ containerRef, actions, externalSelection, composer, suspended: suspendedProp = false, externalOnly = false, dock: dockProp = false, codeSelection = false, copyOnSelect = false }: SelectionToolbarProps) {
   // Behind a remote Crew the toolbar is hidden with its Crew (components/overlayRoot)
   // and suspends like a hidden tab, so a key aimed at the Crew in front cannot
   // reach it. The draft survives and returns with the Crew.
@@ -481,6 +493,10 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   const externalOpenSeqRef = useRef(0)
   const codeSelectionRef = useRef(codeSelection)
   codeSelectionRef.current = codeSelection
+  const copyOnSelectRef = useRef(copyOnSelect)
+  copyOnSelectRef.current = copyOnSelect
+  // Runs the row's Copy action; set below once `handleAction` exists.
+  const autoCopyRef = useRef<() => void>(() => {})
   // The composer's draft text lives HERE, not in `ComposerBox`, so it survives
   // a suspension (the box unmounts while its tab is hidden) and comes back
   // with the tab. Reset on submit and on every close.
@@ -557,6 +573,8 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
   // still under its drag handles (focus collapses them and summons the
   // keyboard). Those open the box unfocused; Enter, or a tap, moves in.
   const [composerAutoFocus, setComposerAutoFocus] = useState(true)
+  // Bumped on every open of the composer over a passage: the dictation key.
+  const [composerOpenSeq, setComposerOpenSeq] = useState(0)
   // The composer's textarea, for the Enter-to-focus path above.
   const composerInputRef = useRef<HTMLTextAreaElement>(null)
   // Whether the input holds unsaved text. A click-away with a draft keeps the
@@ -715,10 +733,13 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       // A notice from an earlier copy or post attempt does not belong to this selection.
       setCopyFailed(false)
       setSubmitFailed(false)
+      setComposerOpenSeq(n => n + 1)
       activeComposer.onOpen?.(text)
       restoreDraft(text)
     }
     setVisible(true)
+    // Tells the mouseup path a selection was actually taken (copy on select).
+    return true
   }, [containerRef, restoreDraft])
 
   // After the toolbar mounts/repositions, measure it and clamp its position so
@@ -829,13 +850,41 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       pending.add(id)
     }
 
+    // The document selection as the last press began. Copy on select copies
+    // only when the press itself changed it: a click on a control that keeps
+    // the selection (a `preventDefault` mousedown, such as a Copy button)
+    // leaves it as it was and must not overwrite the clipboard with it again.
+    type SelectionSnapshot = { anchor: Node | null; anchorOffset: number; focus: Node | null; focusOffset: number }
+    const readSelection = (): SelectionSnapshot | null => {
+      const sel = window.getSelection()
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null
+      return { anchor: sel.anchorNode, anchorOffset: sel.anchorOffset, focus: sel.focusNode, focusOffset: sel.focusOffset }
+    }
+    let selectionAtPress: SelectionSnapshot | null = null
+    const selectionChangedSincePress = () => {
+      const now = readSelection()
+      const before = selectionAtPress
+      if (!now || !before) return !!now
+      return now.anchor !== before.anchor || now.anchorOffset !== before.anchorOffset
+        || now.focus !== before.focus || now.focusOffset !== before.focusOffset
+    }
+
     const onMouseUp = (e: MouseEvent) => {
       if (suspendedRef.current) return
       if (toolbarRef.current && toolbarRef.current.contains(e.target as Node)) return
       triggeredByMouseRef.current = true
       lastMouseRef.current = { x: e.clientX, y: e.clientY }
-      // Small delay to let selection finalize
-      defer(checkSelection, 50)
+      // Only a primary-button release can copy. A right-click on macOS selects
+      // the word under the pointer before the context menu opens, and that
+      // must not replace the clipboard.
+      const primary = e.button === 0
+      // Small delay to let selection finalize. Only a selection the check took
+      // is copied: a collapsed click, a whitespace-only drag, one outside the
+      // container, or one under a typed draft returns without it. So is one
+      // this press left untouched (see `selectionAtPress`).
+      defer(() => {
+        if (checkSelection() && primary && copyOnSelectRef.current && selectionChangedSincePress()) autoCopyRef.current()
+      }, 50)
     }
 
     const onKeyUp = (e: KeyboardEvent) => {
@@ -863,6 +912,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     }
 
     const onMouseDown = (e: MouseEvent) => {
+      selectionAtPress = readSelection()
       if (suspendedRef.current) return
       // Don't dismiss if clicking inside the toolbar
       if (toolbarRef.current && toolbarRef.current.contains(e.target as Node)) return
@@ -994,6 +1044,13 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
     }
   }, [flashCopied])
 
+  useEffect(() => {
+    autoCopyRef.current = () => {
+      const copy = actions.find(a => a.id === 'copy')
+      if (copy) handleAction(copy)
+    }
+  }, [actions, handleAction])
+
   // Cancel a pending "copied!" reset timer on unmount so it can never fire
   // after the component (or a test's jsdom environment) is torn down.
   useEffect(() => () => {
@@ -1060,6 +1117,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
       setComposerAutoFocus(!isTouchDevice())
       setCopyFailed(false)
       setSubmitFailed(false)
+      setComposerOpenSeq(n => n + 1)
       activeComposer.onOpen?.(externalSelection.text)
       restoreDraft(externalSelection.text)
     }
@@ -1287,6 +1345,7 @@ export default function SelectionToolbar({ containerRef, actions, externalSelect
               submitting={submitting}
               submitFailed={submitFailed}
               onDismissSubmitFailed={dismissSubmitFailed}
+              voiceTarget={composerOpenSeq}
             />
           ) : (
           <div
@@ -1362,7 +1421,9 @@ const COMPOSER_MAX_INPUT_H = 160
  * its placeholder naming the way in (Enter), and the toolbar's document-level
  * Enter handler moves focus here.
  */
-function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAction, onSubmit, onEscape, onCopyShortcut, onGrow, text, onTextChange, copyFailed, onDismissCopyFailed, submitting, submitFailed, onDismissSubmitFailed }: {
+/** The comment box itself, exported so a box drawn on an image opens the same
+ *  composer a text selection does rather than a look-alike that drifts from it. */
+export function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAction, onSubmit, onEscape, onCopyShortcut, onGrow, text, onTextChange, copyFailed, onDismissCopyFailed, submitting, submitFailed, onDismissSubmitFailed, inputLabel, voiceTarget }: {
   inputRef: React.RefObject<HTMLTextAreaElement>
   autoFocus: boolean
   actions: SelectionAction[]
@@ -1385,6 +1446,12 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
   /** The host refused the last submit: the text is still here, say so. */
   submitFailed: boolean
   onDismissSubmitFailed: () => void
+  /** The input's accessible name. Defaults to the text-selection wording; a
+   *  caller commenting on something other than selected text names its own. */
+  inputLabel?: string
+  /** What the comment is about (a passage open, an image box). A new value
+   *  starts a fresh dictation session and drops one still in flight. */
+  voiceTarget?: string | number
 }) {
   const ime = useImeGuard()
   const stacked = useStackedComposer()
@@ -1419,6 +1486,20 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
     onGrow()
   }, [onGrow])
 
+  // Read when a transcript lands, which can be renders after the press.
+  const textRef = useRef(text)
+  textRef.current = text
+  // The input is read-only while the post is in flight, and a transcript that
+  // settles then is dropped too: written, it would land in the draft slot after
+  // the posted text and outlive the post as a draft of an already-stored comment.
+  const submittingRef = useRef(submitting)
+  submittingRef.current = submitting
+  const [voiceError, setVoiceError] = useState<string | null>(null)
+  // A notice about a dictation for another passage does not belong here.
+  const [errorTarget, setErrorTarget] = useState(voiceTarget)
+  if (errorTarget !== voiceTarget) { setErrorTarget(voiceTarget); setVoiceError(null) }
+  // Re-clamp after the notice changes the rendered box height.
+  useLayoutEffect(() => { onGrow() }, [voiceError, onGrow])
   const canSubmit = text.trim().length > 0 && !submitting
   // The button names the state while the host has the post in flight: a
   // spinner alone reads as "could be loading"; "Saving…" says wait, not retry.
@@ -1446,6 +1527,19 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
           has the post in flight, so a slow network reads as saving, not as a
           frozen box. */}
         {submitting ? <Loader2 size={13} className="animate-spin" data-testid="composer-submitting" /> : <MessageSquarePlus size={13} />}{submitLabel}</button>
+      {/* Dictation ADDS to the draft; the person still reads it and adds it.
+          Keyed by the passage, so a dictation started for one never lands in
+          the box after it moved to another. */}
+      <CommentVoiceButton
+        key={voiceTarget}
+        disabled={submitting}
+        onError={setVoiceError}
+        onText={t => {
+          if (submittingRef.current) return
+          onTextChange(spliceDictationText(textRef.current, t.trim(), null).value)
+          requestAnimationFrame(() => { const el = inputRef.current; if (el) { autoGrow(el); el.focus() } })
+        }}
+      />
       <div
         role="group"
         aria-label={i18nT('components.selectionToolbar.more_actions')}
@@ -1505,7 +1599,7 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
     >
       <textarea
         ref={inputRef}
-        aria-label={i18nT('components.selectionToolbar.comment_input')}
+        aria-label={inputLabel ?? i18nT('components.selectionToolbar.comment_input')}
         placeholder={focused || autoFocus
           ? i18nT('components.commentOverlay.write_a_comment')
           : isTouchDevice() ? i18nT('components.selectionToolbar.tap_to_comment') : i18nT('components.selectionToolbar.press_enter_to_comment')}
@@ -1547,6 +1641,17 @@ function ComposerBox({ inputRef, autoFocus, actions, copiedId, hintIdBase, onAct
           className="basis-full"
           message={i18nT('components.selectionToolbar.copy_failed')}
           onDismiss={onDismissCopyFailed}
+        />
+      )}
+      {/* No hand-off: the comment draft in this box is unsaved, and the agent
+          hand-off navigates to the chat, which would discard it. Pressing the
+          mic again is the retry. */}
+      {voiceError && (
+        <ErrorNotice
+          variant="inline"
+          className="basis-full"
+          message={voiceError}
+          onDismiss={() => setVoiceError(null)}
         />
       )}
       {/* No hand-off here either: the text the post refused is still in this
