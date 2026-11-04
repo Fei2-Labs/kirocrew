@@ -120,6 +120,7 @@ function createWindowLifecycle(options) {
     isQuitting = () => false,
     requestQuit,
     connectWindow,
+    gatewayControls = null,
     // Re-apply the launch port's managed-tunnel choice after a save here, so
     // ticking or un-ticking it takes effect without a relaunch.
     syncTunnel = () => {},
@@ -180,6 +181,7 @@ function createWindowLifecycle(options) {
 
   let mainWindow = null;
   let tray = null;
+  let refreshTrayMenu = () => {};
   let appMenu = null;
   // The fullscreen-transition watch for the current main window. Its `pending()`
   // is what keeps a close-to-tray exit from abandoning a transition AppKit is

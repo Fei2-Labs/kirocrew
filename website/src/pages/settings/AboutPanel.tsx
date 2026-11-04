@@ -21,6 +21,7 @@ import { useGatewayAutoUpdate, type SwitchState } from '../../hooks/useGatewayAu
 import { useAppAutoDownload } from '../../hooks/useAppAutoDownload'
 import { storeAnsweredUpdateInfo, updateInfoQuery } from '../../api/updateInfoQuery'
 import { failedWithNoData } from '../../api/queryState'
+import { errMessage } from '../../utils/thunkError'
 import ErrorNotice from '../../components/ErrorNotice'
 import { LockedByPolicyBadge } from '../../components/settingRef/LockedByPolicyBadge'
 import { CopyCommand } from '../../components/agentHarness/CopyCommand'
@@ -325,8 +326,8 @@ function ForkUpgradeButton() {
     try {
       const res = await api.checkForkUpdate()
       setInfo(res)
-    } catch (e: any) {
-      setInfo({ error: e?.message || 'check failed' })
+    } catch (e: unknown) {
+      setInfo({ error: errMessage(e) || 'check failed' })
     } finally { setChecking(false) }
   }
 
@@ -338,8 +339,8 @@ function ForkUpgradeButton() {
       if (res.ok) {
         setTimeout(() => { window.location.reload() }, 8000)
       }
-    } catch (e: any) {
-      setApplyResult({ ok: false, error: e?.message || 'apply failed' })
+    } catch (e: unknown) {
+      setApplyResult({ ok: false, error: errMessage(e) || 'apply failed' })
     } finally { setApplying(false) }
   }
 

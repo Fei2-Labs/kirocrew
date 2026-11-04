@@ -43,6 +43,7 @@ function switchableHttp(state) {
   return {
     requests,
     get(url, _options, callback) {
+      const handler = typeof _options === "function" ? _options : callback;
       requests.push(url);
       const request = new EventEmitter();
       request.destroy = () => {};
@@ -54,7 +55,7 @@ function switchableHttp(state) {
         const response = new EventEmitter();
         response.statusCode = state.status;
         response.resume = () => {};
-        callback(response);
+        handler(response);
         response.emit("data", state.body || "");
         response.emit("end");
       });
@@ -117,6 +118,7 @@ function harness(overrides = {}) {
   const spawnCalls = [];
   const store = overrides.store || fakeStore();
   const mainWindow = overrides.mainWindow || null;
+  const ipcMain = overrides.ipcMain || { on: () => {}, removeListener: () => {} };
   const port = overrides.port ?? 5476;
   const processRef = overrides.processRef || {
     platform: "test",
@@ -153,7 +155,7 @@ function harness(overrides = {}) {
     dialog: overrides.dialog
       || { showMessageBox: async () => ({ response: 1 }) },
     shell: { showItemInFolder: () => {} },
-    ipcMain: { on: () => {}, removeListener: () => {} },
+    ipcMain,
     port,
     backendUrl: overrides.backendUrl || `http://localhost:${port}`,
     home: "/virtual/kirocrew-home",
@@ -202,7 +204,7 @@ function harness(overrides = {}) {
     dirname: "/virtual/electron",
   });
 
-  return { supervisor, store, logs, warnings, errors, spawnCalls, fsMod };
+  return { supervisor, store, logs, warnings, errors, spawnCalls, fsMod, timers: overrides.timers };
 }
 
 const APP_EXEC_PATH = "/virtual/Applications/KiroCrew.app/Contents/MacOS/KiroCrew";

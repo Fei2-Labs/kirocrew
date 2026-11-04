@@ -87,6 +87,7 @@ const { createHolderDecision } = require("./runtime/gateway/holder-decision");
 const { createShutdown } = require("./runtime/gateway/shutdown");
 const { createReconnect } = require("./runtime/gateway/reconnect");
 const { createRemoteSwitch } = require("./runtime/gateway/remote-switch");
+const { createTrayControls } = require("./runtime/gateway/tray-controls");
 
 const DEFAULT_THEME_ACCENT = "#8E48FF";
 const THEME_ACCENT_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
@@ -220,6 +221,9 @@ function createGatewaySupervisor({
   //   reused-local    adopted local same-family process; bounded recovery
   //   reused-service  adopted service process; allow a manager rebind grace
   let gatewayOwnership = "none";
+  let gatewayStartPromise = null;
+  let gatewayStoppedByTray = false;
+  let trayControls = null;
   let livenessMonitor = null;
   // Terminal exit of the child we spawned. Only primary own-port boot waits
   // consult this record; connection windows must never observe cross-talk.
@@ -382,7 +386,8 @@ function createGatewaySupervisor({
   // owner needs is written at its composition. Each owner gets only the slots
   // it uses.
   const getGatewayOwnership = () => gatewayOwnership;
-  const setGatewayOwnership = (ownership) => { gatewayOwnership = ownership; };
+  const setGatewayOwnership = (ownership) => { gatewayOwnership = ownership; trayControls?.notifyStateChange(); };
+  const setGatewayProcess = (child) => { gatewayProcess = child; trayControls?.notifyStateChange(); };
   const getRunLocalGateway = () => runLocalGateway;
   const {
     canOfferLocalStart,
@@ -426,7 +431,7 @@ function createGatewaySupervisor({
     posixDescendantPids, isTrustedWindowsGatewayCommand, sameHomeGatewayPid, runGatewayStop,
     isCurrentBundleGateway, getRunLocalGateway, getGatewayOwnership,
     getGatewayProcess: () => gatewayProcess,
-    setGatewayProcess: (child) => { gatewayProcess = child; },
+    setGatewayProcess,
     setSpawnedExecutablePaths: (paths) => { spawnedExecutablePaths = paths; },
   });
   const {
@@ -456,14 +461,14 @@ function createGatewaySupervisor({
     stopGatewayGracefully, waitForPortFree, startGateway, showLoadingThenConnect,
   });
 
+  trayControls = createTrayControls({
+    getGatewayProcess: () => gatewayProcess, getGatewayOwnership,
+    startGateway: startGatewayFromTray, stopGatewayGracefully: stopGatewayFromTray,
+    getMainWindow: mainWindow, log: glog,
+  });
+
   function sendStatus(message) {
-    // A WebContents can exist and still be destroyed -- that is the state of
-    // the main window while its renderer is in a crash loop -- and `send` on
-    // it throws. Several callers reach here from async paths with no catch, so
-    // without this guard that throw surfaced as an unhandledRejection (#14524).
-    const contents = mainWindow()?.webContents;
-    if (!contents || contents.isDestroyed()) return;
-    contents.send("status", message);
+    trayControls?.sendStatus(message);
   }
 
   function currentThemeAccent() {
@@ -537,6 +542,17 @@ function createGatewaySupervisor({
   }
 
   function startGateway() {
+    if (gatewayStartPromise) return gatewayStartPromise;
+    let attempt;
+    try { attempt = Promise.resolve(startGatewayAttempt()); }
+    catch (error) { return Promise.reject(error); }
+    gatewayStartPromise = attempt;
+    const clear = () => { if (gatewayStartPromise === attempt) gatewayStartPromise = null; };
+    attempt.then(clear, clear);
+    return attempt;
+  }
+
+  function startGatewayAttempt() {
     reresolveAttempts = 0;
     glog(`launch: port=${PORT} home=${KIROCREW_HOME} packaged=${app.isPackaged} resourcesPath=${processObj.resourcesPath || "(none)"} log=${gatewayLogPath()}`);
     sendStatus("Checking if gateway is running…");
@@ -697,6 +713,11 @@ function createGatewaySupervisor({
       resolve(false);
       return;
     }
+    if (gatewayStoppedByTray) {
+      glog(`not starting a gateway on :${PORT}: it was stopped from the tray`);
+      resolve(false);
+      return;
+    }
     // The gateway owns its data root. Create it before deriving the redirected
     // bytecode cache, honoring an explicit KIROCREW_HOME without touching the
     // deprecated legacy directory on a clean install.
@@ -845,6 +866,7 @@ function createGatewaySupervisor({
     });
     gatewayProcess = child;
     gatewayOwnership = "spawned";
+    trayControls.notifyStateChange();
     if (IS_WIN) {
       spawnedExecutablePaths = windowsGatewayExecutablePaths(spawnBin, {
         realpathSync: windowsRealpath,
@@ -878,7 +900,7 @@ function createGatewaySupervisor({
         spawnErrorCode,
         attempts: reresolveAttempts,
         quitting: quitting(),
-        installingUpdate: installingUpdate || switchingToRemote,
+        installingUpdate: installingUpdate || switchingToRemote || gatewayStoppedByTray,
         relaunchTargetExists,
       });
       const cause = exitCode === null ? `spawn ${spawnErrorCode}` : `exit ${exitCode}`;
@@ -896,7 +918,7 @@ function createGatewaySupervisor({
       if (verdict === "reresolve") {
         reresolveAttempts += 1;
         glog(`stale bundle (${cause} on bin=${bin}) — re-resolving the backend and respawning (attempt ${reresolveAttempts})`);
-        gatewayProcess = null;
+        setGatewayProcess(null);
         spawnedExecutablePaths = [];
         gatewayStartFailure = null;
         spawnGateway(resolve);
@@ -909,8 +931,12 @@ function createGatewaySupervisor({
       return true;    };
 
     child.on("error", (error) => {
-      userError(`spawn ERROR code=${error.code || "?"} msg=${error.message}`);
       if (gatewayProcess !== child) return;
+      if (gatewayStoppedByTray) {
+        setGatewayProcess(null);
+        return;
+      }
+      userError(`spawn ERROR code=${error.code || "?"} msg=${error.message}`);
       spawnedExecutablePaths = [];
       const giveUp = () => {
         gatewayStartFailure = { error: error.message, bundled };
@@ -923,7 +949,7 @@ function createGatewaySupervisor({
     child.on("exit", (code, signal) => {
       const exitMessage = `gateway child exited code=${code} signal=${signal}`;
       const currentChild = gatewayProcess === child;
-      const expectedExit = !currentChild || quitting() || installingUpdate || switchingToRemote;
+      const expectedExit = !currentChild || quitting() || installingUpdate || switchingToRemote || gatewayStoppedByTray;
       if (expectedExit) glog(exitMessage);
       else userError(exitMessage);
       // Node's Windows kill maps both signal names to TerminateProcess. The
@@ -933,9 +959,13 @@ function createGatewaySupervisor({
       }
       if (!currentChild) return;
       spawnedExecutablePaths = [];
+      if (gatewayStoppedByTray) {
+        setGatewayProcess(null);
+        return;
+      }
       const giveUp = () => {
         if (!gatewayStartFailure) gatewayStartFailure = { code, signal, bundled };
-        gatewayProcess = null;
+        setGatewayProcess(null);
       };
       if (recoverStaleBackend({ exitCode: code, giveUp })) return;
       giveUp();
@@ -1021,21 +1051,17 @@ function createGatewaySupervisor({
     // A gateway that reached handoff is healthy; a stale-bundle incident that
     // hits it later starts with a fresh re-resolve budget.
     reresolveAttempts = 0;
-    if (livenessMonitor) {
-      livenessMonitor.stop();
-      livenessMonitor = null;
-    }
+    stopLivenessMonitor();
     livenessMonitor = createLivenessMonitor({
       // Not checkBackend(): that is the boot poll's 2s probe. The post-handoff
       // probe has its own, wider budget — see LIVENESS_PROBE_TIMEOUT_MS.
       probe: createBackendProbe({ httpMod: http, url: HEALTH_URL }),
       isWindowAlive: () => !!window && !window.isDestroyed(),
+      setIntervalFn,
+      clearIntervalFn,
       onUnresponsive: () => {
-        if (livenessMonitor) {
-          livenessMonitor.stop();
-          livenessMonitor = null;
-        }
-        if (quitting() || installingUpdate) return;
+        stopLivenessMonitor();
+        if (quitting() || installingUpdate || gatewayStoppedByTray) return;
         // First-run setup's switch to a remote crew stops this gateway on
         // purpose (runtime/gateway/remote-switch.js).
         if (switchingToRemote) return;
@@ -1053,12 +1079,47 @@ function createGatewaySupervisor({
     livenessMonitor.start();
   }
 
+  function stopLivenessMonitor() {
+    if (!livenessMonitor) return;
+    livenessMonitor.stop();
+    livenessMonitor = null;
+  }
+
+  async function startGatewayFromTray() {
+    const joiningStart = Boolean(gatewayStartPromise);
+    gatewayStoppedByTray = false;
+    const started = await startGateway();
+    const window = mainWindow();
+    if (started && !joiningStart && window && !window.isDestroyed()) {
+      await showLoadingThenConnect(window);
+    }
+  }
+
+  async function stopGatewayFromTray() {
+    gatewayStoppedByTray = true;
+    stopLivenessMonitor();
+    try {
+      await stopGatewayGracefully();
+      setGatewayOwnership("none");
+    } catch (error) {
+      if (gatewayProcess && gatewayProcess.exitCode === null) {
+        gatewayStoppedByTray = false;
+        const window = mainWindow();
+        if (window && !window.isDestroyed()) startLivenessMonitor(window);
+      } else {
+        setGatewayOwnership("none");
+      }
+      throw error;
+    }
+  }
+
   /**
    * Recover a gateway that is alive but unresponsive. Ownership is the sole
    * authority: external/tunnel holders are never killed, adopted local holders
    * get a bounded wait, and only a spawned child takes the kill/respawn path.
    */
   async function recoverWedgedGateway(window, { userInitiated = false } = {}) {
+    if (gatewayStoppedByTray) return;
     const strategy = chooseRecoveryStrategy({ gatewayOwnership });
     if (strategy === "reconnect") {
       glog("liveness: backend unresponsive on a gateway we did not spawn (remote tunnel / external gateway) — waiting for it to recover instead of killing the port");
@@ -1084,7 +1145,8 @@ function createGatewaySupervisor({
     // The frozen loop cannot service /api/shutdown. On Windows, await the tree
     // sweep before probing the port or descendants escape and retain locks.
     await killGatewayProcessTree(gatewayProcess, "SIGKILL");
-    gatewayProcess = null;
+    setGatewayProcess(null);
+    if (gatewayStoppedByTray) return;
     spawnedExecutablePaths = [];
     let freed = true;
     let foreignHolder = false;
@@ -1096,7 +1158,7 @@ function createGatewaySupervisor({
       // pre-spawn ownership proof could not be completed.
       glog(`liveness: port probe failed (${error && error.message}); attempting respawn and letting bind confirm`);
     }
-    if (!window || window.isDestroyed() || quitting()) return;
+    if (!window || window.isDestroyed() || quitting() || gatewayStoppedByTray) return;
     if (!freed) {
       const reason = probeFailed
         ? "probe failed"
@@ -1565,6 +1627,9 @@ function createGatewaySupervisor({
 
   return Object.freeze({
     start: startGateway,
+    controlState: trayControls.controlState,
+    runControlAction: trayControls.runControlAction,
+    observeState: trayControls.observeState,
     connect: showLoadingThenConnect,
     mintLocalToken,
     fetchRemoteToken,

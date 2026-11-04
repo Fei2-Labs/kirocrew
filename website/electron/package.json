@@ -158,6 +158,7 @@
       "runtime/gateway/shutdown.js",
       "runtime/gateway/reconnect.js",
       "runtime/gateway/remote-switch.js",
+      "runtime/gateway/tray-controls.js",
       "window-lifecycle.js",
       "runtime/window/chrome.js",
       "runtime/window/prompts.js",

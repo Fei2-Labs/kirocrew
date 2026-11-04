@@ -551,6 +551,12 @@ windows = createWindowLifecycle({
   isQuitting: () => isQuitting,
   requestQuit,
   connectWindow: (...args) => gateway.connect(...args),
+  gatewayControls: {
+    state: () => gateway.controlState(),
+    run: (action) => {
+      void gateway.runControlAction(action);
+    },
+  },
   syncTunnel: () => gateway.syncTunnel(),
   downloadExpectations,
 });
