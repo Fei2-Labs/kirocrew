@@ -114,14 +114,13 @@ test("the updater block does not depend on gateway boot completing", () => {
   );
 });
 
-test("liveness recovery stands down during an update install", () => {
-  // The gateway supervisor now owns both the watchdog and install flag. The
-  // guard must treat an in-flight install exactly like quit, or it can respawn
-  // the gateway in the middle of a bundle swap.
+test("liveness recovery stands down during update installs and tray stops", () => {
+  // The guard prevents recovery from respawning during a bundle swap or after
+  // the user deliberately stopped the gateway from the tray.
   assert.match(
     GATEWAY_SOURCE,
-    /if \(quitting\(\) \|\| installingUpdate\) return;/,
-    "the liveness onUnresponsive guard no longer checks installingUpdate -- recovery can resurrect the gateway during a bundle swap",
+    /if \(quitting\(\) \|\| installingUpdate \|\| gatewayStoppedByTray\) return;/,
+    "the liveness guard must stand down during updater shutdown and tray stops",
   );
   assert.match(
     GATEWAY_SOURCE,

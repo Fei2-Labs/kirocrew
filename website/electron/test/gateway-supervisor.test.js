@@ -10,6 +10,8 @@ const {
   MODULE_PATH,
   fakeStore,
   rejectingHttp,
+  switchableHttp,
+  fakeTimers,
   flush,
   harness,
   ownerProbe,
@@ -49,6 +51,70 @@ test("module has no top-level Electron dependency and its factory accepts fakes"
   ]);
 });
 
+test("tray controls report ownership and serialize gateway actions", async () => {
+  const { createTrayControls } = require("../runtime/gateway/tray-controls");
+  let gatewayProcess = null;
+  let gatewayOwnership = "none";
+  const actions = [];
+  const changes = [];
+  const controls = createTrayControls({
+    getGatewayProcess: () => gatewayProcess,
+    getGatewayOwnership: () => gatewayOwnership,
+    startGateway: async () => {
+      actions.push("start");
+      gatewayProcess = {};
+      gatewayOwnership = "spawned";
+    },
+    stopGatewayGracefully: async () => {
+      actions.push("stop");
+      gatewayProcess = null;
+    },
+    getMainWindow: () => null,
+    log: (message) => changes.push(message),
+  });
+  controls.observeState(() => changes.push("changed"));
+  assert.deepStrictEqual(controls.controlState(), { running: false, owned: false, operation: null });
+  await controls.runControlAction("unknown");
+  assert.deepStrictEqual(actions, []);
+  await controls.runControlAction("start");
+  assert.deepStrictEqual(actions, ["start"]);
+  assert.deepStrictEqual(controls.controlState(), { running: true, owned: true, operation: null });
+  await controls.runControlAction("stop");
+  assert.deepStrictEqual(actions, ["start", "stop"]);
+  assert.ok(changes.includes("changed"));
+});
+
+test("a tray start joins an initial gateway launch already in flight", async () => {
+  const { supervisor, spawnCalls } = harness();
+  await Promise.all([supervisor.start(), supervisor.runControlAction("start")]);
+  assert.equal(spawnCalls.length, 1);
+});
+
+test("stopping from the tray disarms liveness recovery", async () => {
+  const ipcMain = new EventEmitter();
+  const webContents = {
+    isDestroyed: () => false,
+    loadFile() {},
+    loadURL() {},
+    send(channel) {
+      if (channel === "boot-ready") queueMicrotask(() => ipcMain.emit("boot-complete", { sender: webContents }));
+    },
+  };
+  const mainWindow = { webContents, isDestroyed: () => false, show() {}, focus() {} };
+  const timers = fakeTimers();
+  const state = { status: null };
+  const built = harness({ ipcMain, mainWindow, timers, httpMod: switchableHttp(state) });
+  await built.supervisor.start();
+  state.status = 200;
+  await built.supervisor.connect(mainWindow);
+  assert.equal(timers.intervals.length, 1);
+  built.spawnCalls[0].child.exitCode = 0;
+  await built.supervisor.runControlAction("stop");
+  assert.equal(timers.intervals.length, 0);
+  assert.equal(built.spawnCalls.length, 1);
+  assert.deepStrictEqual(built.supervisor.controlState(), { running: false, owned: false, operation: null });
+});
+
 test("runtime gateway owners take every host dependency from the supervisor", () => {
   // The factory injects fs, os, path, http, child_process, timers, process and
   // the Electron directory; an owner that loads its own would bypass every fake
@@ -68,6 +134,7 @@ test("runtime gateway owners take every host dependency from the supervisor", ()
     "shutdown.js",
     "successor-handoff.js",
     "token-sources.js",
+    "tray-controls.js",
   ]);
   const facade = fs.readFileSync(MODULE_PATH, "utf8");
   for (const owner of owners) {

@@ -38,6 +38,7 @@ const SUPERVISOR_FILES = [
   "runtime/gateway/holder-decision.js",
   "runtime/gateway/shutdown.js",
   "runtime/gateway/reconnect.js",
+  "runtime/gateway/tray-controls.js",
   "gateway-supervisor.js",
 ];
 const SUPERVISOR = SUPERVISOR_FILES.map(code).join("\n");
@@ -188,6 +189,11 @@ const NON_PORT_SITES = [
     what: "the gatewayOwnership vocabulary's initial value, not a port reading",
     code: 'let gatewayOwnership = "none";',
     times: 1,
+  },
+  {
+    what: "an explicit tray stop clears supervisor ownership, not a port verdict",
+    code: 'setGatewayOwnership("none");',
+    times: 2,
   },
   {
     what: "controlState's adopted check reads the supervisor's own ownership bookkeeping — the same variable whose initial value is above, not a port probe verdict",

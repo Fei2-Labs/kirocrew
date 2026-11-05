@@ -69,6 +69,12 @@ and each facade composes cohesive owners under `runtime/<area>/`:
 | `auto-update.js` (`initAutoUpdate` and 16 policy exports) | `runtime/update/state-reporter.js` (channel, lane pair, lifecycle pushes, replayable info) · `feed-lane.js` (electron-updater discovery, download, staged install, and the download-time freshness gate that re-checks the feed before a click's download) · `freshness-gate.js` (composed by the feed lane: the check lifecycle — claim, settle, abandon — and `verifyStageIsLatest`, the pre-install verdict that re-checks the feed so only the newest build is installed) · `managed-lane.js` (the marker-driven check and apply commands) | Channel and feed policy (`KNOWN_CHANNELS`, `channelHasLane`, `channelForVersion`, `buildFeedBase`, `manualDownloadUrl`), the update-policy flags, the `EXTERNALLY-MANAGED` marker reader and its caps, the narrowed marker-command `PATH`, the install-shape probes, and the gates that choose a lane |
 | `crash-collector.js` (`armCrashCollector`, `collectCrashReports`, `crashNoticeSummary`) | `runtime/crash/ownership.js` · `artifact-parsers.js` · `candidates.js` · `persistence.js` · `scan.js` | The export surface and `crashNoticeSummary`, the one renderer-facing view |
 
+Gateway tray state, actions and status forwarding live in
+`runtime/gateway/tray-controls.js`; the supervisor composes that owner and
+notifies it when gateway process or ownership state changes. Concurrent startup
+requests share one launch, and an explicit tray stop disarms liveness recovery;
+the updater's separate stop path retains its failure-recovery behavior.
+
 Three rules keep this layout safe to change:
 
 - Consumers require only the facades. Their export names, factory options,

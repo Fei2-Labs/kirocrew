@@ -1835,4 +1835,35 @@ describe("main window close action", () => {
       ["Show Kiro Crew", "separator", "New Connection Window…", "separator", "Open Config File", "separator", "Quit"],
     );
   });
+
+  it("refreshes gateway actions when tray state changes", () => {
+    const menus = [];
+    const actions = [];
+    let state = { running: false, owned: false, operation: null };
+    const lifecycle = createWindowLifecycle(validOptions({
+      electron: {
+        app: { name: "Kiro Crew", getVersion: () => "0.13.0", getPath: () => "/virtual/logs" },
+        Tray: class { setToolTip() {} setContextMenu() {} on() {} },
+        Menu: { buildFromTemplate: (template) => { menus.push(template); return { template }; } },
+        nativeImage: {
+          createFromPath: () => ({ resize: () => ({ fake: "icon" }), setTemplateImage() {} }),
+        },
+        shell: {},
+      },
+      store: { path: "/virtual/config.json", get: () => undefined, set() {} },
+      gatewayControls: { state: () => state, run: (action) => actions.push(action) },
+      env: {},
+    }));
+
+    assert.doesNotThrow(() => lifecycle.refreshTrayMenu());
+    lifecycle.createTray();
+    assert.equal(menus[0].find((item) => item.label === "Gateway: Stopped").enabled, false);
+    menus[0].find((item) => item.label === "Start Gateway").click();
+    assert.deepEqual(actions, ["start"]);
+
+    state = { running: true, owned: true, operation: "Restart" };
+    lifecycle.refreshTrayMenu();
+    assert.ok(menus[1].some((item) => item.label === "Gateway: Restart…"));
+    assert.equal(menus[1].find((item) => item.label === "Stop Gateway").enabled, true);
+  });
 });

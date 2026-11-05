@@ -113,8 +113,13 @@ test("only the primary local window owns the gateway liveness monitor", () => {
   const allStarts = GATEWAY_SOURCE.match(/startLivenessMonitor\(window\);/g) || [];
   assert.strictEqual(
     allStarts.length,
-    guardedStarts.length,
-    "every liveness start must remain inside the primary-local-window guard",
+    guardedStarts.length + 1,
+    "only the two handoff starts and the tray-stop rollback may arm liveness",
+  );
+  assert.match(
+    GATEWAY_SOURCE,
+    /function stopGatewayFromTray\(\)[\s\S]{0,600}?const window = mainWindow\(\);[\s\S]{0,150}?startLivenessMonitor\(window\);/,
+    "a failed tray stop may re-arm liveness only for the primary window",
   );
 });
 
