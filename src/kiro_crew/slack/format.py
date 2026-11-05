@@ -25,10 +25,16 @@ from kiro_crew.messaging.markup import flatten_mermaid_body
 from kiro_crew.messaging.renderer import cap_choices, format_overflow
 from kiro_crew.messaging.tables import _MAX_INDENT as _TABLE_MAX_INDENT
 from kiro_crew.messaging.tables import _cells as _table_cells
-from kiro_crew.messaging.tables import _fence_delimiter, _is_row_candidate, _table_run_end
+from kiro_crew.messaging.tables import (
+    _code_spans,
+    _fence_delimiter,
+    _is_row_candidate,
+    _table_run_end,
+)
 from kiro_crew.platform.context import redact_via_context
 from kiro_crew.security.exfil import redact_exfiltration_urls
 from kiro_crew.security.redaction import redact_credentials
+from kiro_crew.slack.break_point import last_break
 
 logger = logging.getLogger(__name__)
 
@@ -925,12 +931,11 @@ def to_slack_mrkdwn(text: str, *, keep_tables: bool = False, in_code: bool = Fal
 
     if len(text) > SLACK_MAX_TEXT:
         # rfind returns -1 (no newline in window) or the last newline's index —
-        # NOT a bool. `rfind(...) or SLACK_MAX_TEXT` mishandles both: -1 is
-        # truthy so text[:-1] keeps ~39000 chars (Slack then rejects the
-        # message), and a newline at index 0 falls through to the cap. Use the
-        # explicit -1 check already used by split_message().
+        # NOT a bool, so it is compared, never used as one. A line break less
+        # than a quarter in (including none, -1) would keep almost nothing of
+        # the text, so the cut falls back to the cap.
         cut = text[:SLACK_MAX_TEXT].rfind("\n")
-        if cut <= 0:
+        if cut < SLACK_MAX_TEXT // 4:
             cut = SLACK_MAX_TEXT
         text = f"{text[:cut]}\n\n_…truncated ({len(text)} chars total)_"
 
@@ -983,22 +988,71 @@ _HR_RE = re.compile(r"^[\s]*([-*_])\1{2,}\s*$")
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
 
 
+#: Stands in for one inline code span while the emphasis passes run.
+_CODE_TOKEN_RE = re.compile(r"\x00(\d+)\x00")
+
+
+def _hide_inline_code(line: str) -> tuple[str, list[str]]:
+    """Swap each inline code span in *line* for a ``\\x00<n>\\x00`` token.
+
+    Spans are found by :func:`kiro_crew.messaging.tables._code_spans`, the
+    CommonMark backtick pairing the table renderer uses. A line that already
+    holds a NUL is returned as-is, so input text can never pose as a token.
+    """
+    if "\x00" in line or "`" not in line:
+        return line, []
+    spans: list[str] = []
+    out: list[str] = []
+    pos = 0
+    for start, end in _code_spans(line):
+        out.append(line[pos:start])
+        out.append(f"\x00{len(spans)}\x00")
+        spans.append(line[start:end])
+        pos = end
+    out.append(line[pos:])
+    return "".join(out), spans
+
+
+def _restore_inline_code(line: str, spans: list[str]) -> str:
+    """Put back the code spans :func:`_hide_inline_code` took out."""
+    if not spans:
+        return line
+    return _CODE_TOKEN_RE.sub(lambda m: spans[int(m.group(1))], line)
+
+
 def _convert_inline(line: str) -> str:
     """Convert a single non-code line from markdown to Slack mrkdwn."""
-    # Headings → bold
+    # Headings → bold. The heading text runs the same inline passes as any
+    # other line, so a link in it stays a link; its own ``**`` markers are
+    # dropped, since the whole heading is already bold and Slack does not
+    # nest bold.
     m = _HEADING_RE.match(line)
     if m:
-        return f"*{m.group(2).strip()}*"
+        return f"*{_convert_inline_markup(m.group(2).strip(), bold='')}*"
 
     # Horizontal rule → unicode line
     if _HR_RE.match(line):
         return "─" * 30
 
+    return _convert_inline_markup(line, bold="*")
+
+
+def _convert_inline_markup(line: str, *, bold: str) -> str:
+    """Bold, strike and link passes of :func:`_convert_inline`.
+
+    ``bold`` replaces each markdown ``**`` marker.
+    """
+    # Inline code is shown as written, so its markers sit out the emphasis
+    # passes: ``**kwargs`` and ``a~~b~~c`` inside backticks keep both chars.
+    line, spans = _hide_inline_code(line)
+
     # **bold** → *bold*
-    line = line.replace("**", "*")
+    line = line.replace("**", bold)
 
     # ~~strike~~ → ~strike~
     line = _STRIKE_RE.sub(r"~\1~", line)
+
+    line = _restore_inline_code(line, spans)
 
     # [text](url) → <url|text>
     line = _LINK_RE.sub(r"<\2|\1>", line)
@@ -1160,7 +1214,9 @@ def strip_thinking_tags(text: str, *, strip_whitespace: bool = True) -> tuple[st
 def split_message(text: str, limit: int = SLACK_MSG_LIMIT) -> list[str]:
     """Split text into chunks that fit within Slack's message limit.
 
-    Splits on newline boundaries when possible to avoid breaking mid-line.
+    Splits at the line break :func:`~kiro_crew.slack.break_point.last_break`
+    picks (at least a quarter into the chunk, or one before a line that fits one
+    post whole); with none that counts, it cuts where the limit falls.
     """
     if len(text) <= limit:
         return [text]
@@ -1176,10 +1232,13 @@ def split_message(text: str, limit: int = SLACK_MSG_LIMIT) -> list[str]:
         # loop would spin forever. Keep at least one character of progress per
         # iteration so the function always terminates regardless of `limit`.
         chunk_limit = max(1, limit - len(CONTINUATION))
-        # Try to split at last newline within limit
-        cut = text.rfind("\n", 0, chunk_limit)
+        cut = last_break(text, chunk_limit, ("\n",))
         if cut <= 0:
-            cut = chunk_limit
+            # The last post carries no CONTINUATION, so a remainder up to
+            # ``limit`` still goes out whole after an early line break.
+            early = text.rfind("\n", 0, chunk_limit)
+            fits = early > 0 and len(text[early:].lstrip("\n")) <= limit
+            cut = early if fits else chunk_limit
         remainder = text[cut:].lstrip("\n")
         if remainder:
             parts.append(text[:cut] + CONTINUATION)
@@ -1274,8 +1333,9 @@ def _truncated(text: str, limit: int, total: int | None = None) -> list[str]:
     """
     if len(text) <= limit:
         return [text]
+    # A line break less than a quarter in would keep almost nothing of the text.
     cut = text[:limit].rfind("\n")
-    if cut <= 0:
+    if cut < limit // 4 or cut <= 0:
         cut = limit
     notice = f"\n\n_…truncated ({len(text) if total is None else total} chars total)_"
     # Charge the notice against the ceiling so the result really fits.

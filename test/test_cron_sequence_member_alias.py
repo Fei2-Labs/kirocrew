@@ -577,3 +577,171 @@ async def test_each_sequence_step_marks_its_key_finished_just_before_it_releases
     ]
     for key in steps:
         assert order.index(("finish", "seq-finish", key)) == order.index(("release", key)) - 1
+
+
+def _context_templates(monkeypatch):
+    """The ``agent=`` each cron turn hands ``ctx_builder.build_message``.
+
+    That keyword is the execution template: a private crewmate's essentials
+    read the named template's documents and refuse the turn with
+    ``Essential template '<name>': not found`` when no such template exists,
+    which is the case for a crew alias whose ``kiro_agent`` differs from it.
+    """
+    from kiro_crew.slack import gateway
+
+    seen = []
+
+    async def record(fn, *args, **kwargs):
+        seen.append(kwargs.get("agent"))
+        return "message", None
+
+    monkeypatch.setattr(gateway, "run_in_embed_pool", record)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_sequence_steps_build_context_from_their_dispatched_template(monkeypatch):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    seen = _context_templates(monkeypatch)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-context",
+        name="sequence context",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    assert seen == ["beta-mode", "alpha-mode"]
+
+
+@pytest.mark.asyncio
+async def test_each_sequence_step_hands_the_gate_its_alias_not_its_template(monkeypatch):
+    """The governance gate looks a task profile up by the agent it is given, so
+    each step names its alias, as a chat turn on that agent does, not the
+    template it dispatches."""
+    from kiro_crew.slack import gateway
+
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["alpha"].kiro_agent = "alpha-mode"
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    gate_identity = []
+
+    async def stream(_client, _message, **kw):
+        gate_identity.append((kw.get("session_key"), kw.get("agent"), kw.get("unattended")))
+        return "done", 0
+
+    monkeypatch.setattr(gateway, "_cron_stream_with_posttoken_resume", stream)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-gate",
+        name="sequence gate",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+    )
+
+    assert await callback(job) == "done"
+    assert gate_identity == [
+        ("cron:seq-gate:beta", "beta", True),
+        ("cron:seq-gate:alpha", "alpha", True),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("agent_id", "member", "expected"),
+    [
+        # A private crewmate's alias builds from that crewmate's template.
+        ("beta", "beta", "beta-mode"),
+        # A plain template name, and a name that is neither, pass through.
+        ("kirocrew-lite", None, "kirocrew-lite"),
+        ("no-such-agent", None, "no-such-agent"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_single_agent_cron_builds_context_from_its_dispatched_template(
+    monkeypatch, agent_id, member, expected
+):
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    _let_sequence_complete(monkeypatch, gw)
+    seen = _context_templates(monkeypatch)
+    record = None
+    if member:
+        record = ExecutionContext(
+            member,
+            MemoryStoreRef(f"member-{member}", member),
+            "member",
+            member,
+            "persistent",
+            "app",
+        ).to_record()
+    job = CronJob(
+        id="single-context",
+        name="single context",
+        message="task",
+        agent_id=agent_id,
+        execution_context=record,
+    )
+
+    await callback(job)
+    assert seen == [expected]
+    assert gw.sessions.get_or_create.call_args.kwargs["agent"] == expected
+
+
+@pytest.mark.asyncio
+async def test_a_sequence_with_a_project_path_runs_every_step_there(monkeypatch, tmp_path):
+    """The job's project directory is one per job, so it outranks
+    each step's own workspace; the step still runs as its own crew."""
+    import os
+
+    write_member_home(config_dir(), "alpha", "beta")
+    loader._invalidate_config_cache()
+    cfg = KiroCrewConfig.load()
+    from kiro_crew.config.sections import WorkspaceConfig
+
+    beta_tree = tmp_path / "beta-tree"
+    beta_tree.mkdir()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    cfg.workspaces["beta-ws"] = WorkspaceConfig(dir=str(beta_tree))
+    cfg.agents["beta"].kiro_agent = "beta-mode"
+    cfg.agents["beta"].workspace = "beta-ws"
+
+    gw, callback = await _cron_callback(monkeypatch, cfg)
+    captured = ExecutionContext(
+        "alpha", MemoryStoreRef("member-alpha", "alpha"), "member", "alpha", "persistent", "app"
+    )
+    job = CronJob(
+        id="seq-proj",
+        name="sequence in a repo",
+        message="task",
+        agent_sequence=["beta", "alpha"],
+        execution_context=captured.to_record(),
+        project_path=os.path.realpath(repo),
+    )
+    with pytest.raises(RuntimeError, match="stop before the provider"):
+        await callback(job)
+
+    first = gw.sessions.get_or_create.call_args_list[0]
+    assert first.kwargs["cwd"] == os.path.realpath(repo)
+    assert first.kwargs["agent"] == "beta-mode"
+    assert first.kwargs["crew_agent"] == "beta"

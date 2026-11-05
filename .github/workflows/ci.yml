@@ -87,6 +87,7 @@ jobs:
       only_frontend: ${{ steps.decide.outputs.only_frontend }}
       linux_packaging: ${{ steps.filter.outputs.linux_packaging }}
       wheel_closure: ${{ steps.filter.outputs.wheel_closure }}
+      render_bench: ${{ steps.filter.outputs.render_bench }}
       leaf_tests: ${{ steps.leaf.outputs.leaf_tests }}
       leaf_targets: ${{ steps.leaf.outputs.leaf_targets }}
       leaf_gates: ${{ steps.leaf.outputs.leaf_gates }}
@@ -235,6 +236,18 @@ jobs:
               - 'setup.cfg'
               - 'pyproject.toml'
               - 'scripts/ci/install_requires_closure.py'
+            # Independent of the buckets above: the files that can change what
+            # the render benchmark counts (the SPA source, the store seam it
+            # hooks into, its own scripts, budgets and build config).
+            render_bench:
+              - 'website/src/**'
+              - 'website/scripts/bench-render.mjs'
+              - 'website/scripts/lib/**'
+              - 'website/scripts/vite.profiling.config.mjs'
+              - 'website/vite.config.ts'
+              - 'website/perf-budgets.json'
+              - 'website/package-lock.json'
+              - '.github/workflows/ci.yml'
 
       - name: Decide surface
         id: decide
@@ -1059,20 +1072,11 @@ jobs:
     name: Native Redaction Gate (kc_native)
     needs: [changes, await-fast-gate, lint-gate]
     if: ${{ !cancelled() && needs.lint-gate.result == 'success' && needs.changes.outputs.only_frontend != 'true' }}
-    # Hosted, off the enterprise-shared standard pool: the `kirocrew-runners`
-    # group is the same Ubuntu image on a cap this organization owns. A fork
-    # cannot reach an organization group, so its own copy stays hosted-standard.
-    #
-    # NOT the fleet, and not for a capacity reason: this job's `cargo` comes
-    # pre-installed on the hosted Ubuntu image, and no workflow in this
-    # repository installs a Rust toolchain -- its only setup steps are
-    # `setup-python` and `setup-uv`. On `aws/codebuild/standard:7.0` the "Rust
-    # unit tests" step therefore dies at `cargo test` with exit 127, which an
-    # earlier fleet-routed revision of this lane did. Moving it needs a
-    # SHA-pinned toolchain step in the SAME change as the routing, since the
-    # step alone installs what the hosted image already has and the routing
-    # alone reds a gate that holds `PR Readiness`. Tracked in #27405.
-    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
+    # Default fleet compute, through the shared resolver, so the fleet's actor
+    # and event admission is not restated here. A run the fleet does not admit
+    # takes the `kirocrew-runners` group in this repository and the hosted
+    # image in a fork, the destination this lane had before.
+    runs-on: ${{ needs.changes.outputs.linux_runner || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1082,6 +1086,15 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+
+      # The fleet image (`aws/codebuild/standard:7.0`) carries no `cargo`, so
+      # both `cargo test` and `maturin build` below need this step there; it
+      # installs rustup first when the image has none. On the hosted image it
+      # updates the preinstalled toolchain to the current `stable`, so both
+      # images build with the same release.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # default-branch tip 2026-10-16
+        with:
+          toolchain: stable
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
@@ -1233,6 +1246,10 @@ jobs:
         # are never promoted to explicit arguments just to partition the suite.
         # Hash assignment is stable, not duration-balanced. Every file's tests
         # and parameters stay together; xdist still uses loadgroup within a job.
+        # The full-suite run (not the reduced or leaf ones) also reads
+        # scripts/ci_file_shard_pins.txt, which moves the heaviest files to fixed
+        # shards so the shards' test time comes out even; the slowest shard sets
+        # this job's time. scripts/ci_file_shard_pins.py regenerates it.
         #
         # Coverage runs on every shard: since the floor moved to >= 3.12 the
         # matrix has a single Python, so there is no --no-cov lane left. Each
@@ -1298,17 +1315,22 @@ jobs:
           if [ "$REDUCED" = "true" ]; then
             while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then TARGETS+=("$line"); fi; done < "$TARGETS_FILE"
           fi
-          # Leaf-test scope: run the whole narrow set on every matrix job, NOT
-          # split across shards -- 14 files do not shard usefully, and the point
-          # is repeats. Each shard job is then an independent roll on its own
-          # runner, which is what a flake fix actually needs. Measured
-          # on this checkout: one pass over the narrow set is ~38s (910 tests)
-          # against ~29 minutes for the slowest full shard.
+          # Leaf-test scope: the CHANGED files repeat LEAF_REPEATx on every matrix
+          # job (each shard job is an independent roll on its own runner, which is
+          # what a flake fix needs). The corpus gates are sharded across the matrix
+          # exactly as the full-suite path -- each job runs 1/SHARD_COUNT of the
+          # gates once, because they are deterministic and repeating them buys
+          # nothing. Measured on this checkout: ~38s/job (910 tests) for changed
+          # files; gate shard timing to follow from the first green run.
           if [ "$LEAF" = "true" ]; then
-            # The corpus gates run ONCE: they are deterministic content assertions,
-            # so repeating them buys nothing and -- at ~3 minutes a pass over ~158
-            # files -- would dominate the run and undo the reduction. Only the
-            # CHANGED files repeat, because that is where a flake lives.
+            # The corpus gates are deterministic content assertions, so repeating
+            # them buys nothing. With ~814 gate files unsharded, every matrix job
+            # ran the whole set once (~44 min), causing mass timeouts on
+            # process-count tests (test_xdist_host_budget, test_session_transfer,
+            # etc.). The fix: shard the gates across the matrix exactly as the
+            # full-suite path does -- each job runs 1/SHARD_COUNT of the gates once,
+            # via the same ci_file_shards plugin. Only the CHANGED files still
+            # repeat LEAF_REPEATx on every job, because that is where a flake lives.
             GATES=()
             while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then GATES+=("$line"); fi; done <<< "$LEAF_GATES"
             CHANGED=()
@@ -1324,26 +1346,29 @@ jobs:
               exit 1
             fi
             if [ "${#GATES[@]}" -gt 0 ]; then
-              echo "::group::leaf corpus gates (${#GATES[@]} file(s), once)"
-              pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -q -n "$WORKERS" --timeout=120 --no-cov -m "not ipv6_required" ${GATES[@]+"${GATES[@]}"}
+              echo "::group::leaf corpus gates (${#GATES[@]} file(s), shard ${{ matrix.group }}/$SHARD_COUNT)"
+              python -m pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -p scripts.ci_file_shards -q -n "$WORKERS" --timeout=120 --no-cov -m "not ipv6_required and not real_venv" \
+                --file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }} \
+                ${GATES[@]+"${GATES[@]}"}
               echo "::endgroup::"
             fi
             for pass in $(seq 1 "$LEAF_REPEAT"); do
               echo "::group::leaf changed files, pass $pass/$LEAF_REPEAT"
-              pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -q -n "$WORKERS" --timeout=120 --no-cov -m "not ipv6_required" ${CHANGED[@]+"${CHANGED[@]}"}
+              pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -q -n "$WORKERS" --timeout=120 --no-cov -m "not ipv6_required and not real_venv" ${CHANGED[@]+"${CHANGED[@]}"}
               echo "::endgroup::"
             done
             exit 0
           fi
           if [ "$REDUCED" = "true" ]; then
-            python -m pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -p scripts.ci_file_shards -q -n "$WORKERS" --timeout=120 -m "not ipv6_required" \
+            python -m pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -p scripts.ci_file_shards -q -n "$WORKERS" --timeout=120 -m "not ipv6_required and not real_venv" \
               --file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }} \
               --no-cov \
               ${TARGETS[@]+"${TARGETS[@]}"}
             exit 0
           fi
-          python -m pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -p scripts.ci_file_shards -q -n "$WORKERS" --timeout=120 -m "not ipv6_required" \
+          python -m pytest ${PROGRESS[@]+"${PROGRESS[@]}"} -p scripts.ci_file_shards -q -n "$WORKERS" --timeout=120 -m "not ipv6_required and not real_venv" \
             --file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }} \
+            --file-shard-pins scripts/ci_file_shard_pins.txt \
             --cov=kiro_crew --cov=sage_lib \
             --cov=src/kiro_crew/apps/builtins/aws_control/crew/packaging \
             --cov=src/kiro_crew/apps/builtins/code_review_sage/tests
@@ -1510,7 +1535,7 @@ jobs:
           echo "::remove-matcher owner=python::"
           python -m pytest -p scripts.ci_pytest_progress -p scripts.ci_file_shards \
             --ci-progress-dir "$RUNNER_TEMP/pytest-progress" \
-            -q -n auto --timeout=180 --no-cov --max-worker-restart=0 -m "not ipv6_required" \
+            -q -n auto --timeout=180 --no-cov --max-worker-restart=0 -m "not ipv6_required and not real_venv" \
             --file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }}
         # Ordinary shards plus backend-test-ipv6 retain every Windows test.
         # Windows has no namespace sandbox, so `userns_available()` is False and every
@@ -2176,7 +2201,7 @@ jobs:
           for pass in $(seq 1 "$LEAF_REPEAT"); do
             echo "::group::stability pass $pass/$LEAF_REPEAT"
             rc=0
-            pytest -q -n auto --timeout=${{ matrix.pytest_timeout }} --no-cov -m "not ipv6_required" \
+            pytest -q -n auto --timeout=${{ matrix.pytest_timeout }} --no-cov -m "not ipv6_required and not real_venv" \
               --max-worker-restart=0 \
               ${TARGETS[@]+"${TARGETS[@]}"} || rc=$?
             echo "::endgroup::"
@@ -3668,7 +3693,12 @@ jobs:
     runs-on: ${{ needs.changes.outputs.linux_runner_large || 'ubuntu-latest' }}
     # Per-shard budget. The whole suite was ~23 min on one runner; split four
     # ways each shard is well under this, and a hung shard fails fast.
-    timeout-minutes: 25
+    #
+    # Route-aware for the same reason backend-test is: off the CodeBuild fleet
+    # the shards run on `kirocrew-linux-4-core`, where the slowest of five
+    # observed fork shards took 18.3 minutes, leaving under 7 of the 25. The
+    # fleet keeps 25, so this costs the fast path nothing.
+    timeout-minutes: ${{ startsWith(needs.changes.outputs.linux_runner_large, 'codebuild-') && 25 || 35 }}
     strategy:
       max-parallel: 4
       # Don't cancel sibling shards when one fails -- we want the full failure
@@ -3749,6 +3779,11 @@ jobs:
           I18N_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
           REDUCED: ${{ steps.scope.outputs.reduced }}
           TARGETS_FILE: ${{ runner.temp }}/frontend-targets.txt
+          # The @testing-library/dom prettyDOM default (7000 chars) truncates
+          # inside sidebar SVG icons, before the portal section -- making the
+          # dialog/slot state unreadable in failure dumps.  200 000 chars
+          # captures the full document including portalled modals.
+          DEBUG_PRINT_LIMIT: "200000"
         # `actions/checkout` fetches depth 1, so the base is not present and
         # `git diff`/`git show` against it would fail. Fetch just that one commit, and
         # fail the step if it cannot be fetched — the gates throw on an unresolvable
@@ -4100,6 +4135,68 @@ jobs:
         working-directory: website
         run: npm run i18n:render
 
+  # React render counts for four replayed websocket scenarios against the
+  # budgets in website/perf-budgets.json (website/docs/testing.md, "Render
+  # benchmark"). It gates counts rather than milliseconds, but the number of
+  # React commits still depends on how fast the runner drains frames, so the
+  # job is pinned to one runner class instead of the fleet resolver: the
+  # organization's larger-runner group serves one image, and the budgets were
+  # measured on it. A fork running its own CI has no such runner and no
+  # matching budgets, so the job runs in this repository only.
+  #
+  # continue-on-error: this REPORTS while the budgets are new. A budget
+  # overrun turns this job's own check red, but not the CI run that PR
+  # Readiness reads, so it blocks no merge. Dropping continue-on-error is the
+  # follow-up once the budgets have held on main.
+  bench-render:
+    name: Render Benchmark (counter budgets)
+    needs: [changes, await-fast-gate, lint-gate]
+    if: ${{ !cancelled() && github.repository == 'kirodotdev/KiroCrew' && needs.lint-gate.result == 'success' && needs.changes.outputs.render_bench == 'true' }}
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
+    continue-on-error: true
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/seed-node-tool-cache
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: website
+        run: npm ci --no-audit --no-fund
+
+      # Same browser location as `i18n-render` and `e2e`, set per step because
+      # a job-level env cannot read runner.temp.
+      - name: Install Playwright browser (Chromium)
+        timeout-minutes: 6
+        working-directory: website
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: npx playwright install chromium
+
+      - name: Build the profiling bundle and check render budgets
+        working-directory: website
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: npm run bench:render -- --out "$RUNNER_TEMP/bench-render"
+
+      # The per-run counts are what a budget change is measured from, so keep
+      # the report on a failure too.
+      - name: Upload render benchmark report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-render-report
+          path: ${{ runner.temp }}/bench-render/bench-render.json
+          if-no-files-found: warn
+          retention-days: 14
+
   # The browser gate runs on the CodeBuild fleet. The one step that needed a
   # user namespace -- the real private-workflow MCP run -- moved to
   # `e2e-private-namespace` below, the only piece of this lane the fleet cannot
@@ -4127,7 +4224,13 @@ jobs:
     needs: [changes, await-fast-gate, lint-gate]
     if: ${{ !cancelled() && needs.lint-gate.result == 'success' }}
     runs-on: ${{ needs.changes.outputs.linux_runner_large || 'ubuntu-latest' }}
-    timeout-minutes: 25
+    # Route-aware, for the same reason backend-test is. Off the CodeBuild fleet
+    # this job runs on `kirocrew-linux-4-core`, where the slowest of six
+    # observed fork runs took 23.9 of the 25 minutes -- 66 seconds of margin, so
+    # a green run is one slow dependency install away from a cancellation with
+    # no failing test. The fleet keeps 25; only the slower route gets room, and
+    # a genuinely hung job is still bounded.
+    timeout-minutes: ${{ startsWith(needs.changes.outputs.linux_runner_large, 'codebuild-') && 25 || 40 }}
     defaults:
       run:
         shell: /usr/local/bin/ci-shell {0}
@@ -4335,6 +4438,11 @@ jobs:
           VOICE_EVIDENCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           KIROCREW_STRICT_ON_LOOP_PERSIST: "1"
           KIROCREW_MEMORY_UI_EVIDENCE_DIR: ${{ runner.temp }}/memory-embedding-evidence
+          # The Playwright run's ceiling is sized from this job's wall-clock budget
+          # so it cannot kill a green suite that still has job budget to spare. Set
+          # from the SAME expression as this job's timeout-minutes above so the two
+          # cannot drift: 25 on the CodeBuild fleet, 40 on the hosted route.
+          KIROCREW_E2E_JOB_TIMEOUT_MINUTES: ${{ startsWith(needs.changes.outputs.linux_runner_large, 'codebuild-') && 25 || 40 }}
         run: exec python scripts/ci_e2e_parallel.py
 
       - name: Upload read-aloud recovery evidence
@@ -4503,6 +4611,42 @@ jobs:
           path: ${{ runner.temp }}/integration-hits/
           if-no-files-found: ignore
           retention-days: 7
+
+  # Real venv/pip build end-to-end proof for the shadow-update engine.
+  #
+  # The Backend Test shards run the shadow-venv tests with stubs so they
+  # stay under the 120 s per-test timeout on a loaded CodeBuild shard.
+  # This job runs the one real-subprocess test
+  # (TestBuildChildEnvironment.test_build_and_verify_a_real_shadow_venv)
+  # on a plain ubuntu-latest runner -- no file-sharding, no shard contention --
+  # behind KIROCREW_REAL_VENV_TESTS=1, with a 300 s per-test cap that is safely
+  # above the 120 s venv-create timeout even on a slow runner.
+  wheel-engine-real-venv:
+    name: Wheel Engine (real venv build)
+    needs: [changes, await-fast-gate, lint-gate]
+    if: ${{ !cancelled() && needs.lint-gate.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            setup.cfg
+      - name: Install dependencies
+        run: uv pip install --system -e ".[voice,desktop]" --group dev
+      - name: Run real venv build test
+        run: |
+          echo "::remove-matcher owner=python::"
+          python -m pytest -v -n0 --no-cov --timeout=300 -m real_venv \
+            test/test_wheel_engine_lifecycle.py::TestBuildChildEnvironment::test_build_and_verify_a_real_shadow_venv
 
   # The only job that BOOTS A GATEWAY on macOS and Windows.
   #

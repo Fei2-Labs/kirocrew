@@ -37,6 +37,7 @@ import { useFontOptions } from '../../hooks/useFontOptions'
 import { isFontInstalled, monospaceFontStack, proportionalFontStack } from '../../utils/fontDetect'
 
 import { i18nT } from '../../i18n/t'
+import { useGatewayPlatform } from '../../hooks/useGatewayPlatform'
 import { ThemeDroppedRulesNotice } from './ThemeDroppedRulesNotice'
 import { ThemeExperienceSettings } from './ThemeExperienceSettings'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -47,6 +48,7 @@ import { useExplorePreview } from '../../hooks/usePreviewFlag'
 import { useCloseAction } from '../../hooks/useCloseAction'
 import { TranslucentPanelsPreview } from './TranslucentPanelsPreview'
 import { canOpenExternalTerminal, detectExternalTerminals } from '../../lib/externalTerminal'
+import { RadioChipGroup, radioChip } from '../../components/RadioChipGroup'
 /**
  * Lightweight inline spinner (no modal / progress bar — matches the "status,
  * not ceremony" preference). Colors come from theme CSS vars via Tailwind
@@ -382,6 +384,13 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
     onFailure: () => setCompletionError(i18nT('pages.settings.displayPanel.terminal_completion_save_failed')),
     onSupersede: () => setCompletionError(null),
   }))
+  // A Windows gateway answers every completion request with an empty list:
+  // the command tier's PATH filter refuses every directory there and the path
+  // tier has no shell cwd. That reply is the same one the off setting gets, so
+  // the switch would look on while nothing ever pops up. It shows as off and
+  // unavailable instead, with the stored value left untouched. A non-owner
+  // reads the platform as unknown and keeps the plain switch.
+  const completionUnavailable = useGatewayPlatform() === 'windows'
 
   // Run-in-terminal tab reuse (dashboard.terminal.reuse_current). Server-side
   // and off by default — the run-in-terminal handler reads it on each click, so
@@ -670,7 +679,7 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
             <SettingsToggle
               settingId="display.keep-running-in-the-background-after-closing-the-window"
               label={i18nT('pages.settings.displayPanel.keep_running_when_window_closed')}
-              description={i18nT('pages.settings.displayPanel.keep_running_when_window_closed_desc')}
+              hint={i18nT('pages.settings.displayPanel.keep_running_when_window_closed_desc')}
               checked={closeAction === 'background'}
               disabled={closeActionPending}
               onChange={on => setCloseAction(on ? 'background' : 'quit')}
@@ -865,9 +874,10 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
           <SettingsToggle
             label={i18nT('pages.settings.displayPanel.terminal_completion')}
             hint={i18nT('pages.settings.displayPanel.terminal_completion_desc')}
-            checked={shownCompletion}
+            description={completionUnavailable ? i18nT('pages.settings.displayPanel.terminal_completion_unavailable_windows') : undefined}
+            checked={!completionUnavailable && shownCompletion}
             onChange={v => completionMut.mutate(v)}
-            disabled={!mcQ.isSuccess}
+            disabled={!mcQ.isSuccess || completionUnavailable}
             configKey="dashboard.terminal.completion.enabled"
           />
           {/* No hand-off: the toggle itself has no draft (it saves on click),
@@ -877,7 +887,7 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
           <ErrorNotice message={completionError} variant="inline" />
           <SettingsToggle
             label={i18nT('pages.settings.displayPanel.terminal_reuse_current')}
-            description={i18nT('pages.settings.displayPanel.terminal_reuse_current_desc')}
+            description={i18nT('pages.settings.displayPanel.terminal_reuse_current_desc_summary')} hint={i18nT('pages.settings.displayPanel.terminal_reuse_current_desc')}
             checked={shownReuseCurrent}
             onChange={v => reuseCurrentMut.mutate(v)}
             disabled={reuseCurrentMut.isPending || !mcQ.isSuccess}
@@ -1180,14 +1190,14 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
           <ErrorNotice message={unreadDotError} variant="inline" />
           {/* Color swatches use raw buttons — circular color dots don't fit SettingsButtonGroup's text-button pattern */}
           <div className="flex flex-col gap-1.5 py-1.5" data-setting-label={i18nT('pages.settings.displayPanel.default_for_new_sessions')}>
-            <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>
-            <div className="flex flex-wrap items-center gap-1.5">
-              <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} aria-pressed={defaultColor === null} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
+            <span className="text-[13px] font-semibold text-text" id="display-default-session-color-label">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>
+            <RadioChipGroup className="flex flex-wrap items-center gap-1.5" ariaLabelledBy="display-default-session-color-label">
+              <button type="button" aria-label={i18nT('pages.settings.displayPanel.no_color')} {...radioChip(defaultColor === null)} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultColor === null ? 'border-accent scale-110' : 'border-border'}`} style={{ background: 'var(--bg-accent)', backgroundImage: 'linear-gradient(135deg, transparent 45%, var(--danger) 45%, var(--danger) 55%, transparent 55%)' }} onClick={() => dispatch(setSessionDefaultColor(null))} title={i18nT('pages.settings.displayPanel.no_color')} />
               {colors.map((c, i) => (
-                <button type="button" key={i} aria-label={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} aria-pressed={defaultSlot === i} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultSlot === i ? 'border-accent scale-110' : 'border-border'}`} style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${c} ${boost.activePct[i]}%, var(--bg-accent)) 50%, color-mix(in srgb, ${c} ${boost.idlePct[i]}%, var(--bg-accent)) 50%)` }} onClick={() => dispatch(setSessionDefaultColor(i))} title={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} />
+                <button type="button" key={i} aria-label={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} {...radioChip(defaultSlot === i)} className={`w-7 h-7 rounded-full border-2 cursor-pointer transition-transform hover:brightness-125 swatch-cue ${defaultSlot === i ? 'border-accent scale-110' : 'border-border'}`} style={{ background: `linear-gradient(135deg, color-mix(in srgb, ${c} ${boost.activePct[i]}%, var(--bg-accent)) 50%, color-mix(in srgb, ${c} ${boost.idlePct[i]}%, var(--bg-accent)) 50%)` }} onClick={() => dispatch(setSessionDefaultColor(i))} title={i18nT('pages.settings.displayPanel.color', { n: i + 1 })} />
               ))}
-              <button type="button" className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium cursor-pointer border transition-all ${defaultColor === 'auto' ? 'bg-accent-subtle text-accent border-accent' : 'bg-transparent text-muted border-border hover:border-border-strong hover:text-text'}`} onClick={() => dispatch(setSessionDefaultColor('auto'))}>{i18nT('pages.settings.displayPanel.auto')}</button>
-            </div>
+              <button type="button" {...radioChip(defaultColor === 'auto')} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[13px] font-medium cursor-pointer border transition-all ${defaultColor === 'auto' ? 'bg-accent-subtle text-accent border-accent' : 'bg-transparent text-muted border-border hover:border-border-strong hover:text-text'}`} onClick={() => dispatch(setSessionDefaultColor('auto'))}>{i18nT('pages.settings.displayPanel.auto')}</button>
+            </RadioChipGroup>
           </div>
         </SettingsCard>
       </SettingsSection>

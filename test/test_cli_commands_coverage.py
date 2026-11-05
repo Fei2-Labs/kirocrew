@@ -316,22 +316,25 @@ class TestSpawnCli:
 
 
 class TestAppCli:
-    def test_install_success_reports_registrations(
+    def test_install_success_registers_nothing_and_points_at_enable(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         with (
             patch("kiro_crew.cli_commands.install_app", return_value=_result(True, name="demo")),
             patch(
-                "kiro_crew.cli_commands.register_app",
-                return_value=_registration(
-                    agents=["a"], skills=["s"], crons=["c"], errors=["partial"]
-                ),
+                "kiro_crew.cli_commands.get_app",
+                return_value={"name": "demo", "enabled": False},
             ),
+            patch(
+                "kiro_crew.cli_commands.register_app",
+                return_value=_registration(agents=["a"]),
+            ) as register,
         ):
             cc._handle_app(_ns(app_action="install", source="/pkg"))
+        register.assert_not_called()
         out = capsys.readouterr().out
-        assert "Agents: a" in out and "Skills: s" in out and "Crons:  c" in out
-        assert "partial" in out and "kirocrew app enable demo" in out
+        assert "Agents:" not in out
+        assert "kirocrew app enable demo" in out
 
     def test_install_failure_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -823,6 +826,7 @@ class TestAppCli:
             patch(
                 "kiro_crew.cli_commands.install_app", return_value=_result(True, name="demo")
             ) as local_install,
+            patch("kiro_crew.cli_commands.get_app", return_value={"name": "demo"}),
             patch(
                 "kiro_crew.cli_commands.register_app", return_value=_registration(agents=["a"])
             ) as local_register,
@@ -831,9 +835,8 @@ class TestAppCli:
 
         assert urlopen.call_args.kwargs["socket_path"].name == "dashboard-5476.sock"
         local_install.assert_called_once_with("/pkg")
-        local_register.assert_called_once_with("demo")
+        local_register.assert_not_called()
         out = capsys.readouterr().out
-        assert "Agents: a" in out
         assert "kirocrew app enable demo" in out
 
     def test_install_missing_local_secret_keeps_file_only_path(
@@ -1335,9 +1338,16 @@ class TestAppCli:
         # stdout is the MCP stdio channel: the dispatcher must add nothing to it.
         assert capsys.readouterr().out == ""
 
-    def test_unknown_action_prints_usage(self, capsys: pytest.CaptureFixture[str]) -> None:
-        cc._handle_app(_ns(app_action=None))
-        assert "Usage: kirocrew app" in capsys.readouterr().out
+    def test_unknown_action_prints_usage_and_exits_two(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A missing or unknown sub-action is a usage error: the usage line goes
+        # to stderr and the command exits 2 (argparse convention), not a 0 on
+        # stdout a script would read as success.
+        with pytest.raises(SystemExit) as exited:
+            cc._handle_app(_ns(app_action=None))
+        assert exited.value.code == 2
+        assert "Usage: kirocrew app" in capsys.readouterr().err
 
 
 class TestRunAppMcpServer:

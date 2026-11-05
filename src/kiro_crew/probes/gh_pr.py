@@ -127,8 +127,8 @@ _CHECK_PAGE_SIZE = 100
 _MAX_CHECK_PAGES = 12
 
 #: Comments and reviews carried, newest first. The judge reads the recent end:
-#: a long discussion can hold hundreds of remarks, with the newest exchange at
-#: the tail.
+#: a long-running pull request holds hundreds of remarks and the one
+#: that needs an answer is at the tail.
 _MAX_REMARKS = 6
 
 #: One remark body. A reviewer's verdict and its first ask sit at the start of a

@@ -49,6 +49,7 @@ if TYPE_CHECKING:
         InstalledKasBundle,
         KasBundleError,
         KasBundleManifest,
+        KasHostUnsupported,
         fetch_manifest,
         host_node_key,
         host_platform_key,
@@ -77,6 +78,7 @@ _OWNED: dict[str, str] = {
         "InstalledKasBundle",
         "KasBundleError",
         "KasBundleManifest",
+        "KasHostUnsupported",
         "parse_manifest",
         "fetch_manifest",
         "host_node_key",
@@ -96,10 +98,15 @@ __all__ = [
     "KAS_SPEC_PERMISSIONS_MIN_ENGINE_VERSION",
     "KAS_VERSION_OVERRIDE_ENV",
     "bundle_spawn_argv",
+    "engine_install_snapshot",
     "engine_spec_permissions_supported",
+    "install_pinned_engine",
     "installed_engine_label",
     "kas_bundle_route",
+    "kas_route",
+    "last_kas_route",
     "pinned_version",
+    "require_loadable_host",
     "sha256_bytes",
     "sha256_file",
     *sorted(_OWNED),
@@ -160,6 +167,15 @@ def sha256_file(path: Path) -> str:
     return _owner("installed_bundle")._sha256_file(path)
 
 
+def require_loadable_host() -> None:
+    """Raise ``KasHostUnsupported`` when this host's glibc is too old for the engine.
+
+    The same check :func:`install_bundle` runs, for a caller that prints progress
+    before calling it and must refuse first.
+    """
+    _owner("install_bundle")._require_loadable_glibc(None, None)
+
+
 def sha256_bytes(data: bytes) -> str:
     """Hex sha256 of bytes already read, so a caller verifies the buffer it parses."""
     import hashlib
@@ -187,7 +203,10 @@ def kas_operator_override(binary: str, environ: Mapping[str, str]) -> bool:
 
 
 def kas_bundle_route() -> bool:
-    """Whether the next agent spawn runs Crew's own engine: KAS selected AND the bundle on.
+    """Whether the next agent spawn runs Crew's own engine: KAS selected AND the bundle route.
+
+    The bundle route is ``agent.kas_bundle`` on, or the automatic switch when
+    kiro-cli's relay cannot run here (:func:`kas_route`, ``acp/kas_route.py``).
 
     The one predicate the kiro-cli-facing diagnostics share -- ``kirocrew doctor``,
     the diagnostics bundle's version line, the gateway self-update's ``kiro-cli
@@ -206,9 +225,47 @@ def kas_bundle_route() -> bool:
 
     try:
         agent = KiroCrewConfig.load().agent
-        return agent.acp_backend == ACP_BACKEND_KAS and bool(agent.kas_bundle)
+        return agent.acp_backend == ACP_BACKEND_KAS and (
+            bool(agent.kas_bundle) or bool(kas_route().bundle)
+        )
     except Exception:
         return False
+
+
+def kas_route() -> Any:
+    """The route the next KAS spawn takes, computed fresh (``acp.kas_route.KasRoute``).
+
+    The bundle route is taken when ``agent.kas_bundle`` is on, or automatically
+    when kiro-cli's relay cannot run on this host. Blocking (reads config, resolves
+    kiro-cli, reads the sign-in stores); never raises.
+    """
+    from kiro_crew.acp.kas_route import resolve_kas_route
+
+    return resolve_kas_route()
+
+
+def last_kas_route() -> dict[str, Any] | None:
+    """The route the last KAS spawn in this process took, as plain data, or ``None``."""
+    from kiro_crew.acp.kas_route import last_spawn_route
+
+    route = last_spawn_route()
+    return None if route is None else route.as_dict()
+
+
+def engine_install_snapshot() -> dict[str, Any]:
+    """The gateway's engine install state: ``running``, ``done``, ``total``, ``error``."""
+    from kiro_crew.acp.kas_engine_install import install_snapshot
+
+    return install_snapshot()
+
+
+def install_pinned_engine(
+    base_url: str, *, caller: str, on_progress: ProgressCallback | None = None
+) -> InstalledKasBundle:
+    """Install the pinned engine through the gateway's one-at-a-time installer."""
+    from kiro_crew.acp.kas_engine_install import install_pinned_engine as _install
+
+    return _install(base_url, caller=caller, on_progress=on_progress)
 
 
 def installed_engine_label() -> str | None:

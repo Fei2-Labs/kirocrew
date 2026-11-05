@@ -70,6 +70,12 @@ The electron-builder configuration lives in
   `rpm.depends` needs no such thing but uses entirely different names
   (`gtk3`, `nss`, `alsa-lib`). Both lists are verified against a real
   `apt-get install` / `dnf` resolution by `scripts/smoke-linux-packages.sh`.
+  Both lists name libgbm (`libgbm1` / `mesa-libgbm`) because the desktop
+  binary links `libgbm.so.1` and no other entry requires it: Ubuntu 24.04,
+  Debian 12 and Amazon Linux 2023 bring it in only as a recommendation or weak
+  dependency, which a minimal install skips, and on Ubuntu 22.04 nothing brings
+  it in. Without it the app installs but cannot start.
+  `website/electron/test/packaging.test.js` pins both entries.
 - `build.files` is an explicit per-file allowlist, not a glob: electron-builder
   packs exactly those paths into `app.asar` at the same relative location, plus
   `package.json` and the production `node_modules`. The four lifecycle facades
@@ -741,8 +747,16 @@ reusing a same-family local gateway on a fixed-path POSIX install, the shell
 checks whether its sole listener is running from this app's current bundled
 backend path. If that bundled gateway reports an older version than the app,
 the shell warns that updated features may be unavailable and offers Continue or
-Quit. The warning explains how to stop the old gateway before reopening the
-app; it adds service guidance only when the listener is service-classified.
+Quit. On an install that keeps each version in its own folder, the same warning
+covers the previous version's gateway: its path is this app's path with one
+version-named folder swapped for the version the gateway reports. That folder
+is found by the swap, not by the app's own version, because a packager may
+name folders by a build number (`0.12.0.4`) while the app reports its release
+version (`0.12.0-rc.5`); the warning then compares and names the folder's
+version. A fourth build-number part decides when the first three tie
+(`0.12.0.4` is newer than `0.12.0.3`). The warning explains how to stop the old
+gateway before reopening the app; it adds service guidance only when the
+listener is service-classified and, on macOS, launchd runs it as a job.
 Unknown owners, remote tunnels, separate CLI installs, same or newer versions,
 Windows, and moved AppImages keep the existing reuse behavior. The shell does
 not restart or force-stop a stale gateway automatically.
@@ -1662,7 +1676,12 @@ commands honored must install the resources directory root-owned.
 
 On the managed path the app treats a `checkCommand` that exits 0 and prints a
 version as an available update. With the app's update switch on, it then runs
-`updateCommand` on the next quit.
+`updateCommand` on the next quit. Windows shutdown, restart and sign-out end the
+app without a quit, so on Windows the app shows a "Kiro Crew update ready"
+notice at session end instead, telling the user to quit from the tray to
+install. It never runs `updateCommand` then: Windows gives the app a few seconds,
+and an apply cut short can leave a half-installed app. The notice appears only
+while the update switch is still on, and not once an install has started.
 
 **A package manager's own update pause holds only if the check command honours
 it**: on this managed lane while the app's update switch is on, and on the

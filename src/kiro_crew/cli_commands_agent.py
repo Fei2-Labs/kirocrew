@@ -205,12 +205,12 @@ def _handle_agent(args: argparse.Namespace) -> None:
 
     elif action == "create":
         if external_text_requires_redaction(args.name):
-            print("Error: invalid Crew Member name (credential-shaped text)", file=sys.stderr)
+            print("Error: invalid Bot name (credential-shaped text)", file=sys.stderr)
             sys.exit(1)
         try:
             validate_member_name(args.name)
         except MemberNameError as exc:
-            print(f"Error: invalid Crew Member name ({exc})", file=sys.stderr)
+            print(f"Error: invalid Bot name ({exc})", file=sys.stderr)
             sys.exit(1)
         # Same keying as POST /api/agents.
         keyed = key_new_crew(
@@ -342,6 +342,20 @@ def _handle_agent(args: argparse.Namespace) -> None:
         if new_workspace is not None and not new_workspace.strip():
             print("Note: blank --workspace ignored; the workspace is unchanged", file=sys.stderr)
             new_workspace = None
+        if (
+            args.kiro_agent is None
+            and new_workspace is None
+            and getattr(args, "model", None) is None
+            and getattr(args, "display_name", None) is None
+        ):
+            # Nothing to write: saying "Updated" here would report a change
+            # that never happened. Exit 0 stays, so a script calling it keeps working.
+            print(
+                f"Warning: nothing to update for agent '{args.name}'; pass --kiro-agent, "
+                "--workspace, --display-name or --model",
+                file=sys.stderr,
+            )
+            return
         if new_workspace is not None:
             from kiro_crew.member_workspace import DEFAULT_WORKSPACE
 
@@ -456,8 +470,20 @@ def _handle_agent(args: argparse.Namespace) -> None:
     elif action == "reset-model":
         _agent_reset_model(args)
 
+    elif action == "pin":
+        from kiro_crew.cli_agent_pin import agent_pin
+
+        agent_pin(args)
+
     else:
-        print("Usage: kirocrew agent {list|create|update|delete|reset-model}")
+        # No sub-action or an unknown one: a usage error. Print to stderr and
+        # exit 2, the argparse convention, so a script does not read 0 after a
+        # typo.
+        print(
+            "Usage: kirocrew agent {list|create|update|delete|pin|reset-model}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
 
 #: How a failed teardown step names what it could not remove.

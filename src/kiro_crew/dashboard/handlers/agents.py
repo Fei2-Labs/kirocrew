@@ -47,7 +47,7 @@ from kiro_crew import agent_state  # noqa: F401
 from kiro_crew import crew_teams as teams_mod  # noqa: F401
 from kiro_crew import model_registry, model_scope
 from kiro_crew._facade_compose import compose as _facade_compose
-from kiro_crew.acp.backends import Dialect, dialect_of
+from kiro_crew.acp.backends import Dialect, UnknownAcpBackend, dialect_of
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp.types import ACP_BACKENDS_AUTO_MODEL
 from kiro_crew.acp_backends import (  # noqa: F401 - selectable_backend_values is a facade name
@@ -330,9 +330,10 @@ from kiro_crew.dashboard.handlers.models_kas_bundle import api_models_kas_bundle
 from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401
     owner_view_for_request,
 )
-from kiro_crew.dashboard.kas_local_commands import served_slash_commands
+from kiro_crew.dashboard.kas_local_commands import local_harness_menu
 from kiro_crew.dashboard.kiro_readiness import (
     KIRO_PREREQUISITE_REQUIRED_CODE,
+    kiro_latched_ready,
     reject_if_kiro_unverified,
 )
 from kiro_crew.dashboard.state import DashboardState
@@ -1481,12 +1482,13 @@ async def _fetch_kiro_catalog() -> list[dict]:
     return [wire_row(m) for m in models if not is_deprecated_model(m.get("model_name", ""))]
 
 
-def _shared_catalog_fetch() -> "asyncio.Task[list[dict]]":
+def _shared_catalog_fetch(gate_req: web.Request | None = None) -> "asyncio.Task[list[dict]]":
     """Return the in-flight catalog fetch, starting one if none is running.
 
     Single-flight: concurrent polls share one spawn. The task caches its result
     (and clears itself) when it finishes, so the next poll after a slow success
     is served straight from the cache rather than starting another cold start.
+    A *gate_req* runs the sign-in gate right before the spawn (see api_models).
     """
     existing = _catalog_cache.task
     if existing is not None and not existing.done():
@@ -1494,6 +1496,12 @@ def _shared_catalog_fetch() -> "asyncio.Task[list[dict]]":
 
     async def _run() -> list[dict]:
         try:
+            if gate_req is not None and await reject_if_kiro_unverified(gate_req) is not None:
+                raise _CatalogUnavailable(  # nothing spawned, so no backoff entry
+                    "kiro sign-in not verified; catalog refresh skipped",
+                    backoff=False,
+                    code=KIRO_PREREQUISITE_REQUIRED_CODE,
+                )
             models = await _fetch_kiro_catalog()
         except _CatalogUnavailable as exc:
             # Remember a failed spawn so the polls inside the backoff window
@@ -1579,26 +1587,6 @@ async def api_models(request: web.Request) -> web.Response:
     # backend, which is why it is not a capability-set branch like the one above.
     if bundle_route:
         return await api_models_kas_bundle(request)
-    # Signed-out gateways must never reach the spawn below. kiro-cli auto-opens
-    # an interactive browser login for ANY subcommand run unauthenticated
-    # (--no-interactive does not suppress it, and there is no opt-out env var),
-    # and the frontend polls this endpoint every 8s while the model list is
-    # degraded — which is exactly the signed-out state. Ungated, that pairing
-    # opened a browser window every 8s indefinitely. The 503 is the same
-    # degraded response the timeout/unresolved branches already return, so the
-    # client contract is unchanged; only the subprocess is skipped.
-    #
-    # Keep the tight destructive bound here: this endpoint polls only while the
-    # model list is a degraded fallback and stops the instant a live fetch wins
-    # (website/src/providers/modelListHealth.ts), so it is not polled at all when
-    # healthy and gains no latency from a wider window. Its only server-side
-    # cooldown is the short failure backoff below, so a wide stale-authorize window
-    # would still let a stale ready=True latch spawn a browser-opening login on
-    # most degraded ticks.
-    blocked = await reject_if_kiro_unverified(request)
-    if blocked is not None:
-        return blocked
-
     # Backend scope, checked BEFORE the kiro-cli spawn: on another ACP backend
     # that subprocess is both impossible (the binary may be absent) and wrong
     # (its ids are kiro-namespace and the other backend rejects them). The
@@ -1618,7 +1606,15 @@ async def api_models(request: web.Request) -> web.Response:
             },
             status=503,
         )
-    if _alt_backend:
+    # KIRO-dialect members (kiro-cli's "" already fell through; KAS is the
+    # configured default now) read the same --list-models catalog below, so
+    # only a foreign dialect takes the advertised path. An id with no
+    # descriptor (a registry-prefixed adapter) is foreign by definition.
+    try:
+        _alt_is_kiro_family = bool(_alt_backend) and dialect_of(_alt_backend) is Dialect.KIRO
+    except UnknownAcpBackend:
+        _alt_is_kiro_family = False
+    if _alt_backend and not _alt_is_kiro_family:
         advertised = (
             _models_from_provider(scope_provider)
             if scope_provider is not None
@@ -1664,6 +1660,10 @@ async def api_models(request: web.Request) -> web.Response:
 
     try:
         cached = _catalog_cache.models
+        if cached is None or not await kiro_latched_ready(request):
+            blocked = await reject_if_kiro_unverified(request)
+            if blocked is not None:
+                return blocked
         if cached is not None:
             # Serve the last good catalog straight away; a stale one is refreshed
             # behind the reply (stale-while-revalidate). Entitlement narrowing
@@ -1672,7 +1672,7 @@ async def api_models(request: web.Request) -> web.Response:
             # A refresh that just failed is not retried until its backoff ends.
             stale = time.monotonic() - _catalog_cache.fetched_at >= _LIST_MODELS_CATALOG_TTL_SECS
             if stale and _catalog_cache.recent_failure() is None:
-                _shared_catalog_fetch()
+                _shared_catalog_fetch(gate_req=request)
             models = await _entitled_kiro_models(request, list(cached))
             return web.json_response(models)
 
@@ -1804,7 +1804,11 @@ async def api_slash_commands(request: web.Request) -> web.Response:
             for c in cc_commands
             if f"/{c}" not in blocked_commands
         ]
+        # The commands the dashboard answers before any harness sees the turn.
         for command in (
+            "/agent",
+            "/goal",
+            "/prompts",
             "/side",
             "/workflow",
             *(("/todos",) if "/todos" not in blocked_commands else ()),
@@ -1822,10 +1826,10 @@ async def api_slash_commands(request: web.Request) -> web.Response:
     offered = _SLASH_COMMANDS - blocked_commands
     # The same holds for a harness with no command channel: the slash gate answers
     # its commands with a notice, so list only what the dashboard serves there
-    # (served_slash_commands). /compact stays: it has a gate of its own.
-    if cfg.agent.acp_backend in ACP_BACKENDS_LOCAL_HARNESS_COMMANDS:
-        served = served_slash_commands(cfg.agent.acp_backend, _DASHBOARD_SERVED_SLASH_COMMANDS)
-        offered = offered & (served | {"/compact"})
+    # (local_harness_menu, which /help prints too). Scoped to the live harness,
+    # same as the command list above.
+    if backend and backend in ACP_BACKENDS_LOCAL_HARNESS_COMMANDS:
+        offered = offered & local_harness_menu(backend)
     return web.json_response(
         [{"name": c, "description": SLASH_COMMAND_DESCRIPTIONS.get(c, "")} for c in sorted(offered)]
     )

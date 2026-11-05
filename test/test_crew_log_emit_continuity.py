@@ -1,12 +1,8 @@
 """Live turns under eviction, resume, claims and teardown, and the `previous` edge.
 
-It pins that eviction, a reconnect or a warm reuse never closes an open turn, that only a
-resume repairs one, and that a resume leaves alone a turn this process is still running; how
-a claim and a teardown hold or release the log's write ownership; what a dispatched child
-records and how child pins are capped; that a refused turn writes no start; that call-index
-numbering survives cache pressure; and which earlier store of the same slot a newly created
-log names as `previous`. The repair of a superseded log's tail and the chain walk are pinned
-in `test_crew_log_emit.py`, and the writer in `test_crew_log_emit_write_path.py`.
+Only a resume repairs an open turn, and never one this process is still running. The
+superseded-tail repair and chain walk are in `test_crew_log_emit.py`; the writer is in
+`test_crew_log_emit_write_path.py`.
 """
 
 from __future__ import annotations
@@ -35,17 +31,14 @@ from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import emit
 from kiro_crew.crew_log import projection as crew_log_projection
 
-# --- cache pressure -------------------------------------------------------
+# cache pressure
 
 
 def test_cache_pressure_never_closes_a_live_turn(monkeypatch):
     """What a bounded LRU of open handles must not do to a running turn.
 
-    With more concurrent crew logs than the cache holds, evicting a live session's
-    handle makes the next emit in that same turn reopen the crew log -- and an open
-    that repaired would append a false `turn/completed {interrupted}` into a turn
-    that then keeps writing. Two things prevent it: repair is opt-in and only a
-    resume asks for it, and a session with a turn in flight is not evicted at all.
+    A reopen that repaired would write a false `turn/completed {interrupted}` into a turn
+    that keeps writing. Only a resume repairs, and a live turn is never evicted.
     """
     _open_session()
     emit.on_turn_started(SESSION, 7, "user")
@@ -336,7 +329,7 @@ def test_the_child_probe_reports_present_while_this_session_owes_an_entry():
             asyncio.run(_owe(SESSION))
             assert gone("sub-1") is False, "a child was reported gone while its session owed"
             release.set()
-            assert emit.flush(timeout=10.0)
+            assert_drained()
         assert gone("sub-1") is True, "the debt outlived the entry that landed"
     finally:
         release.set()
@@ -559,7 +552,7 @@ def test_a_claim_does_not_take_back_a_pin_a_queued_closer_still_owes(monkeypatch
     )
 
     release.set()
-    assert emit.flush(timeout=20.0)
+    assert_drained()
     assert "turn/completed" in [e["type"] for e in _body()]
     assert emit.live_turn(SESSION) == 0, "the write job never released the pin it owed"
 

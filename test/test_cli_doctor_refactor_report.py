@@ -53,6 +53,7 @@ _SECTIONS = (
     "_doctor_skill_currency",
     "_doctor_deprecated_agent_specs",
     "_doctor_path_launcher",
+    "_doctor_service_launch",
     "_doctor_trust_root",
     "_doctor_signing_key",
     "_doctor_name_grant_platform_scope",
@@ -93,6 +94,7 @@ _TAKES_ISSUES = frozenset(_SECTIONS) - {
     "_doctor_agent_auth",
     "_doctor_data_home",
     "_doctor_path_launcher",
+    "_doctor_service_launch",
     "_doctor_trust_root",
     "_doctor_name_grant_platform_scope",
     "_doctor_strict_identity",
@@ -108,6 +110,7 @@ _TAKES_ISSUES = frozenset(_SECTIONS) - {
 _FAMILY_ONLY = {
     "_doctor_signing_key": access,
     "_doctor_kiro_chat_delegate": services,
+    "_doctor_service_launch": install,
 }
 
 _GATED_OFF = frozenset({"kirocrew-computer"})
@@ -225,7 +228,6 @@ class _Host:
         mp.setattr(cli_doctor, "machine_hostname", lambda: "devbox")
         mp.setattr(cli_doctor, "is_local_only", lambda host, has_slack: self.local)
         import kiro_crew._sqlite_compat as sqlite_compat
-        import kiro_crew.browser_cli.install as browser_install
         import kiro_crew.channels as channels
 
         mp.setattr(sqlite_compat, "fts5_available", lambda: self.fts5)
@@ -233,19 +235,6 @@ class _Host:
         # the host's real data never decides.
         mp.setattr(install, "_tz_probe_offset", lambda: self.tz_offset)
         mp.setattr(install, "_tz_data_from_system", lambda: True)
-        # The browser-bootstrap rows resolve through the patched ``shutil.which``;
-        # pin the writability probe too, so the host's real files never decide.
-        mp.setattr(
-            browser_install,
-            "bootstrap_tool_provenance",
-            lambda path: {
-                "path": path,
-                "real_path": path,
-                "writable_at": "",
-                "own_toolchain": False,
-                "shared_write": False,
-            },
-        )
         mp.setattr(channels, "channel_readiness", lambda cfg, creds: tuple(self.readiness))
         import kiro_crew.doctor_checks.resources as resources
 
@@ -395,10 +384,6 @@ Dependencies
   <<_doctor_agent_auth>>
   git:         ✅ /usr/bin/git
   node:        ✅ /usr/bin/node (v22.3.0)
-  browser npm: ⏹ not found (the browser install needs Node.js with npm)
-  browser node: ✅ /usr/bin/node
-               These rows resolve from this shell's PATH; the gateway logs the npm and Node it
-               actually ran at install time.
 
 Project
   source dir:  ✅ <TMP>/checkout (Kiro Crew source checkout)
@@ -426,6 +411,7 @@ Configuration
   <<_doctor_skill_currency>>
   <<_doctor_deprecated_agent_specs>>
   <<_doctor_path_launcher>>
+  <<_doctor_service_launch>>
   <<_doctor_trust_root>>
   <<_doctor_signing_key>>
   <<_doctor_name_grant_platform_scope>>
@@ -659,10 +645,6 @@ Dependencies
   git:         ❌ not found (needed for kirocrew update)
   node:        ❌ v18.19.0 < v20.0.0
                Fix: Node.js v18.19.0 is too old: Kiro Crew needs v20.0.0 or newer. Update Node.js: install 24 LTS from https://nodejs.org, or run `nvm install 24` / `mise use -g node@24`.
-  browser npm: ⏹ not found (the browser install needs Node.js with npm)
-  browser node: ✅ /usr/bin/node
-               These rows resolve from this shell's PATH; the gateway logs the npm and Node it
-               actually ran at install time.
 
 Project
   source dir:  ❌ stale — points to deleted <TMP>/gone
@@ -692,6 +674,7 @@ Configuration
   <<_doctor_skill_currency>>
   <<_doctor_deprecated_agent_specs>>
   <<_doctor_path_launcher>>
+  <<_doctor_service_launch>>
   <<_doctor_trust_root>>
   <<_doctor_signing_key>>
   <<_doctor_name_grant_platform_scope>>
@@ -1092,3 +1075,28 @@ def test_bundle_mode_exits_one_when_the_bundle_cannot_be_written(host, capsys, m
         "     Check that ~/.kiro/crew is writable and has free space.\n"
     )
     assert code == 1
+
+
+def test_bundle_route_without_node_on_path_reads_the_bundles_node(
+    host, capsys, monkeypatch
+) -> None:
+    """The node row on the KAS bundle route names the engine's own Node, not an install."""
+    _ready(host)
+    host.kiro = None
+    del host.which["node"]
+    monkeypatch.setattr(cli_doctor.kas_bundle, "kas_bundle_route", lambda: True)
+    monkeypatch.setattr(
+        cli_doctor.kas_bundle,
+        "installed_bundle",
+        lambda: SimpleNamespace(node_version="22.23.3"),
+    )
+    monkeypatch.setattr(cli_doctor.kas_bundle, "installed_engine_label", lambda: "KAS 0.66.33")
+
+    out, code = host.run(capsys)
+
+    assert (
+        "  node:        ⏭  not on PATH; not needed "
+        "(KAS runs its engine bundle's own Node 22.23.3)\n"
+    ) in out
+    assert "Fix: install Node.js" not in out
+    assert "node" not in (out.rsplit("Fix these issues:", 1)[1] if code else "")

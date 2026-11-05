@@ -197,7 +197,11 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "function",
             "(handoff: '_ClaimHandoff', job: 'CronJob', fn: 'Callable[..., Any]', *args: 'Any') -> 'Any'",
         ),
-        ("_annotate_model_fallback", "function", "(text: 'str', provider: 'Any') -> 'str'"),
+        (
+            "_annotate_model_fallback",
+            "function",
+            "(text: 'str', provider: 'Any', *, stop_reason: 'str | None' = None) -> 'str'",
+        ),
         (
             "_cron_stream_with_posttoken_resume",
             "async function",
@@ -335,6 +339,8 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(self, *, mandatory: 'bool', mandatory_key: 'str' = '') -> 'bool'",
         ),
         ("_finish_auto_update_apply", "async method", "(self) -> 'None'"),
+        ("_restart_gate_when_idle", "async method", "(self) -> 'tuple[bool, int, int]'"),
+        ("_release_restart_gate_hold", "async method", "(self) -> 'None'"),
         ("_wheel_apply_module", "staticmethod", "() -> 'Any'"),
         ("_dashboard_policy_applies", "staticmethod", "() -> \"list['asyncio.Task[Any]']\""),
         (
@@ -529,7 +535,9 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "async method",
             "(self, watchdog: 'asyncio.Future | None' = None) -> 'None'",
         ),
+        ("_park_if_force_exit_claimed", "async method", "(self) -> 'None'"),
         ("_MARKER_WRITE_WAIT_SECS", "value", "'float'"),
+        ("_FORCE_EXIT_DEADLINE_SECS", "value", "'float'"),
     ),
     "process_entry": (
         ("_live_session_work_dirs", "function", "(sessions: 'Any') -> 'list[str]'"),
@@ -766,7 +774,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_inject_with_retry",
             "async method",
-            "(self, info: 'SubagentInfo', client, msg: 'str', parent_key: 'str', label: 'str') -> 'str | None'",
+            "(self, info: 'SubagentInfo', client, msg: 'str', parent_key: 'str', label: 'str', *, delivery: 'dict[str, Any] | None' = None) -> 'str | None'",
         ),
     ),
     "channel_boot": (

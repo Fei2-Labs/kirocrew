@@ -202,6 +202,10 @@ from kiro_crew.subagent_cost import (
     read_cap_costs,
     read_learned_costs_checked,
 )
+from kiro_crew.subagent_ending import (  # noqa: F401
+    SubagentEnding,
+    classify_ending,
+)
 from kiro_crew.subagent_manager import (
     CancellationCoordinator,
     ClaimPoint,
@@ -435,6 +439,7 @@ from kiro_crew.subagent_parts.start_pricing import (  # noqa: F401
     _spawn_memory_floor_and_cost,
     _startup_memory_reserve_gb,
 )
+from kiro_crew.subagent_parts.terminal_surface import write_refusal_tombstone  # noqa: F401
 from kiro_crew.subagent_persistence import (  # noqa: F401 - read_tombstone resolved by run_lifecycle.py via bind_component_globals
     DISMISSAL_FAILED,
     _agent_dir,

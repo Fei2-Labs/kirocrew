@@ -773,6 +773,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _refuse_session_approval_from_cli,
         _refuse_unsafe_app_name,
         _register_app_crons_to_scheduler,
+        _register_unrecorded_builtin,
         _run_app_action_through_gateway,
         _run_app_mcp_server,
         _warn_backend_not_stopped,
@@ -785,6 +786,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _cron_add_fail,
         _cron_dispatch,
         _cron_preview,
+        _cron_update_not_found,
         _format_schedule,
     )
     from kiro_crew.cli_commands_eval import (  # noqa: F401
@@ -841,6 +843,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _handle_secrets_authorize,
         _publish_secret_request_policy,
         _spawn_precreates_policy_directory,
+        _windows_authorize_unavailable,
     )
     from kiro_crew.cli_commands_security import (  # noqa: F401
         _TIME_SELECTOR_RE,

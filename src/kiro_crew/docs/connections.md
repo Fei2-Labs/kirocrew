@@ -17,18 +17,18 @@ the only place a sign-in is offered.
 
 ## The vendor catalogue
 
-`src/kiro_crew/connections/registry.json` holds **29** curated providers. A catalogue
+`src/kiro_crew/connections/registry.json` holds **37** curated providers. A catalogue
 entry is what lets Kiro Crew offer a one-click **Connect** instead of asking you for
 a URL: the entry carries the vendor's MCP endpoint, the scopes worth asking for, the
 revoke page to send you to later, and a baseline of the vendor's published OAuth
 metadata that a nightly job watches for drift.
 
-Of those, **8** render a card today. Two conditions decide which:
+Of those, **14** render a card today. Two conditions decide which:
 
 | Entry state | Card | Why |
 |---|---|---|
 | Launch gate passed | **Connect** | A human has walked the whole flow on this provider and recorded its revoke surface. Six entries: Notion, Linear, Atlassian, Stripe, Vercel, GitLab |
-| Needs an operator-registered OAuth app | **Configure OAuth app** | The vendor refuses runtime client registration, so the card is an instruction rather than an offer. Two entries: GitHub, Asana |
+| Needs an operator-registered OAuth app | **Configure OAuth app** | The vendor refuses runtime client registration, so the card is an instruction rather than an offer. One Google OAuth client can serve all six Google cards; paste it into each. Eight entries: GitHub, Asana, Gmail, Google Drive, Google Calendar, Google Sheets, Google Docs and Google Slides |
 | Launch gate not yet walked | hidden | The entry exists so the nightly metadata check covers it; nothing about it is claimed to you yet |
 | Vendor admits clients by allowlist or waitlist | hidden | No per-install app can satisfy it, which is a dead end rather than an instruction. Four entries: Figma, Canva, Dropbox, Square |
 
@@ -103,6 +103,40 @@ looks like the sign-in failed.
 
 After authorizing: drain the warm pool (or restart the gateway) **first**, then start
 a fresh session.
+
+### Render: an API key instead of a sign-in
+
+Render hosts an MCP server at `https://mcp.render.com/mcp`. It is not in the
+catalogue: Render's sign-in refuses apps it has not registered itself and documents
+no way to register one, so a sign-in started from Kiro Crew cannot complete. It
+takes a Render API key instead.
+
+Before you connect it:
+
+- **Some tools change your account.** They create services and databases that
+  Render bills for, overwrite all of a service's environment variables (any left
+  out are deleted), and start deploys. Rollback is not one of the server's tools;
+  roll back in the Render Dashboard.
+- **The agent holds the key.** A `.env` value reaches the agent's shell, so the
+  agent can also use the key through Render's own API, which can delete services and
+  databases. Picking a workspace in step 4 does not limit the key. Use one you are
+  willing to hand to the agent.
+- **Removing the server does not revoke the key.** Revoke it on Render's Account
+  Settings page.
+
+To connect it:
+
+1. Create an API key on your Render **Account Settings** page.
+2. Add `RENDER_API_KEY=<your key>` to `~/.kiro/crew/.env`, then stop and start the
+   gateway ([Credentials](configuration.md#credentials)).
+3. Add a [remote server](#adding-your-own-mcp-server) named `render`:
+
+   ```json
+   { "url": "https://mcp.render.com/mcp", "headers": { "Authorization": "Bearer ${RENDER_API_KEY}" } }
+   ```
+
+4. In a [cold session](#the-tools-appear-in-the-next-cold-session), tell the agent
+   which Render workspace to use. Every Render tool acts on the workspace it selects.
 
 ## Credentials, and what Kiro Crew can see
 
@@ -191,25 +225,28 @@ so no provider dispatch happens outside the governed, audited agent path.
 
 ## Tool aliases: why a tool's name may differ
 
-Two MCP servers can ship the same tool name. Linear and Vercel both expose
-`list_projects`; Linear, GitHub and GitLab all expose `list_issues`; Atlassian and
-Todoist both expose `search` and `fetch`. An agent calls a tool by bare name, so the
-second server to mount would shadow the first — one provider's tool becomes
-unreachable and the agent silently calls the other one's.
+Two MCP servers can ship the same tool name. Linear, Vercel and TickTick all expose
+`list_projects`; Linear, GitHub and GitLab all expose `list_issues`; Atlassian,
+Todoist and TickTick all expose `search` and `fetch`; Sentry, Figma and Railway all
+expose `whoami`. An agent calls a tool by bare name, so the second server to mount
+would shadow the first — one provider's tool becomes unreachable and the agent
+silently calls the other one's.
 
 Kiro Crew renames the collision instead. The pattern is always
 `<provider>_<tool>`, and **every** claimant is renamed — none keeps the bare name, so
 there is no "first one wins" to reason about:
 
 ```text
-list_projects  →  linear_list_projects   and   vercel_list_projects
+list_projects  →  linear_list_projects, ticktick_list_projects, vercel_list_projects
 list_issues    →  github_list_issues, gitlab_list_issues, linear_list_issues
-search         →  atlassian_search, gitlab_search, neon_search, todoist_search
+search         →  atlassian_search, gitlab_search, neon_search, ticktick_search, todoist_search
+whoami         →  figma_whoami, railway_whoami, sentry_whoami
 ```
 
-Renames are declared in the catalogue for seven providers today — GitHub, Linear,
-Vercel, GitLab, Atlassian, Neon and Todoist — and only for the tools that actually collide.
-A server that is not the catalogue provider gets no renames, whatever it calls itself.
+Renames are declared in the catalogue for eleven providers today — GitHub, Linear,
+Vercel, GitLab, Atlassian, Neon, Todoist, TickTick, Sentry, Figma and Railway — and
+only for the tools that actually collide. A server that is not the catalogue provider
+gets no renames, whatever it calls itself.
 
 **If you are an agent:** when a tool you expected is absent, check for the
 `<provider>_<tool>` spelling before reporting the server broken, and call the tool

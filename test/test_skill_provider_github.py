@@ -374,7 +374,8 @@ class TestProviderShape:
         assert p.api_base == "https://api.github.com"
         # Always available: unauthenticated, so nothing can be unconfigured. The
         # discovery policy gate in _build_registry is what disables the provider,
-        # and test_a_refused_policy_keeps_the_provider_unregistered covers that.
+        # and test_skill_discovery_seam.py's
+        # test_a_refused_policy_keeps_the_github_provider_unregistered covers that.
         assert p.is_available()
 
 
@@ -419,6 +420,23 @@ class TestSearch:
             f"acme/widgets@{_COMMIT}:skills/releaser",
             f"acme/widgets@{_COMMIT}:skills/reviewer",
         ]
+
+    @pytest.mark.asyncio
+    async def test_skills_the_path_rules_refuse_do_not_use_up_the_limit(self):
+        # Directories sort before "skills/" when they start with "." -- the
+        # ".claude/skills" and ".kiro/skills" layouts -- and the path rules refuse
+        # every one of them. They are dropped either way; they must not also take
+        # the result slots, or a repository with enough of them lists nothing.
+        refused = [(f".claude/skills/s{i}/SKILL.md", 10) for i in range(3)]
+        fake = _Fake(
+            json_routes={"/git/trees/": _tree(*refused, ("skills/reviewer/SKILL.md", 10))},
+            text_routes={"/commits/": _COMMIT, "/SKILL.md": _SKILL_MD},
+        )
+        with fake.install():
+            results = await gh.GitHubRepoProvider().search("acme/widgets", limit=2)
+        assert [r.id for r in results] == [f"acme/widgets@{_COMMIT}:skills/reviewer"]
+        # A refused directory is not fetched either: its row was never going to exist.
+        assert not any("/.claude/" in u for u in fake.text_urls)
 
     @pytest.mark.asyncio
     async def test_row_carries_frontmatter_and_pinned_urls(self):

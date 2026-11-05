@@ -359,3 +359,15 @@ def _configured_acp_backend() -> str:
     except Exception:
         logger.debug("Could not read agent.acp_backend for the readiness gate", exc_info=True)
         return ""
+
+
+async def kiro_latched_ready(request: web.Request) -> bool:
+    """The request app's latched readiness: no probe, fails closed.
+
+    For a read that spawns nothing and only has to notice a KNOWN sign-out (a
+    refused refresh probe or a chat turn's auth failure narrows the latch), so
+    it can fall back to :func:`reject_if_kiro_unverified` instead of paying its
+    re-probe on every call.
+    """
+
+    return await kiro_session_ready(_service(request))

@@ -96,8 +96,10 @@ from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agent_spec_format import (  # noqa: F401
     NATIVE_SKILL_ALIAS_PREFIX,
     SKILL_VIEW_PROJECTION_CEILING,
+    count_authored_agent_files,
     is_agent_spec_name,
     shadowed_markdown_specs,
+    skill_view_ceiling,
 )
 from kiro_crew.agents_janitor import sweep_agents_dir  # noqa: F401
 from kiro_crew.atomic_write import atomic_write
@@ -481,6 +483,19 @@ def _selected_roles_run_kiro_cli(cfg: KiroCrewConfig) -> tuple[bool, bool]:
     return kiro_role, relay_kas_role
 
 
+def _selected_roles_run_claude(cfg: KiroCrewConfig) -> bool:
+    """Whether the main or the crewmate backend selects the Claude Code harness.
+
+    A positive test, like ``_selected_roles_run_kiro_cli``: only a role that names
+    ``ACP_BACKEND_CLAUDE`` makes a missing Claude component fatal. Imported here
+    rather than at module level so the name stays off this facade, where it would be
+    a second binding of the one ``doctor_checks.agents`` imports.
+    """
+    from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+
+    return ACP_BACKEND_CLAUDE in (cfg.agent.acp_backend, cfg.agent.member_acp_backend)
+
+
 _KIRO_VERSION_TIMEOUT_SECS = 5
 
 
@@ -633,6 +648,10 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                 print(f"  jail:        ❌ composition failed: {exc}")
                 issues.append(f"jail provider composition failed: {exc}")
 
+    # Loaded once, before the first row that reads it, so every row of one report
+    # describes the same selection.
+    cfg = KiroCrewConfig.load()
+
     # ── Dependencies ──
     print("Dependencies")
     # kiro-cli is the DEFAULT agent backend and the floor every deployment keeps.
@@ -662,7 +681,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         print("  kiro-cli:    ⏭  not found (the default agent backend)")
         print("               Install kiro-cli per its docs, then: kiro-cli login")
 
-    agents._doctor_claude_backend()
+    agents._doctor_claude_backend(issues, required=_selected_roles_run_claude(cfg))
     # After the install rows, and per harness rather than per provider: sign-in is a
     # different question from install with a different remedy, and every harness's
     # answer now comes from one declaration instead of a block written per backend.
@@ -678,8 +697,17 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     else:
         print("  git:         ⏭  not found (not needed: this install updates without git)")
 
-    _report_node(issues)
-    install._doctor_browser_bootstrap()
+    # On the bundle route the engine runs the Node its bundle ships, so the row
+    # names that one; an unreadable install record only drops the version.
+    bundle_node_version: str | None = None
+    if bundle_route:
+        try:
+            installed_engine = kas_bundle.installed_bundle()
+        except Exception:
+            installed_engine = None
+        if installed_engine is not None:
+            bundle_node_version = installed_engine.node_version or None
+    _report_node(issues, bundle_route=bundle_route, bundle_node_version=bundle_node_version)
 
     # venv detection — used by the runtime section below. Windows venvs put the
     # interpreter under .venv\Scripts\python.exe, not .venv/bin/python3, so a
@@ -694,8 +722,6 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Project ──
     proj = install._doctor_project(issues)
-
-    cfg = KiroCrewConfig.load()
 
     # ── Agent config ──
     print("\nAgent")
@@ -755,6 +781,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     install._doctor_skill_currency(issues)
     agents._doctor_deprecated_agent_specs(cfg, issues)
     install._doctor_path_launcher()
+    install._doctor_service_launch()
     access._doctor_trust_root()
     access._doctor_signing_key(issues)
     access._doctor_name_grant_platform_scope()

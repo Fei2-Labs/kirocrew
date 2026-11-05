@@ -704,6 +704,8 @@ class SessionManager:
     agent_autocompact_default = _turn_context.agent_autocompact_default
     set_autocompact_pct = _turn_context.set_autocompact_pct
     compact_if_needed = _turn_context.compact_if_needed
+    compact_if_idle = _turn_context.compact_if_idle
+    cancel_idle_compaction = _turn_context.cancel_idle_compaction
     set_compact_callback = _turn_context.set_compact_callback
     set_compacting_callback = _turn_context.set_compacting_callback
     is_compacting = _turn_context.is_compacting
@@ -816,6 +818,8 @@ class SessionManager:
     _has_attached_subagents = _sweeps._has_attached_subagents
     set_injection_probe = _sweeps.set_injection_probe
     _has_pending_injection = _sweeps._has_pending_injection
+    set_idle_compaction_probe = _sweeps.set_idle_compaction_probe
+    _idle_compaction_blocker = _sweeps._idle_compaction_blocker
     _expire_idle_hook = _sweeps._expire_idle_hook
     _bg_drain_reap_hook = _sweeps._bg_drain_reap_hook
     _released_sessions_hook = _sweeps._released_sessions_hook
@@ -873,6 +877,9 @@ class SessionManager:
         # Installed by the gateway once it owns this manager (set_injection_probe);
         # None means "no gateway, so no completion injection can be in flight".
         self._injection_probe: "Callable[[str], bool] | None" = None
+        # Installed by the dashboard (set_idle_compaction_probe); None means no
+        # chat can be shown idle, so no idle compaction runs.
+        self._idle_compaction_probe: "Callable[[str], str | None] | None" = None
         # Both cold-start widths are restart settings. Built on the gateway boot
         # path and the event loop, so "auto" is sized from the cached host
         # reading only (the floors until it exists); widen_cold_start_queues
@@ -1042,8 +1049,13 @@ class SessionManager:
         if not hasattr(SessionManager, "_agent_model_cache"):
             SessionManager._agent_model_cache = {}  # type: ignore[attr-defined]
         cache = SessionManager._agent_model_cache  # type: ignore[attr-defined]
+        from kiro_crew import agent_spec_pins
 
-        entry = cache.get(agent)
+        # Keyed with the pin folded in: a pin change picks another file, and the
+        # agents directory's mtime does not move for it.
+        pins = agent_spec_pins.spec_pins()
+        cache_key = agent_spec_pins.pinned_memo_key(agent, pins)
+        entry = cache.get(cache_key)
         if entry is not None:
             cached_model, cached_mtime, cached_ts = entry
             if cached_mtime == dir_mtime and (now - cached_ts) < _AGENT_MODEL_CACHE_TTL:
@@ -1056,20 +1068,25 @@ class SessionManager:
             # thread (the walk and the reads are filesystem work), and a match
             # still stops all later spec reads rather than building a full map
             # on every cache miss / TTL expiry.
-            for agent_file in iter_agent_spec_files(agents_dir, ordered=False):
-                data = _read_agent_spec(
+            # ``pick_spec_row`` keeps that first-match rule with no pin and reads
+            # every spec only when ``agent.spec_pins`` pins this agent.
+            rows = (
+                (
+                    _read_agent_spec(
+                        agent_file,
+                        operation="resolve_agent_model",
+                        source="unknown",
+                    ),
                     agent_file,
-                    operation="resolve_agent_model",
-                    source="unknown",
                 )
-                if data is None:
-                    continue
-                if data.get("name") == agent or agent_file.stem == agent:
-                    model = spec_model(data)
-                    break
+                for agent_file in iter_agent_spec_files(agents_dir, ordered=False)
+            )
+            picked = agent_spec_pins.pick_spec_row(rows, agent, pins)
+            if picked is not None:
+                model = spec_model(picked)
         except Exception:
             pass
-        cache[agent] = (model, dir_mtime, now)
+        cache[cache_key] = (model, dir_mtime, now)
         return model
 
     def commit_provider_switch_replay_sid(self, key: str) -> bool:

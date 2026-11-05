@@ -39,7 +39,14 @@ vi.mock('framer-motion', async () => {
       }
       return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
-  const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
+  // One component per tag: a fresh type on every read would remount the subtree.
+  const byTag = new Map<string, ReturnType<typeof make>>()
+  const motion = new Proxy({}, {
+    get: (_t, tag: string) => {
+      if (!byTag.has(tag)) byTag.set(tag, make(tag))
+      return byTag.get(tag)
+    },
+  })
   return {
     motion,
     useReducedMotion: () => false,
@@ -314,7 +321,8 @@ describe('chat sidebar — loop waiting-on-you subtitle', () => {
   it('a stalled loop keeps its danger reading — a dead turn cannot collect the answer', () => {
     const slots = [{ key: 'k', title: 'loop', running: false, messages: 5, has_options: true, interrupted: true }]
     const { getByText, queryByText } = renderSidebar(slots, { goalLoops: { k: { cycle_count: 7, max_cycles: 24 } } })
-    expect(getByText(/interrupted/)).toBeTruthy()
+    // The row's own reading, not the shelf's "N interrupted sessions" row.
+    expect(getByText('interrupted')).toBeTruthy()
     expect(queryByText(WAITING_LABEL)).toBeNull()
   })
 

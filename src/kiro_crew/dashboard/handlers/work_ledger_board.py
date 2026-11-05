@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Any
 
@@ -56,6 +56,7 @@ from kiro_crew.dashboard.handlers.work_ledger import (
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.platform.context import redact_via_context
+from kiro_crew.work_vocab import WORK_BLOCKED_REASONS
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,41 @@ def _project_item(
     return projected
 
 
+#: The most offered answers one item keeps, the cap goal-board draws.
+_ASK_OPTIONS_MAX = 6
+
+
+def _conductor_asks(slot: str, item_ids: set[str]) -> dict[str, list[str]]:
+    """The conductor's offered answers per item: goal-board's agentic ``asks`` field.
+
+    ``{item_id: {options: [...]}}`` as the conductor wrote it with ``dashboard_write``,
+    read from the slot's own ``agentic`` fold (the value its page is filled from), and
+    cut to this board's items and to non-empty strings. FILE I/O -- call off the loop.
+    TOTAL: a fold that cannot be read, or holds no ``asks``, answers ``{}``.
+    """
+    try:
+        from kiro_crew.crew_log import projection
+
+        value = projection.read_slot_projection(slot, "agentic").value
+        fields = value.get("fields") if isinstance(value, Mapping) else None
+        row = fields.get("asks") if isinstance(fields, Mapping) else None
+        asks = row.get("value") if isinstance(row, Mapping) else None
+    except Exception:
+        logger.debug("no conductor asks for this board", exc_info=True)
+        return {}
+    out: dict[str, list[str]] = {}
+    if not isinstance(asks, Mapping):
+        return out
+    for item_id, entry in asks.items():
+        options = entry.get("options") if isinstance(entry, Mapping) else None
+        if item_id not in item_ids or not isinstance(options, list):
+            continue
+        kept = [o for o in options if isinstance(o, str) and o.strip()][:_ASK_OPTIONS_MAX]
+        if kept:
+            out[item_id] = kept
+    return out
+
+
 def _redact_deep(value: Any) -> Any:
     """Run every STRING in the payload through the egress credential redactor.
 
@@ -219,13 +255,30 @@ def _redact_deep(value: Any) -> Any:
     patterns. It is deliberately fail-closed on a composition error, which surfaces
     as a 500 here -- a host that cannot compose its redaction must not answer with
     un-redacted content instead.
+
+    Each DISTINCT string is redacted once per call: a board repeats the same keys,
+    states and words thousands of times, and the redactor is a wide regex sweep.
+    The memo is local to this one call, so nothing is kept across replies or users.
     """
+    memo: dict[str, str] = {}
+
+    def redact(text: str) -> str:
+        hit = memo.get(text)
+        if hit is None:
+            hit = memo[text] = redact_via_context(text)
+        return hit
+
+    return _redact_walk(value, redact)
+
+
+def _redact_walk(value: Any, redact: Callable[[str], str]) -> Any:
+    """The recursive half of :func:`_redact_deep`, with its per-call *redact*."""
     if isinstance(value, str):
-        return redact_via_context(value)
+        return redact(value)
     if isinstance(value, dict):
         redacted: dict[Any, Any] = {}
         for key, item in value.items():
-            safe_key = redact_via_context(key) if isinstance(key, str) else key
+            safe_key = redact(key) if isinstance(key, str) else key
             if safe_key in redacted:
                 # Two distinct keys can redact to the same placeholder. Keep both
                 # rows rather than let the later one overwrite the earlier.
@@ -233,10 +286,10 @@ def _redact_deep(value: Any) -> Any:
                 while f"{safe_key} ({suffix})" in redacted:
                     suffix += 1
                 safe_key = f"{safe_key} ({suffix})"
-            redacted[safe_key] = _redact_deep(item)
+            redacted[safe_key] = _redact_walk(item, redact)
         return redacted
     if isinstance(value, list):
-        return [_redact_deep(item) for item in value]
+        return [_redact_walk(item, redact) for item in value]
     return value
 
 
@@ -269,10 +322,9 @@ def answered_since_report(item: work_ledger.WorkItem, events: list[dict[str, Any
     counts, so the conductor row and this board agree that the worker has its answer.
 
     Stamps are seconds-precision, so when the tail holds the report itself the tail's
-    ORDER decides: only an answer recorded after the newest report answers it, and a
-    steer in the same second just before a new question does not."""
-    if work_item_answered(item):
-        return True
+    ORDER decides, ahead of the item's stamps: only an answer recorded after the newest
+    report answers it, and a decision or steer in the same second just before a new
+    question does not. Only a tail without the report falls back to the stamps."""
     last_report = max(
         (n for n, e in enumerate(events) if isinstance(e, dict) and e.get("kind") == "report"),
         default=None,
@@ -282,6 +334,8 @@ def answered_since_report(item: work_ledger.WorkItem, events: list[dict[str, Any
             isinstance(e, dict) and e.get("kind") in _ANSWER_KINDS
             for e in events[last_report + 1 :]
         )
+    if work_item_answered(item):
+        return True
     # Through ``work_ledger.parse_stamp``, which answers offset-aware datetimes only:
     # a peer's report stamp may carry no offset, and an aware/naive compare raises.
     reported = work_ledger.parse_stamp(item.last_report_at or "")
@@ -293,6 +347,18 @@ def answered_since_report(item: work_ledger.WorkItem, events: list[dict[str, Any
         if stamp is not None and (reported is None or stamp >= reported):
             return True
     return False
+
+
+def awaits_person(item: work_ledger.WorkItem, events: list[dict[str, Any]]) -> bool:
+    """Whether *item* waits on the PERSON: its last report is ``blocked`` / ``question``
+    naming one (:data:`~kiro_crew.work_vocab.WORK_BLOCKED_REASONS`), and nobody has
+    answered it since (:func:`answered_since_report`). The one test behind the
+    sidebar's crew count and the Ultra Mode Board's Needs your input, so they agree."""
+    return (
+        item.status in work_ledger.WAITING_STATUSES
+        and item.reason in WORK_BLOCKED_REASONS
+        and not answered_since_report(item, events)
+    )
 
 
 def closed_items(slot_key: str) -> list[dict[str, Any]]:
@@ -340,8 +406,13 @@ def _alive_of(state: DashboardState, worker_key: str) -> str:
     return "closed"
 
 
-def with_worker_facts(value: Any, state: Any) -> Any:
-    """*value* with each LOCAL work item stamped ``worker`` and ``stale``.
+def with_worker_facts(value: Any, state: Any, conductor: str = "") -> Any:
+    """*value* with each LOCAL work item stamped ``worker``, ``stale``, ``awaits_person``
+    and, when *conductor* names the board's slot, ``orphaned``.
+
+    ``awaits_person`` is :func:`awaits_person` over the item's own event tail, the one
+    test the Board and the sidebar count read, so goal-board's "needs you" agrees with
+    them and clears when a person's answer lands on the item.
 
     The page may not see ``worker_session_key`` (``member_dashboard._page_safe`` drops
     it), yet whether that worker is mid-turn is what tells "working" from "waiting".
@@ -351,12 +422,20 @@ def with_worker_facts(value: Any, state: Any) -> Any:
     behind ``stale`` is :func:`work_ledger.item_liveness`, both as the Crew page reads
     them, so the two pages cannot disagree.
 
+    ``orphaned`` is :func:`work_ledger.is_orphaned` over whether *conductor*'s slot is
+    still open, the Crew page's own read: no main chat is left to read the item's
+    reports. With no *conductor* it is not stamped and the page draws the item as it
+    did before.
+
     Only a list whose entries are work items (``item_id`` beside
     ``worker_session_key``) is touched. A remote item has no slot here, so it is left
-    as it is and the page draws it as it always did. Memory reads only.
+    as it is and the page draws it as it always did. It gets no ``orphaned`` either:
+    without its ``worker`` the page could not tell a running remote worker from a
+    stuck one, and stuck would win. Memory reads only.
     """
     if state is None or not isinstance(value, list):
         return value
+    conductor_alive = _slot_open(state, conductor) if conductor else None
     out: list[Any] = []
     for raw in value:
         if not (isinstance(raw, Mapping) and "item_id" in raw and "worker_session_key" in raw):
@@ -366,6 +445,9 @@ def with_worker_facts(value: Any, state: Any) -> Any:
         if item.worker_instance_id:
             out.append(raw)
             continue
+        facts: dict[str, Any] = {}
+        if conductor_alive is not None:
+            facts["orphaned"] = work_ledger.is_orphaned(item, conductor_slot_exists=conductor_alive)
         running, closed, looping = work_ledger.item_liveness(
             "",
             item,
@@ -373,11 +455,15 @@ def with_worker_facts(value: Any, state: Any) -> Any:
             closed=lambda k: _slot_closed(state, k),
             looping=_slot_looping,
         )
-        stale = work_ledger.is_stale(
+        facts["stale"] = work_ledger.is_stale(
             item, worker_running=running, worker_closed=closed, worker_looping=looping
         )
-        worker = _alive_of(state, item.worker_session_key or "")
-        out.append({**raw, "worker": worker, "stale": stale})
+        facts["worker"] = _alive_of(state, item.worker_session_key or "")
+        events = raw.get("events")
+        facts["awaits_person"] = not item.is_terminal and awaits_person(
+            item, [e for e in events if isinstance(e, dict)] if isinstance(events, list) else []
+        )
+        out.append({**raw, **facts})
     return out
 
 
@@ -482,7 +568,10 @@ async def api_work_ledger_board(request: web.Request) -> web.Response:
         )
         row["acceptance_concrete"] = work_ledger.is_acceptance_concrete(item.acceptance)
         row["report_undelivered"] = undelivered.get(item.item_id)
-        row["events"] = _mask_events([event.to_dict() for event in event_tails[item.item_id]])
+        events = [event.to_dict() for event in event_tails[item.item_id]]
+        # Waits on the PERSON: the one test the sidebar's crew_work count uses too.
+        row["awaits_person"] = not item.is_terminal and awaits_person(item, events)
+        row["events"] = _mask_events(events)
         rows.append(
             _project_item(
                 row,
@@ -496,10 +585,17 @@ async def api_work_ledger_board(request: web.Request) -> web.Response:
             )
         )
 
+    # The conductor's offered answers, which the Ultra Mode Board's Needs your input
+    # draws as Reply buttons the way goal-board does.
+    asks = await asyncio.to_thread(
+        _conductor_asks, requested, {item.item_id for item in items if not item.is_terminal}
+    )
+
     payload = {
         "conductor": record.to_dict(),
         "conductor_alive": "idle" if conductor_alive else "closed",
         "items": rows,
+        "asks": asks,
         # The ONE capability the page actually reads, because it changes what the
         # page renders: no take-over button is rendered while this is false.
         #

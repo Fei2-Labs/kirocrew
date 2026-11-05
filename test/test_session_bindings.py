@@ -42,6 +42,8 @@ from kiro_crew.session_parts.state_views import StateProperty
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_session_bindings")
 
+SHARED_BINDINGS_CHECKS = ("the_field_scan_counts_every_read_and_write_shape",)
+
 #: Member -> (kind, coroutine, signature digest, owning module). Frozen at the split: the
 #: kind, coroutine flag and signature are BASE's; the owner is where the member lives now
 #: (``session`` is the facade, any other name a ``kiro_crew.session_parts`` module).
@@ -103,6 +105,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_has_attached_subagents": ("function", False, "9c6eda911dd8", "sweeps"),
     "_has_pending_injection": ("function", False, "1eda252b53bd", "sweeps"),
     "_identity_sweep_lock": ("property", False, "fd738ff11600", "state_views"),
+    "_idle_compaction_blocker": ("function", False, "4b576121a346", "sweeps"),
     "_idle_sweep_enabled": ("property", False, "a6632a57e602", "state_views"),
     "_idle_timeout": ("property", False, "fa6cfecd5574", "state_views"),
     "_in_flight_pids": ("function", False, "6e67e49bb5fd", "runtimes"),
@@ -185,6 +188,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "batched_save": ("function", False, "08ba78a8a6e0", "links"),
     "begin_turn": ("function", False, "958babeb61c8", "claims"),
     "cancel_current": ("function", True, "9859e2116ea5", "teardown"),
+    "cancel_idle_compaction": ("function", False, "1eda252b53bd", "turn_context"),
     "cancel_owned_turn": ("function", True, "86bfc9daa5fd", "teardown"),
     "cancel_queued": ("function", False, "50fe52427d8c", "claims"),
     "capability_runtime_view": ("function", False, "de139dca2f5d", "claims"),
@@ -199,6 +203,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "close_all": ("function", True, "9679ccba1fac", "teardown"),
     "close_replay_gap": ("function", False, "958babeb61c8", "teardown"),
     "commit_provider_switch_replay_sid": ("function", False, "1eda252b53bd", "session"),
+    "compact_if_idle": ("function", True, "b7ea3f0979bb", "turn_context"),
     "compact_if_needed": ("function", True, "f1d40e624ae4", "turn_context"),
     "compact_wait_budget_secs": ("function", False, "59162e39f6f1", "turn_context"),
     "compaction_due_after_turn": ("function", False, "9e38ffe0e60c", "turn_context"),
@@ -213,7 +218,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "destroy": ("function", True, "958babeb61c8", "teardown"),
     "destroy_if": ("function", True, "b2e16ab8f2dd", "teardown"),
     "detach_queue": ("function", False, "197b82a5019f", "claims"),
-    "discard_conversation": ("function", True, "b225e6bcbd95", "teardown"),
+    "discard_conversation": ("function", True, "185d63c540e6", "teardown"),
     "drain_active_turns": ("function", True, "5944c6af44b2", "teardown"),
     "drain_all_providers": ("function", True, "f5423acdeebc", "teardown"),
     "drain_warm_pool": ("function", True, "f5423acdeebc", "runtimes"),
@@ -313,6 +318,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "set_compact_callback": ("function", False, "6f1bae527bd9", "turn_context"),
     "set_compacting_callback": ("function", False, "2aed1f018edf", "turn_context"),
     "set_continuable_fallback": ("function", False, "9129b57ccbd2", "claims"),
+    "set_idle_compaction_probe": ("function", False, "29fcd4f6cb4d", "sweeps"),
     "set_injection_probe": ("function", False, "f6fd6f250ecd", "sweeps"),
     "set_lifecycle_turn_active": ("function", False, "3656499fe52f", "claims"),
     "set_mirror_link": ("function", False, "e65f668f550c", "links"),
@@ -805,16 +811,6 @@ def _fields(fns: list[ast.FunctionDef | ast.AsyncFunctionDef]) -> tuple[set[str]
             ):
                 (written if func.id == "setattr" else read).add(node.args[1].value)
     return written - set(_MEMBERS), read - written - set(_MEMBERS)
-
-
-def test_the_field_scan_counts_every_read_and_write_shape() -> None:
-    tree = ast.parse(
-        "def f(self):\n"
-        "    self.a = 1\n    del self.b\n    self.c[k] = v\n    del self.d[k]\n"
-        "    self.e.add(1)\n    self.f.setdefault(k, v)\n    setattr(self, 'g', 1)\n"
-        "    return self.h, getattr(self, 'i', None), hasattr(self, 'j'), self.e\n"
-    )
-    assert _fields([tree.body[0]]) == ({"a", "b", "c", "d", "e", "f", "g"}, {"h", "i", "j"})
 
 
 def test_the_field_scan_reads_self_dict_keys_as_fields() -> None:

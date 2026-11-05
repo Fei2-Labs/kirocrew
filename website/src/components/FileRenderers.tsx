@@ -1,6 +1,6 @@
 import { memo, useState, useMemo, useCallback, useEffect, useId, useRef, type ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronLeft, ChevronRight, Download, ExternalLink, FileText, Film, Moon, Music, Sparkles, Sun } from 'lucide-react'
+import { ChevronDown, ChevronLeft, ChevronRight, Download, ExternalLink, FileText, Film, Moon, Music, Sparkles, Sun } from 'lucide-react'
 import DOMPurify from 'dompurify'
 
 import { i18nT } from '../i18n/t'
@@ -25,6 +25,7 @@ import {
   MD_TABLE_HEAD_CELL_CLS,
   MD_UL_CLS,
 } from './markdown/typography'
+import { RadioChipGroup, radioChip } from './RadioChipGroup'
 /* ── extension helpers ── */
 const IMG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.avif', '.svg', '.ico'])
 const CSV_EXTS = new Set(['.csv', '.tsv'])
@@ -221,7 +222,7 @@ export const CsvViewer = memo(function CsvViewer({ content, filePath }: { conten
           ))}
         </tbody>
       </table>
-      {body.length > 500 && <div className="text-center text-muted text-[11px] py-2">{i18nT('components.fileRenderers.showing_500_of')} {body.length} {i18nT('components.fileRenderers.rows')}</div>}
+      {body.length > 500 && <div className="text-center text-muted text-[11px] py-2">{i18nT('components.fileRenderers.showing_first_rows', { shown: 500, count: body.length })}</div>}
     </div>
   )
 })
@@ -307,8 +308,10 @@ function JsonNode({ value, depth }: { value: unknown; depth: number }) {
 
   return (
     <span>
-      <button className="text-muted hover:text-text cursor-pointer bg-transparent border-none font-mono text-sm" onClick={() => setOpen(!open)}>
-        {open ? '▼' : '▶'} {bracket[0]}{!open && <span className="text-muted"> {entries.length} {i18nT('components.fileRenderers.items')} {bracket[1]}</span>}
+      <button className="text-muted hover:text-text cursor-pointer bg-transparent border-none font-mono text-sm" aria-expanded={open} onClick={() => setOpen(!open)}>
+        {open
+          ? <ChevronDown size={12} className="lucide-inline" aria-hidden="true" />
+          : <ChevronRight size={12} className="lucide-inline" aria-hidden="true" />} {bracket[0]}{!open && <span className="text-muted"> {i18nT('components.fileRenderers.items_count', { count: entries.length })} {bracket[1]}</span>}
       </button>
       {open && (
         <div style={{ paddingLeft: 16 }}>
@@ -319,7 +322,7 @@ function JsonNode({ value, depth }: { value: unknown; depth: number }) {
               <JsonNode value={v} depth={depth + 1} />
             </div>
           ))}
-          {entries.length > 200 && <div className="text-muted">… {entries.length - 200} {i18nT('components.fileRenderers.more')}</div>}
+          {entries.length > 200 && <div className="text-muted">… {i18nT('components.fileRenderers.more_count', { count: entries.length - 200 })}</div>}
         </div>
       )}
       {open && <span className="text-muted">{bracket[1]}</span>}
@@ -346,7 +349,7 @@ export const JsonlViewer = memo(function JsonlViewer({ content }: { content: str
 
   return (
     <div ref={containerRef} onScroll={onScroll} className="h-full overflow-auto p-3 bg-bg-elevated border border-border rounded-md space-y-2">
-      <div className="text-muted text-[11px]">{lines.length} {i18nT('components.fileRenderers.lines')}</div>
+      <div className="text-muted text-[11px]">{i18nT('components.fileRenderers.lines_count', { count: lines.length })}</div>
       {lines.slice(0, visible).map((line, i) => (
         <div key={i} className="border-b border-border/50 pb-2">
           <JsonViewer content={line} />
@@ -1319,18 +1322,19 @@ export const SheetViewer = memo(function SheetViewer({ filePath }: { filePath: s
   return (
     <div className="h-full flex flex-col border border-border rounded-md bg-bg-elevated overflow-hidden">
       {payload.sheets.length > 1 && (
-        <div className="flex gap-1 px-2 pt-2 pb-0 bg-chrome border-b border-border overflow-x-auto shrink-0">
+        <RadioChipGroup className="flex gap-1 px-2 pt-2 pb-0 bg-chrome border-b border-border overflow-x-auto shrink-0" ariaLabel={i18nT('components.fileRenderers.sheet_tabs_label')}>
           {payload.sheets.map((s, i) => (
             <button
               key={i}
-              aria-pressed={i === active}
+              type="button"
+              {...radioChip(i === active)}
               onClick={() => setActive(i)}
               className={`px-3 py-1.5 rounded-t text-[12px] whitespace-nowrap cursor-pointer border border-b-0 ${
                 i === active ? 'bg-bg-elevated text-text border-border font-semibold' : 'bg-transparent text-muted border-transparent hover:text-text'
               }`}
             >{s.name}</button>
           ))}
-        </div>
+        </RadioChipGroup>
       )}
       {sheet && hasFormulas && (
         <div className="text-center text-muted text-[12px] py-1.5 border-b border-border bg-chrome shrink-0">
