@@ -587,33 +587,6 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         host_logout_retires_children=False,
         entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),
-    # ── This build's registry adapters ──
-    # FORK-ONLY (restored at the 2026-09-21 sync, where a whole-file pick took
-    # upstream's table and dropped the row). copilot is in this fork's
-    # BASELINE_SELECTABLE_BACKENDS but not upstream's, so only our table owes it
-    # a declaration.
-    #
-    # It signs in through its OWN tooling and Kiro Crew never reads the result.
-    # No credential leaf is declared: none has been verified on disk here, and a
-    # guessed path would fence the wrong file while leaving the real one open
-    # (.fork-sync.yml, divergences/fork-adapters-without-corpus). The remedy states
-    # the action only and asserts no state.
-    AgentAuthDeclaration(
-        backend=ACP_BACKEND_COPILOT,
-        credential_leaves=(),
-        home_override_env_vars=(),
-        adapter_own_leaves=(),
-        sign_in_remedy=(
-            "GitHub Copilot signs in on its own — run copilot in a terminal and "
-            "complete its login (or gh auth login). Nothing is checked here."
-        ),
-        signed_out_message=(
-            "Copilot is not signed in. Run copilot in a terminal and complete its "
-            "login, then start a new chat."
-        ),
-        host_logout_retires_children=False,
-        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
-    ),
     AgentAuthDeclaration(
         backend=ACP_BACKEND_GOOSE,
         # Verified on disk rather than read off documentation: the harness's own

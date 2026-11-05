@@ -633,16 +633,6 @@ class AcpProvider(LLMProvider):
         return self._client.backend == ACP_BACKEND_KAS
 
     @property
-    def is_copilot_backend(self) -> bool:
-        """True when this ACP provider talks to GitHub Copilot CLI's own ACP server.
-
-        Positive identity per harness parity H5. Copilot is a fork-only BYOK
-        seam predating the registry adapters; it needs a name of its own for
-        the same reason every other known backend does.
-        """
-        return self._client.backend == ACP_BACKEND_COPILOT
-
-    @property
     def defer_replay_sid_promotion(self) -> bool:
         """Whether this fresh session waits for replay settlement before SID publish."""
         return self._defer_replay_sid_promotion
