@@ -1071,6 +1071,9 @@ async def _dispatch_events(
             await _prompt_events.aclose()
             _raise_acp_error(msg.error, self._advertised_model_ids(), backend=self.backend)
         if action == "permission":
+            if not self._permission_frame_answerable(msg):
+                await self._reject_unanswerable_permission(msg)
+                continue
             permission_event = self._build_permission_event(msg)
             if permission_event is None:
                 if msg.id is not None:

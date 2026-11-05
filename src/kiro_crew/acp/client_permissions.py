@@ -520,6 +520,9 @@ async def _handle_permission(self: AcpClient, msg: JsonRpcMessage) -> None:
     unrecorded, while its reject id is kept so a floor refusal answers with the
     advertised reject option.
     """
+    if not self._permission_frame_answerable(msg):
+        await self._reject_unanswerable_permission(msg)
+        return
     event = self._build_permission_event(msg)
     if event is None:
         if msg.id is not None:

@@ -219,6 +219,9 @@ class AcpSessionHandle:
     _audit_handle_reject = _sh_permissions._audit_handle_reject
     apply_session_permission_routing = _sh_permissions.apply_session_permission_routing
     _build_permission_event = _sh_permissions._build_permission_event
+    _registered_session_ids = _sh_permissions._registered_session_ids
+    _permission_frame_answerable = _sh_permissions._permission_frame_answerable
+    _reject_unanswerable_permission = _sh_permissions._reject_unanswerable_permission
     _handle_elicitation_request = _sh_elicitation._handle_elicitation_request
     _audit_elicitation_decision = _sh_elicitation._audit_elicitation_decision
     answer_elicitation = _sh_elicitation.answer_elicitation
