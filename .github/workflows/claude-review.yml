@@ -77,12 +77,11 @@ jobs:
     # reports the intended name instead. `test_ai_review_workflows_fork_stage2.py` asserts
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
-    name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'Opus 5.5 Review' || 'Opus 5.5 Review (same-repo lane, not applicable to forks)' }}"
+    name: "${{ github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository && 'Opus 5.5 Review' || 'Opus 5.5 Review (same-repo lane, not applicable to forks)' }}"
     # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
     # "Larger runners for the review lanes and CodeQL" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && fromJSON('{"group":"kirocrew-runners"}') || 'ubuntu-latest' }}
     # Runaway/hang backstop only, NOT a per-review budget: a healthy review
     # self-terminates at --max-turns 180 per stage (two stages; see below)
     # long before this, so this
@@ -97,7 +96,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         with:
           # The merge ref plus its two parents (the base tip and the PR head),
           # not the whole history: the next step fetches the one other commit
@@ -112,7 +111,7 @@ jobs:
       # trees and needs no history, and it is the same diff the three-dot
       # range gave on a full clone.
       - name: Fetch the merge-base commit (shallow history)
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         id: merge_base
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -134,7 +133,7 @@ jobs:
       # large enough that a single review pass may not cover it reliably. Only
       # the vendored tree is excluded. This ONLY warns — it never fails the check.
       - name: Flag oversized reviewable diff (non-blocking)
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           MERGE_BASE: ${{ steps.merge_base.outputs.pr }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -153,7 +152,7 @@ jobs:
       # PR HEAD, so a PR can neither weaken the rules that govern it nor rewrite
       # the prompt that reviews it.
       - name: Extract base-ref AUTOSDE rules and review prompts
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -179,7 +178,7 @@ jobs:
           done
 
       - name: Resolve human override
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         id: human_override
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -236,6 +235,7 @@ jobs:
       # covered by Semgrep, CodeQL, the nightly/release Dependency Audit and the build/tests.
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -256,7 +256,7 @@ jobs:
       # Written to runner.temp, NOT the workspace, so nothing the PR tracks can
       # shadow the path, and the tree is never modified by the fetch.
       - name: Prefetch the reviewable diff (data only)
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           MERGE_BASE: ${{ steps.merge_base.outputs.pr }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -289,6 +289,7 @@ jobs:
       - name: Opus 5.5 discovery
         id: discover
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -326,6 +327,7 @@ jobs:
       - name: Stage the base-owned redactor
         id: redactor
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -351,6 +353,7 @@ jobs:
       # argument, and a file has no arg-length ceiling.
       - name: Capture discovery candidates
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           steps.discover.outcome == 'success'
@@ -490,6 +493,7 @@ jobs:
       # job timeout as the only wall. Keep in sync with codex-review.yml.
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -507,6 +511,7 @@ jobs:
       - name: Opus 5.5 validation
         id: review
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -538,6 +543,7 @@ jobs:
 
       - name: Capture and redact review output
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -598,6 +604,7 @@ jobs:
       - name: Detect turn-budget exhaustion
         id: budget
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -628,6 +635,7 @@ jobs:
       - name: Post Opus 5.5 review summary
         id: post
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -1268,6 +1276,7 @@ jobs:
       # this mechanism and must be loud rather than silently produce no record.
       - name: Retain this run's unpublished verdict
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -1298,6 +1307,7 @@ jobs:
           retention-days: 90
       - name: Gate on Opus 5.5 review
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()

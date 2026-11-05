@@ -141,8 +141,7 @@ jobs:
     # `kirocrew-runners-windows` larger-runner group, targeted by GROUP not
     # label; see "The Windows larger-runner group" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners-windows
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && fromJSON('{"group":"kirocrew-runners-windows"}') || 'windows-latest' }}
     # Consumes build-wheel's artifact rather than building its own wheel: that
     # job already stages the frontend dist into the package before building, so
     # its wheel is the one users install. Building a second wheel here would add

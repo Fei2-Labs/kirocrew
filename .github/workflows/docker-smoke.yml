@@ -62,8 +62,7 @@ jobs:
     # `ubuntu-latest`, with roughly ten times the disk, but drawn from the
     # separate larger-runner concurrency ceiling instead of the shared standard
     # pool this repository saturates.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && fromJSON('{"group":"kirocrew-runners"}') || 'ubuntu-latest' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -254,8 +253,7 @@ jobs:
     # same reasoning as the `smoke` job above. The arm64 cross-build is the
     # disk-hungriest job in this file, so it is also the one that benefits most
     # from the larger image.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && fromJSON('{"group":"kirocrew-runners"}') || 'ubuntu-24.04-arm' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

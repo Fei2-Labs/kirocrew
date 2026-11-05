@@ -67,12 +67,11 @@ jobs:
     # reports the intended name instead. `test_ai_review_workflows_fork_stage2.py` asserts
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
-    name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'GPT 6.1 Review' || 'GPT 6.1 Review (same-repo lane, not applicable to forks)' }}"
+    name: "${{ github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository && 'GPT 6.1 Review' || 'GPT 6.1 Review (same-repo lane, not applicable to forks)' }}"
     # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
     # "Larger runners for the review lanes and CodeQL" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && fromJSON('{"group":"kirocrew-runners"}') || 'ubuntu-latest' }}
     # Runaway/hang backstop only, NOT a per-review budget: each pass carries its
     # own PASS_WALL and self-terminates first. This wall MUST therefore stay
     # above the sum of the pass walls plus setup -- otherwise it, not the named
@@ -89,7 +88,7 @@ jobs:
       # GITHUB_TOKEN into .git/config, where the read-only agentic reviewer
       # could read it from untrusted PR content and leak a PR-write token.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         with:
           # The merge ref plus its two parents (the base tip and the PR head),
           # not the whole history: the next step fetches the one other commit
@@ -105,7 +104,7 @@ jobs:
       # range gave on a full clone. Runs before every `git show "$BASE_SHA:..."`
       # below, which would otherwise read a missing base as "no rules".
       - name: Fetch the merge-base commit (shallow history)
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         id: merge_base
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -125,7 +124,7 @@ jobs:
       # Load AUTOSDE rules from the BASE commit, not the PR HEAD, so a PR
       # cannot weaken the rules that govern it.
       - name: Extract base-ref AUTOSDE rules
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
@@ -137,7 +136,7 @@ jobs:
       # ai-review-human-override.yml. Raw PR comments are untrusted and can
       # never directly turn this gate green.
       - name: Resolve human override
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         id: human_override
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -212,6 +211,7 @@ jobs:
       # install never runs with the Bedrock credentials in its environment.
       - name: Install review CLI
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -263,6 +263,7 @@ jobs:
       # Clearing the gate lets the read-only sandbox initialize.
       - name: Enable unprivileged user namespaces for the review sandbox
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -271,6 +272,7 @@ jobs:
 
       - name: Configure the review CLI for Amazon Bedrock
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -295,6 +297,7 @@ jobs:
 
       - name: Write review prompt
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -623,6 +626,7 @@ jobs:
       # pull_request-scoped) so a leaked token can't reach the Opus 5.5 reviewer's model access.
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -633,6 +637,7 @@ jobs:
 
       - name: GPT 6.1 review (discovery pass)
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -725,6 +730,7 @@ jobs:
       # not session expiry, and not the job wall above it -- is what bounds it.
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -736,6 +742,7 @@ jobs:
       - name: GPT 6.1 review (falsification pass)
         id: gpt_pass2
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
@@ -901,6 +908,7 @@ jobs:
       - name: Stage the base-owned redactor
         id: redactor
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -929,6 +937,7 @@ jobs:
       # short-lived and scoped to Bedrock only.
       - name: Redact credential shapes from review output
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always() && github.actor != 'dependabot[bot]'
@@ -978,6 +987,7 @@ jobs:
       - name: Extract blocking findings for adjudication
         id: adj_input
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           steps.gpt_pass2.outputs.blocking == 'true'
@@ -1212,6 +1222,7 @@ jobs:
       # than by job boundary.
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           (steps.adj_input.outputs.adjudicable != '' && steps.adj_input.outputs.adjudicable != '0')
@@ -1235,6 +1246,7 @@ jobs:
       - name: Assert the adjudicator's Claude Code version floor
         id: adj_cli
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           (steps.adj_input.outputs.adjudicable != '' && steps.adj_input.outputs.adjudicable != '0')
@@ -1275,6 +1287,7 @@ jobs:
       - name: Opus 5.5 adjudication (blocking findings only)
         id: adjudicate
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           (steps.adj_input.outputs.adjudicable != '' && steps.adj_input.outputs.adjudicable != '0')
@@ -1334,6 +1347,7 @@ jobs:
       - name: Adjudicate the blocking verdict (script arithmetic, fail closed)
         id: adj
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always() && steps.gpt_pass2.outputs.blocking == 'true'
@@ -1495,6 +1509,7 @@ jobs:
       - name: Post/update review comment
         id: post
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always() && github.actor != 'dependabot[bot]'
@@ -2365,6 +2380,7 @@ jobs:
       # this mechanism and must be loud rather than silently produce no record.
       - name: Retain this run's unpublished verdict
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -2394,7 +2410,7 @@ jobs:
           # added to remove -- and leaves the republisher nothing to read.
           retention-days: 90
       - name: Gate on findings
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         env:
           HEAD: ${{ github.event.pull_request.head.sha }}
           ACTOR: ${{ github.actor }}

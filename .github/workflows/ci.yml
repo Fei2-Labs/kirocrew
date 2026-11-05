@@ -1768,8 +1768,7 @@ jobs:
     # `kirocrew-runners-windows` larger-runner group, targeted by GROUP not
     # label; see "The Windows larger-runner group" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners-windows
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && fromJSON('{"group":"kirocrew-runners-windows"}') || 'windows-latest' }}
     # A cold boot pays for the venv build, interpreter start, config seeding and
     # the health wait. The test's own bound is 180s; this is the job's. The
     # label opt-in measured 76s (boot canary) + 205s (55 scenarios) plus the SPA
