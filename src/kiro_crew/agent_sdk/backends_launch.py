@@ -318,8 +318,6 @@ ACP_BACKEND_PROCESS_NAMES: Mapping[str, str] = {
     ACP_BACKEND_CLAUDE: "claude-agent-acp",
     ACP_BACKEND_CODEX: "codex-acp",
     ACP_BACKEND_PI: "pi-acp",
-    # Fork-only: the copilot backend this fork selects has no upstream row.
-    ACP_BACKEND_COPILOT: "copilot",
     **{backend: record.binary for backend, record in sorted(ACP_BACKEND_LAUNCH.items())},
 }
 

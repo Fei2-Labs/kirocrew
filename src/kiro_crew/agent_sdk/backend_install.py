@@ -106,8 +106,7 @@ COMPONENT_CLAUDE_CODE_CLI = "claude"
 COMPONENT_CODEX_ACP_ADAPTER = ACP_BACKEND_PROCESS_NAMES[ACP_BACKEND_CODEX]
 
 #: GitHub Copilot CLI serves ACP from its own binary (``copilot --acp``); one
-#: component, no adapter beside it. Fork-only, see ``ACP_BACKEND_COPILOT`` in
-#: ``agent_sdk/backends.py``.
+#: component, no adapter beside it.
 COMPONENT_COPILOT_CLI = ACP_BACKEND_PROCESS_NAMES[ACP_BACKEND_COPILOT]
 
 #: The component of a harness that serves ACP from its own binary is that binary, so
@@ -406,24 +405,6 @@ def _probe_codex() -> BackendInstallState:
     )
 
 
-def _probe_copilot() -> BackendInstallState:
-    """The Copilot backend needs one component, and names it when it is absent.
-
-    Fork-only harness (see ``ACP_BACKEND_COPILOT``). Without this probe the switch
-    reported UNKNOWN for a binary the spawn resolves on every session, so the panel
-    told an operator with a working install that it "could not check".
-
-    No ``install_command``: the descriptor carries ``""`` on purpose -- the GitHub
-    Copilot CLI installer/updater owns distribution and this module prints only
-    commands the repo establishes. No ``restart_required``: the spawn keeps no
-    process-lifetime cache for this binary, so there is no cached negative to read.
-    """
-    policy_id = _policy_id(ACP_BACKEND_COPILOT)
-    if acp_driver.copilot_resolves():
-        return BackendInstallState(ACP_BACKEND_COPILOT, policy_id, INSTALLED)
-    return BackendInstallState(ACP_BACKEND_COPILOT, policy_id, MISSING, (COMPONENT_COPILOT_CLI,))
-
-
 def _probe_pi() -> BackendInstallState:
     """The pi backend needs BOTH components, and names the absent one.
 
@@ -504,8 +485,6 @@ _PROBES: Dict[str, Callable[[], BackendInstallState]] = {
     ACP_BACKEND_CLAUDE: _probe_claude,
     ACP_BACKEND_CODEX: _probe_codex,
     ACP_BACKEND_PI: _probe_pi,
-    # Fork-only, see ACP_BACKEND_COPILOT.
-    ACP_BACKEND_COPILOT: _probe_copilot,
     # Every harness that serves ACP from its own binary is probed by the one function
     # above, bound to its id. Generated from the membership rather than listed, so
     # onboarding a harness of that shape adds no row here at all -- and a harness with

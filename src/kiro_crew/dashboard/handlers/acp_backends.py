@@ -125,8 +125,8 @@ def _probe_installed(
 
             return "installed" if pi.resolve_argv_cached() else "missing"
         if backend == ACP_BACKEND_COPILOT:
-            # Fork-only harness, resolved by the SAME function the spawn calls; it has
-            # no cached variant because the spawn resolves it per session.
+            # Use the same resolver as spawn; it has no cached variant because the
+            # spawn resolves it per session.
             from kiro_crew.acp.client import _resolve_copilot_bin
 
             return "installed" if _resolve_copilot_bin() else "missing"

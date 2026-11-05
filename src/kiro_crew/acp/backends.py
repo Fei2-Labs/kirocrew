@@ -356,8 +356,8 @@ _CODEX = BackendDescriptor(
 )
 
 _COPILOT = BackendDescriptor(
-    # Fork-only backend: GitHub Copilot CLI's own ACP server mode
-    # (`copilot --acp`), verified against a live process — it answers
+    # GitHub Copilot CLI's own ACP server mode (`copilot --acp`), verified
+    # against a live process — it answers
     # `initialize` with protocolVersion 1 and a normal ACP payload
     # (agentInfo.name == "Copilot"). One process per session on the AcpClient
     # path, like the other spec adapters.

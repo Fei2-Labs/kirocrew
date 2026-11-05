@@ -309,11 +309,8 @@ PROJECTIONS: dict[str, McpProjection] = {
         # (providers/mirrors/opencode.py::opencode_projection).
         per_tool_deny=PerToolDeny.SETTINGS_FILE,
     ),
-    # FORK-ONLY (restored at the 2026-09-21 sync, where a whole-file pick took
-    # upstream's table and dropped it). copilot is in this fork's
-    # BASELINE_SELECTABLE_BACKENDS but not upstream's, so upstream's table owes
-    # it no row and ours does: projection_for() REFUSES a selectable backend
-    # carrying neither a mirror nor a declaration.
+    # Every selectable backend needs an explicit MCP projection declaration;
+    # projection_for() refuses one with neither a mirror nor a declaration.
     ACP_BACKEND_COPILOT: McpProjection(
         kind=ProjectionKind.NO_CHANNEL,
         channel="the ``session/new`` ``mcpServers`` array (``acp/spec_servers.py``)",
