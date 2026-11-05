@@ -125,7 +125,8 @@ jobs:
       pull-requests: read
     # Only for a SUCCESSFUL Stage 1 run that was itself a fork pull_request.
     if: >-
-      github.event.workflow_run.event == 'pull_request'
+      github.repository == 'kirodotdev/KiroCrew'
+      && github.event.workflow_run.event == 'pull_request'
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.head_repository.full_name != github.repository
     outputs:
@@ -837,7 +838,8 @@ jobs:
     # An accepted human override skips the review whole, as on the same-repo
     # lane: nothing was proposed, so there is nothing to validate or adjudicate.
     if: >-
-      always()
+      github.repository == 'kirodotdev/KiroCrew'
+      && always()
       && needs.generate.outputs.in_scope == 'true'
       && needs.generate.outputs.override != 'true'
       && github.event.workflow_run.event == 'pull_request'
@@ -1216,7 +1218,8 @@ jobs:
     permissions:
       contents: read
     if: >-
-      needs.validate.outputs.adjudicate == 'true'
+      github.repository == 'kirodotdev/KiroCrew'
+      && needs.validate.outputs.adjudicate == 'true'
       && github.event.workflow_run.event == 'pull_request'
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.head_repository.full_name != github.repository
@@ -1459,7 +1462,8 @@ jobs:
     # `always()` would otherwise run this job on a skipped same-repo trigger and
     # publish a verdict for a review that never ran.
     if: >-
-      always()
+      github.repository == 'kirodotdev/KiroCrew'
+      && always()
       && github.event.workflow_run.event == 'pull_request'
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.head_repository.full_name != github.repository

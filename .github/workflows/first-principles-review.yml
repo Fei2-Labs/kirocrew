@@ -72,13 +72,12 @@ jobs:
     # reports the intended name instead. `test_ai_review_workflows_fork_stage2.py` asserts
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
-    name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'First Principles Review' || 'First Principles Review (same-repo lane, not applicable to forks)' }}"
+    name: "${{ github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository && 'First Principles Review' || 'First Principles Review (same-repo lane, not applicable to forks)' }}"
     # Agentic reviewer reading untrusted PR diff content -- never gets fleet credentials, same isolation as claude-review.yml/codex-review.yml.
     # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
     # "Larger runners for the review lanes and CodeQL" in
     # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && fromJSON('{"group":"kirocrew-runners"}') || 'ubuntu-latest' }}
     # Consumer counting is grep-heavy, so this lane runs more turns than the
     # other whole-design lanes; keep headroom for the model-latency fat tail.
     timeout-minutes: 60
@@ -89,7 +88,7 @@ jobs:
       # still works (the next step fetches the merge-base it diffs from); the
       # posting step uses its own scoped GH_TOKEN. Mirrors design-review.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         with:
           # The merge ref plus its two parents (the base tip and the PR head),
           # not the whole history.
@@ -104,7 +103,7 @@ jobs:
       # on a full clone. Runs before the base-ref contract read, which would
       # otherwise read a missing base as "no contract".
       - name: Fetch the merge-base commit (shallow history)
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         id: merge_base
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -128,7 +127,7 @@ jobs:
       # catch. Only a change that ships no capability at all (docs, tests,
       # screenshots, generated files) skips, with no model call.
       - name: Detect reviewable surface
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         id: scope
         env:
           MERGE_BASE: ${{ steps.merge_base.outputs.tree }}
@@ -167,6 +166,7 @@ jobs:
       - name: Extract the review contract from the base commit
         id: contract
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.scope.outputs.surface == 'true'
@@ -212,6 +212,7 @@ jobs:
       - name: Prefetch the change as data files
         id: intent
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]'
@@ -243,7 +244,7 @@ jobs:
           echo "Wrote the diff ($(wc -c < "$PATCH") bytes) as a data file."
 
       - name: Resolve human override
-        if: github.event.pull_request.head.repo.full_name == github.repository
+        if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name == github.repository
         id: human_override
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -302,6 +303,7 @@ jobs:
       # failure can never keep the override from clearing the lane.
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]' && steps.scope.outputs.surface == 'true' && steps.human_override.outputs.active != 'true'
@@ -318,6 +320,7 @@ jobs:
         # by human review). The always()-run steps below still post a leak-safe
         # comment and log the outcome regardless.
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           github.actor != 'dependabot[bot]'
@@ -386,6 +389,7 @@ jobs:
       - name: Stage the base-owned redactor
         id: redactor
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -417,6 +421,7 @@ jobs:
       - name: Post first-principles review summary
         id: post
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -1513,6 +1518,7 @@ jobs:
       # this mechanism and must be loud rather than silently produce no record.
       - name: Retain this run's unpublished verdict
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()
@@ -1543,6 +1549,7 @@ jobs:
           retention-days: 90
       - name: First-principles review status (gates on BLOCK)
         if: >-
+          github.repository == 'kirodotdev/KiroCrew' &&
           github.event.pull_request.head.repo.full_name == github.repository
           && (
           always()

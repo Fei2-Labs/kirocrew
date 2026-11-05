@@ -86,12 +86,13 @@ jobs:
       issues: read
     # FORK ONLY, both event shapes. Same-repo PRs are unaffected.
     if: >-
-      ( github.event_name == 'workflow_run'
+      github.repository == 'kirodotdev/KiroCrew'
+      && ( ( github.event_name == 'workflow_run'
         && github.event.workflow_run.event == 'pull_request'
         && github.event.workflow_run.head_repository.full_name != github.repository )
       || ( github.event_name == 'pull_request_target'
            && github.event.label.name == 'allow-fork-workflow-change'
-           && github.event.pull_request.head.repo.full_name != github.repository )
+           && github.event.pull_request.head.repo.full_name != github.repository ) )
     steps:
       - name: Evaluate workflow-change guard
         env:
@@ -219,7 +220,8 @@ jobs:
       group: kirocrew-runners
     timeout-minutes: 10
     if: >-
-      github.event_name == 'pull_request_target'
+      github.repository == 'kirodotdev/KiroCrew'
+      && github.event_name == 'pull_request_target'
       && github.event.action == 'synchronize'
       && github.event.pull_request.head.repo.full_name != github.repository
     permissions:

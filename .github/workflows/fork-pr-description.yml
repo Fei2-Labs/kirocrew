@@ -76,7 +76,7 @@ jobs:
     # Fork PRs only. `head.repo.full_name` is null for a PR from a deleted
     # fork, which compares unequal and is therefore treated as a fork -- the
     # fail-toward-evaluating direction.
-    if: github.event.pull_request.head.repo.full_name != github.repository
+    if: github.repository == 'kirodotdev/KiroCrew' && github.event.pull_request.head.repo.full_name != github.repository
     # Fork work cannot reach the CodeBuild fleet -- the `workflow_job` webhook
     # payload carries no fork indicator, so the AWS side cannot admit it -- and
     # the group is the only other capacity source. It is where the fork review
