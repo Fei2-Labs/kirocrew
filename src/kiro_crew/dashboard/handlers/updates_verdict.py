@@ -498,6 +498,10 @@ def _set_update_info(**fields: object) -> None:
             "can_arm": False,
             "channel_move_pending": False,
             "fork_suppressed": False,
+            "upstream_version": "",
+            "fork_ahead_of_upstream": 0,
+            "fork_behind_upstream": 0,
+            "fork_sync_available": False,
         }
     )
     _update_info.update(fields)

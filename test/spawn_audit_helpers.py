@@ -732,6 +732,13 @@ BENIGN_PACKAGE_SPAWNS: frozenset[str] = frozenset(
         # Same classification as l0_probe: a CLI entry point driving an
         # in-process aiohttp sweep with asyncio.run.
         "connections/l1_smoke.py::main",
+        # NOT a subprocess spawn: the AST heuristic matches ``asyncio.run``
+        # (attribute ``run`` on base ``asyncio``). ``_invoke`` runs one
+        # coordinator-memory coroutine to completion inside the worker-thread
+        # executor ``_offload`` already parked it on; the sqlite3 work is
+        # in-process and no child is created. Same classification as the other
+        # ``asyncio.run`` sites in this list.
+        "run_coordinator/sqlite.py::_invoke",
         "cloud/source.py::_git_tracked_files",
         # `check-attr filter` over the same tracked list: reads attributes, runs
         # no driver, fixed argv, the hardened env. Same classification.
@@ -805,12 +812,33 @@ BENIGN_PACKAGE_SPAWNS: frozenset[str] = frozenset(
         # environment value, never agent input. Read-only version comparison —
         # nothing here writes to the tree.
         "dashboard/handlers/updates_check.py::_check_git_checkout",
+        # The check's read-only git helper: fixed list-argv (`config --get`,
+        # `ls-remote --symref`, `show --no-textconv <sha>:<path>`,
+        # `rev-list --count --left-right <sha>...<sha>`) spawned only by
+        # `_check_git_checkout`'s version read and fork-upstream probe. Every
+        # ref operand is a hex OID git itself produced or a literal remote
+        # name; cwd is the operator's checkout, env is `git_command_env()`,
+        # stdin is DEVNULL, and timeout/cancel go through kill-and-reap. Same
+        # trust class as the enclosing check it serves.
+        "dashboard/handlers/updates_check.py::_git_read",
         # (_venv_pip_install removed — it now delegates the install to
         # dep_sync.sync_or_reinstall and spawns nothing itself.)
         "dashboard/handlers/updates_apply.py::api_update_apply",
         # Fixed argv `git config --global --path --get core.excludesFile`: reads the
         # operator's own config file for an ignore-list path, runs no program.
         "dashboard/handlers/updates_apply.py::_user_excludes_file",
+        # The fork-release apply lane: `sys.executable -m pip install
+        # --force-reinstall --no-deps <wheel>` (one retry without
+        # --break-system-packages), list-argv, no shell, 120s timeout, run
+        # off-loop. Reachable only through POST /api/update/fork behind
+        # require_owner_dashboard_request — an operator button, never an agent
+        # tool. The wheel path is a fresh mkdtemp dir plus the asset filename
+        # from the GitHub Releases API of the hardcoded FORK_REPO
+        # (Fei2-Labs/kirocrew); no agent-, model-, or config-supplied value
+        # reaches argv, cwd is inherited, and pip installs a local file, not a
+        # URL. Same trust class as updates_apply.py::api_update_apply, which
+        # performs the equivalent install for the git lane.
+        "dashboard/handlers/updates_fork.py::_download_and_install",
         "dashboard/handlers_system.py::_collect_system_metrics",
         # Split out of _collect_system_metrics above so the whole-machine process
         # walk can be cached on its own (much longer) TTL instead of the live
@@ -839,6 +867,16 @@ BENIGN_PACKAGE_SPAWNS: frozenset[str] = frozenset(
         "dashboard/stale_bundle_guard.py::_backend_website_tree",
         "env.py::_run",
         "env.py::activate_mise",
+        # fork_version's git probe behind `_git_revision`: fixed list-argv
+        # (`rev-parse --short=N HEAD`, `status --porcelain [-- <paths>]`) with
+        # the binary PINNED via platform_compat.trusted_git_bin (system dirs,
+        # never PATH) and `-C` aimed at the package's own tree derived from
+        # `__file__`. env is os.environ minus the GIT_* location variables,
+        # timeout is 5s per call, and the output is only parsed into a
+        # (sha, dirty) pair for the version string — read-only, once per
+        # process, off the event loop via warm(). No agent-, model-, or
+        # config-supplied value reaches argv.
+        "fork_version.py::_run",
         # Node bootstrap: runs the bundled ``ensure-node.sh`` (a fixed `bash
         # <script>` argv, script path derived from KIROCREW_PROJECT_DIR / the
         # module's own location, never agent input) when no node resolves. Same

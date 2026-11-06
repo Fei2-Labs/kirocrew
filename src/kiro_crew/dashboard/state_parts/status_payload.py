@@ -150,6 +150,10 @@ def status_snapshot(
     fork_revision: str = "",
     fork_dirty: bool = False,
     update_fork_suppressed: bool = False,
+    upstream_version: str = "",
+    fork_ahead_of_upstream: int = 0,
+    fork_behind_upstream: int = 0,
+    fork_sync_available: bool = False,
     version_display: str = "",
     bundle_id: str = "",
 ) -> dict[str, Any]:
@@ -251,6 +255,16 @@ def status_snapshot(
         "fork_revision": fork_revision,
         "fork_dirty": fork_dirty,
         "update_fork_suppressed": update_fork_suppressed,
+        # Fork-maintainer signal: how far the fork's main sits from the
+        # canonical upstream — `fork_behind_upstream` counts commits upstream
+        # has that the fork lacks (the sync debt), `fork_ahead_of_upstream`
+        # counts fork-only commits upstream lacks. Display-only — the fleet
+        # updates from the fork's remote, never from upstream; this tells the
+        # operator a sync + compatibility review is due.
+        "upstream_version": upstream_version,
+        "fork_ahead_of_upstream": fork_ahead_of_upstream,
+        "fork_behind_upstream": fork_behind_upstream,
+        "fork_sync_available": fork_sync_available,
         "update_last_checked_at": update_last_checked_at,
         "update_check_interval_secs": update_check_interval_secs,
         # Mandatory-update verdict (enterprise governance pin OR the release

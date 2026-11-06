@@ -203,8 +203,11 @@ evals/*/iteration-*/
 .trellis/
 .playwright-mcp/
 # A distribution stamps its build number here at packaging time (see
-# kiro_crew/__init__.py); never committed -- a dev checkout runs the bare core.
-src/kiro_crew/BUILD_VERSION
+# kiro_crew/__init__.py). This fork COMMITS its stamp: git-checkout installs
+# have no packaging step, and the committed value is what makes every fork
+# push a version_newer event for the fleet's auto-update. stamp-distribution.sh
+# still overwrites it for packaged artifacts.
+!src/kiro_crew/BUILD_VERSION
 
 # The crew image's wheel, staged by crew/scripts/build_crew_base_image.sh for the
 # context bind mount. `vendor/` is a TRACKED directory (its .gitkeep ships in the

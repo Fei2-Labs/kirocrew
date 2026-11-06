@@ -213,6 +213,12 @@ class TestAllStatusSnapshotCallersPassTheUpdateFields:
             "fork_revision",
             "fork_dirty",
             "update_fork_suppressed",
+            # The maintainer's upstream-ahead signal: only a checkout carrying
+            # an `upstream` remote ever reports it non-default.
+            "upstream_version",
+            "fork_ahead_of_upstream",
+            "fork_behind_upstream",
+            "fork_sync_available",
         }
 
     def test_the_shared_reader_never_flattens_a_missing_verdict(self) -> None:

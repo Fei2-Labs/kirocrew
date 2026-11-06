@@ -321,6 +321,27 @@ def local_segment() -> str:
     return LOCAL_SEPARATOR + ".".join(parts)
 
 
+def peek_local_segment() -> str:
+    """:func:`local_segment` for callers ON the event loop: memoized only.
+
+    ``local_segment`` derives through :func:`fork_revision`, which may spawn
+    git — fine off-loop, a stall on it. This reads the same memo
+    :func:`peek_revision` exposes, so an unwarmed process answers ``""``
+    rather than blocking; the update loop's ``warm`` fills it before the
+    status surface asks.
+    """
+    cached = peek_revision()
+    if cached is None:
+        return ""
+    sha, dirty = cached
+    if not sha:
+        return ""
+    parts = [FORK_LABEL, f"{REVISION_PREFIX}{sha}"]
+    if dirty:
+        parts.append(DIRTY_IDENTIFIER)
+    return LOCAL_SEPARATOR + ".".join(parts)
+
+
 def is_fork_build() -> bool:
     """Whether a fork revision could be derived for this build.
 
@@ -378,6 +399,7 @@ __all__ = [
     "full_version",
     "is_fork_build",
     "local_segment",
+    "peek_local_segment",
     "reset_cache_for_tests",
     "strip_local",
 ]

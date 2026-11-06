@@ -769,6 +769,27 @@ class TestGitCheckoutStillWorks:
 
         async def _exec(*args, **kwargs):
             calls.append(tuple(args))
+            # Reads every fixture checkout answers the same way and which the
+            # positional queue does not model: no committed BUILD_VERSION stamp
+            # (rc 128, file absent) and no `upstream` remote (rc 1, key unset) —
+            # the fleet shape these tests stand in for. Serving them from the
+            # queue would shift every later entry one slot.
+            if "BUILD_VERSION" in " ".join(str(a) for a in args):
+                class _Absent:
+                    returncode = 128
+
+                    async def communicate(self):
+                        return (b"", b"fatal: path does not exist")
+
+                return _Absent()
+            if "remote.upstream.url" in " ".join(str(a) for a in args):
+                class _Unset:
+                    returncode = 1
+
+                    async def communicate(self):
+                        return (b"", b"")
+
+                return _Unset()
             rc, out = queue.pop(0) if queue else (0, b"")
 
             class _Proc:

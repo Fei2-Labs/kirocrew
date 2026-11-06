@@ -42,8 +42,11 @@ import pluralKeys from './pluralKeys.json'
  * kiroPrerequisiteGate/agentImportFlow copy) that a prior catalog edit had accidentally
  * pruned along with genuinely-dead ones, and a later fix restored -- these predate this
  * sync and are not new. Prune them in a follow-up, not part of the sync.
+ *
+ * Lowered 27→0: the catalog was reconciled against the post-merge source tree and
+ * every remaining dead key was pruned, so the ratchet now pins zero.
  */
-const BASELINE = 27
+const BASELINE = 0
 
 const SRC = join(__dirname, '..')
 const PLURAL_SUFFIX = /_(zero|one|two|few|many|other)$/

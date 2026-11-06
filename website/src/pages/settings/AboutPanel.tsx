@@ -604,6 +604,12 @@ export function AboutPanel() {
   // would replace the fork rather than update it. Without this the panel would
   // render an unexplained "up to date" beside a newer upstream version.
   const forkUpdateSuppressed = useAppSelector(s => s.dashboard.status?.update_fork_suppressed) === true
+  // Fork-maintainer signal, straight from the status push: the canonical
+  // upstream moved ahead of the fork's own main. Only a checkout carrying an
+  // `upstream` remote ever reports it, so fleet installs stay silent.
+  const forkSyncAvailable = useAppSelector(s => s.dashboard.status?.fork_sync_available) === true
+  const forkBehindUpstream = useAppSelector(s => s.dashboard.status?.fork_behind_upstream) || 0
+  const upstreamVersion = useAppSelector(s => s.dashboard.status?.upstream_version) || ''
   // The desktop lane pair, live-first. `info` is a one-shot `getInfo()` read from
   // mount, while every later check pushes its own answer on the lifecycle payload,
   // so preferring the push is what keeps the chip and the prerelease ask correct
@@ -1161,12 +1167,35 @@ export function AboutPanel() {
                     {i18nT('pages.settings.aboutPanel.fork_uncommitted_changes')}
                   </span>
                 )}
+                {/* The maintainer's badge: upstream moved and the fork has not
+                    synced it yet. Warn pill, same shape as the hero verdicts —
+                    it is an attention state, not an installable update (fleet
+                    installs update from the fork, never from upstream). */}
+                {forkSyncAvailable && (
+                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold rounded-full px-2 py-0.5"
+                    style={{ color: 'var(--warn)', background: 'color-mix(in oklab, var(--warn) 14%, transparent)' }}
+                    data-testid="about-fork-sync-badge">
+                    <GitBranch size={10} className="lucide-inline" aria-hidden /> {i18nT('pages.settings.aboutPanel.fork_sync_badge')}
+                  </span>
+                )}
               </div>
             )}
             {forkUpdateSuppressed && gwStatusLatest && (
               <div className="text-[12px] mt-1" style={{ color: 'var(--warn)' }} data-testid="about-fork-update-withheld">
                 {i18nT('pages.settings.aboutPanel.fork_update_withheld', {
                   version: gwStatusLatestDisplay || gwStatusLatest,
+                })}
+              </div>
+            )}
+            {/* The panel half of the fork-sync badge: how far upstream moved
+                and what to do about it. Informational only — the sync itself
+                is a git operation on the maintainer's checkout (compatibility
+                review → merge → push), never something this install applies. */}
+            {forkSyncAvailable && (
+              <div className="text-[12px] mt-1" style={{ color: 'var(--warn)' }} data-testid="about-fork-sync-panel">
+                {i18nT('pages.settings.aboutPanel.fork_sync_panel', {
+                  distance: i18nT('pages.settings.aboutPanel.commits_behind', { count: forkBehindUpstream }),
+                  version: upstreamVersion,
                 })}
               </div>
             )}

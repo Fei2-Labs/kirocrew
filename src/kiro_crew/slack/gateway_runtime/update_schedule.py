@@ -1401,13 +1401,32 @@ async def _check_for_updates_legacy(self: GatewayOrchestrator) -> None:
             # without a version bump lights the badge below instead, and the
             # dashboard's own apply path (`git pull`, dirty tree refused) is
             # the non-destructive way in.
+            #
+            # A FORK build is the exception the gate was written for: its
+            # tracked remote IS the distribution channel, so every push to it
+            # is a release the fleet is meant to take — including fork-only
+            # commits that leave `__version__` untouched. Commit distance
+            # (behind-only, never diverged: `update_available` already excludes
+            # that) is the signal, and `_refused_before_reset` re-verifies
+            # ahead-count, dirty tree and exec config immediately before the
+            # irreversible step, so a developer checkout is still refused.
+            from kiro_crew.fork_version import is_fork_build
             from kiro_crew.update_deferral import user_deferred_update
 
             # "Later" in an update prompt is the user's answer for that version:
             # it stays offered, and is never installed and restarted unattended.
             deferred = user_deferred_update(cfg, str(info.get("latest_version") or ""))
             installs = cfg.auto_update and effect.effect == AUTO_EFFECT_INSTALL and not deferred
-            if installs and effect.route == AUTO_ROUTE_GIT and info.get("version_newer"):
+            _fork_fast_forward = (
+                is_fork_build()
+                and int(info.get("commits_behind") or 0) > 0
+                and int(info.get("commits_ahead") or 0) == 0
+            )
+            if (
+                installs
+                and effect.route == AUTO_ROUTE_GIT
+                and (info.get("version_newer") or _fork_fast_forward)
+            ):
                 if not await self._prepare_auto_update_apply(mandatory=False):
                     return
                 try:

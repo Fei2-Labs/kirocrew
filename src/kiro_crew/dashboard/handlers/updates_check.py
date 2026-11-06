@@ -41,7 +41,12 @@ from kiro_crew.dashboard.handlers.updates_verdict import (
     remediation_command,
 )
 from kiro_crew.fork_version import is_fork_build
-from kiro_crew.git_divergence import DivergenceUnreadable, count_divergence
+from kiro_crew.git_divergence import (
+    DivergenceUnreadable,
+    count_divergence,
+    divergence_count_args,
+    parse_divergence_counts,
+)
 from kiro_crew.platform import feed_trust
 from kiro_crew.platform.update_capability import (
     CHECK_DEFERRED,
@@ -210,11 +215,15 @@ def status_update_fields() -> dict[str, object]:
         # `0.4.1`, masking the very upgrade the reload detection exists to
         # catch. Falls back to the raw version until a check has resolved the
         # channel (`_display_local_version` keys on it; only stable folds).
-        "version_display": _display_local_version(),
+        "version_display": _display_local_version() + fork_version.peek_local_segment(),
         "upstream_base_version": fork_version.base_version(),
         "fork_revision": revision[0] if revision else "",
         "fork_dirty": revision[1] if revision else False,
         "update_fork_suppressed": bool(_update_info.get("fork_suppressed")),
+        "upstream_version": str(_update_info.get("upstream_version") or ""),
+        "fork_ahead_of_upstream": int(_update_info.get("fork_ahead_of_upstream") or 0),
+        "fork_behind_upstream": int(_update_info.get("fork_behind_upstream") or 0),
+        "fork_sync_available": bool(_update_info.get("fork_sync_available")),
     }
 
 
@@ -587,33 +596,11 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
 
     # Compare the remote's version (or the on-disk one when already pulled).
     target_sha = remote_sha if local_sha != remote_sha else local_sha
-    show = await asyncio.create_subprocess_exec(
-        git,
-        "show",
-        "--no-textconv",
-        f"{target_sha}:src/kiro_crew/__init__.py",
-        cwd=proj,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-        start_new_session=platform_compat.IS_POSIX,
-        creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
-    )
-    try:
-        show_out, _ = await asyncio.wait_for(show.communicate(), timeout=10)
-    except asyncio.CancelledError:
-        await platform_compat.kill_and_reap(show)
-        raise
-    except asyncio.TimeoutError:
-        await platform_compat.kill_and_reap(show)
-        _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
-        return
-    match = re.search(r'__version__\s*=\s*"(.+?)"', show_out.decode(errors="replace"))
-    if not match:
+    remote_version = await _version_at_sha(proj, target_sha, git=git, env=env)
+    if not remote_version:
         logger.warning("Could not read __version__ at %s", target_sha)
         _set_update_info(**base, check_status=CHECK_FAILED, error_code=ERR_GIT_READ_FAILED)
         return
-    remote_version = match.group(1)
     # Two independent reasons a checkout is out of date, either one sufficient:
     #   * it is behind its upstream — commits to pull;
     #   * the on-disk ``__version__`` outranks the one this process IMPORTED, so
@@ -689,6 +676,20 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
                 lines.append(line[1:])
         changes = "\n".join(lines).strip()
 
+    try:
+        upstream_fields = await _fork_upstream_probe(
+            proj, git=git, env=env, fork_tip=remote_sha
+        )
+    except Exception:
+        # Advisory only: a probe failure must never fail the check that feeds
+        # the fleet's real update verdict.
+        logger.debug("fork upstream probe failed", exc_info=True)
+        upstream_fields = {
+            "upstream_version": "",
+            "fork_ahead_of_upstream": 0,
+            "fork_behind_upstream": 0,
+            "fork_sync_available": False,
+        }
     _set_update_info(
         **base,
         update_available=available,
@@ -701,7 +702,150 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
         commits_ahead=ahead,
         commits_behind=behind,
         check_status=CHECK_SUCCEEDED,
+        **upstream_fields,
     )
+
+
+async def _git_read(
+    proj: str,
+    *args: str,
+    git: str,
+    env: dict[str, str],
+    timeout: float = 10.0,
+) -> str | None:
+    """stdout of one read-only ``git`` call in *proj*; ``None`` on any failure.
+
+    Same guards as the rest of the check: trusted binary, pinned exec env, no
+    stdin, output decoded lossily — a git error line is never user-facing here.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            git,
+            *args,
+            cwd=proj,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+            start_new_session=platform_compat.IS_POSIX,
+            creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+        )
+    except OSError:
+        return None
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await platform_compat.kill_and_reap(proc)
+        return None
+    except asyncio.CancelledError:
+        await platform_compat.kill_and_reap(proc)
+        raise
+    if proc.returncode != 0:
+        return None
+    return out.decode(errors="replace")
+
+
+_BUILD_VERSION_SPEC = "src/kiro_crew/BUILD_VERSION"
+_VERSION_LITERAL_RE = re.compile(r'__version__\s*=\s*"(.+?)"')
+_BARE_RELEASE_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+_BUILD_SUFFIX_RE = re.compile(r"\.[0-9]+")
+
+
+async def _version_at_sha(proj: str, sha: str, *, git: str, env: dict[str, str]) -> str:
+    """Effective ``__version__`` at *sha*, mirroring import-time resolution.
+
+    ``kiro_crew.__init__`` lets a committed ``BUILD_VERSION`` stamp extend the
+    ``__init__.py`` literal by one numeric segment, so the stamp wins when it
+    validates against that literal — the same rule ``_apply_build_version_file``
+    applies at runtime. Without it a fork's per-push build number is invisible
+    to the ``version_newer`` gate and the fleet never auto-installs a fork-only
+    commit. ``""`` means the version could not be read at all.
+    """
+    init = await _git_read(
+        proj, "show", "--no-textconv", f"{sha}:src/kiro_crew/__init__.py",
+        git=git, env=env,
+    )
+    if init is None:
+        return ""
+    match = _VERSION_LITERAL_RE.search(init)
+    if not match:
+        return ""
+    literal = match.group(1)
+    stamped = await _git_read(
+        proj, "show", "--no-textconv", f"{sha}:{_BUILD_VERSION_SPEC}",
+        git=git, env=env,
+    )
+    if stamped is not None:
+        candidate = stamped.strip()
+        suffix = candidate[len(literal) :] if candidate.startswith(literal) else ""
+        if candidate == literal or (
+            _BARE_RELEASE_RE.fullmatch(literal)
+            and _BUILD_SUFFIX_RE.fullmatch(suffix)
+        ):
+            return candidate
+    return literal
+
+
+async def _fork_upstream_probe(
+    proj: str, *, git: str, env: dict[str, str], fork_tip: str
+) -> dict[str, object]:
+    """How far a remote literally named ``upstream`` is ahead of the fork tip.
+
+    The maintainer's signal: the check above compares the checkout against its
+    TRACKED remote (the fork's own ``origin``), so an upstream release stays
+    invisible until somebody merges it — exactly when compatibility review is
+    due. When the checkout also carries an ``upstream`` remote, measure its
+    default branch against *fork_tip* (the tracked remote's fetched tip, not
+    HEAD: local commits are the operator's business) and report commit counts
+    plus upstream's effective version. Every failure degrades to empty fields —
+    this probe is advisory and must never fail the check that feeds it.
+    """
+    fields: dict[str, object] = {
+        "upstream_version": "",
+        "fork_ahead_of_upstream": 0,
+        "fork_behind_upstream": 0,
+        "fork_sync_available": False,
+    }
+    url = await _git_read(
+        proj, "config", "--get", "remote.upstream.url", git=git, env=env
+    )
+    if not url or not url.strip():
+        return fields
+    # ``ls-remote --symref`` answers "ref: refs/heads/<b>\tHEAD" plus the sha.
+    head = await _git_read(
+        proj, "ls-remote", "--symref", "upstream", "HEAD",
+        git=git, env=env, timeout=30,
+    )
+    if not head:
+        return fields
+    branch = ""
+    for line in head.splitlines():
+        if line.startswith("ref: refs/heads/"):
+            branch = line.split("ref: refs/heads/", 1)[1].split("\t", 1)[0].strip()
+            break
+    if not branch:
+        return fields
+    upstream_sha = await fetch_and_pin_upstream(
+        proj, "upstream", branch, git=git, env=env, timeout=30
+    )
+    if not upstream_sha:
+        return fields
+    # count_divergence() always measures HEAD; the probe's subject is the
+    # fork tip (remote_sha), so compose the same rev-list args directly.
+    revs = await _git_read(
+        proj, *divergence_count_args(upstream_sha, head=fork_tip),
+        git=git, env=env,
+    )
+    counts = parse_divergence_counts(revs or "")
+    if counts is None:
+        return fields
+    fields["upstream_version"] = await _version_at_sha(
+        proj, upstream_sha, git=git, env=env
+    )
+    fields["fork_ahead_of_upstream"] = counts.ahead
+    fields["fork_behind_upstream"] = counts.behind
+    fields["fork_sync_available"] = counts.behind > 0
+    return fields
 
 
 async def _fetch_feed_bytes(url: str) -> tuple[int, bytes]:

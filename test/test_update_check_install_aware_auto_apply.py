@@ -341,6 +341,66 @@ class TestAutoApplyGuard:
         # The git apply reloads `kiro_crew`, so its queued restart is never held.
         assert orch._pending_update_version == ""
 
+    def test_a_fork_build_auto_applies_on_commit_distance_alone(self, gateway_logs):
+        """Fork pushes are releases: every fast-forwardable commit installs.
+
+        ``version_newer`` stays the gate for upstream checkouts — commit
+        distance there is a developer's tree, not a release. A fork build's
+        tracked remote IS the distribution channel, so behind-only distance
+        (never diverged: ``update_available`` already excludes that) is enough.
+        ``_refused_before_reset`` still re-verifies ahead-count, dirty tree and
+        exec config immediately before the irreversible step.
+        """
+        with patch("kiro_crew.fork_version.is_fork_build", return_value=True):
+            orch = self._run(
+                {
+                    "update_available": True,
+                    "can_apply": True,
+                    "managed_by": "git",
+                    "version_newer": False,
+                    "commits_ahead": 0,
+                    "commits_behind": 3,
+                },
+                auto_update=True,
+                effect=AutoUpdateEffect("install", "git"),
+            )
+        orch._auto_apply_update.assert_awaited_once()
+        assert "Auto-update enabled — applying update" in gateway_logs()
+
+    def test_a_diverged_fork_checkout_does_not_auto_apply(self, gateway_logs):
+        """``commits_ahead > 0`` keeps the fork gate shut: a reset would drop them."""
+        with patch("kiro_crew.fork_version.is_fork_build", return_value=True):
+            orch = self._run(
+                {
+                    "update_available": True,
+                    "can_apply": True,
+                    "managed_by": "git",
+                    "version_newer": False,
+                    "commits_ahead": 2,
+                    "commits_behind": 3,
+                },
+                auto_update=True,
+                effect=AutoUpdateEffect("install", "git"),
+            )
+        orch._auto_apply_update.assert_not_awaited()
+
+    def test_an_upstream_checkout_still_needs_a_version_bump(self, gateway_logs):
+        """``is_fork_build`` False keeps commit distance badge-only, as before."""
+        with patch("kiro_crew.fork_version.is_fork_build", return_value=False):
+            orch = self._run(
+                {
+                    "update_available": True,
+                    "can_apply": True,
+                    "managed_by": "git",
+                    "version_newer": False,
+                    "commits_ahead": 0,
+                    "commits_behind": 3,
+                },
+                auto_update=True,
+                effect=AutoUpdateEffect("install", "git"),
+            )
+        orch._auto_apply_update.assert_not_awaited()
+
     def test_a_failed_check_does_not_claim_up_to_date(self, capsys):
         orch = self._run(
             {"update_available": None, "error_code": "feed_unreachable", "managed_by": "kirocrew"},

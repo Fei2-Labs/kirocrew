@@ -525,6 +525,8 @@ class TestGitCheckoutFailurePaths:
                 _FakeProc(out=b"aaa111\n"),
                 _FakeProc(out=b"0\t0\n"),
                 _FakeProc(out=b'__version__ = "not/a/version"\n'),
+                # No committed BUILD_VERSION stamp at that sha.
+                _FakeProc(returncode=128),
             ],
         )
         self._assert_failed_check(updates.ERR_VERSION_UNPARSEABLE)
@@ -545,7 +547,11 @@ class TestGitCheckoutFailurePaths:
                 _FakeProc(out=b"aaa111\n"),
                 _FakeProc(out=b"0\t7\n"),
                 _FakeProc(out=b'__version__ = "999.0.0"\n'),
+                # No committed BUILD_VERSION stamp at that sha.
+                _FakeProc(returncode=128),
                 _FakeProc(time_out=True, kill_raises=True),
+                # The fork-upstream probe: no `upstream` remote configured.
+                _FakeProc(returncode=1),
             ],
         )
         assert updates._update_info["update_available"] is True
@@ -573,7 +579,11 @@ class TestGitCheckoutFailurePaths:
                 _FakeProc(out=b"aaa111\n"),
                 _FakeProc(out=b"0\t7\n"),
                 _FakeProc(out=b'__version__ = "999.0.0"\n'),
+                # No committed BUILD_VERSION stamp at that sha.
+                _FakeProc(returncode=128),
                 _FakeProc(out=diff),
+                # The fork-upstream probe: no `upstream` remote configured.
+                _FakeProc(returncode=1),
             ],
         )
         # The ``+++`` header is a diff artifact, not a changelog line.

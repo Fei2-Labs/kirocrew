@@ -146,4 +146,44 @@ describe('AboutPanel fork identity', () => {
     await screen.findByTestId('about-fork-build')
     expect(screen.queryByTestId('about-fork-update-withheld')).toBeNull()
   })
+
+  it('badges and explains an upstream-ahead fork on the maintainer checkout', async () => {
+    store.dispatch(sseStatus({
+      ...BLANK_STATUS,
+      version: '0.13.0.1',
+      version_display: '0.13.0.1+fork.g22e041c8',
+      upstream_base_version: '0.13.0',
+      fork_revision: '22e041c8',
+      fork_dirty: false,
+      upstream_version: '0.14.0',
+      fork_ahead_of_upstream: 4,
+      fork_behind_upstream: 17,
+      fork_sync_available: true,
+    } as never))
+    mountWeb()
+    expect(await screen.findByTestId('about-fork-sync-badge')).toBeTruthy()
+    const panel = await screen.findByTestId('about-fork-sync-panel')
+    // The distance renders through the commits_behind plural, and the panel
+    // names upstream's own version so the maintainer sees WHAT moved.
+    expect(panel.textContent).toContain('17 commits behind')
+    expect(panel.textContent).toContain('0.14.0')
+  })
+
+  it('stays silent for a fleet install whose checkout has no upstream remote', async () => {
+    // A fork build with no probe answer: fork_sync_available never fired, so
+    // neither the badge nor the panel may appear — fleet machines update from
+    // the fork and must not be told to chase upstream.
+    store.dispatch(sseStatus({
+      ...BLANK_STATUS,
+      version: '0.13.0.1',
+      version_display: '0.13.0.1+fork.g22e041c8',
+      upstream_base_version: '0.13.0',
+      fork_revision: '22e041c8',
+      fork_dirty: false,
+    } as never))
+    mountWeb()
+    await screen.findByTestId('about-fork-build')
+    expect(screen.queryByTestId('about-fork-sync-badge')).toBeNull()
+    expect(screen.queryByTestId('about-fork-sync-panel')).toBeNull()
+  })
 })

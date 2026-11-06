@@ -10,6 +10,20 @@ export interface StatusData {
   fork_dirty?: boolean
   upstream_base_version?: string
   update_fork_suppressed?: boolean
+  /**
+   * Fork-maintainer signal: the canonical upstream moved ahead of the fork's
+   * own main. Only a checkout carrying an `upstream` remote ever reports it —
+   * fleet installs cloned from the fork alone never see these fields non-default,
+   * so the update pill and About badge stay silent for them. `upstream_version`
+   * is upstream's effective version at its tip ("" until a probe answered);
+   * `fork_behind_upstream` counts commits upstream has that the fork lacks (the
+   * sync debt), `fork_ahead_of_upstream` the reverse; `fork_sync_available` is
+   * the behind-count rendered as a boolean. All absent/zero on older gateways.
+   */
+  upstream_version?: string
+  fork_ahead_of_upstream?: number
+  fork_behind_upstream?: number
+  fork_sync_available?: boolean
   uptime: string
   start_time?: number
   sessions: number

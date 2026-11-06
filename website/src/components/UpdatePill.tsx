@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { Download, RefreshCw } from 'lucide-react'
+import { Download, GitBranch, RefreshCw } from 'lucide-react'
 
 import { useAppSelector } from '../store'
 import { i18nT } from '../i18n/t'
@@ -50,6 +50,11 @@ export default function UpdatePill({ variant = 'pill', showLabel = false }: { va
   const updateAvailable = useAppSelector(
     s => s.dashboard.status?.update_available === true || s.dashboard.desktopUpdateAvailable
   )
+  // Fork-maintainer signal: the canonical upstream moved ahead of the fork's
+  // own main. Only a checkout carrying an `upstream` remote ever reports it —
+  // fleet installs cloned from the fork alone never see this state, so the
+  // pill stays silent for them exactly as it does for "up to date".
+  const forkSync = useAppSelector(s => s.dashboard.status?.fork_sync_available === true)
   const { data: desktop } = useQuery<UpdateState | null>({
     queryKey: ['update-state'],
     queryFn: () => null,
@@ -57,7 +62,7 @@ export default function UpdatePill({ variant = 'pill', showLabel = false }: { va
     staleTime: Infinity,
   })
 
-  if (!updateAvailable) return null
+  if (!updateAvailable && !forkSync) return null
 
   // Status labels, not action labels: the pill only NAVIGATES (to Settings ›
   // About), so a label like "Restart to update" would promise an action the
@@ -65,14 +70,21 @@ export default function UpdatePill({ variant = 'pill', showLabel = false }: { va
   // fall into once per release.
   let label = i18nT('components.updatePill.update_available')
   let Icon = Download
-  if (desktop?.state === 'downloading') {
+  if (updateAvailable && desktop?.state === 'downloading') {
     const pct = typeof desktop.percent === 'number' ? Math.round(desktop.percent) : null
     label = pct === null
       ? i18nT('components.updatePill.downloading')
       : i18nT('components.updatePill.downloading_percent', { percent: pct })
-  } else if (desktop?.state === 'downloaded') {
+  } else if (updateAvailable && desktop?.state === 'downloaded') {
     label = i18nT('components.updatePill.update_ready')
     Icon = RefreshCw
+  } else if (!updateAvailable) {
+    // The fork-sync-only state: no installable update, but upstream moved and
+    // a sync + compatibility review is due on the maintainer's checkout. A
+    // real update outranks it (the branches above), and the destination is
+    // the same — Settings › About carries the explanation and the counts.
+    label = i18nT('components.updatePill.upstream_sync')
+    Icon = GitBranch
   }
 
   if (variant === 'menu-item') {

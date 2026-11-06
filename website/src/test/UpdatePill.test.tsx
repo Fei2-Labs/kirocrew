@@ -51,6 +51,20 @@ describe('UpdatePill', () => {
     expect(pill()).toBeInTheDocument()
   })
 
+  it('shows the upstream-sync label when only the fork probe fired', async () => {
+    // The maintainer signal: canonical upstream moved ahead of the fork's
+    // main, but there is no installable update — the pill must say "sync",
+    // not "update", because nothing here installs upstream bytes.
+    await mount({ status: { fork_sync_available: true } })
+    expect(pill()).toBeInTheDocument()
+    expect(pill()).toHaveTextContent('Upstream sync')
+  })
+
+  it('lets a real update outrank the upstream-sync label', async () => {
+    await mount({ status: { update_available: true, fork_sync_available: true } })
+    expect(pill()).toHaveTextContent('Update available')
+  })
+
   it('shows live percent while the desktop build downloads', async () => {
     await mount({ desktop: true, state: { state: 'downloading', version: '9.9.9', percent: 41.6 } })
     // React Query batches cache notifications, so the label lands a tick
