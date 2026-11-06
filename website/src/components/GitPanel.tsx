@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronRight, FolderGit2, GitBranch, RefreshCw, RefreshCwOff } from 'lucide-react'
 import { api } from '../api/client'
 import ErrorNotice from './ErrorNotice'
+import GitBranchChanges from './GitBranchChanges'
 import { Btn } from './ui'
 import { errMessage } from '../utils/thunkError'
 import { findReport } from '../utils/errorReport'
@@ -147,6 +148,7 @@ interface GitPanelProps {
 }
 
 export default function GitPanel({ projectDir, onFileOpen, section, onOpenChange }: GitPanelProps) {
+  const queryClient = useQueryClient()
   const prevBranch = useRef<string | undefined>(undefined)
   // The discovery scan is cached for 60s server-side; force a fresh scan on
   // an explicit refresh so newly cloned repositories appear immediately.
@@ -408,8 +410,14 @@ export default function GitPanel({ projectDir, onFileOpen, section, onOpenChange
   // the "Retry" button inside a status/log error notice so the two controls do
   // the same thing (a reader takes the icon and the in-notice action for two
   // different retries). Not offered under a filter-driver refusal, where the
-  // copy says a retry will not help and Refresh is deliberately inert.
-  const retrySection = () => { refetchStatus(); refetchLog() }
+  // copy says a retry will not help and Refresh is deliberately inert. The
+  // branch comparison is keyed on HEAD, so a base that moved under an unchanged
+  // HEAD needs this explicit read too; a collapsed section stays unread.
+  const retrySection = () => {
+    refetchStatus()
+    refetchLog()
+    queryClient.invalidateQueries({ queryKey: ['git-branch-diff', projectDir] })
+  }
 
   // Refresh. Inert under a filter-driver refusal: the copy right below
   // says retrying won't help, and a live button over that sentence
@@ -678,6 +686,11 @@ export default function GitPanel({ projectDir, onFileOpen, section, onOpenChange
               )}
             </div>
           </section>
+        )}
+
+        {/* ── BRANCH CHANGES section: collapsed, fetched only when opened ── */}
+        {isRepository && (
+          <GitBranchChanges projectDir={projectDir} head={log?.commits?.find(c => c.isHead)?.sha} />
         )}
 
         {/* ── COMMITS section ── */}

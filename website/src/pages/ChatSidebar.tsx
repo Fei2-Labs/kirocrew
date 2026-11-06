@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { useCrewMode, useMateSessionsHidden, usePreviewFlag } from '../hooks/usePreviewFlag'
 import { selectLiveMateThreads } from '../store/dashboardSlice'
+import { selectCloseNotice } from '../store/dashboard/closeWatch'
 import { PREVIEW_FOLDER_CONDUCTOR } from '../utils/previewFlags'
 import { useStore } from 'react-redux'
 import { useAppDispatch, useAppSelector } from '../store'
@@ -67,6 +68,7 @@ import FolderCleanupPanel from './chat-sidebar/FolderCleanupPanel'
 import { useSidebarResize } from './chat-sidebar/resize'
 import { useSidebarScrollPeek, useFullTitlesOnScrollSetting } from './chat-sidebar/scrollPeek'
 import ScrollPeekLayer from './chat-sidebar/ScrollPeekLayer'
+import NeedsMeHoverLayer from './chat-sidebar/NeedsMeHoverCard'
 import { useSidebarTags } from './chat-sidebar/tags'
 import { useSidebarModels } from './chat-sidebar/models'
 import { useBoardColumns, useColumnPopover, useBoardColumnMutations, useColumnMatches, useBoardFolderCollapse, crewLaneSets } from './chat-sidebar/board'
@@ -273,6 +275,7 @@ function ChatSidebar({
   const {
     renamingSlot, renameScope, renameValue, renameError, setRenameError, renameInputRef,
     suppressMenuRestore, disarmMenuRestore, onRenameStart, onRenameChange, onRenameCancel, onRenameCommit, renameAnnouncement, slotRenameEnterRef,
+    renameOfflineSlot, renameOfflineScope,
     onMenuCloseAutoFocus,
   } = useSessionRename({ dispatch, store, queryClient })
   const { autoTitleError, setAutoTitleError, onAutoTitle } = useSessionAutoTitle({ dispatch, store })
@@ -330,6 +333,7 @@ function ChatSidebar({
   } = useHistoryPane({ setHistoryFilter, slotFilter, dispatch })
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [folderCleanupOpen, setFolderCleanupOpen] = useState(false)  // header ⋮ → "Clean up empty folders" panel
+  const [folderCleanupRoot, setFolderCleanupRoot] = useState<ChatFolder | null>(null)  // folder ⋮ → "Close sessions and delete…"
   const [manageTagsOpen, setManageTagsOpen] = useState(false)  // header ⋮ → "Manage tags…" panel (list-view tag CRUD)
   const [broadcastOpen, setBroadcastOpen] = useState(false)  // header ⋮ → "Broadcast message…" panel
   const [filterSortOpen, setFilterSortOpen] = useState(false)
@@ -736,7 +740,7 @@ function ChatSidebar({
   // each behaviour has one definition. Rename + Tags stay local (they drive this
   // component's inline-edit + tag-popover state).
   const sessionActions = useSessionActions(mode, { onOpened: onSelectSlot })
-  const closeRefused = useAppSelector(st => st.chat.closeRefused)
+  const closeRefused = useAppSelector(selectCloseNotice)
   const { forkError: duplicateError, clearForkError: clearDuplicateError } = sessionActions
   // Which sessions are currently open in a popped-out window (shared singleton).
   const { poppedOut } = useChatPopouts()
@@ -812,6 +816,7 @@ function ChatSidebar({
   // reference, so none of these may take a new identity per render.
   const rowActions = useMemo(() => ({
     renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle, slotRenameEnterRef,
+    renameOfflineSlot, renameOfflineScope,
     onDuplicate: sessionActions.duplicate, onCloseSession: sessionActions.close,
     onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource: stableOpenSource,
     onOpenPeerSession: openPeerSession,
@@ -821,6 +826,7 @@ function ChatSidebar({
     onDropSessionRef, canStageSessionRef,
   }), [
     renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel, onAutoTitle, slotRenameEnterRef,
+    renameOfflineSlot, renameOfflineScope,
     sessionActions.duplicate, sessionActions.close, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab,
     stableOpenSource, openPeerSession, startBoardCardDrag, endNativeSessionDrag, reorderPinnedByKeyboard,
     reorderManualByKeyboard, openElsewhere, toggleConductorExpanded,
@@ -954,7 +960,7 @@ function ChatSidebar({
     seedStateLanesMutation, selectInstance, selectRecentPreset, sessionCleanup, setAllFiltersPaused,
     setAutoTitleError, setBoardError, setCleanupOpen, setCollapsedHistoryGroups, setColumnEditId,
     setDerivedHintCol, setEditingId, setEditName, setEditScope, setFilterSortOpen, setFlatView,
-    setFolderActionError, setFolderCleanupOpen, setFolderOfflineNotice, refuseCreateOffline, setFolderCreateError, setFolderModal, setFoldersShelved,
+    setFolderActionError, setFolderCleanupOpen, setFolderCleanupRoot, setFolderOfflineNotice, refuseCreateOffline, setFolderCreateError, setFolderModal, setFoldersShelved,
     setHistoryFilter, setHistoryOpen, setLaneScrollEl, setBroadcastOpen, setManageTagsOpen, setModelFilterExcluded,
     setNewChatError, setNewChatMenuOpen, setPinnedOrderError, setRecentAmountDraft, setRemoteCrewError, setRenameError,
     setSeedError, setSlotFilter, setSortKey: pickSort, setStaleCollapseMs, setStaleExpanded, setToggleSaveFailed,
@@ -983,6 +989,8 @@ function ChatSidebar({
       {/* Scroll peek: full titles in a floating, click-through layer. The
           card itself keeps `sidebarWidth`. */}
       <ScrollPeekLayer titles={peekTitles} />
+      {/* Hovering a needs-me row opens its recap, asks and quick reply beside it (desktop pointer only). */}
+      <NeedsMeHoverLayer rootRef={sidebarRootRef} />
       {/* Outside the row list on purpose: a notice under a row adds a line every session
           pays for in above-fold density (AUTOSDE session-row-fixed-height). */}
       {duplicateError ? (
@@ -1036,6 +1044,7 @@ function ChatSidebar({
 
       {/* Clean Up dialog */}
       {folderCleanupOpen && <FolderCleanupPanel folders={folders} onClose={() => setFolderCleanupOpen(false)} />}
+      {folderCleanupRoot && <FolderCleanupPanel key={folderCleanupRoot.id} folders={folders} root={folderCleanupRoot} slots={localSlots} onClose={() => setFolderCleanupRoot(null)} />}
       {cleanupOpen && renderSessionCleanupPanel(scope)}
 
       {/* Switch-all-to-model dialog — mirrors the Clean Up panel. Picking a

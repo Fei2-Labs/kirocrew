@@ -120,6 +120,13 @@ describe('SessionStorageScreen (inventory)', () => {
     expect(screen.getByText('Storage screen redesign')).toBeTruthy()
   })
 
+  it('names the sort dropdown for what it controls', async () => {
+    // Without a name the trigger reads only the chosen order ("Largest first").
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText('Refactor the ACP adapter')).toBeTruthy())
+    expect(screen.getByLabelText('Sort sessions')).toBeTruthy()
+  })
+
   it('collapses background sessions into one group row', async () => {
     renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
     await waitFor(() => expect(screen.getByText(/Background agents/)).toBeTruthy())
@@ -224,6 +231,23 @@ describe('SessionStorageScreen (inventory)', () => {
     const confirmAt = labels.findIndex(t => /Delete forever/.test(t))
     expect(cancelAt).toBeGreaterThanOrEqual(0)
     expect(cancelAt).toBeLessThan(confirmAt)
+  })
+
+  /** Arming and Cancel each unmount the focused button; focus must not fall to the page. */
+  it('moves focus to Cancel on arm, and back to Delete forever on Cancel', async () => {
+    inventory = withTrash()
+    renderWithProviders(<SessionStorageScreen onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByText(/Delete forever/)).toBeTruthy())
+
+    const arm = screen.getByRole('button', { name: /Delete forever/ })
+    arm.focus()
+    await userEvent.keyboard('{Enter}')
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Cancel' })))
+
+    await userEvent.keyboard('{Enter}')
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull())
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: /Delete forever/ }))
+    expect(emptyFn).not.toHaveBeenCalled()
   })
 
   it('restores a batch without arming anything', async () => {

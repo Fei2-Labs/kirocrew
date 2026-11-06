@@ -8,7 +8,8 @@ default (:func:`published_config_timezone`), never a config load, because the
 timer tick and prompt assembly call these on the event loop.
 
 The service owns the state these read (the job list, which jobs are running);
-nothing here holds any, bar a bounded warn-once memo for bad cron expressions.
+nothing here holds any, bar bounded warn-once memos for bad cron expressions
+and unresolvable timezones.
 """
 
 from __future__ import annotations
@@ -85,7 +86,9 @@ def validate_cron_expr(expr: str) -> bool:
     execution contract cannot honor refuses before it persists. The one-field
     ``@`` aliases (``@daily``, ``@yearly``) stay — they carry no seconds field.
     """
-    if not croniter.is_valid(expr):
+    # croniter calls ``.lower()`` on its input, so a non-string (a JSON number,
+    # list or object from a PATCH body) raised instead of reading as invalid.
+    if not isinstance(expr, str) or not croniter.is_valid(expr):
         return False
     parts = expr.split()
     if len(parts) == 5:
@@ -522,13 +525,37 @@ def _job_tz(job: CronJob) -> tzinfo:
     gateway on the following tick; the host zone is refreshed by the tick's
     worker-thread scan, so a laptop that changes zone does too.
     """
+    name = ""
     try:
-        return ZoneInfo(resolve_timezone_name(job_zone_name(job)) or "UTC")
-    except Exception:
-        logger.warning("Failed to resolve timezone for job %s, using UTC", job.id, exc_info=True)
+        name = resolve_timezone_name(job_zone_name(job)) or "UTC"
+        zone = ZoneInfo(name)
+    except Exception as exc:
+        # Every tick re-resolves every job: warn once per job+zone, with no
+        # traceback; a full memo refuses rows, said once.
+        key, val = hash(job.id), hash(name)
+        if key in _BAD_TZ_WARNED or len(_BAD_TZ_WARNED) < _BAD_TZ_WARNED_MAX:
+            if _BAD_TZ_WARNED.get(key) != val:
+                _BAD_TZ_WARNED[key] = val
+                logger.warning(
+                    "Failed to resolve timezone %r for job %s, using UTC: %r", name, job.id, exc
+                )
+        else:
+            if not _BAD_TZ_REFUSED[0]:
+                logger.warning("Bad timezone warn-once memo is full; further jobs are not logged")
+            _BAD_TZ_REFUSED[0] = min(_BAD_TZ_REFUSED[0] + 1, 2**31)  # saturating count
         # Fixed UTC needs no tz database, so the Schedule page and the timer
         # keep working on a host that has none (see get_local_tz).
         return timezone.utc
+    if _BAD_TZ_WARNED:
+        _BAD_TZ_WARNED.pop(hash(job.id), None)
+    return zone
+
+
+# hash(job id) -> hash(zone name) already warned about by _job_tz. Fixed-size
+# ints, so the count cap below bounds the bytes too.
+_BAD_TZ_WARNED: dict[int, int] = {}
+_BAD_TZ_WARNED_MAX = 1024
+_BAD_TZ_REFUSED = [0]  # resolutions the full memo refused a row
 
 
 def backoff_delaying_next_run(job: CronJob, now: float | None = None) -> float | None:
@@ -603,7 +630,7 @@ def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
         if job.schedule.kind == "cron":
             result = _compute_next_run_ts_raw(job, backoff_until)
         else:
-            result = backoff_until
+            result = _next_unskipped_ts(job, backoff_until)
     # Float-gated like every non-finite check in this module: a bignum int
     # result serializes as digits (valid JSON) and math.isfinite(huge_int)
     # raises OverflowError -- the exact escape this guard exists to prevent.
@@ -658,6 +685,36 @@ def _next_cron_boundary_ts(job: CronJob, now: float) -> float | None:
     return nxt
 
 
+def _next_unskipped_ts(job: CronJob, candidate: float) -> float | None:
+    """First allowed instant at or after an interval or one-shot deadline.
+
+    These schedules stay due until attempted, so an excluded deadline moves to
+    the next allowed local day's start, without advancing the stored schedule.
+    Calendar days, rather than elapsed 24-hour periods, preserve DST boundaries.
+    """
+    if not job.skip_dates:
+        return candidate
+    from kiro_crew import cron as seams
+
+    try:
+        tz = _job_tz(job)
+        skipped = set(job.skip_dates)
+        horizon = candidate + _MAX_SKIP_DATE_HORIZON_SECS
+        for _ in range(len(skipped) + 1):
+            local = seams.datetime.fromtimestamp(candidate, tz=tz)
+            if local.strftime("%Y-%m-%d") not in skipped:
+                return candidate
+            midnight = (local + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0, fold=0
+            )
+            candidate = midnight.timestamp()
+            if candidate > horizon:
+                return None
+    except Exception:
+        logger.warning("Failed to compute allowed run date for job %s", job.id, exc_info=True)
+    return None
+
+
 def _compute_next_run_ts_raw(job: CronJob, now: float | None = None) -> float | None:
     """Unchecked next-fire-time computation; see :func:`compute_next_run_ts`."""
     from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
@@ -672,9 +729,9 @@ def _compute_next_run_ts_raw(job: CronJob, now: float | None = None) -> float | 
             if last is None:
                 return None
             nxt = last + sched.every_secs
-            return nxt if nxt > now else now
+            return _next_unskipped_ts(job, nxt if nxt > now else now)
         if sched.kind == "at" and sched.at_ts is not None:
-            return sched.at_ts if sched.at_ts > now else None
+            return _next_unskipped_ts(job, sched.at_ts) if sched.at_ts > now else None
         if sched.kind == "cron" and sched.cron_expr is not None:
             # croniter interprets cron_expr in base's timezone; get_next(float) returns UTC epoch
             tz = _job_tz(job)

@@ -1,18 +1,9 @@
 """Coverage-focused tests for the less-travelled paths of ``vector_memory``.
 
-The store's happy paths are already covered by ``test_vector_memory.py`` and the
-topic files its docstring names. This module targets the branches that only fire
-on legacy/degraded input: the legacy markdown migration, the export/import round
-trip, episodic promotion, the keyword fallback, the embedding backfill sweeps,
-and the many "value on disk is not what the writer promised" recovery paths.
-
-Everything runs against a fresh SQLite file under ``tmp_path`` with a
-deterministic in-process embedder — no network, no model download, no FAISS
-requirement.
-
-The module's "Additional coverage" section -- further vector-space lifecycle,
-lesson-dedup and ranking cases -- is in ``test_vector_memory_coverage_vector_space.py``;
-the store and embedder builders both modules use are in
+Branches that fire on legacy or degraded input: markdown migration, export/import,
+promotion, keyword fallback, backfill sweeps and on-disk recovery. A fresh SQLite file
+and a deterministic embedder; no network or FAISS. More cases are in
+``test_vector_memory_coverage_vector_space.py``; builders in
 ``vector_memory_coverage_helpers.py``.
 """
 
@@ -625,13 +616,9 @@ class TestCosineSimDimensionGuard:
 
 class TestStoredSimilarityScorer:
     """The scorer built by `_stored_similarity_scorer`
-    backs the two threshold callers (semantic dedup, contradiction detection)
-    as well as the two ranking callers, so it must (1) reject a mismatched
-    dimension the same way `_cosine_sim` now does, (2) return the raw
-    (possibly negative) cosine value rather than clamping at 0.0 -- a
-    threshold caller comparing against a band that may include non-positive
-    bounds needs the true value, and (3) agree with `_cosine_sim` to float64
-    precision, not the ~1e-7 the numpy path's old float32 accumulation gave.
+    backs threshold and ranking callers, so it must reject a mismatched dimension like
+    `_cosine_sim`, return the raw (possibly negative) cosine for threshold bands, and
+    agree with `_cosine_sim` to float64 precision.
     """
 
     def _row(self, vec: list) -> dict:
@@ -999,6 +986,22 @@ class TestMigrateFromMarkdown:
             if was_enabled:
                 gc.enable()
             gc.collect()
+        assert counts["semantic"] == 2
+        assert counts["skipped"] == 1
+        assert len(store.get_lessons()) == 2
+
+    def test_a_lessons_line_that_is_not_utf8_is_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One undecodable byte costs only its own line, not the migration."""
+        home = self._home(tmp_path, monkeypatch)
+        (home / "lessons.jsonl").write_bytes(
+            (json.dumps({"rule": "Always pin the release tag before publishing"}) + "\n").encode()
+            + b'{"rule": "bad \xff byte"}\n'
+            + (json.dumps({"rule": "Never bind a debug server to a public address"}) + "\n").encode()
+        )
+        store = _store(tmp_path)
+        counts = store.migrate_from_markdown()
         assert counts["semantic"] == 2
         assert counts["skipped"] == 1
         assert len(store.get_lessons()) == 2

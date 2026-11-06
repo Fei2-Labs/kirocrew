@@ -324,7 +324,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     dispatch, activeSlot, splitMode, drafts, saveDraftsDebounced, composerSlotRef, setInput, inputRef, mainComposerAppend, raisePrefillHint,
   })
   useSignedLinkAnchor({
-    embedded, mode, dispatch, setSearchParams, composerSlotRef, setInput, autoSendRef, newSessionRef, raisePrefillHint, setAutoSendTick, tokenConsumingRef,
+    embedded, mode, dispatch, composerSlotRef, setInput, autoSendRef, newSessionRef, raisePrefillHint, setAutoSendTick, tokenConsumingRef,
     getNoCarryCreateIdsRef: () => noCarryCreateIdsRef,
   })
 
@@ -909,7 +909,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // A busy turn: steer into it, answer its question card, stop it, and the queued-message cards.
   const {
     queuedMessages, systemDeliveryCount, steer, stopTurn, keepQuestionAnswer, answerQuestionCard,
-    handleCancelQueued, handleInterruptQueued, handleEditQueued, handleReorderQueued, queuePendingIds,
+    handleCancelQueued, handleInterruptQueued, handleEditQueued, handleEditOpenQueued, handleReorderQueued, queuePendingIds,
     handleSteerAction, steerActionPending, steerActionRefusals, steerActionRequestFailures,
   } = useBusyTurnControls({
     activeSlot,
@@ -934,9 +934,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     onSlashRefused: reportSlashRefusal,
   })
   // The endpointer's auto-submit is an Enter press: the composer's default busy
-  // decision for the active slot (never the flipped chord), so it steers where
-  // Send would steer. Assigned in render so the voice callback (composerHost.ts) always
-  // reaches the latest send() and steer().
+  // decision for the active slot (never the flipped chord), including a worker
+  // composer's steer-only mode, so it steers where Send would steer. Assigned in
+  // render so the voice callback (composerHost.ts) always reaches the latest send() and steer().
   voiceSubmitRef.current = () => {
     // The composer is held (the Crew Mode switch in flight, or a crew member's
     // closed conductor): an endpoint sends nothing. Dictation stops, its text
@@ -945,7 +945,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const slot = activeSlotRef.current
     // send() owns the disconnected guard and upload hold, so route either state there before steer() can consume the composer.
     if (!connected || isComposerSendHeld(slot) || isComposerSendHeld(composerSlotRef.current)) { void send(); return }
-    const flag = slot ? slotBusySteer(store.getState(), slot, jevAutoConsented) : undefined
+    const flag = slot
+      ? slotBusySteer(store.getState(), slot, jevAutoConsented, currentCrewRoot && currentSlot ? 'steer-only' : undefined)
+      : undefined
     if (flag) steer(flag === 'auto' ? { auto: true } : undefined)
     else void send()
   }
@@ -1201,7 +1203,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               pinModelToAgentMut={pinModelToAgentMut} projectBranch={projectBranch} projectGit={projectGit} projectGitError={projectGitError} shownModel={shownModel}
               cardOwnsRecovery={cardOwnsRecovery} continuable={continuable} continuing={continuing} handleContinue={handleContinue} interrupted={interrupted} dockGutter={dockGutter} dockRef={dockRef}
               endQuoteFlight={endQuoteFlight} flyingQuote={flyingQuote} inputAreaRef={inputAreaRef} isAtBottom={isAtBottom} answerQuestionCard={answerQuestionCard}
-              handleCancelQueued={handleCancelQueued} handleEditQueued={handleEditQueued} handleInterruptQueued={handleInterruptQueued} handleReorderQueued={handleReorderQueued}
+              handleCancelQueued={handleCancelQueued} handleEditQueued={handleEditQueued} handleEditOpenQueued={handleEditOpenQueued} handleInterruptQueued={handleInterruptQueued} handleReorderQueued={handleReorderQueued}
               keepQuestionAnswer={keepQuestionAnswer} queuedMessages={queuedMessages} queuePendingIds={queuePendingIds} steer={steer} stopTurn={stopTurn} systemDeliveryCount={systemDeliveryCount}
               handleEditLastRequest={handleEditLastRequest} composerOptimizing={composerOptimizing} handleOptimizingChange={handleOptimizingChange} memorySwitching={memorySwitching}
               // Crew Mode is chosen on the welcome state: while it is on neither the
