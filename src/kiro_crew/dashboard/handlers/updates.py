@@ -19,6 +19,7 @@ from kiro_crew import _facade_mirror
 #   ``updates_streams`` -- the log stream, the log level and the status SSE
 #   ``updates_step_up`` -- arming and approving an in-app update
 #   ``updates_channel`` -- the auto-update policy, release channel, revalidation, changelog
+#   ``updates_fork`` -- the fork's own GitHub-Releases wheel lane
 #: Owner modules, lowest layer first: the first holder of a name answers its reads.
 _OWNERS = (
     "kiro_crew.dashboard.handlers.updates_verdict",
@@ -27,6 +28,7 @@ _OWNERS = (
     "kiro_crew.dashboard.handlers.updates_streams",
     "kiro_crew.dashboard.handlers.updates_step_up",
     "kiro_crew.dashboard.handlers.updates_channel",
+    "kiro_crew.dashboard.handlers.updates_fork",
 )
 for _owner in _OWNERS:
     _importlib.import_module(_owner)
@@ -143,6 +145,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew import __version__ as _local_version  # noqa: F401
     from kiro_crew import dep_sync  # noqa: F401
+    from kiro_crew import fork_version  # noqa: F401
     from kiro_crew import platform_compat  # noqa: F401
     from kiro_crew import shutdown_event  # noqa: F401
     from kiro_crew import update_ownership  # noqa: F401
@@ -169,9 +172,13 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.dashboard.ws_event_scope import audit_teammate_withheld  # noqa: F401
     from kiro_crew.executors import subprocess_executor  # noqa: F401
     from kiro_crew.gateway_restart import resolve_restart_launcher  # noqa: F401
+    from kiro_crew.fork_version import is_fork_build  # noqa: F401
+    from kiro_crew.fork_version import strip_local  # noqa: F401
     from kiro_crew.git_divergence import UNREADABLE_TIMEOUT  # noqa: F401
     from kiro_crew.git_divergence import DivergenceUnreadable  # noqa: F401
     from kiro_crew.git_divergence import count_divergence  # noqa: F401
+    from kiro_crew.git_divergence import divergence_count_args  # noqa: F401
+    from kiro_crew.git_divergence import parse_divergence_counts  # noqa: F401
     from kiro_crew.platform import feed_trust  # noqa: F401
     from kiro_crew.platform import release_apply  # noqa: F401
     from kiro_crew.platform.update_capability import AUTO_EFFECT_UNKNOWN  # noqa: F401
@@ -188,6 +195,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.platform.update_capability import EXTERNALLY_MANAGED_MESSAGES  # noqa: F401
     from kiro_crew.platform.update_capability import MANAGED_BY_COMMAND  # noqa: F401
     from kiro_crew.platform.update_capability import MANAGED_BY_GIT  # noqa: F401
+    from kiro_crew.platform.update_capability import MANAGED_BY_KIROCREW  # noqa: F401
     from kiro_crew.platform.update_capability import MODE_NONE  # noqa: F401
     from kiro_crew.platform.update_capability import MODE_NOTIFY  # noqa: F401
     from kiro_crew.platform.update_capability import AutoUpdateEffect  # noqa: F401

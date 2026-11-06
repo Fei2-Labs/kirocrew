@@ -610,6 +610,13 @@ export function AboutPanel() {
   const forkSyncAvailable = useAppSelector(s => s.dashboard.status?.fork_sync_available) === true
   const forkBehindUpstream = useAppSelector(s => s.dashboard.status?.fork_behind_upstream) || 0
   const upstreamVersion = useAppSelector(s => s.dashboard.status?.upstream_version) || ''
+  // The GitHub-Releases wheel lane only applies where pip can replace the
+  // install's bytes. Git checkouts update through the git lane, Electron
+  // bundles through the desktop updater, containers through an image pull,
+  // and a policy `updates` provider owns whatever it governs — the endpoint
+  // refuses those shapes, so the button must not invite the click.
+  const updateManagedBy = useAppSelector(s => s.dashboard.status?.update_managed_by) || ''
+  const forkReleaseLane = !['git', 'electron', 'container', 'command'].includes(updateManagedBy)
   // The desktop lane pair, live-first. `info` is a one-shot `getInfo()` read from
   // mount, while every later check pushes its own answer on the lifecycle payload,
   // so preferring the push is what keeps the chip and the prerelease ask correct
@@ -1201,8 +1208,10 @@ export function AboutPanel() {
             )}
             {/* Fork upgrade: check the fork's own GitHub Releases feed and
                 offer a one-click upgrade. This replaces the upstream update
-                path, which is permanently disabled for fork builds. */}
-            {forkRevision && <ForkUpgradeButton />}
+                path, which is permanently disabled for fork builds. Only on
+                the release lane — a git checkout's updates come from the fork
+                remote, not from a wheel. */}
+            {forkRevision && forkReleaseLane && <ForkUpgradeButton />}
             {/* The gateway's own line, only when it is not the build the shell
                 badge above names. The branch and commit chips live here in that
                 case — they are gateway stamps, so beside the shell badge they

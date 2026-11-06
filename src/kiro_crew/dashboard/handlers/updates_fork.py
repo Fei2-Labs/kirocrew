@@ -24,8 +24,10 @@ from aiohttp import web
 
 import kiro_crew
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.dashboard.handlers.updates_verdict import _is_newer
+from kiro_crew.platform.update_capability import MANAGED_BY_KIROCREW, derive_capability
 
-logger = logging.getLogger("kiro_crew.dashboard.handlers.updates_fork")
+logger = logging.getLogger("kiro_crew.dashboard.handlers.updates")
 
 FORK_REPO = "Fei2-Labs/kirocrew"
 RELEASES_API = f"https://api.github.com/repos/{FORK_REPO}/releases/latest"
@@ -70,8 +72,72 @@ def _current_fork_sha() -> str:
         return ""
 
 
+async def _wheel_lane_refusal() -> dict[str, Any] | None:
+    """None when the release/wheel lane may serve this install, else the reason.
+
+    Only a ``kirocrew``-managed venv can have its bytes replaced by
+    ``pip install --force-reinstall``: a git checkout updates through the git
+    lane (fetch + reset + rebuild), an Electron bundle through its own updater,
+    a container through an image pull, and a policy ``updates`` provider owns
+    whatever it governs. The releases feed is the fallback lane for plain
+    pip-managed installs — everywhere else it is a wrong answer at best and a
+    clobbered checkout at worst. Both probes shell out or read pinned policy,
+    so they run off the event loop together.
+    """
+    def _probe() -> tuple[Any, Any]:
+        from kiro_crew.platform.update_provider import resolve_provider
+        return derive_capability(), resolve_provider()
+
+    try:
+        capability, provider = await asyncio.get_running_loop().run_in_executor(None, _probe)
+    except Exception:
+        # Fail closed: an install whose lane cannot be identified must not be
+        # offered a wheel that could clobber a checkout or bundle it sits in.
+        logger.warning("fork update: capability probe failed", exc_info=True)
+        return {"available": False, "managed_by": "unknown"}
+    if provider is not None:
+        return {"available": False, "managed_by": "command"}
+    if capability.managed_by == MANAGED_BY_KIROCREW:
+        return None
+    return {
+        "available": False,
+        "managed_by": capability.managed_by,
+        "unavailable_reason": capability.unavailable_reason or "",
+    }
+
+
+def _release_is_newer(tag: str) -> tuple[bool, str, str]:
+    """(available, remote_version, remote_sha) for a release tag.
+
+    Ordering, not inequality: a release OLDER than this build must never read
+    as an upgrade — the tag's sha differs from HEAD on every check either way,
+    which is what used to light the button on an up-to-date install.
+    Same-version different-sha still counts: the fork cuts rebuilds
+    deliberately, and only the sha can tell those builds apart.
+    """
+    parsed = _parse_tag(tag)
+    if not parsed:
+        return False, "", ""
+    remote_version, remote_sha = parsed
+    current_version = kiro_crew.__version__
+
+    newer = _is_newer(remote_version, current_version)
+    if newer is None:
+        available = remote_sha != _current_fork_sha()
+    elif newer:
+        available = True
+    else:
+        same_version = _is_newer(current_version, remote_version) is False
+        available = same_version and remote_sha != _current_fork_sha()
+    return available, remote_version, remote_sha
+
+
 async def api_update_fork_check(request: web.Request) -> web.Response:
     """GET /api/update/fork — check for a newer fork release."""
+    refusal = await _wheel_lane_refusal()
+    if refusal is not None:
+        return web.json_response(refusal)
+
     try:
         release = await _fetch_latest_release()
     except Exception as exc:
@@ -79,19 +145,14 @@ async def api_update_fork_check(request: web.Request) -> web.Response:
         return web.json_response({"available": False, "error": str(exc)}, status=502)
 
     tag = release.get("tag_name", "")
-    parsed = _parse_tag(tag)
-    if not parsed:
+    if not _parse_tag(tag):
         return web.json_response({"available": False, "error": f"unrecognized tag: {tag}"})
 
-    remote_version, remote_sha = parsed
-    current_sha = _current_fork_sha()
-    current_version = kiro_crew.__version__
-
-    available = remote_sha != current_sha
+    available, remote_version, remote_sha = _release_is_newer(tag)
     return web.json_response({
         "available": available,
-        "current_version": current_version,
-        "current_sha": current_sha,
+        "current_version": kiro_crew.__version__,
+        "current_sha": _current_fork_sha(),
         "remote_version": remote_version,
         "remote_sha": remote_sha,
         "remote_tag": tag,
@@ -106,11 +167,28 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
     if refused is not None:
         return refused
 
+    refusal = await _wheel_lane_refusal()
+    if refusal is not None:
+        return web.json_response(
+            {"ok": False, "error": f"release-lane update refused: managed_by={refusal['managed_by']}"},
+            status=409,
+        )
+
     try:
         release = await _fetch_latest_release()
     except Exception as exc:
         logger.error("fork update: cannot fetch release: %s", exc)
         return web.json_response({"ok": False, "error": str(exc)}, status=502)
+
+    tag = release.get("tag_name", "")
+    available, _, _ = _release_is_newer(tag)
+    if not available:
+        # Same ordering gate as the check: a direct POST must not install a
+        # release the check would have refused as older-or-equal.
+        return web.json_response(
+            {"ok": False, "error": f"latest release {tag or '?'} is not newer than this build"},
+            status=409,
+        )
 
     wheel_url = _find_wheel_url(release)
     if not wheel_url:
@@ -118,7 +196,6 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
             {"ok": False, "error": "no wheel asset in latest release"}, status=404
         )
 
-    tag = release.get("tag_name", "")
     logger.info("fork update: applying %s from %s", tag, wheel_url)
 
     def _download_and_install() -> str:
