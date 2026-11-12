@@ -39,6 +39,7 @@ import {
 
 import { Trans } from 'react-i18next'
 import { i18nT } from '../i18n/t'
+import { asSentence, kiroPrerequisiteIsBlocking, kiroPrerequisiteRefetchInterval } from './KiroPrerequisiteGateQueries'
 const QUERY_KEY = ['kiro-prerequisite'] as const
 export { asSentence, kiroPrerequisiteIsBlocking, kiroPrerequisiteRefetchInterval } from './KiroPrerequisiteGateQueries'
 

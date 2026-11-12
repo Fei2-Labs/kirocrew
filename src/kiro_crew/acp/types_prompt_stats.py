@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from kiro_crew.acp.types import RefusalInfo, TurnUsage
 
 
 logger = logging.getLogger(__name__)
@@ -171,6 +174,8 @@ class AcpPromptStats:
         nothing.
         """
         if self.refusal is not None:
+            from kiro_crew.acp.types import STOP_REASON_REFUSAL
+
             return STOP_REASON_REFUSAL, self.refusal
         return stop_reason, None
 

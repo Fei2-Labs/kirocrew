@@ -81,6 +81,8 @@ const shortcutsEnabled = () => localStorage.getItem(SHORTCUTS_ENABLED_KEY) !== '
 function isTerminalTarget(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null
   return !!el && typeof el.closest === 'function' && !!el.closest('.xterm')
+}
+
 function subscribePaletteShortcuts(onChange: () => void): () => void {
   // `key === null` is a `localStorage.clear()` in another tab.
   const onStorage = (e: StorageEvent) => { if (e.key === SHORTCUTS_ENABLED_KEY || e.key === null) onChange() }

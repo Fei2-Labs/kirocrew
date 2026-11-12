@@ -29,6 +29,7 @@ from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
     create_subprocess_limited,
+    sandboxed_spawn_argv,
     sandboxed_spawn_argv_off_loop,
 )
 

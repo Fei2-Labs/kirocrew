@@ -979,10 +979,6 @@ class AcpClient:
         return self.backend == ACP_BACKEND_DEEPSEEK
 
     @property
-    def _is_copilot(self) -> bool:
-        return self.backend == ACP_BACKEND_COPILOT
-
-    @property
     def _is_strands(self) -> bool:
         return self.backend == ACP_BACKEND_STRANDS
 
