@@ -1,0 +1,6 @@
+{
+  "managedBy": "Kiro Crew fork",
+  "checkCommand": "ELECTRON_RUN_AS_NODE=1 \"/Applications/KiroCrew.app/Contents/MacOS/KiroCrew\" \"/Applications/KiroCrew.app/Contents/Resources/fork-update/fork-update.js\" check",
+  "updateCommand": "ELECTRON_RUN_AS_NODE=1 \"/Applications/KiroCrew.app/Contents/MacOS/KiroCrew\" \"/Applications/KiroCrew.app/Contents/Resources/fork-update/fork-update.js\" apply",
+  "relaunchPath": "/Applications/KiroCrew.app/Contents/MacOS/KiroCrew"
+}

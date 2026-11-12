@@ -303,6 +303,13 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "fork-update",
+        "to": "fork-update",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "publish": [

@@ -17,10 +17,15 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      sha: ${{ steps.tag.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # full history for stamp-distribution.sh
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -78,3 +83,60 @@ jobs:
           files: dist/kirocrew-*.whl
           make_latest: true
           generate_release_notes: false
+
+  # The arm64 macOS desktop app, self-updating WITHOUT an Apple certificate:
+  # the build bakes packaging/fork/mac-managed-marker.json into app.asar, which
+  # routes the Electron shell into its EXTERNALLY-MANAGED update lane. That
+  # lane shells out to website/electron/fork-update/fork-update.js (shipped as
+  # a plain file in Contents/Resources) to check this repo's releases and swap
+  # the bundle in place. Squirrel.Mac can't serve ad-hoc-signed builds — its
+  # feed gate pins a stable signing identity and ad-hoc signatures only carry
+  # a per-build cdhash.
+  desktop-mac:
+    needs: build
+    runs-on: macos-14
+    permissions:
+      contents: write  # upload assets to the release the build job created
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # stamp-distribution.sh bakes FORK_REVISION from git
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build arm64 desktop app
+        # Single-arch: the fleet target is arm64 only. CSC discovery stays off
+        # so electron-builder never picks up a stray identity; the ad-hoc sign
+        # below is what lets the app launch at all. The marker env points the
+        # build at the fork's managed-lane declaration. build-desktop.sh
+        # self-provisions uv/PBS and needs no other credentials.
+        run: bash packaging/build-desktop.sh
+        env:
+          UNIVERSAL: "0"
+          TARGET_ARCH: arm64
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          KIROCREW_MANAGED_INSTALL_MARKER: packaging/fork/mac-managed-marker.json
+
+      - name: Ad-hoc sign and package
+        working-directory: website/electron/dist/mac-arm64
+        run: |
+          # arm64 macOS refuses to run unsigned code; an ad-hoc signature is
+          # enough to launch, and the managed lane (not Squirrel) owns updates.
+          codesign --force --deep --sign - KiroCrew.app
+          ditto -c -k --sequesterRsrc --keepParent KiroCrew.app KiroCrew-fork-mac-arm64.zip
+          shasum -a 512 KiroCrew-fork-mac-arm64.zip | cut -d' ' -f1 > KiroCrew-fork-mac-arm64.zip.sha512
+
+      - name: Upload desktop assets to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          files: |
+            website/electron/dist/mac-arm64/KiroCrew-fork-mac-arm64.zip
+            website/electron/dist/mac-arm64/KiroCrew-fork-mac-arm64.zip.sha512

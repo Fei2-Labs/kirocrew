@@ -24,6 +24,7 @@ from aiohttp import web
 
 import kiro_crew
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.dashboard.handlers.updates_apply import _restart_gateway
 from kiro_crew.dashboard.handlers.updates_verdict import _is_newer
 from kiro_crew.platform.update_capability import MANAGED_BY_KIROCREW, derive_capability
 
@@ -244,14 +245,23 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
 
     logger.info("fork update: installed %s, scheduling restart", tag)
 
-    # Schedule a restart after responding — give the response time to reach the client.
+    # Restart through _restart_gateway, the same path POST /api/restart takes:
+    # reexec_python_module() takes required args, so calling it bare raised
+    # TypeError in the task and the gateway stayed up on the old code.
+    state = request.app["state"]
+
     async def _delayed_restart() -> None:
+        # Reply BEFORE restarting — the exec replaces the process image.
         await asyncio.sleep(2)
         logger.info("fork update: restarting gateway")
-        from kiro_crew.platform_compat import reexec_python_module
-        reexec_python_module()
+        try:
+            await _restart_gateway(state)
+        except Exception:
+            logger.exception("fork update: gateway restart failed")
 
-    asyncio.get_event_loop().create_task(_delayed_restart())
+    task = asyncio.create_task(_delayed_restart())
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
 
     return web.json_response({
         "ok": True,
