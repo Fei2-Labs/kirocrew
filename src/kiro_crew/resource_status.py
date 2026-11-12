@@ -15,8 +15,8 @@ The advisory surfaces carry no enforcement, no lease, no cross-session
 coordination. Two sessions can both read "ample" and both launch heavy work —
 the tradeoff of a cheap, zero-tuning guard. One narrow enforcement point sits
 on top: :func:`admission_check` gates *background* work admission (scheduled
-cron firings, task-runner steps) while posture is CRITICAL, so the scheduler
-stops piling work onto a host that is about to freeze. Subagent spawns are not
+cron firings, task-runner steps, background helper turns) while posture is CRITICAL,
+so the scheduler stops piling work onto a host about to freeze. Subagent spawns are not
 gated here: they admit on their own memory floor (``agent.spawn_min_memory_gb``),
 which the pull tool reports on the gate's own figure (:func:`spawn_floor_reading`)
 because the posture can read AMPLE while that floor holds every start. Direct user chat turns
@@ -1317,14 +1317,15 @@ def probe(cfg: object | None = None) -> ResourceStatus:
 XDIST_AUTO_ENV = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 
 #: Platform-aware assumed steady-state memory of one xdist worker (GB). A
-#: full-suite worker holds ~1.5 GB on Linux but 14.9-16.1 GB on macOS, so no
-#: single fixed number is correct for every host. macOS is sized to that
-#: footprint; Linux/Windows to the collection floor plus headroom. Deliberately
+#: Linux worker running a long suite was measured at ~4.5 GB anonymous RSS (a
+#: host OOM's process table), a macOS one at 14.9-16.1 GB, so no single fixed
+#: number is correct for every host. macOS is sized to that footprint;
+#: Linux/Windows to the measured Linux worker plus headroom. Deliberately
 #: a constant, not a config key -- ``xdist_auto_cap`` is the single operator
 #: knob. Sized identically to the local ``-n auto`` budget (``xdist_budget``)
 #: so the two never disagree.
 _MACOS_XDIST_PER_WORKER_GB = 16.0
-_DEFAULT_XDIST_PER_WORKER_GB = 3.0
+_DEFAULT_XDIST_PER_WORKER_GB = 5.0
 
 
 def _resolve_xdist_per_worker_gb() -> float:
@@ -1439,7 +1440,7 @@ def admission_check(cfg: object | None = None) -> AdmissionDecision:
     The single enforcement point layered on the advisory posture tier: a
     CRITICAL posture refuses; every other posture — ample, tight, and unknown —
     admits. Callers on the gated paths (scheduled cron firings, task-runner
-    steps) consult this once per admission decision; it reuses the
+    steps, background helper turns) consult this once per admission decision; it reuses the
     same cheap :func:`probe` the advisory surfaces use (fingerprint-cached
     config, one memory read, and a handful of single-value cgroup reads for the
     slice's task figure) and never scans processes. The task figure is reported,

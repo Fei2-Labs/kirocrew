@@ -278,6 +278,23 @@ class TestPatchRoute:
         assert node == value
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", [15.0, 30.0])
+    async def test_an_integral_float_frame_rate_is_stored_as_the_choice(
+        self, cfg_home, value
+    ) -> None:
+        """``15.0`` equals the choice ``15``, so the route accepts it; the loader
+        reads only an int, so it must be stored as the choice it matched."""
+        cfg_home.write_text(json.dumps({"dashboard": {}}), encoding="utf-8")
+        async with TestClient(TestServer(_app())) as c:
+            resp = await c.patch(
+                "/api/config/kirocrew", json={"path": "browser.live.max_fps", "value": value}
+            )
+            assert resp.status == 200, await resp.text()
+        stored = json.loads(cfg_home.read_text(encoding="utf-8"))["browser"]["live"]["max_fps"]
+        assert stored == int(value) and type(stored) is int
+        assert KiroCrewConfig.load().browser.live.max_fps == int(value)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("path", "value"),
         [
@@ -362,7 +379,7 @@ class TestRetiredBrowserKeysOnDashboardSaves:
             assert resp.status == 200, await resp.text()
         assert self._assert_dropped(cfg_home)["agent"]["max_subagents"] == 8
 
-    def test_the_helper_touches_only_the_warned_keys(self) -> None:
+    def test_the_helper_keeps_renamed_spellings(self) -> None:
         from kiro_crew.config.resolution import drop_retired_section_keys
 
         data = {

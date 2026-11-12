@@ -1,7 +1,7 @@
 /** The chat state's shape: `ChatState`, the entity types it is built from, the
  *  initial value, and the one persisted key family it seeds from
  *  (`mc-activity-open:<slot>`). */
-import { safeSetItem } from '../../utils/safeStorage'
+import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
 import type { PhaseDetail, ToolPhaseDetail } from '../../utils/toolStatusLabel'
 import type { ChatMessage, SessionInfo, SubagentActivity, ToolActivity } from '../../types'
 import type { SubagentQueuedReason } from '../../pages/chat/subagentQueuedReason'
@@ -11,6 +11,7 @@ import type { ErrorReport } from '../../utils/errorReport'
 import type { AgentSwitchNotice } from '../../utils/agentSwitchFeedback'
 import type { HistoryDeleteRefusal } from '../../utils/historyDeleteRefusal'
 import type { ParkedThinking } from './thinking'
+import type { PasteBlock } from '../../utils/pasteTokens'
 
 /** Per-slot activity-panel open/closed state, persisted to localStorage so the
  *  panel's open/closed choice survives a full page reload — keeping it
@@ -37,6 +38,9 @@ export const persistActivityOpen = (slot: string | null, open: boolean): void =>
   if (!slot) return
   safeSetItem(ACTIVITY_OPEN_PREFIX + slot, String(open))
 }
+/** Whether `slot` has a saved panel open/closed choice: the panel was opened or
+ *  closed in that chat at least once. */
+export const hasSavedActivityOpen = (slot: string): boolean => safeGetItem(ACTIVITY_OPEN_PREFIX + slot) !== null
 /** The panel state a chat is entered with: its own saved choice (closed when it
  *  has none), or open while Keep side panel open is on and the entry CHANGES the
  *  chat. Re-entering the chat already shown (a return to the chat page, a switch
@@ -62,8 +66,9 @@ const seedSlotActivity = (): ChatState['slotActivity'] =>
 
 export type SlotState = 'idle' | 'streaming' | 'tool_running' | 'stopping' | 'compacting'
 export type EndedTurn = { gen: string; turn: number }
-/** One prompt this tab submitted: the bubble text and the send's own id. */
-export type SendAttempt = { text: string; sendId: string }
+/** One prompt this tab submitted: the bubble text, the send's own id and the
+ *  paste blocks its tokens name. */
+export type SendAttempt = { text: string; sendId: string; pastes?: PasteBlock[] }
 /** Retention bound for `ChatState.sendAttempts`, per slot. */
 export const SEND_ATTEMPTS_PER_SLOT_MAX = 50
 
@@ -236,14 +241,17 @@ export interface ChatState {
    *  the tab that resume replaced. `leaveSplit` marks a resume whose caller
    *  asked the chat page to leave Split View once it takes the view. */
   lastResumeActivation?: { requestId: string; replaced: string | null; leaveSplit?: boolean } | null
-  /** The last session the user OPENED by a gesture, set when that open's
-   *  transcript load lands (`switchSlot.fulfilled` for a switch marked
-   *  `gesture`, which only user-initiated opens set; see `SwitchSlotArg`). `seq` counts the opens,
-   *  so opening the same session again is a new value. A restore, an
-   *  automatic move or a failed load never sets it. Read by
-   *  `useAckCronNotesInView`: opening a cron run's chat is what marks its bell
-   *  note read (#23564). */
-  userOpen?: { key: string; seq: number }
+  /** The last session the user OPENED by a gesture, set when that open starts
+   *  (`switchSlot.pending` for a switch marked `gesture`, which only
+   *  user-initiated opens set; see `SwitchSlotArg`). `landed` turns true when
+   *  its transcript load lands (`switchSlot.fulfilled`); a failed or
+   *  superseded load never sets it. `seq` counts the opens, so opening the
+   *  same session again is a new value. A restore or an automatic move never
+   *  sets it. Read by `useAckCronNotesInView`: opening a cron run's chat is
+   *  what marks its bell note read (#23564). */
+  userOpen?: { key: string; seq: number; landed: boolean }
+  /** Bumped when a slot switch asks the chat page to leave Split View. */
+  leaveSplitSeq?: number
   /** Forks started in this window that will open their child when they
    *  succeed and `forkMayOpen` allows it. Creates are tracked by
    *  `foregroundCreateId`. While either is pending, the chat page does not
@@ -658,8 +666,9 @@ export interface ChatState {
    *  consumed the tick would make a NEWER snapshot read as stale. Warm
    *  against warm is ordered by `runWarmSeq`, the `warmSeq` of the newest
    *  warm whose run-state verdict was applied; an older warm landing after
-   *  it declines. */
-  slotRun: Record<string, { state: SlotState; lastChunkSeq?: number; lastChunkGen?: string; tick?: number; runWarmSeq?: number }>
+   *  it declines. `pendingTurn` is `pendingTurnSlot` for a slot that is not
+   *  on screen: a local send still awaiting server confirmation. */
+  slotRun: Record<string, { state: SlotState; lastChunkSeq?: number; lastChunkGen?: string; tick?: number; runWarmSeq?: number; pendingTurn?: true }>
   /** Path B: per-slot one-time hydration guard so the server history is
    *  prepended exactly once even if a WS frame seeds slotMessages first. */
   slotHydrated: Record<string, boolean>
@@ -746,9 +755,12 @@ export interface ChatState {
   // IS an answer — the user who keeps typing has declined by conduct — and the
   // backend needs no telling because it never re-offers this slot anyway.
   folderSuggestions: Record<string, { folderId: string; folderName: string; breadcrumb: string; ts: number; turns: number }>
-  // Slot with a locally-started turn awaiting server confirmation. While set,
-  // the slots-sync ignores a server running=false for it (the snapshot may
-  // predate the send). Cleared on server confirmation or turn end.
+  // The active slot, while it has a locally-started turn awaiting server
+  // confirmation. While set, the slots-sync ignores a server running=false for
+  // it (the snapshot may predate the send). Cleared on server confirmation or
+  // turn end. Leaving the slot parks the mark on its `slotRun` entry
+  // (`pendingTurn`) and entering it brings the mark back (`enterActiveSlot`),
+  // so each slot keeps its own; `selectPendingTurn` reads either place.
   pendingTurnSlot: string | null
   // The last close the server refused, so the row that came back is explained.
   // Set by `deleteSlot` itself, so every close path (sidebar X, any session

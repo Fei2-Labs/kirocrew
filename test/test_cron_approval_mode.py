@@ -109,10 +109,13 @@ class TestCronApprovalModeGateway:
 
         return captured
 
-    def test_auto_mode_passes_auto_approve_and_no_callback(self) -> None:
+    def test_auto_mode_passes_auto_approve_and_a_live_auto_check(self) -> None:
         captured = self._run_cron_callback("auto")
         assert captured["approval_policy"] == ToolApprovalPolicy.AUTO_APPROVE
-        assert captured["on_tool_approval"] is None
+        # The callback approves while ``auto`` holds; a mid-turn policy deny asks
+        # instead (RFC LTS edition D9).
+        approve = captured["on_tool_approval"]
+        assert asyncio.run(approve(MagicMock())) is True
 
     def test_empty_mode_passes_hook_based_and_callback(self) -> None:
         captured = self._run_cron_callback("")
@@ -484,7 +487,8 @@ class TestCronSubagentInjection:
         gw._cron_runs_holding = set()
         gw._cfg = MagicMock()
         gw._cfg.agent.max_subagents = 5
-        gw.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
+        # The cron run's live session: a completion continues it (``is_new`` False).
+        gw.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
         gw.sessions.release = MagicMock()
         gw.sessions.reset = AsyncMock()
         gw.sessions.cancel_current = AsyncMock()

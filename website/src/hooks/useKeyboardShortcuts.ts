@@ -7,7 +7,7 @@ import { askAppConfirm } from '../lib/appConfirm'
 import { forgetClosedSessionRef, hasRecentlyClosedSession, isClosedSessionOpenIn, rememberClosedSession, restoreClosedSession, takeRecentlyClosedSession, trackClosedSessionClose, waitForClosedSession } from '../lib/recentlyClosedSessions'
 import type { ClosedSessionRef } from '../lib/recentlyClosedSessions'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
-import { focusComposerElement, focusComposerForResumedSession, queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
+import { focusComposerElement, focusComposerForResumedSession, queryComposerOrExpand, queryPendingApprovalAction, rejectPendingApproval, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { reportSeamCollision } from '../apps/seamCollision'
 import {
   loadPanelToggleOverrides,
@@ -47,7 +47,7 @@ import { noteEscapeStoppedSpeech } from '../utils/speechStopKey'
 
 /** Shortcuts scoped to the session on screen (see the crew-window guard). */
 const CREW_WINDOW_SCOPED: ReadonlySet<string> = new Set([
-  'close-chat', 'focus-input', 'focus-approval',
+  'close-chat', 'focus-input', 'focus-approval', 'reject-approval',
   'cycle-agent', 'cycle-prev-agent', 'cycle-reasoning', 'cycle-prev-reasoning',
   'cycle-approval', 'cycle-prev-approval', 'cycle-model', 'cycle-prev-model',
   'pop-out-session',
@@ -277,12 +277,15 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'nav-notifications': 'hooks.useKeyboardShortcuts.notifications_panel',
   'nav-projects': 'hooks.useKeyboardShortcuts.projects_panel',
   'nav-schedule': 'hooks.useKeyboardShortcuts.schedule_panel',
-  // Reused: the same commands as the top-bar arrows, so the reference list and
-  // the buttons cannot drift apart.
-  'history-back': 'app.nav_back',
-  'history-forward': 'app.nav_forward',
+  // Same commands as the top-bar arrows, but list-only keys: the handler leaves
+  // ⌘/Ctrl+←/→ to a focused text field (line start/end or word-jump), so the
+  // rows name that rule the way the Alt+arrow rows do. The buttons keep the
+  // plain `app.nav_back` / `app.nav_forward`, because a click works anywhere.
+  'history-back': 'hooks.useKeyboardShortcuts.back_outside_text_fields',
+  'history-forward': 'hooks.useKeyboardShortcuts.forward_outside_text_fields',
   'focus-input': 'hooks.useKeyboardShortcuts.focus_text_input',
   'focus-approval': 'hooks.useKeyboardShortcuts.focus_pending_approval',
+  'reject-approval': 'hooks.useKeyboardShortcuts.reject_pending_approval',
   // Reused: the same command as the chat sidebar's own New chat / Close session
   // controls, so the reference list and the buttons cannot drift apart.
   'new-chat': 'pages.chatSidebar.new_chat',
@@ -304,6 +307,8 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   // Reused: the ChatInput control this chord fires.
   'optimize-prompt': 'components.chatInput.optimize_prompt',
   'edit-last-message': 'hooks.useKeyboardShortcuts.edit_last_message',
+  'list-indent': 'hooks.useKeyboardShortcuts.indent_list_line',
+  'list-outdent': 'hooks.useKeyboardShortcuts.outdent_list_line',
   'agent-monitor': 'hooks.useKeyboardShortcuts.open_agent_monitor',
   'stop-speaking': 'hooks.useKeyboardShortcuts.stop_speaking',
   'notification-prev': 'hooks.useKeyboardShortcuts.previous_notification',
@@ -659,7 +664,7 @@ export function formatShortcut(def: ShortcutDef): string {
   if (def.ctrl) parts.push(mac ? '\u2303' : 'Ctrl')
   if (def.alt) parts.push(mac ? '\u2325' : 'Alt')
   if (def.shift) parts.push(mac ? '\u21e7' : 'Shift')
-  const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === 'ArrowUp' ? '\u2191' : def.key === 'ArrowDown' ? '\u2193' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? '\u238b' : def.key.toUpperCase()
+  const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === 'ArrowUp' ? '\u2191' : def.key === 'ArrowDown' ? '\u2193' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? '\u238b' : def.key === 'Tab' ? (mac ? '\u21e5' : 'Tab') : def.key.toUpperCase()
   parts.push(keyLabel)
   return parts.join(mac ? '' : ' + ')
 }
@@ -738,6 +743,11 @@ interface UseKeyboardShortcutsOpts {
    *  panel if needed. Same ownership and unbound-when-undefined rule as
    *  `onToggleTerminal`. */
   onNewTerminal?: () => void
+  /** Close the docked panel's active terminal tab, or select the tab before or
+   *  after it. Same ownership and unbound-when-undefined rule as `onNewTerminal`. */
+  onCloseTerminalTab?: () => void
+  onPrevTerminalTab?: () => void
+  onNextTerminalTab?: () => void
   /** Pop the active session out to its own window, or focus that window when it
    *  is already out. Left undefined in a window that has no pop-out control (a
    *  popout or an embedded pane), which leaves the chord to the browser. */
@@ -747,7 +757,7 @@ interface UseKeyboardShortcutsOpts {
   disabled?: boolean
 }
 
-export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, onPopOutSession, onToggleSideTerminal, disabled }: UseKeyboardShortcutsOpts) {
+export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, onCloseTerminalTab, onPrevTerminalTab, onNextTerminalTab, onPopOutSession, onToggleSideTerminal, disabled }: UseKeyboardShortcutsOpts) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const guardedHistoryStep = useGuardedHistoryStep()
@@ -816,8 +826,11 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     'side-panel': onToggleSidePanel,
     'terminal': onToggleTerminal,
     'terminal-new': onNewTerminal,
+    'terminal-close': onCloseTerminalTab,
+    'terminal-prev': onPrevTerminalTab,
+    'terminal-next': onNextTerminalTab,
     'side-terminal': onToggleSideTerminal,
-  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, onToggleSideTerminal])
+  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, onCloseTerminalTab, onPrevTerminalTab, onNextTerminalTab, onToggleSideTerminal])
 
   const handler = useCallback((e: KeyboardEvent) => {
     const isInput = isEditableTarget(e)
@@ -970,7 +983,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         && (PANEL_TOGGLES_SKIPPING_SHELL.has(panelToggle) || !isTerminalTarget(e.target))) {
       if (!enabled || disabled) return
       e.preventDefault()
-      panelAction()
+      // A held close chord's auto-repeat is not another press: each tick would stop another shell.
+      if (!e.repeat || panelToggle !== 'terminal-close') panelAction()
       return
     }
 
@@ -1025,12 +1039,17 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         // Focus the pending tool-approval row. Firing while typing is safe HERE
         // ONLY BECAUSE IT MOVES FOCUS AND NOTHING ELSE — the decision still costs
         // a second, deliberate press on a control the user can now see is
-        // focused. A chord that ANSWERED the prompt would be a one-keystroke path
+        // focused. A chord that APPROVED the prompt would be a one-keystroke path
         // to running a tool call nobody read, which is why this one stops at
         // focus; see queryPendingApprovalAction. Claimed even with no approval
         // pending: the chord collides with no browser binding, so swallowing it
         // avoids a stray newline in the draft; nothing is focused in that case.
         'focus-approval': () => queryPendingApprovalAction()?.focus(),
+        // Reject the pending tool call once; see rejectPendingApproval. Claimed
+        // with nothing pending so ⌥⇧R never types ‰ into the draft. Inert under
+        // a remote crew, whose local pane is hidden but still mounted, and on an
+        // auto-repeat, which must not refuse the next prompt as it arrives.
+        'reject-approval': () => { if (!e.repeat && appStore.getState().instances.activeId === null) rejectPendingApproval() },
         // Focus text input — works even from other inputs. Unguarded on purpose:
         // a pressed keyboard shortcut proves a keyboard exists —
         // `focusComposer`'s touch-device skip would wrongly no-op it. Still
@@ -1316,7 +1335,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       if (!action) return
       e.preventDefault()
       e.stopPropagation()
-      action()
+      // Same auto-repeat rule as the bubble path above.
+      if (!e.repeat || id !== 'terminal-close') action()
     }
     document.addEventListener('keydown', onSkipShell, true)
     return () => document.removeEventListener('keydown', onSkipShell, true)

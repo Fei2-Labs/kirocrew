@@ -18,6 +18,7 @@ installer from here; its algorithms live in :mod:`kiro_crew.snapshot_merge`.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -29,6 +30,7 @@ from typing import Callable, cast
 
 from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.atomic_write import replace_with_retry
+from kiro_crew.config import loosening_provenance
 from kiro_crew.member_memory_backup import StoresInUse
 from kiro_crew.memory_stores import (
     MEMBER_BACKUPS_DIR_NAME,
@@ -38,6 +40,8 @@ from kiro_crew.memory_stores import (
 )
 from kiro_crew.snapshot_archive import (
     _bundle_carries_named_stores,
+    _recorded_skips,
+    _records_omission_of,
     _safe_name,
 )
 from kiro_crew.snapshot_components import (
@@ -373,6 +377,7 @@ def _backup_and_copy(
                     f"version is in {backup}. Re-run with the gateway stopped."
                 ) from exc
             _lock_down_restored(mc / f, component)
+            _endorse_restored(mc / f, functools.partial(Path.read_bytes, snap / f))
         return
 
     src_fd = pinned_fs.open_dir_pinned(snap, what=f"snapshot payload for {component!r}")
@@ -441,12 +446,33 @@ def _backup_and_copy(
                         # needs restrict_to_owner for its DACL, which is why that call
                         # survives there and not here.
                         pass
+                    if copied:
+                        _endorse_restored(live, functools.partial(_read_at, src_fd, f))
             finally:
                 os.close(backup_fd)
         finally:
             os.close(dst_fd)
     finally:
         os.close(src_fd)
+
+
+def _endorse_restored(live: Path, read: Callable[[], bytes]) -> None:
+    """Endorse the archive bytes just installed at *live* when it is a sealed keystone file.
+
+    A restore is the owner's own write, so the restored ``config.json`` /
+    ``config.local.json`` takes effect instead of being held as pending behind the
+    endorsed copy of the file it replaced (``config.loosening_provenance``). *read* reads
+    the SOURCE, never the installed destination. Anything else is left alone, unread.
+    """
+    if loosening_provenance.leaf_for(live) is not None:
+        loosening_provenance.endorse_installed(live, read())
+
+
+def _read_at(dir_fd: int, name: str) -> bytes:
+    """The bytes of regular file *name* under the pinned *dir_fd*, never following a link."""
+    fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
 
 
 #: Settings documents whose own writers create them owner-only. The config overlay can
@@ -990,9 +1016,18 @@ def _do_replace(
         # target the phase never reached.
         installed: set[str] = set()
         try:
-            facade._do_replace_mutations(
-                snap, mc, backup, components, mem_roots, installed, allow_unpinned=allow_unpinned
-            )
+            # A failed replace puts the previous files back, so the endorsed copies of
+            # the keystone files it restored go back with them.
+            with loosening_provenance.endorsements_restored_on_error():
+                facade._do_replace_mutations(
+                    snap,
+                    mc,
+                    backup,
+                    components,
+                    mem_roots,
+                    installed,
+                    allow_unpinned=allow_unpinned,
+                )
         except BaseException as e:
             # `BaseException`, not `Exception`: `PinnedPathRefusal` and `KeyboardInterrupt`
             # both fire MID-mutation, and a Ctrl-C would otherwise leave live state half
@@ -1090,6 +1125,20 @@ def _drop_derived_indexes_absent_from_bundle(
         print(f"  ↩️  {rel} is not in the archive — moved aside so it can be rebuilt")
 
 
+def _rmtree_or_raise(path: Path) -> None:
+    """Remove a tree, read-only files included, and raise when any of it is left.
+
+    Windows refuses to unlink a read-only file, and git writes its objects that way;
+    ``rmtree_force`` clears the bit but never raises, so a surviving tree raises here.
+    POSIX keeps the descriptor-walking ``shutil.rmtree``: the mode never blocks an unlink
+    there, and the hook's retry by full path could follow a swapped symlink.
+    """
+    if platform_compat.IS_POSIX:
+        shutil.rmtree(path)
+    elif not platform_compat.rmtree_force(path):
+        raise OSError(f"could not remove {path}")
+
+
 def _clear_store_directories(root: Path) -> None:
     """Remove everything under ``memory_stores/`` that a bundle can carry, keep the rest.
 
@@ -1102,7 +1151,7 @@ def _clear_store_directories(root: Path) -> None:
         if is_host_local_store_state((MEMORY_STORES_DIR_NAME, entry.name)):
             continue
         if entry.is_dir() and not platform_compat.is_link_or_junction(entry):
-            shutil.rmtree(str(entry))
+            _rmtree_or_raise(entry)
         elif platform_compat.is_link_or_junction(entry) and not entry.is_symlink():
             platform_compat.unlink_link_or_junction(entry)
         else:
@@ -1148,6 +1197,7 @@ def _do_replace_mutations(
     for comp in _WHOLE_TREE_COMPONENTS:
         if not _want(components, comp):
             continue
+        kept_live = False
         for dirname in COMPONENTS[comp].trees:
             d = mc / dirname
             # Required by `test_each_trees_loop_is_guarded`: the pre-flight runs in the
@@ -1160,6 +1210,17 @@ def _do_replace_mutations(
                 # so this is not gated on `sd.is_dir()`. Only the document moves, under its
                 # owner's lock; the directory is never swapped.
                 rel = _LOCKED_DOCUMENT_TREES[dirname]
+                if not (snap / rel).is_file() and _records_omission_of(_recorded_skips(snap), rel):
+                    # Except where the bundle's own manifest says it could not carry the
+                    # document (a sandboxed run, an unreadable tree): its absence then says
+                    # nothing about the live document, and removing that would lose it.
+                    print(
+                        f"  ↩️  {dirname}: kept the live "
+                        f"{_safe_name(PurePosixPath(rel).name)}; this bundle did not carry it "
+                        "(MANIFEST.json lists it as skipped)."
+                    )
+                    kept_live = True
+                    continue
                 save = _save_locked_document_to(backup, rel)
                 # The rollback copy is taken by the installer inside its lock hold, so
                 # `installed` is recorded only once the mutation has run: a failure
@@ -1174,7 +1235,7 @@ def _do_replace_mutations(
             if sd.is_dir():
                 installed.add(dirname)
                 if d.is_dir():
-                    shutil.rmtree(str(d))
+                    _rmtree_or_raise(d)
                 # Skips are fatal: the live tree is gone. `must_create` refuses a root
                 # recreated between the rmtree and the copy.
                 facade._copytree_safe(
@@ -1184,7 +1245,8 @@ def _do_replace_mutations(
                     must_create=True,
                     on_skip=pinned_fs.fatal_skip_reporter(f"restore of {dirname!r}"),
                 )
-        print(f"  ✅ {comp}")
+        if not kept_live:
+            print(f"  ✅ {comp}")
 
     # Scoped to memory's own trees as `_do_replace` selected them: the two workspace/
     # subtrees only when `workspace` is not also selected (that pass has already replaced
@@ -1207,7 +1269,7 @@ def _do_replace_mutations(
                 # archive never carries those entries (`_never_ships`), so no collision.
                 _clear_store_directories(d)
             else:
-                shutil.rmtree(str(d))
+                _rmtree_or_raise(d)
         if sd.is_dir():
             installed.add(tree)
             # The pinned primitive needs the parent chain to exist (a fresh machine has no
@@ -1309,7 +1371,7 @@ def _restore_everything_from_rollback(
                 if platform_compat.is_link_or_junction(target):
                     platform_compat.unlink_link_or_junction(target)
                 elif target.is_dir():
-                    shutil.rmtree(str(target))
+                    _rmtree_or_raise(target)
                 elif target.exists():
                     target.unlink()
                 # MOVED back, not copied: the rollback holds the only copy, and a move also
@@ -1331,7 +1393,7 @@ def _restore_everything_from_rollback(
                     # the held lock inodes; neither may be removed during recovery.
                     _clear_store_directories(target)
                 elif target.is_dir():
-                    shutil.rmtree(str(target))
+                    _rmtree_or_raise(target)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 # The plain copy is lossless for TREES: `_backup_tree_or_refuse` refuses a
                 # link, so a saved tree is links-free. (Saved core files can be links; the
@@ -1387,7 +1449,7 @@ def _restore_everything_from_rollback(
                     if rel == MEMORY_STORES_DIR_NAME:
                         _clear_store_directories(target)
                         continue
-                    shutil.rmtree(str(target))
+                    _rmtree_or_raise(target)
                 else:
                     # Covers a link or junction as well as a plain file, so it goes through
                     # the helper: `Path.unlink` cannot remove a Windows junction, and the

@@ -442,7 +442,6 @@ from kiro_crew.constants import (  # noqa: F401 - loader namespace compatibility
     SUBAGENT_TIMEOUT_SECS,
 )
 from kiro_crew.effort import is_valid_effort, model_supports_effort  # noqa: F401
-from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path  # noqa: F401
 
 # The memory-store shape rule, applied to store NAMES at load. Leaf module:
 # stdlib only at module scope (it imports this one lazily), so no cycle.
@@ -688,6 +687,18 @@ _OWNERS = (
 for _owner in _OWNERS:
     _importlib.import_module(_owner)
 
+#: The MCP gateway's two path defaults, which this module has always served. Read on
+#: first use (:func:`__getattr__`) instead of imported: the rewriter that owns them loads
+#: the gateway manager and the sandbox, which a process that only reads config never uses.
+_GATEWAY_PATH_DEFAULTS = frozenset({"default_overlay_dir", "default_socket_path"})
+
+
+def __getattr__(name: str) -> Any:
+    if name in _GATEWAY_PATH_DEFAULTS:
+        return getattr(_importlib.import_module("kiro_crew.mcp_gateway.rewriter"), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 #: Owner-bound name this module does not bind -> the owner that answers a read of it.
 _EXPORTS: dict[str, str] = {}
 _EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
@@ -700,6 +711,11 @@ _sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
 # public name of the family, as it was when the family was one module.
 __all__ = sorted(name for name in set(globals()) | set(_EXPORTS) if not name.startswith("_"))
 
+if TYPE_CHECKING:  # the names ``__getattr__`` reads on first use, for type checkers
+    from kiro_crew.mcp_gateway.rewriter import (  # noqa: F401
+        default_overlay_dir,
+        default_socket_path,
+    )
 if TYPE_CHECKING:  # every owner-defined name this module forwards, for type checkers
     from kiro_crew.config.loader_adapter_factory import (  # noqa: F401
         create_adapter_provider_factory,
@@ -719,6 +735,8 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _JSON_TYPE_LABELS,
         _MEMBER_HARNESS_KEY,
         _SECURITY_BOUNDED_FIELDS,
+        MEMBER_BACKEND_INHERITED_ATTR,
+        _agent_section_fields,
         _build_agent_config,
         _build_dashboard_config,
         _build_session_config,
@@ -733,14 +751,18 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _feature_previews,
         _folder_sort_from,
         _jira_auth_entry,
+        _lane_weights_from,
         _load_background_hold_secs,
         _load_idle_exempt_keys,
         _log_config_clamp_event,
+        _member_fallback_logged,
         _member_remap_logged,
+        _note_member_fallback,
         _note_member_remap,
         _otlp_endpoint_rows,
         _read_backend_choice,
         _registry_entry,
+        _resolved_kas_bundle,
         _restore_stored_harness_fields,
         _restore_stored_stt_provider,
         _session_folder_root_or_empty,
@@ -753,6 +775,8 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _translucent_panels_from,
         consume_managed_service_launch_environment,
         launched_as_managed_service,
+        mark_member_backend_inherited,
+        member_backend_inherited,
         resolve_loop_stall_exit_after,
     )
     from kiro_crew.config.loader_credentials import (  # noqa: F401
@@ -778,6 +802,8 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         CRED_SLACK_BOT_TOKEN,
         CRED_TELEGRAM_BOT_TOKEN,
         CRED_WAKATIME_API_KEY,
+        CRED_WAKATIME_OAUTH_CLIENT_SECRET,
+        CRED_WAKATIME_OAUTH_TOKENS,
         CRED_WEBEX_BOT_TOKEN,
         CRED_WECOM_BOT_ID,
         CRED_WECOM_SECRET,
@@ -838,11 +864,14 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
     )
     from kiro_crew.config.loader_document import (  # noqa: F401
         _ABSENT_AGENT_KEY,
+        _RESOLVED_DEFAULT_AGENT_KEYS,
+        _SIDECAR_AGENTS_REPAIRED,
         _SIDECAR_BASE_SHADOW,
         _SIDECAR_BASE_UNREADABLE,
         _SIDECAR_OVERLAY_UNREADABLE,
         ConfigReadError,
         ConfigWriteRefused,
+        PendingEditBlocksSave,
         _agent_key_declared,
         _agent_key_on_disk,
         _aws_project_profiles_on_disk,
@@ -850,12 +879,14 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _bind_content_digest,
         _cached_validated_data,
         _config_fingerprint,
+        _config_text_bytes,
         _config_write_lock,
         _content_digest_of,
         _deepseek_env_on_disk,
         _invalidate_config_cache,
         _lock_target,
         _notify_live_watch,
+        _prior_document,
         _raw_agent_section,
         _raw_config,
         _raw_stt_provider,
@@ -872,13 +903,16 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         acp_backend_declared,
         acp_backend_overlay_owned,
         acp_backend_stored_as_kiro,
+        acp_backend_stored_runs_kas,
         coerce_config_field,
         coerce_dict_section,
         config_content_stamp,
+        kas_bundle_build_default,
         member_acp_backend_declared,
         read_config_for_update,
         refresh_config_meta_stamp,
         stamp_config_meta,
+        strip_undeclared_resolved_defaults,
         unsandboxed_exec_declared,
         unsandboxed_exec_platform_default,
         update_config_locked,
@@ -904,8 +938,11 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         normalize_workspace_path,
         oauth_endpoints_path,
         outbox_dir,
+        overlay_entry,
         overlay_pins,
+        project_hooks_consent_path,
         read_config_text,
+        read_endorsed_config_text,
         read_local_secret,
         read_merged_config_files,
         registry_trust_path,
@@ -919,6 +956,7 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _TOP_LEVEL_DEFAULTS,
         ConfigDocument,
         _parse_app_settings,
+        _recording_config_reader,
         build_config,
         default_project_dir,
         load_config_with_content_stamp,
@@ -944,12 +982,14 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _MATERIALIZED_COMPLETE,
         _MATERIALIZED_LAST_DROPPED,
         _MATERIALIZED_MATE_ONLY,
+        _MATERIALIZED_MEMO,
         _MATERIALIZED_REFRESH_APPLIED,
+        _MATERIALIZED_REFRESH_FLIGHT,
         _MATERIALIZED_REFRESH_ISSUED,
+        _MATERIALIZED_SCAN_COUNTS,
         _MATERIALIZED_SEEN,
         _MATERIALIZED_SEEN_MAX,
         _MATERIALIZED_SEEN_NAME_MAX_CHARS,
-        _MATERIALIZED_SKIPPED,
         _MATERIALIZED_STEMS,
         _SCAN_STATE,
         DEFAULT_KIRO_TEMPLATE,
@@ -960,21 +1000,22 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _locked_workspace_dir,
         _log_default_agent_reset,
         _materialized_kiro_agent,
+        _memo_key,
+        _MemoKey,
         _project_declares_agent,
         _project_scope_excludes,
         _read_hardened_agent_spec,
+        _refresh_or_reuse,
         _remember_seen,
         _removal_evidence,
         _report_dropped,
+        _scan_and_install,
         _scan_materialized_agents,
         _scan_materialized_index,
         _workspace_declares,
         agent_alias_snapshot,
         default_template,
         dispatch_kiro_agent,
-        materialized_agents_generation,
-        materialized_refresh_ticket,
-        materialized_skipped_stems,
         materialized_snapshot_complete,
         member_template_id,
         next_config_load_ticket,
@@ -986,6 +1027,7 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         published_autocompact_pct,
         published_config_timezone,
         refresh_materialized_agents,
+        rescan_before_refusal,
         reset_dangling_default_agent,
         resolve_effective_agent,
         schedule_materialized_agents_refresh,

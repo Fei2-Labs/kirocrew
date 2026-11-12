@@ -44,6 +44,7 @@ if TYPE_CHECKING:
         _main_spec_episode_lock,
         _main_spec_episode_revision,
         _main_spec_unreadable,
+        _make_held_sibling_pass_due,
         _note_main_spec_readable,
         _read_existing_spec,
         _read_spec_capped,
@@ -67,6 +68,7 @@ if TYPE_CHECKING:
         mcp_sources,
         migrate_agent_specs,
         migrate_relocated_skill_uris,
+        one_spec_lock_wait,
         project_agent_names,
         resolved_command_casing,
         saved_command_casing,
@@ -380,6 +382,9 @@ def retry_held_conductor_specs() -> bool:
         # pass that held on them: a rebuild would end held on them again.
         return False
     logger.info("retrying the conductor specs the last agent-config rebuild left unwritten")
+    # This wake is the held spec's retry, so it re-runs a held sibling pass even inside
+    # the interval that keeps the config watcher from re-running it every tick.
+    _make_held_sibling_pass_due()
     held_out: list[bool] = []
     _path, wrote = rebuild_agent_config_reporting(_held_out=held_out)
     if wrote and not (held_out and held_out[0]):
@@ -541,7 +546,10 @@ def _tracks_rebuild_outcome(fn: Any) -> Any:
     def tracked(*args: Any, **kwargs: Any) -> Any:
         global _projected_ceiling_generation, _rebuild_incomplete
         try:
-            return fn(*args, **kwargs)
+            # One scope per rebuild: a stuck agent-spec lock is waited out once,
+            # not once per install site (see one_spec_lock_wait).
+            with one_spec_lock_wait():
+                return fn(*args, **kwargs)
         except BaseException:
             # The rebuild may have written grants derived under an older answer before it
             # raised, so the recorded projection is cleared here, under the lock, rather
@@ -813,12 +821,17 @@ def rebuild_agent_config(
     # manual mcp.json edits — unlike managed servers, they should always
     # be registered regardless of fresh/existing config state.
     mcp_sources.sync_shared_server_refs(config, sources, mounted, mount_only=_mount_only)
-    managed_mcp.register_managed_refs(config, fresh_install=fresh_install, gated_off=gated_off)
+    managed_mcp.register_managed_refs(
+        config, fresh_install=fresh_install, gated_off=gated_off, mounted_aliases=mounted
+    )
     guide_grant_pending = guide_platform.grant_guide_platform_once(
         config, fresh_install=fresh_install
     )
     mate_grant_pending = guide_platform.grant_mate_platform_once(
         config, fresh_install=fresh_install
+    )
+    edition_refs_pending = guide_platform.grant_edition_refs_once(
+        config, fresh_install=fresh_install, gated_off=gated_off, mounted_aliases=mounted
     )
 
     # Final dedup (preserves order).
@@ -857,6 +870,17 @@ def rebuild_agent_config(
                 resolved=resolved,
                 app_owned_at_start=_app_owned_at_start,
             )
+            from kiro_crew import mcp_dropped_servers
+            from kiro_crew.mcp_utils import mcp_server_alias
+
+            # Keep the report ordered with spec writes; aliases can still be mounted.
+            mcp_dropped_servers.record_rebuild_drops(
+                {
+                    key: command
+                    for key, command in resolved.unresolved_commands.items()
+                    if mcp_server_alias(key) not in config["mcpServers"]
+                }
+            )
         except _AgentSpecUnreadable as exc:
             # The commit re-reads the spec inside its write lock
             # (``mcp_aliases._durable_tool_aliases``); a failure there is the same
@@ -875,6 +899,8 @@ def rebuild_agent_config(
         guide_platform.mark_guide_platform_granted()
     if mate_grant_pending:
         guide_platform.mark_mate_platform_granted()
+    if edition_refs_pending:
+        guide_platform.mark_edition_refs_offered(edition_refs_pending)
 
     conductor_held = _install_sibling_specs(refresh_forks, gated_off, clean=clean)
 
@@ -1137,6 +1163,11 @@ def ensure_agent_materialized(agent: str | None) -> bool:
     owned by their own subsystems, so a missing one is reported (``False``) and
     left to the caller's graceful set_mode fallback rather than being guessed at.
 
+    A present file is rebuilt too when a server the last rebuild dropped because
+    its program was not found (``mcp_dropped_servers``) has that program back.
+    Nothing else re-runs the rebuild between gateway starts and config changes,
+    so the server would stay out of every session until a restart.
+
     Returns ``True`` when the managed default file is present (already, or after
     a regenerate); ``False`` when *agent* is non-managed or regeneration failed.
     Best-effort — never raises, so it can sit on the spawn hot path.
@@ -1147,12 +1178,31 @@ def ensure_agent_materialized(agent: str | None) -> bool:
             return False
         agent_file = kiro_agents_dir_path() / AGENT_FILENAME
         if agent_file.exists():
-            return True
-        logger.warning(
-            "Managed agent config %s missing — regenerating before spawn "
-            "(self-heal for kiro-cli 'Mode not found')",
-            agent_file,
-        )
+            from kiro_crew import mcp_dropped_servers
+            from kiro_crew.env import expand_spec_args
+
+            # The rebuild resolver's own expansion and search path, minus a
+            # server's ``env.PATH``: a program found here the rebuild finds too,
+            # so it mounts the server and clears the record, and this stops firing.
+            found = [
+                name
+                for name, rec in mcp_dropped_servers.load_dropped().items()
+                if shutil.which(expand_spec_args([rec["command"]])[0], path=mcp_search_path(""))
+            ]
+            if not found:
+                return True
+            logger.info(
+                "MCP server(s) %r dropped at the last rebuild now have their program; "
+                "rebuilding %s before spawn",
+                found,
+                agent_file,
+            )
+        else:
+            logger.warning(
+                "Managed agent config %s missing — regenerating before spawn "
+                "(self-heal for kiro-cli 'Mode not found')",
+                agent_file,
+            )
         rebuild_agent_config()
         return agent_file.exists()
     except Exception:

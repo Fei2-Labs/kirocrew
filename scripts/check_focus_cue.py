@@ -927,6 +927,12 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         repo = os.path.join(tmp, "r")
         os.makedirs(repo)
+        # The caller's global and system config (a host core.hooksPath) stay out.
+        probe_env = {
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
 
         def run(*args: str) -> str:
             return subprocess.run(
@@ -937,6 +943,7 @@ def self_test() -> int:
                 encoding="utf-8",
                 errors="replace",
                 check=True,
+                env=probe_env,
             ).stdout
 
         run("init", "-q")

@@ -186,9 +186,11 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
         # (`cron:<job>:<run>` for a per-run session, `cron:<job>:<agent>` for a
         # multi-agent one), and folding the whole tail asks for a `cron-<job>:<run>`
         # slot that never exists — so every suffixed turn missed its own open tab
-        # and fell through to origin resolution or suppression.
+        # and fell through to origin resolution or suppression. A
+        # ``new_chat_per_run`` run's own tab, which ``dashboard_slot_key`` names,
+        # comes first.
         job_id = session_key.removeprefix("cron:").split(":", 1)[0]
-        active = state.get_slot(f"cron-{job_id}")
+        active = state.get_slot(dashboard_slot_key(session_key) or f"cron-{job_id}")
         if active is None:
             # A headless script cron has no live "cron-<id>" slot. Rather than
             # leak the card into whichever tab happens to be focused, route it to
@@ -208,9 +210,9 @@ async def api_outbox_notify(request: web.Request) -> web.Response:
                 if active is None:
                     active = await rehydrate_slot_from_history_async(state, origin_slot_key)
     elif session_key.startswith(_SUBAGENT_SESSION_PREFIX):
-        # A sub-agent has no tab of its own, so route its card to the PARENT slot
-        # — the same destination its completion injection and its ``subagent_*`` WS
-        # frames already use. Only the dedicated-process arm arrives here: a
+        # A sub-agent has no tab of its own, so route its card to the slot its
+        # ``subagent_*`` WS frames draw in: its PARENT's, or for a nested run the
+        # root chat's. Only the dedicated-process arm arrives here: a
         # shared-runtime sub-agent's MCP stub carries the parent's own key and is
         # resolved by the branch below. An unknown run or a parent with no open tab
         # yields "" and falls through to suppression — never into an unrelated

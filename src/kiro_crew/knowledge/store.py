@@ -49,6 +49,8 @@ from .store_parts.bundle_transfer import _validated_json_column  # noqa: F401
 from .store_parts.bundle_transfer import _validated_properties  # noqa: F401
 from .store_parts.content_stats import ContentStats  # noqa: F401
 from .store_parts.content_stats import SourceContentStats  # noqa: F401
+from .store_parts.entity_graph import MAX_ENTITY_ALIAS_LEN  # noqa: F401
+from .store_parts.entity_graph import MAX_ENTITY_ALIASES  # noqa: F401
 from .store_parts.entity_graph import SimpleDiGraph  # noqa: F401
 from .store_parts.entity_graph import _EdgeView  # noqa: F401
 from .store_parts.entity_graph import _NodeView  # noqa: F401
@@ -63,6 +65,8 @@ from .store_parts.source_rows import _ACCOUNT_BOUND_URI_PREFIX  # noqa: F401
 from .store_parts.source_rows import _WALKING_SOURCE_TYPES  # noqa: F401
 from .store_parts.source_rows import AUTO_ADDED_PROP  # noqa: F401
 from .store_parts.source_rows import AUTO_REGISTRATION_RETIRED_PROP  # noqa: F401
+from .store_parts.source_rows import PENDING_REASON_IMPORT_BUDGET  # noqa: F401
+from .store_parts.source_rows import PENDING_REASON_PROP  # noqa: F401
 from .store_parts.source_rows import _without_sync_status  # noqa: F401
 from .store_parts.source_rows import is_auto_registered  # noqa: F401
 
@@ -153,9 +157,9 @@ class IngestionGate:
     Ingestion writes a source in several autocommit steps, and the orphan
     sweep would read those half-states (a source without items, an entity
     without a mention) as orphans. ``ingestion_in_flight()`` brackets one
-    ingest (many may hold it); ``maintenance_window()`` waits until no holder
-    remains, and new ingests wait at entry meanwhile, so a stream of ingests
-    cannot starve the sweep.
+    ingest or ``.knowledge`` bundle import (many may hold it);
+    ``maintenance_window()`` waits until no holder remains, and new ingests
+    wait at entry meanwhile, so a stream of ingests cannot starve the sweep.
 
     The wait is bounded: if ingestion never drains inside ``timeout`` the
     window yields ``False``, the caller skips its sweep and the next launch
@@ -174,10 +178,14 @@ class IngestionGate:
         *admitted* is for a hold handed from a current holder to a task it
         starts: it skips the wait for a pending maintenance window, which
         would deadlock (the window waits for the parent, the parent for this
-        entry) until the window's timeout. An admitted hold still counts.
+        entry) until the window's timeout. It skips that wait only while some
+        hold is still open: the window cannot have started its body then, so
+        this hold is counted and the window waits for it too. Once every hold
+        is gone the window may be running, and an admitted entrant waits like
+        any other. An admitted hold still counts.
         """
         with self._cond:
-            while self._maintenance and not admitted:
+            while self._maintenance and not (admitted and self._ingesting):
                 self._cond.wait()
             self._ingesting += 1
         try:
@@ -557,7 +565,11 @@ class KnowledgeStore:
     reload_graph = _entity_graph.reload_graph
     mark_graph_stale = _entity_graph.mark_graph_stale
     add_entity = _entity_graph.add_entity
+    add_entity_aliases = _entity_graph.add_entity_aliases
+    entity_alias_index_ready = _entity_graph.entity_alias_index_ready
     find_entity = _entity_graph.find_entity
+    entity_identity_candidates = _entity_graph.entity_identity_candidates
+    split_entity_candidates = _entity_graph.split_entity_candidates
     merge_entities = _entity_graph.merge_entities
     add_entity_relation = _entity_graph.add_entity_relation
     add_mention = _entity_graph.add_mention
@@ -618,6 +630,7 @@ class KnowledgeStore:
     has_pending_one_time_work = _schema_migrations.has_pending_one_time_work
     has_embed_state_index = _schema_migrations.has_embed_state_index
     ensure_search_indexes = _schema_migrations.ensure_search_indexes
+    _ensure_entity_alias_index = _schema_migrations._ensure_entity_alias_index
     _VECTOR_ITEM_COLUMNS = _schema_migrations._VECTOR_ITEM_COLUMNS
     _ensure_vector_generation = _schema_migrations._ensure_vector_generation
     vector_generation = _schema_migrations.vector_generation

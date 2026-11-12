@@ -322,17 +322,17 @@ class TaskRunner:
         self._stop_settles: dict[str, asyncio.Task[None]] = {}
         # task_id -> the conversation the run was started FROM, so a notification
         # can be routed back to the surface the operator is actually watching.
-        # Deliberately in memory only and deliberately not on ``Project``: it is
-        # a routing hint for the lifetime of one process, and a persisted channel
-        # key would outlive the binding it names and send a restart's first
-        # notice into a conversation that may no longer resolve.
+        # A routing hint, not on ``Project``: ``runs.json`` carries it across a
+        # restart so the recovery and resume notices reach that conversation,
+        # and the sink resolves it at delivery time (an open dashboard tab, a
+        # governed channel binding), so a key that does not resolve reaches
+        # only the bell.
         self._run_session_keys: dict[str, str] = {}
         # Optional publication port into the shared workflow history. TaskRunner
         # remains the owner of planning/execution semantics; this port only
         # mirrors lifecycle and progress for one unified management surface.
         self._workflow_service = workflow_service
         self._workflow_initializing = False
-        self._agent: str = ""
         # Durable task queue (``taskq``): attached by the gateway once the
         # SubagentManager's store is open. None keeps the legacy behaviour --
         # a fixed run cap and no rows. See ``attach_task_admission``.
@@ -344,6 +344,7 @@ class TaskRunner:
         # holds their records meanwhile).
         self._recovery_pending: set[str] = set()
         self._last_id_suffix = 0  # ``mint_task_id``'s last suffix
+        self._runs_file = self._work_dir / self._RUNS_FILE  # ``_load_runs`` settles it
         self._load_runs()
 
     @property
@@ -398,6 +399,11 @@ class TaskRunner:
             _override = _resolve_workspace_dir(workspace_dir)
             if _override and run.status == "planned":
                 run.work_dir = _override
+            # The agent follows the same rule: a run that has begun keeps the agent its
+            # steps ran with, so resuming it (the Projects page sends its selector with
+            # Resume too) or adopting it after a restart cannot switch it.
+            if agent and run.status == "planned":
+                run.agent = agent
 
             # Guard: limit concurrent running tasks — check BEFORE mutating state.
             # With the task queue attached the cap is the lane's: excess steps
@@ -426,7 +432,6 @@ class TaskRunner:
             await self._grant_run_trust(run, bool(auto_approve))
             await self._apersist_runs()
 
-            self._agent = agent
             history_key = await self._bound_history_key(run, f"taskrunner:run:{task_id}")
         except BaseException:
             self._release_start(task_id)
@@ -597,6 +602,7 @@ class TaskRunner:
                 run.finished_at,
                 run.started_at,
                 run.last_task_time,
+                run.agent,
             )
             previous_tasks = [
                 (task, task.status, task.error, task.result, task.verification, task.attempts)
@@ -613,6 +619,9 @@ class TaskRunner:
                 run.error = ""
                 run.finished_at = 0.0
                 run.started_at = run.last_task_time = time.time()
+                # An explicit agent re-targets the retried steps; none keeps the run's.
+                if agent:
+                    run.agent = agent
                 # The global timeout counts from here; the watchdog and the executor
                 # both read this one age of it, so they cannot disagree after a step.
                 _MonotonicAge.of_run_start(run, fresh=True)
@@ -621,14 +630,18 @@ class TaskRunner:
                 # Persistence drains its worker even on repeated cancellation.
                 # Restore in place: callers may retain the Project/Task objects.
                 # Restore live state until a later snapshot succeeds.
-                run.status, run.error, run.finished_at, run.started_at, run.last_task_time = (
-                    previous_run
-                )
+                (
+                    run.status,
+                    run.error,
+                    run.finished_at,
+                    run.started_at,
+                    run.last_task_time,
+                    run.agent,
+                ) = previous_run
                 for task, status, error, result, verification, attempts in previous_tasks:
                     task.status, task.error, task.result = status, error, result
                     task.verification, task.attempts = verification, attempts
                 raise
-            self._agent = agent
         except BaseException:
             self._release_start(task_id)
             raise

@@ -868,6 +868,33 @@ class TestModelPicker:
         assert sess._gp.set_models == ["m-fast"]
 
     @pytest.mark.asyncio
+    async def test_a_session_the_account_check_retires_defers_to_the_next_message(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+
+        async def _retire_then_refuse(key: str) -> bool:
+            # The acquire's Kiro account check retired the session: it held another
+            # account, so nothing is live by the time the lease would be taken.
+            sess._has = False
+            return False
+
+        sess.try_acquire = _retire_then_refuse  # type: ignore[method-assign]
+        outcome = await d._apply_model(d._scope_id("u1", ""), "discord:dm:u1", "m-fast")
+
+        assert outcome == "✅ Model set to m-fast — it applies to your next message."
+        assert sess._gp.set_models == []
+
+    @pytest.mark.asyncio
+    async def test_a_session_the_account_check_flags_defers_to_the_next_message(self) -> None:
+        # Flagged, not retired (an idle parent the check spared for its running
+        # sub-agents): refused, yet still registered, and no reply is running.
+        d, _cli, sess = _dispatcher({"u1"})
+        sess.retiring = True
+        outcome = await d._apply_model(d._scope_id("u1", ""), "discord:dm:u1", "m-fast")
+
+        assert outcome == "✅ Model set to m-fast — it applies to your next message."
+        assert sess._gp.set_models == [] and sess.acquired == []
+
+    @pytest.mark.asyncio
     async def test_a_second_press_is_refused_rather_than_applied_twice(self) -> None:
         d, cli, sess = _dispatcher({"u1"})
         sess._gp.models = [{"modelId": "m-fast", "name": "Fast"}]
@@ -1103,7 +1130,9 @@ class TestGuildCommandRefusalsAreVisible:
     which discloses nothing to the rest of a shared channel.
     """
 
-    def _cmd(self, *, guild: str = "", channel: str = "c1") -> DiscordInteraction:
+    def _cmd(
+        self, *, guild: str = "", channel: str = "c1", name: str = "status"
+    ) -> DiscordInteraction:
         return DiscordInteraction(
             interaction_id="i1",
             interaction_token="tok",
@@ -1112,7 +1141,7 @@ class TestGuildCommandRefusalsAreVisible:
             message_id="",
             guild_id=guild,
             kind=2,
-            command_name="status",
+            command_name=name,
         )
 
     @pytest.mark.asyncio
@@ -1127,13 +1156,33 @@ class TestGuildCommandRefusalsAreVisible:
     @pytest.mark.asyncio
     async def test_a_governance_denied_command_is_told_why_without_naming_policy(self) -> None:
         d, cli, _ = _dispatcher({"u1"})
-        with mock.patch.object(td_mod, "channel_inbound_permitted", return_value=False):
+        with mock.patch(
+            "kiro_crew.messaging.dispatch.channel_inbound_permitted", return_value=False
+        ):
             await d.on_interaction(self._cmd())
         assert len(cli.responses) == 1
         _iid, body, ephemeral = cli.responses[0]
         assert ephemeral is True and "disabled by policy" in body
         # The profile's CONTENTS are the operator's ceiling, not the user's to read.
         assert "profile" not in body.lower() and "scope" not in body.lower()
+
+    @pytest.mark.asyncio
+    async def test_a_slash_stop_survives_a_governance_deny(self, monkeypatch) -> None:
+        from kiro_crew.messaging import dispatch
+
+        async def _denied(_channel_type: str) -> bool:
+            return False
+
+        # Denied in both namespaces that read the ceiling, so a strict read
+        # anywhere on the way in drops the stop.
+        monkeypatch.setattr(dispatch, "channel_inbound_permitted", _denied)
+        monkeypatch.setattr(td_mod, "channel_inbound_permitted", _denied)
+        d, cli, sess = _dispatcher({"u1"})
+        sess._busy = True
+        await d.on_interaction(self._cmd())
+        assert "disabled by policy" in cli.responses[-1][1] and sess._gp.cancelled == 0
+        await d.on_interaction(self._cmd(name="stop"))
+        assert sess._gp.cancelled == 1 and "Stopped" in cli.sent[-1][0]
 
     @pytest.mark.asyncio
     async def test_an_unauthorized_user_gets_nothing_at_all(self) -> None:

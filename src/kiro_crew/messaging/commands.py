@@ -66,6 +66,7 @@ from kiro_crew.cron import (
 )
 from kiro_crew.messaging.queue_drain import entries_queued_by
 from kiro_crew.messaging.queue_receipt import ReceiptQueue, ReceiptSurface
+from kiro_crew.messaging.turn_bracket import arm_cancelled_turn
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
@@ -220,8 +221,9 @@ async def stop_running_turn(
         cancel = getattr(provider, "cancel", None)
         if cancel is not None:
             try:
-                await cancel(wait_ack_timeout=0)
+                outcome = await cancel(wait_ack_timeout=0)
                 cancelled_turn = True
+                arm_cancelled_turn(sessions, session_key, outcome)
             except Exception:
                 logger.warning(
                     "%s: stop could not cancel the running turn for %s",
@@ -686,6 +688,22 @@ def compact_unsupported_reply_zh(backend: str) -> str:
 #: of its own; held here, once, for the same reason as
 #: :func:`compact_unsupported_reply_zh`.
 COMPACT_TIMED_OUT_REPLY_ZH = "⚠️ 压缩超时。"
+
+
+#: The manual ``/compact`` refusal for a session the Kiro account check flagged
+#: (``SessionManager.is_retiring``). ``try_acquire`` refuses it while it stays
+#: registered, so it would otherwise read as busy, yet waiting would not help even
+#: when a reply is still finishing on it: the next message's claim retires it and
+#: starts a new conversation on the current account. Plain text, so every surface
+#: can send it, with or without a glyph.
+COMPACT_ACCOUNT_CHANGED_TEXT = (
+    "The Kiro account changed, so this conversation restarts with your next message. "
+    "There is nothing to compact until then."
+)
+#: :data:`COMPACT_ACCOUNT_CHANGED_TEXT` for the three Chinese-language surfaces.
+COMPACT_ACCOUNT_CHANGED_REPLY_ZH = (
+    "ℹ️ Kiro 账号已变更，这段对话会在你发下一条消息时重新开始，在此之前没有可压缩的内容。"
+)
 
 
 #: How much of a cron job's message body a list row shows.

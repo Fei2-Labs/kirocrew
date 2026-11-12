@@ -14,7 +14,7 @@ import {
   Rocket,
 } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
-import { fmtBytes, fmtPercent, fmtUnit } from '../../i18n/format'
+import { fmtBytes, fmtNumber, fmtPercent, fmtUnit } from '../../i18n/format'
 import {
   filterStepMarkers, syncFailureTail, lastLine, provPhase, fmtElapsed, memColor, type PodResources,
   type IssueRef, type TicketRef, type Worktree, type UndoTarget, type FleetData, type SyncRun, type ProvRun,
@@ -60,7 +60,7 @@ export function PodReadout({ r }: { r?: PodResources | null }) {
     parts.push(<span key="cpu" style={chip} title={i18nT('pages.devFleetPage.pod_cpu_usage')}>{fmtPercent(r.cpu_pct / 100, { maximumFractionDigits: 1 })}</span>)
   }
   if (r.tasks != null) {
-    parts.push(<span key="tasks" style={chip} title={i18nT('pages.devFleetPage.pod_task_count')}>{r.tasks} {i18nT('pages.devFleetPage.pod_tasks_label')}</span>)
+    parts.push(<span key="tasks" style={chip} title={i18nT('pages.devFleetPage.pod_task_count')}>{i18nT('pages.devFleetPage.pod_task_chip', { count: r.tasks, n: fmtNumber(r.tasks) })}</span>)
   }
   if (parts.length === 0) return null
   return (
@@ -80,6 +80,15 @@ export function PodReadout({ r }: { r?: PodResources | null }) {
   )
 }
 
+/** The PR state badge's word. Literal keys so the catalog gates see each one;
+ *  a state GitHub adds later still shows, lowercased, as it did before. */
+const PR_STATE_LABEL: Record<string, () => string> = {
+  OPEN: () => i18nT('pages.devFleetPage.pr_state_open'),
+  MERGED: () => i18nT('pages.devFleetPage.pr_state_merged'),
+  CLOSED: () => i18nT('pages.devFleetPage.pr_state_closed'),
+}
+const prStateLabel = (state?: string) => PR_STATE_LABEL[state ?? '']?.() ?? (state || '').toLowerCase()
+
 /* ─── Detail Panel (expanded row) ─── */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function DetailPanel({ w, d, busy, onRemove, onLoadLogs, logs, logsLoading }: { w: Worktree; d: any; busy: Record<string, boolean>; onRemove: () => void; onLoadLogs: () => void; logs?: string; logsLoading?: boolean }) {
@@ -95,7 +104,7 @@ export function DetailPanel({ w, d, busy, onRemove, onLoadLogs, logs, logsLoadin
             #{d.pr.number || '?'}{d.pr.title ? ' \u2014 ' + d.pr.title : ''}
           </a>{' '}
           <Badge variant={d.pr.state === 'MERGED' ? 'aim' : d.pr.state === 'OPEN' ? 'ok' : 'warn'}>
-            {(d.pr.state || '').toLowerCase()}
+            {prStateLabel(d.pr.state)}
           </Badge>
         </div>
       ) : null}

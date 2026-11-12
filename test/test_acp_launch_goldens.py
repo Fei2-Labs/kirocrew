@@ -527,6 +527,7 @@ class _FakeHost:
         self._sandbox_cleanup: str | None = None
         self._sandbox_wrapped_by_crew = False
         self._sandbox_hidden_dirs: tuple[str, ...] = ()
+        self._child_env_names: frozenset[str] = frozenset()
         self._spawn_work_dir = str(work_dir)
         self._bound_workspace_fd: int | None = None
         self.guarded: list[str] = []
@@ -727,9 +728,49 @@ def test_the_tail_hands_the_plan_mask_and_the_scratch_window_to_the_sandbox(
     assert host._sandbox_cleanup == "/run/launcher.sh"
     assert host._sandbox_wrapped_by_crew is True
     assert host._sandbox_hidden_dirs == ("/srv/creds/.aws",)
+    # The verdict the child's env was built with, for the servers it starts later.
+    assert host._ssh_auth_sock_forwarded is True
     # The cgroup scope is OUTERMOST, around the sandboxed command.
     assert rec.factory_argv == ["scope", "sandbox", "/opt/bin/host", "acp"]
     assert launched.scope_unit == ""
+
+
+def test_a_forward_the_wrap_dropped_is_the_one_the_tail_records_and_scrubs_with(
+    monkeypatch, tmp_path
+) -> None:
+    """The wrap re-judges the forward on the tier it applies; its verdict wins.
+
+    The tail judged the forward on (``_forward`` answers True), then the wrap
+    dropped it (a floor raised between the two reads). A record of the tail's own
+    verdict would let a server the engine starts later be handed the socket the
+    engine's wrap took away, and the parent-side scrub would keep it for a
+    passthrough wrap that relies on that scrub.
+    """
+    _launch_env(monkeypatch)
+    # The withheld-socket notice is not under test; with no socket it never runs.
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    host = _FakeHost(tmp_path)
+    rec = _Recording()
+    scrubbed_with: list[bool] = []
+
+    async def _dropping_wrap(argv, **kwargs):
+        # Reports the drop to a caller that hands it a list, as ``wrap_argv`` does.
+        kwargs.get("forward_ssh_auth_sock_out", []).append(False)
+        return ["sandbox", *argv], None
+
+    def _scrub(env, *, forward_ssh_auth_sock=False):
+        scrubbed_with.append(forward_ssh_auth_sock)
+        return env
+
+    tools = dataclasses.replace(
+        _launch_tools(rec, scratch=_Scratch(None)),
+        wrap_argv_async=_dropping_wrap,
+        scrub_agent_subprocess_env=_scrub,
+    )
+    _run_launch(host, _request(), tools)
+
+    assert host._ssh_auth_sock_forwarded is False
+    assert scrubbed_with == [False]
 
 
 def test_the_child_environment_is_built_in_one_fixed_order(monkeypatch, tmp_path) -> None:
@@ -782,6 +823,7 @@ def test_the_child_environment_is_built_in_one_fixed_order(monkeypatch, tmp_path
     assert "PYTEST_XDIST_AUTO_NUM_WORKERS" not in after_scratch
     child = rec.factory_kwargs["env"]
     assert child["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "2"
+    assert host._child_env_names == frozenset(child), "the names the child got, no more"
     assert rec.calls.index("scrub_agent_subprocess_env") < rec.calls.index(
         "apply_pod_home_remap:True"
     )

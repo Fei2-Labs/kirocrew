@@ -31,6 +31,7 @@ from typing import BinaryIO, Callable, Iterator, Literal, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import replace_with_retry
+from kiro_crew.bounded_read import bounded_read
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.node_modules_txn import NodeModulesBackup
 
@@ -480,10 +481,15 @@ class FrontendBuildResult:
     tail: str = ""
 
     def failure_message(self) -> str:
-        """One message naming the failure, the log file and its last lines."""
+        """One message: the failure, its log file and last lines, or that no log was written."""
         message = "Frontend build did not complete — the dashboard still serves the previous bundle"
         if self.log_path is not None:
             message += f". Build output: {self.log_path}"
+        else:
+            message += (
+                ". No build log was written; run `npm ci` and `npm run build` in website/"
+                " to see the npm output"
+            )
         if self.tail:
             message += f"\n{self.tail}"
         return message
@@ -581,7 +587,7 @@ def _build_log_tail(build_log: Optional[BinaryIO]) -> str:
         if os.fstat(build_log.fileno()).st_size > _BUILD_LOG_REDACT_MAX_BYTES:
             return ""
         build_log.seek(0)
-        data = build_log.read(_BUILD_LOG_REDACT_MAX_BYTES + 1)
+        data = bounded_read(build_log, _BUILD_LOG_REDACT_MAX_BYTES + 1)
     except (OSError, ValueError):
         return ""
     if len(data) > _BUILD_LOG_REDACT_MAX_BYTES:
@@ -1020,7 +1026,10 @@ def _point_static_dist_at(static_dist: Path, target: Path) -> bool:
     another, so the old one is removed first: removing a junction does not touch
     the tree behind it, so no open handle refuses it and the gap is a single
     directory-entry operation. A real ``static/dist`` directory is renamed aside
-    once, to a name the next sweep removes.
+    once, to a name the next sweep removes. An overlay filesystem refuses that
+    rename with ``EXDEV`` for a directory from a lower (image) layer, so there it
+    is copied aside and then removed, and a removal that fails or is interrupted
+    part-way is undone from the copy.
 
     The link always carries an absolute target: a relative one would be read
     against the link's own directory, not the caller's working directory.
@@ -1040,7 +1049,25 @@ def _point_static_dist_at(static_dist: Path, target: Path) -> bool:
                 platform_compat.unlink_link_or_junction(static_dist)
         elif os.path.lexists(static_dist):
             retired = static_dist.with_name(_staged_name())
-            replace_with_retry(static_dist, retired)
+            try:
+                replace_with_retry(static_dist, retired)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                shutil.copytree(static_dist, retired, symlinks=True)
+                try:
+                    shutil.rmtree(static_dist)
+                except BaseException:
+                    # Ctrl-C included. Put back only what the removal took: a
+                    # surviving file is the original.
+                    shutil.copytree(
+                        retired,
+                        static_dist,
+                        symlinks=True,
+                        dirs_exist_ok=True,
+                        copy_function=lambda s, d: os.path.lexists(d) or shutil.copy2(s, d),
+                    )
+                    raise
         replace_with_retry(tmp, static_dist)
     except OSError:
         if not os.path.lexists(static_dist):
@@ -1230,7 +1257,8 @@ def build_frontend_sync(
     edition rather than staging a stock bundle over it.
 
     Returns a :class:`FrontendBuildResult`; the install and build output is
-    written to ``<data home>/logs/frontend-build.log``, which it names.
+    written to ``<data home>/logs/frontend-build.log``, which it names. Where no
+    pinned walk exists (Windows) no log is opened and the output is discarded.
     """
     website_dir = proj_path / _DIR_NAME
     if not website_dir.is_dir():
@@ -1398,6 +1426,10 @@ async def build_frontend_async(
     Returns a :class:`FrontendBuildResult` like the sync helper, with the
     install and build output in the same log file.
     """
+    # Local import: the update seam loads the platform package, which the sync
+    # build and the `stage` entry point never need.
+    from kiro_crew.platform.update_provider import _start_installer
+
     proj_path = Path(proj)
     website_dir = proj_path / _DIR_NAME
 
@@ -1539,19 +1571,25 @@ async def build_frontend_async(
             return await _finish_log(False)
         await _offload(lambda: _log_step(build_log, install_args))
         try:
-            npm_i = await asyncio.create_subprocess_exec(
-                npm, *install_args,
-                cwd=str(website_dir),
-                stdout=build_log if build_log is not None else asyncio.subprocess.DEVNULL,
-                stderr=(
-                    asyncio.subprocess.STDOUT
-                    if build_log is not None
-                    else asyncio.subprocess.DEVNULL
+            # Through `_start_installer`: a cancel inside a bare spawn await kills
+            # npm's pid alone and leaves `npm_i` unset, so the cancellation arm
+            # below would have nothing to kill while the rollback clears the tree.
+            npm_i = await _start_installer(
+                asyncio.create_subprocess_exec(
+                    npm, *install_args,
+                    cwd=str(website_dir),
+                    stdout=build_log if build_log is not None else asyncio.subprocess.DEVNULL,
+                    stderr=(
+                        asyncio.subprocess.STDOUT
+                        if build_log is not None
+                        else asyncio.subprocess.DEVNULL
+                    ),
+                    # Its own group, so the whole install tree can be signalled --
+                    # see _kill_and_wait. No-op on the platform that lacks each half.
+                    start_new_session=platform_compat.IS_POSIX,
+                    creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
                 ),
-                # Its own group, so the whole install tree can be signalled --
-                # see _kill_and_wait. No-op on the platform that lacks each half.
-                start_new_session=platform_compat.IS_POSIX,
-                creationflags=platform_compat.CREATE_NEW_PROCESS_GROUP,
+                stop=_kill_and_wait,
             )
         except OSError as exc:
             await _offload(backup.rollback)

@@ -86,12 +86,11 @@ def test_cron_defs_read_still_answers_empty_for_a_damaged_file(
     assert bridges_crons.load_app_cron_defs("demo") == []
 
 
-# --- Official catalog caches -------------------------------------------------
+# Official catalog caches
 #
 # The store refreshes these caches through ``atomic_write`` with no lock, so two
-# store requests race every reader. A read folded into "no cache" makes
-# ``load_official_catalog`` fetch again, and an offline fetch then overwrites the
-# good cache with the failure sentinel.
+# store requests race every reader. A read folded into "no cache" makes the
+# module fetch again for a document it already has.
 
 _CACHE_MODULES = [oc, co, oe]
 

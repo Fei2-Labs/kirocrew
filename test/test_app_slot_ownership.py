@@ -130,6 +130,140 @@ def test_only_conversations_that_still_hold_a_pointer_are_listed(tmp_path, monke
     assert bridges.app_conversation_keys(APP) == [OWNED]
 
 
+@pytest.mark.asyncio
+async def test_a_conversation_the_app_s_page_embed_began_is_found(tmp_path, monkeypatch):
+    """A page embed sends with the person's session, so its request carries no app.
+
+    The send names the embed's app, and the line written for the conversation it
+    begins records that, so uninstalling the app finds it, after the slot's own save
+    rebuilt the line too. A conversation that was already on disk is the person's: an
+    embed naming its key does not make it the app's, and neither send makes the slot
+    app-owned.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+    from chat_test_helpers import _make_app
+
+    from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+
+    state = _embed_state(tmp_path, monkeypatch)
+    _seed_transcript(tmp_path, MINE)
+    async with TestClient(TestServer(_make_app(state))) as client:
+        for key in (OWNED, MINE):
+            slot_key = key.removeprefix("dashboard:")
+            resp = await client.post(
+                "/api/chat?ws=1", json={"slot": slot_key, "message": "hi", "embed_app": APP}
+            )
+            assert resp.status == 200, await resp.text()
+            slot = state.get_slot(slot_key)
+            await slot.task
+            assert slot._app == ""
+            assert _save_slot_to_history(state, slot, force=True)
+
+    assert bridges.app_conversation_keys(APP, mapped_keys={OWNED, MINE}) == [OWNED]
+
+
+@pytest.mark.asyncio
+async def test_an_embed_send_that_could_not_record_its_app_is_refused_and_retried(
+    tmp_path, monkeypatch
+):
+    """The first line is the only place the embed's app lands, so a send that could
+    not write it is refused rather than run without it, and the retry, on the slot the
+    refusal kept, still begins the conversation and records the app."""
+    from aiohttp.test_utils import TestClient, TestServer
+    from chat_test_helpers import _make_app
+
+    from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+
+    state = _embed_state(tmp_path, monkeypatch)
+    send = {"slot": OWNED.removeprefix("dashboard:"), "message": "hi", "embed_app": APP}
+    async with TestClient(TestServer(_make_app(state))) as client:
+        failing = OSError(errno.EIO, "I/O error")
+        with patch.object(state.conversation_log, "update_metadata_if", side_effect=failing):
+            resp = await client.post("/api/chat?ws=1", json=send)
+        assert resp.status == 503, await resp.text()
+        resp = await client.post("/api/chat?ws=1", json=send)
+        assert resp.status == 200, await resp.text()
+        slot = state.get_slot(send["slot"])
+        await slot.task
+        assert _save_slot_to_history(state, slot, force=True)
+
+    assert bridges.app_conversation_keys(APP, mapped_keys={OWNED}) == [OWNED]
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_an_app_page_created_is_found(tmp_path, monkeypatch):
+    """An app page creates its session with the person's session too (``useChatSession``,
+    or its own create before it mounts ``ChatPanel``), and the sends that follow name no
+    app. The create names it, and the first line it writes records that, so uninstalling
+    the app finds the conversation. A create naming a conversation already on disk does
+    not make it the app's."""
+    from aiohttp.test_utils import TestClient, TestServer
+    from chat_test_helpers import _make_app
+
+    from kiro_crew.dashboard.chat import api_chat_slot_create
+    from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+
+    state = _embed_state(tmp_path, monkeypatch)
+    _seed_transcript(tmp_path, MINE)
+    app = _make_app(state)
+    app.router.add_post("/api/chat/slots", api_chat_slot_create)
+    async with TestClient(TestServer(app)) as client:
+        for key in (OWNED, MINE):
+            slot_key = key.removeprefix("dashboard:")
+            resp = await client.post("/api/chat/slots", json={"name": slot_key, "embed_app": APP})
+            assert resp.status == 200, await resp.text()
+            resp = await client.post("/api/chat?ws=1", json={"slot": slot_key, "message": "hi"})
+            assert resp.status == 200, await resp.text()
+            slot = state.get_slot(slot_key)
+            await slot.task
+            assert slot._app == ""
+            assert _save_slot_to_history(state, slot, force=True)
+
+    assert bridges.app_conversation_keys(APP, mapped_keys={OWNED, MINE}) == [OWNED]
+
+
+@pytest.mark.asyncio
+async def test_an_app_page_create_that_could_not_record_its_app_is_refused(tmp_path, monkeypatch):
+    """A create that could not write the line naming its app is refused and keeps no
+    session, so the retry begins the conversation and records the app."""
+    from aiohttp.test_utils import TestClient, TestServer
+    from chat_test_helpers import _make_app
+
+    from kiro_crew.dashboard.chat import api_chat_slot_create
+
+    state = _embed_state(tmp_path, monkeypatch)
+    app = _make_app(state)
+    app.router.add_post("/api/chat/slots", api_chat_slot_create)
+    create = {"name": OWNED.removeprefix("dashboard:"), "embed_app": APP}
+    async with TestClient(TestServer(app)) as client:
+        failing = OSError(errno.EIO, "I/O error")
+        with patch.object(state.conversation_log, "update_metadata_if", side_effect=failing):
+            resp = await client.post("/api/chat/slots", json=create)
+        assert resp.status == 503, await resp.text()
+        assert (await resp.json())["code"] == "history_unavailable"
+        assert create["name"] not in state._slots
+        resp = await client.post("/api/chat/slots", json=create)
+        assert resp.status == 200, await resp.text()
+
+    assert bridges.app_conversation_keys(APP, mapped_keys={OWNED}) == [OWNED]
+
+
+def _embed_state(tmp_path, monkeypatch):
+    """A dashboard state whose turns finish at once, for a page embed's sends."""
+    from chat_test_helpers import _make_state
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    state = _make_state(tmp_path / "sessions")
+    state.broadcast_ws = MagicMock()
+
+    async def run_chat(_state, slot, _message, **_kwargs):
+        slot.append("done", "", "done", broadcast=False)
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", run_chat)
+    return state
+
+
 def test_a_clear_that_could_not_be_written_is_not_reported_as_clean(tmp_path, monkeypatch):
     """A failed WRITE must not read as "this app owned nothing".
 

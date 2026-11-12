@@ -243,18 +243,18 @@
           all_time_none: 'No board reports a cost, so there is no all-time figure to compare the week to.',
           each_one_says: ', each one says what to do',
           review_empty_boards: 'No draft is waiting on you. Every open piece of work is still being written.',
-          review_empty_noboard: 'The record carries no board for this Bot yet, so there is nothing to review.',
+          review_empty_noboard: 'The record carries no board for this bot yet, so there is nothing to review.',
           meta_no_report_time: 'no report time on the record', reported_prefix: 'reported ',
           just_now: 'just now',
-          file_unreadable: 'the Bot wrote a file name here this page cannot read',
+          file_unreadable: 'the bot wrote a file name here this page cannot read',
           no_file: 'No file name written', in_chat_box: 'In your chat box:', undo: 'Undo',
           answer_it: 'Answer it', approve_it: 'Approve it', revise: 'Revise', say_revise: 'revise it',
           this_draft: 'this draft',
-          drafts_unreadable_note: 'The Bot published a drafts value this page cannot read, so every row above is drawn from the record alone.',
+          drafts_unreadable_note: 'The bot published a drafts value this page cannot read, so every row above is drawn from the record alone.',
           delivered_empty_boards: 'Nothing has been accepted today. The In progress list below is what is moving.',
-          noboard_short: 'The record carries no board for this Bot yet.',
+          noboard_short: 'The record carries no board for this bot yet.',
           inprogress_empty_boards: 'Every board on the record is closed out. Nothing is being written.',
-          step_unreadable: 'The Bot wrote a step here this page cannot read.',
+          step_unreadable: 'The bot wrote a step here this page cannot read.',
           no_step_open: 'No step written. Open: ', and_prefix: ' and ', more_suffix: ' more',
           no_step_none: 'No step written, and the record names no open task on this board.',
           not_counted: 'the record does not count this board',
@@ -559,10 +559,16 @@
       }
 
       //: THE CHAT BOX, never the wire. The host fills the person's composer with this
-      //: text and the person presses send, so the page can offer a reply and can never
-      //: speak as them.
+      //: text and the person presses send.
       function act(text) {
         try { parent.postMessage({ type: 'kirocrew-dashboard:act', text: text }, '*'); }
+        catch (e) { /* no host: the choice simply does nothing */ }
+      }
+      //: A review row's buttons are FINISHED answers, so they ask the host to send in one
+      //: click. The host sends only when the person turned "Send replies in one click"
+      //: on; otherwise, or on any refusal, it fills the composer exactly as `act` does.
+      function send(text) {
+        try { parent.postMessage({ type: 'kirocrew-dashboard:send', text: text }, '*'); }
         catch (e) { /* no host: the choice simply does nothing */ }
       }
       //: Rows the person already picked a choice on, by item id. Kept across refills so a
@@ -728,7 +734,7 @@
             b.type = 'button';
             b.title = c.say;
             b.addEventListener('click', function () {
-              act(c.say);
+              send(c.say);
               picked[id] = c.label;
               card.classList.add('of-going');
               setTimeout(render, 160);

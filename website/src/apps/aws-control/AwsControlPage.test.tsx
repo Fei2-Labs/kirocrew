@@ -1000,6 +1000,28 @@ describe('accounts pane', () => {
     expect(screen.queryByTestId('accounts-list')).toBeNull()
   })
 
+  it('Refresh re-probes the keys instead of re-reading the cached snapshot', async () => {
+    // A plain read returns the backend's cached probe snapshot (the stale
+    // payload here); only `refresh` re-probes. The dashboard client never goes
+    // stale on its own, so the test client must not either.
+    const healed = accountsPayload()
+    healed.accounts[1] = {
+      ...healed.accounts[1],
+      health: 'ok',
+      profiles: [{ ...healed.accounts[1].profiles[0], identityOk: true, detail: '' }],
+    }
+    vi.mocked(awsControlApi.accounts).mockImplementation(async (refresh) => (refresh ? healed : accountsPayload()))
+    renderWithProviders(<AwsControlPage />, { queryDefaults: { staleTime: Infinity } })
+    await screen.findByTestId('overview-pane')
+    fireEvent.click(screen.getByTestId('rail-accounts'))
+    await screen.findByTestId('accounts-pane')
+    const health = () => screen.getAllByTestId('health-dot').map((d) => d.getAttribute('data-health'))
+    expect(health()).toEqual(['ok', 'degraded'])
+
+    fireEvent.click(screen.getByTestId('refresh'))
+    await waitFor(() => expect(health()).toEqual(['ok', 'ok']))
+  })
+
   it('keeps the rescue off the pane when a listed account owns the grant', async () => {
     // A grant OWNED by a listed account renders on that account's usage pane,
     // not here — the accounts pane is accounts and nothing else.
@@ -1362,6 +1384,37 @@ describe('add accounts', () => {
     expect(screen.queryByTestId('add-accounts-checkbox')).toBeNull()
   })
 
+  it('with no local profile at all, says to create one rather than "all registered"', async () => {
+    let answer!: (v: AvailableProfilesResponse) => void
+    vi.mocked(awsControlApi.availableProfiles).mockReturnValue(
+      new Promise((resolve) => { answer = resolve }),
+    )
+    await openAccountsPane()
+    fireEvent.click(await screen.findByTestId('add-accounts-toggle'))
+    await screen.findByTestId('add-accounts-body')
+    // The scan is in flight; before it answers, nothing claims every profile is registered.
+    expect(awsControlApi.availableProfiles).toHaveBeenCalled()
+    expect(screen.queryByTestId('add-accounts-none')).toBeNull()
+
+    await act(async () => { answer(availablePayload({ profiles: [], registeredCount: 0 })) })
+    expect(await screen.findByTestId('add-accounts-no-profiles')).toHaveTextContent(
+      i18nT('apps.awsControl.page.add_accounts_no_profiles'),
+    )
+    expect(screen.queryByTestId('add-accounts-none')).toBeNull()
+  })
+
+  it('with every local profile registered, says none are left', async () => {
+    vi.mocked(awsControlApi.availableProfiles).mockResolvedValue(
+      availablePayload({ profiles: [{ name: 'personal', registered: true }] }),
+    )
+    await openAccountsPane()
+    fireEvent.click(await screen.findByTestId('add-accounts-toggle'))
+    expect(await screen.findByTestId('add-accounts-none')).toHaveTextContent(
+      i18nT('apps.awsControl.page.add_accounts_none'),
+    )
+    expect(screen.queryByTestId('add-accounts-no-profiles')).toBeNull()
+  })
+
   it('surfaces a message when register fails, never silently', async () => {
     vi.mocked(awsControlApi.registerProfiles).mockRejectedValue(
       new AwsControlError('unknown_profile', 400),
@@ -1394,6 +1447,19 @@ describe('add accounts', () => {
     expect(screen.queryByTestId('add-accounts-none')).toBeNull()
   })
 
+  it('AWS CLI v1 on the gateway is named, with no Try again that can never work', async () => {
+    vi.mocked(awsControlApi.availableProfiles).mockRejectedValue(
+      new AwsControlError('unsupported_aws_cli_v1', 501),
+    )
+    await openAccountsPane()
+
+    fireEvent.click(await screen.findByTestId('add-accounts-toggle'))
+    expect(await screen.findByTestId('add-accounts-load-error')).toHaveTextContent(
+      i18nT('apps.awsControl.page.add_accounts_cli_v1'),
+    )
+    expect(screen.queryByTestId('add-accounts-load-error-retry')).toBeNull()
+  })
+
   it('a ticked profile withholds every hand-off on the pane until the tick is cleared', async () => {
     // The ticks live only in the disclosure's state. "Ask the agent" on any
     // notice on this pane navigates to chat, which unmounts the disclosure and
@@ -1412,7 +1478,7 @@ describe('add accounts', () => {
     fireEvent.click(within(panel).getByTestId('reconnect-toggle'))
     const notice = await screen.findByTestId('reconnect-error')
     // No draft yet: the hand-off is offered.
-    expect(within(panel).getByRole('button', { name: /ask the agent/i })).toBeTruthy()
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeTruthy()
 
     fireEvent.click(screen.getByTestId('add-accounts-toggle'))
     const boxes = await screen.findAllByTestId('add-accounts-checkbox')
@@ -1428,7 +1494,7 @@ describe('add accounts', () => {
     fireEvent.click(boxes[0])
     expect(boxes[0]).not.toBeChecked()
     await waitFor(() =>
-      expect(within(panel).getByRole('button', { name: /ask the agent/i })).toBeTruthy(),
+      expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeTruthy(),
     )
   })
 })

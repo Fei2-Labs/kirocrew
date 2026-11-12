@@ -44,13 +44,13 @@ from kiro_crew.cron import (
     validate_managed_by,
 )
 from kiro_crew.cron_script import resolve_script_path
-from kiro_crew.cron_trigger import trigger_cron_job
 from kiro_crew.history import ConversationLog
 from kiro_crew.mcp_cron import _vet_cron_capability_governance, _vet_script_file, _vet_shell_command
 from kiro_crew.platform import redact_log_via_context
 from kiro_crew.port_resolution import resolve_client_port_ex
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
+from kiro_crew.terminal_safe import safe_terminal_line
 from kiro_crew.validation import (
     _AGENT_NAME_RE,
     _MODEL_NAME_RE,
@@ -98,6 +98,25 @@ def _cron_add_bounds(field_name: str) -> tuple[int, int]:
     spec = next(s for s in CRON_ADD_SCHEMA.fields if s.name == field_name)
     assert spec.min_val is not None and spec.max_val is not None, field_name
     return int(spec.min_val), int(spec.max_val)
+
+
+def _cron_model(model: str) -> str:
+    """A ``--model`` value as it is stored, or ``ValueError`` naming the format rule.
+
+    ``""`` stays ``""`` (no override). The "auto" inherit sentinel resolves to no
+    pinned provider id and is stored as unset, as the dashboard and ``cron_add`` do.
+    """
+    if not model:
+        return ""
+    if len(model) > MAX_SHORT_STRING:
+        raise ValueError(f"invalid model format (expected at most {MAX_SHORT_STRING} characters)")
+    if not _MODEL_NAME_RE.match(model):
+        # Read here, not at module level: the facade mirrors every module-level
+        # import of its owners, and its import inventory is frozen.
+        from kiro_crew.validation import MODEL_NAME_HINT
+
+        raise ValueError(f"invalid model format ({MODEL_NAME_HINT})")
+    return "" if model_registry.to_provider_id(model, "claude_code") == "" else model
 
 
 def _cron_update_not_found(job_id: str) -> NoReturn:
@@ -159,6 +178,38 @@ def _cron_add_fail(msg: str, *, audit_kind: str = "") -> NoReturn:
             )
     print(text, file=sys.stderr)
     sys.exit(1)
+
+
+def _cron_folder_ref(ref: str) -> tuple[str, str | None]:
+    """Resolve ``--folder`` for ``cron add`` / ``cron update``, creating a missing name.
+
+    The same resolver the ``cron_add`` / ``cron_update`` tools run
+    (``mcp_cron._resolve_cron_folder_via``: empty -> ungrouped, exact id,
+    case-insensitive name, an ambiguous name or unreadable store refused, an
+    id-shaped miss refused), with the CLI's transport as its create leg:
+    ``_create_cron_folder`` POSTs to the running gateway's
+    ``/api/cron-folders``. Returns ``(folder_id, error)``.
+    """
+    # In-function: the facade mirrors every module-level import of its owners.
+    from kiro_crew.cli_commands_gateway_api import _create_cron_folder
+    from kiro_crew.mcp_cron import _resolve_cron_folder_via
+
+    return _resolve_cron_folder_via(ref, _create_cron_folder)
+
+
+#: ``cron list --folder`` value that selects jobs filed in no folder.
+_CRON_LIST_UNGROUPED = "-"
+
+
+def _cron_folder_label(folder_id: str, names: dict[str, str]) -> str:
+    """A job's folder as ``cron list`` prints it: its name, else its raw id.
+
+    Folder names are stored as written (an agent can write one), so the label
+    goes through ``safe_terminal_line`` before it reaches the terminal.
+    """
+    if not folder_id:
+        return "(none)"
+    return safe_terminal_line(names.get(folder_id) or folder_id)
 
 
 def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
@@ -326,31 +377,10 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
     # ── Fields validated up front so an invalid value never strands a job ──
     if channel and (len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel)):
         _cron_add_fail(f"invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})")
-    if model:
-        if len(model) > MAX_SHORT_STRING:
-            _cron_add_fail(f"invalid model format (expected at most {MAX_SHORT_STRING} characters)")
-        if not _MODEL_NAME_RE.match(model):
-            # Read here, not at module level: the facade mirrors every module-level
-            # import of its owners, and its import inventory is frozen.
-            from kiro_crew.validation import MODEL_NAME_HINT
-
-            _cron_add_fail(f"invalid model format ({MODEL_NAME_HINT})")
-        # Same normalisation as the dashboard and cron_add: the "auto" inherit
-        # sentinel resolves to no pinned provider id and is stored as unset.
-        if model_registry.to_provider_id(model, "claude_code") == "":
-            model = ""
-    # Resolve BEFORE add_job so a typo'd folder never leaves an orphaned
-    # job behind. Existing folders only: cron_folders.json is owned by the
-    # dashboard (its state rewrites the file wholesale), so a CLI-side
-    # create could be silently clobbered by the next Schedule-page folder
-    # operation.
-    folder_id = ""
-    if folder_ref:
-        found = lookup_cron_folder_id(folder_ref)
-        if found.error:
-            _cron_add_fail(found.error)
-        folder_id = found.folder_id
-
+    try:
+        model = _cron_model(model)
+    except ValueError as e:
+        _cron_add_fail(str(e))
     if script:
         kind = "script"
     elif command:
@@ -412,6 +442,8 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
         # fail every wake. An already-absolute spec round-trips unchanged.
         script = f"{script_file}:{func}"
 
+    folder_id = ""
+
     # ── Session shape: the store's defaults, exactly as cron_add and the
     # dashboard POST forward them. One defaulting policy across every create
     # surface, so the same --command job means the same job whichever door it
@@ -460,6 +492,31 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
         project_path = (getattr(args, "project_path", "") or "").strip()
         if project_path:
             fields["project_path"] = project_path
+        if folder_ref:
+            # ── Folder: resolved after every vet and BEFORE add_job, the
+            # position cron_add resolves it in. ``build_job`` is the store's
+            # own pure (no I/O) field check, run here first so a job the store
+            # would refuse (a bad cron expression, timezone, approval mode)
+            # never creates a folder; before add_job, so an unresolvable
+            # reference never leaves an orphaned job behind. A missing name is
+            # created through the running gateway (``_cron_folder_ref``),
+            # never by writing cron_folders.json here.
+            from kiro_crew.cron_service.fields import build_job
+
+            build_job(**fields)
+            # An unreadable store refuses add_job, and a key that already has a
+            # job is refused by add_managed_job; refuse both here too, before the
+            # folder create. Unlocked pre-checks only: the locked checks in the
+            # store stay the ones that decide.
+            svc.raise_if_store_unreadable()
+            if managed_by is not None and any(
+                j.managed_by == managed_by for j in svc.list_jobs(include_disabled=True)
+            ):
+                _cron_add_fail(f"a job is already managed by {managed_by!r}")
+            folder_id, folder_err = _cron_folder_ref(folder_ref)
+            if folder_err:
+                _cron_add_fail(folder_err)
+            fields["folder_id"] = folder_id
         if managed_by is not None:
             job = svc.add_managed_job(managed_by, **fields)
         else:
@@ -564,14 +621,35 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
 
     action = getattr(args, "cron_action", None)
     if action == "list":
+        # Read-only on folders: the filter resolves an EXISTING folder and never
+        # creates one, and an unknown or ambiguous reference is an error rather
+        # than an empty listing that reads as "no jobs there".
+        folder_filter = getattr(args, "folder", None)
+        want_folder: str | None = None
+        if folder_filter is not None:
+            ref = folder_filter.strip()
+            if ref in ("", _CRON_LIST_UNGROUPED):
+                want_folder = ""
+            else:
+                found = lookup_cron_folder_id(ref)
+                if found.error:
+                    print(f"Error: {found.error}", file=sys.stderr)
+                    sys.exit(1)
+                want_folder = found.folder_id
+        from kiro_crew.cron import load_cron_folders
+
+        folder_names = {f["id"]: f["name"] for f in load_cron_folders()}
         jobs = svc.list_jobs(include_disabled=True)
+        if want_folder is not None:
+            jobs = [j for j in jobs if (j.folder_id or "") == want_folder]
         if not jobs:
-            print("No cron jobs.")
+            print("No cron jobs." if want_folder is None else "No cron jobs in that folder.")
             return
         for j in jobs:
             status = "✅" if j.enabled else "⏸️"
             sched = _format_schedule(j.schedule, tz_name=job_zone_name(j))
-            print(f"  {status} {j.id}  {j.name}  ({sched})  {j.message[:60]}")
+            folder = _cron_folder_label(j.folder_id or "", folder_names)
+            print(f"  {status} {j.id}  {j.name}  ({sched})  [folder: {folder}]  {j.message[:60]}")
             # Ownership is printed because it decides which surfaces can manage
             # the job at all: a job with no owning session is outside every chat
             # session's scope, so `cron_list` from chat does not list it and the
@@ -702,6 +780,10 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             "timeout_secs",
             "auto_pause_after_failures",
             "alert_after_failures",
+            "persistent_session",
+            "minimal_context",
+            "hide_in_chat",
+            "silent",
         ):
             val = getattr(args, field, None)
             if val is not None:
@@ -731,6 +813,15 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             kwargs["approval_mode"] = "" if args.approval_mode == "default" else args.approval_mode
         if getattr(args, "project_path", None) is not None:
             kwargs["project_path"] = args.project_path.strip()
+        if getattr(args, "model", None) is not None:
+            try:
+                kwargs["model"] = _cron_model(args.model.strip())
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+        # The store validates the zone; "" resets it to the default, as on cron_update.
+        if getattr(args, "timezone", None) is not None:
+            kwargs["timezone"] = args.timezone.strip()
         # ``--every 0`` and a blank ``--cron`` name no schedule, and the store
         # treats an empty schedule value as "unchanged". Say so instead of
         # reporting an update that did not happen; the other fields still apply.
@@ -743,7 +834,8 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             del kwargs["cron_expr"]
             blank_schedule = True
             print("Warning: an empty --cron leaves the schedule unchanged", file=sys.stderr)
-        if not kwargs:
+        folder_ref = getattr(args, "folder", None)
+        if not kwargs and folder_ref is None:
             # A blank schedule was the only field: nothing is written, but a
             # stale id still fails as it does with any other field. An
             # unreadable store reads as empty, so probe it first: a corrupt
@@ -759,6 +851,35 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
         if "every_secs" in kwargs and "cron_expr" in kwargs:
             print("Provide --every or --cron, not both", file=sys.stderr)
             sys.exit(1)
+        if folder_ref is not None:
+            # Same contract as cron_update's ``folder``: "" ungroups, a missing
+            # name is created through the running gateway. Resolved last, after
+            # every other check, and only for a job that exists, so a refused or
+            # mistyped update never leaves a new empty folder behind.
+            if folder_ref.strip():
+                svc.raise_if_store_unreadable()
+            if folder_ref.strip() and svc.get_job(args.job_id) is None:
+                _cron_update_not_found(args.job_id)
+            if folder_ref.strip():
+                # Dry-run the store's own update check on a copy first, so an
+                # update the store would refuse (a bad cron expression, an
+                # out-of-range timeout) never creates a folder.
+                import copy
+
+                from kiro_crew.cron_service.fields import apply_job_update
+
+                current = svc.get_job(args.job_id)
+                if current is not None:
+                    try:
+                        apply_job_update(copy.deepcopy(current), dict(kwargs), None)
+                    except ValueError as e:
+                        print(f"Error: {e}", file=sys.stderr)
+                        sys.exit(1)
+            folder_id, folder_err = _cron_folder_ref(folder_ref)
+            if folder_err:
+                print(f"Error: {folder_err}", file=sys.stderr)
+                sys.exit(1)
+            kwargs["folder_id"] = folder_id
         try:
             updated = svc.update_job(args.job_id, **kwargs)
         except ValueError as e:
@@ -771,6 +892,8 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 # Same rationale as cron.add: the agent picks the sandboxed
                 # subprocess, so the value belongs in the audit trail.
                 audit_resources += f" agent={kwargs['agent_id'] or 'default'}"
+            if "folder_id" in kwargs:
+                audit_resources += f" folder={kwargs['folder_id'] or '(ungrouped)'}"
             sel().log_api_access(
                 caller="cli",
                 operation="cron.update",
@@ -840,7 +963,11 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
         # paired credential would let that sibling run the job.
         port, _evidence_backed = resolve_client_port_ex(None)
         secret_path = config_dir() / ".local_secret"
-        ok, msg = trigger_cron_job(args.job_id, port, secret_path)
+        # Local: a module-level name here would be served by the ``cli_commands``
+        # facade, whose name set is pinned.
+        from kiro_crew.cron_trigger import ALREADY_RUNNING_STATUS, trigger_cron_job_status
+
+        ok, msg, http_status = trigger_cron_job_status(args.job_id, port, secret_path)
         # The success line is the command's output; a failure reason goes to
         # stderr like every other cron refusal.
         print(msg, file=sys.stdout if ok else sys.stderr)
@@ -852,7 +979,9 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             resources=f"job_id={args.job_id}",
         )
         if not ok:
-            sys.exit(1)
+            # A busy job is worth retrying later, unlike a real failure, so it
+            # gets its own code, 75 (EX_TEMPFAIL), a script can test without the text.
+            sys.exit(75 if http_status == ALREADY_RUNNING_STATUS else 1)
 
     elif action == "preview":
         _cron_preview(args)

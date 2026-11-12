@@ -37,7 +37,8 @@ from kiro_crew.dashboard.handlers.knowledge_sync import (
     _source_row,
 )
 from kiro_crew.dashboard.upload_limits import bytes_to_mb_figure, knowledge_upload_max_bytes
-from kiro_crew.knowledge.ingestion import ImportChunkBudgetError, _redact
+from kiro_crew.knowledge.ingestion import FileTooLargeError, ImportChunkBudgetError, _redact
+from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.store import _ACCOUNT_BOUND_SOURCE_TYPE
 from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
@@ -136,7 +137,8 @@ async def ingest_text(request: web.Request) -> web.Response:
             if is_cancel:
                 logger.debug("Agent ingest_text cancelled for source %s", source_id)
                 raise
-            logger.exception("Agent ingest_text failed for source %s", source_id)
+            if not isinstance(exc, FileTooLargeError):  # the pipeline already warned
+                logger.exception("Agent ingest_text failed for source %s", source_id)
             return web.json_response({"error": "internal server error"}, status=500)
         finally:
             Path(tmp.name).unlink(missing_ok=True)
@@ -219,6 +221,14 @@ async def ingest_file(request: web.Request) -> web.Response:
     filename = getattr(field, "filename", None) or "upload"
     suffix = Path(filename).suffix
     ext = suffix.lower()
+    # A format with a reader but kept out of SUPPORTED (.pptx) is not supported:
+    # refuse it here instead of answering 'processing' and failing later.
+    if ext in FileReader._DISPATCH and ext not in FileReader.SUPPORTED:
+        _sel_log("ingest", filename=filename, outcome="rejected", reason="unsupported_type")
+        return web.json_response(
+            {"error": f"Unsupported file type: {ext}", "code": "unsupported_file_type"},
+            status=400,
+        )
     staged = Path(tempfile.gettempdir()) / f"kn_{uuid.uuid4().hex}{suffix}"
     max_ingest_bytes = await asyncio.to_thread(knowledge_upload_max_bytes)
     try:

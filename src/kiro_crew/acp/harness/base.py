@@ -88,6 +88,11 @@ class SpawnContext:
     member_context: bool = field(default=False, kw_only=True)
     """Capture native member context sources for session delivery deduplication."""
 
+    harness_pin: str = field(default="", kw_only=True)
+    """The session's own Bot pin as stored (``agents.<name>.acp_backend``), ``""`` for none.
+
+    Read by KAS's route rule 2 (:func:`kiro_crew.acp.kas_route.automatic_switch_allowed`)."""
+
     sandbox_mode: str = "auto"
     """The sandbox tier this spawn will use, as configured.
 
@@ -346,7 +351,8 @@ class SessionExtras:
     For a host whose payload carries the agent's servers over the ACP wire, where
     Crew withholds credential-bearing fields
     (``kas_agents.withheld_credentials_notice``). ``""`` on every other host and
-    when nothing was withheld.
+    when nothing was withheld. On KAS it also carries the line for a ``file://``
+    prompt the session runs without (``kas_prompt.prompt_unread_notice``).
     """
 
 
@@ -414,6 +420,17 @@ class TeardownPolicy:
 
     local_only: bool = False
     """Unregister without the destructive verb unless privacy requires deletion."""
+
+    delete_disposable_record: Callable[[str, Mapping[str, str] | None], bool] | None = None
+    """Crew's own delete of a disposable session's record, for a host whose verb keeps it.
+
+    ``None`` means the verb, or the kiro-cli transcript sweep the shared runtime
+    already runs, answers for the record. codex evicts and keeps the rollout under
+    ``CODEX_HOME``, so its harness names the rollout delete here. The shared
+    runtime calls it for an incognito or temporary session with the session id
+    and the runtime's ``extra_env``, which can move the store the child wrote.
+    Returns whether the cleanup completed.
+    """
 
 
 # ── Unroutable permission answer ──
@@ -616,6 +633,10 @@ class HarnessAdapter(LaunchAdapter):
         crew_panel: bool = False,
         session_key: str = "",
         worker_stub_names: frozenset[str] | None = None,
+        engine_features: frozenset[str] = frozenset(),
+        session_cwd: str | Path | None = None,
+        ssh_auth_sock_forwarded: bool = False,
+        governance_app: str | None = None,
     ) -> SessionExtras:
         """Per-session payload for this host, for both session start paths.
 
@@ -628,6 +649,22 @@ class HarnessAdapter(LaunchAdapter):
         ``worker_stub_names`` is handed in only for a KAS crewmate worker: the
         names of the stubs ``session/new`` injects for that session, from the
         caller's one overlay lookup. A host that projects nothing ignores it.
+
+        ``ssh_auth_sock_forwarded`` is the verdict the launch tail applied to the
+        running engine's own environment, for a host that starts the session's
+        stdio servers itself (KAS); False when no launch recorded one.
+
+        ``engine_features`` is :func:`kiro_crew.acp.kas_engine_features.advertised`
+        of this process's ``initialize`` answer. Only the KAS projection reads it.
+
+        ``session_cwd`` is the session's own working directory, which can differ
+        from *work_dir* (the runtime's) for a session opened in another checkout.
+        A host that reads workspace settings beside the session reads them there;
+        one that projects nothing ignores it.
+
+        ``governance_app`` is the app whose governance profile the session runs
+        under, or ``None`` when the caller cannot vouch for it. Only the KAS
+        projection reads it, for the profiles a translated allow meets.
         """
 
     def record_session_projection(self, handle: Any, custom_agents: Any, active_agent: str) -> None:
@@ -675,14 +712,17 @@ class HarnessAdapter(LaunchAdapter):
     ) -> tuple[dict[str, Any], str | None]:
         """The ``session/new`` / ``session/load`` params to send, and the agent to activate.
 
-        Asked after the runtime built the request and before it goes out. Every host
-        the backend table serves sends what the runtime built and activates the agent
-        the caller asked for, so this answer returns BOTH of the caller's objects
-        unchanged, and the request stays byte-identical to one built without this
-        seam. A host that places the session where Kiro Crew's agent does not exist
-        (:class:`~kiro_crew.acp.harness.kas_cloud.KasCloudSandboxHarness`) reshapes
-        the request and activates nothing. Raising ``AcpRuntimeError`` here refuses
-        the start before anything is sent.
+        Asked after the runtime built the request and before it goes out. This
+        default sends what the runtime built and activates the agent the caller asked
+        for, so it returns BOTH of the caller's objects unchanged, and the request
+        stays byte-identical to one built without this seam. KAS
+        (:class:`~kiro_crew.acp.harness.kas.KasHarness`) also names the mode a
+        ``session/new`` starts in, its injected agent or the start agent it adds
+        beside one that declares MCP servers, and still activates the
+        caller's agent. A host that places the session where Kiro Crew's agent does
+        not exist (:class:`~kiro_crew.acp.harness.kas_cloud.KasCloudSandboxHarness`)
+        reshapes the request and activates nothing. Raising ``AcpRuntimeError`` here
+        refuses the start before anything is sent.
         """
         return params, agent
 
@@ -724,6 +764,20 @@ class HarnessAdapter(LaunchAdapter):
         returned is the user-facing refusal, ready to raise as-is.
         """
         return None
+
+    def start_mode_ran_servers(self, mode_id: str) -> bool:
+        """Whether the mode a session started in may have started MCP servers of its own.
+
+        Asked after ``set_mode`` switched a new session away from *mode_id*, as a
+        seam rather than a backend test (harness-parity H13). Reports staged
+        before the switch describe that mode's servers, so the start skips them
+        unless the mode had none. This base answer is ``True``: a mode a host
+        chose may run any server. A host that starts a session in an agent it
+        registered without servers answers ``False`` for that agent, and the
+        reports staged under it, which can only name session-level servers,
+        still count.
+        """
+        return True
 
     # ── Seam 4: inbound requests the host answers ──
 

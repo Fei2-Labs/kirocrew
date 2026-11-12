@@ -51,6 +51,8 @@ SHARED_BINDINGS_CHECKS = (
     "the_field_scan_counts_every_read_and_write_shape",
     "the_signature_digest_ignores_an_object_address_in_either_spelling",
     "the_bound_function_scans_include_every_static_method",
+    "the_class_only_scan_can_fail",
+    "leaf_test_scope_derives_this_file_as_a_corpus_gate",
 )
 
 #: Member -> (kind, coroutine, signature digest, owning module). Frozen at the split: the
@@ -68,8 +70,10 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_REVIVE_ANSWER_DRAIN_TIMEOUT": ("data", False, "", "runtime_class"),
     "_ROOT_UNREACHED_REASON_BY_VERDICT": ("data", False, "", "runtime_class"),
     # Takes ``launch_agent``: the app launch copy kiro-cli is asked for (``apps.agent_launch``),
-    # and ``native_skill_projection``: off for the warm mint process, whose specs sit in ``run/``.
-    "__init__": ("function", False, "7da71c4f7900", "runtime_class"),
+    # and ``native_skill_projection``: off for the warm mint process, whose specs sit in ``run/``,
+    # ``harness_pin``: the session's own Bot pin, which KAS's route rule 2 reads,
+    # and ``governance_scope``: the (session key, app) its KAS projection meets the profiles of.
+    "__init__": ("function", False, "7c98559aac93", "runtime_class"),
     "_activate_mode_bracketed": ("function", True, "3dc699e8b0af", "runtime_mode_activation"),
     "_activates_agent_by_mode": ("function", False, "a6632a57e602", "runtime_mode_activation"),
     "_adopt_skill_projection": ("function", False, "5c4748bee6c5", "runtime_mode_activation"),
@@ -88,7 +92,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_audit_denied_off_loop": ("function", False, "bc403500636d", "runtime_host_requests"),
     # Both take ``request_identity``: the vault identity the ``session/new`` went out
     # under, for the KAS catalog recorder (``kas_model_catalog``).
-    "_collect_late_start": ("function", False, "1c91d322411d", "runtime_session_create"),
+    "_collect_late_start": ("function", False, "52e41b8027d5", "runtime_session_create"),
     "_compose_death_summary": ("function", False, "d296f1f5d821", "runtime_liveness"),
     "_confirm_member_projection": ("function", True, "c694d7c95d1b", "runtime_session_setup"),
     "_copy_native_launch_sources": ("function", False, "b4bc0bbb71ed", "runtime_session_setup"),
@@ -99,11 +103,11 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_exit_reason": ("function", False, "5ea8f751c789", "runtime_liveness"),
     "_exit_watch_loop": ("function", True, "b60c5fea256e", "runtime_liveness"),
     "_failed_start_cleanup": ("function", True, "b60c5fea256e", "runtime_spawn_launch"),
-    "_finish_create_session": ("function", True, "417fe88faef2", "runtime_session_create"),
+    "_finish_create_session": ("function", True, "0c17bc8d458e", "runtime_session_create"),
     "_finish_session_init": ("function", False, "eb69f6ac3aa6", "runtime_session_registry"),
     "_flush_dropped_frames": ("function", False, "bc10f150ea47", "runtime_frame_accounting"),
     "_flush_roster_overflow": ("function", False, "bc10f150ea47", "runtime_frame_accounting"),
-    "_guard_unresolved_mcp_refs": ("function", False, "124371616ca9", "runtime_session_setup"),
+    "_guard_unresolved_mcp_refs": ("function", False, "417a1661421e", "runtime_session_setup"),
     "_handshake_client_capabilities": ("function", True, "16d9fe32838b", "runtime_spawn_launch"),
     "_harness": ("property", False, "482ead03a978", "runtime_class"),
     "_initialize_handshake": ("function", True, "9a2155299a08", "runtime_spawn_launch"),
@@ -114,7 +118,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "fa6cfecd5574",
         "runtime_mode_activation",
     ),
-    "_kas_custom_agents": ("function", True, "1cacd0d91137", "runtime_session_setup"),
+    "_kas_custom_agents": ("function", True, "cceb389a5970", "runtime_session_setup"),
     "_kill_failed_start_escapees": ("function", True, "ccaec8d76f05", "runtime_spawn_launch"),
     "_kill_inner": ("function", True, "4f9ced5c4b86", "runtime_tree_kill"),
     "_mark_dead": ("function", False, "e8c36427bffd", "runtime_liveness"),
@@ -129,6 +133,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_mirrored_spec_check_needed": ("function", False, "3cd7cb3cf81a", "runtime_session_setup"),
     "_mode_available": ("staticmethod", False, "08e0d5cbf178", "runtime_mode_activation"),
     "_mount_member_panel": ("function", True, "bcc6c7135aaa", "runtime_session_setup"),
+    "_note_announced_child": ("function", False, "ae18ce00a59d", "runtime_frame_accounting"),
     "_note_dropped_frame": ("function", False, "65da3cb3ad9e", "runtime_frame_accounting"),
     "_note_reaped": ("function", False, "65a401984277", "runtime_liveness"),
     "_note_reaped_after_kill": ("function", False, "0d4bde9dbb0a", "runtime_liveness"),
@@ -162,6 +167,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_resolve_spawn_plan": ("function", True, "a6093c8b82cf", "runtime_spawn_launch"),
     "_resolve_start_alias": ("function", False, "12ab76a15b9b", "runtime_mode_activation"),
     "_retire_tracking_after_exit": ("function", True, "b60c5fea256e", "runtime_liveness"),
+    "_route_owned_child_frame": ("function", True, "ba59d8598812", "runtime_reader_loop"),
     "_returncode_label": ("function", False, "bb418bb7ece8", "runtime_liveness"),
     "_revive_after_failed_start": ("function", True, "a6632a57e602", "runtime_spawn_entry"),
     "_root_identity": ("function", False, "bb418bb7ece8", "runtime_tree_kill"),
@@ -198,11 +204,12 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
         "runtime_mode_activation",
     ),
     "_unclaimed_new_sessions": ("property", False, "67a56d539800", "runtime_class"),
+    "_unconfirmed_teardowns": ("property", False, "67a56d539800", "runtime_class"),
     "_unpooled_control_planes": ("function", True, "5255b093c0d2", "runtime_session_setup"),
     "_verify_spawn_agent_active": ("function", True, "3d143e45e940", "runtime_mode_activation"),
     "_wait_for_answer_capacity": ("function", True, "609119a8d63a", "runtime_host_requests"),
     "_wait_managed_mcp": ("function", True, "318828f7ab77", "runtime_session_load"),
-    "_write_request_bounded": ("function", True, "4ea88874f686", "runtime_wire"),
+    "_write_request_bounded": ("function", True, "905771de4943", "runtime_wire"),
     "_write_response_bounded": ("function", True, "325c14124282", "runtime_wire"),
     "acp_backend": ("property", False, "bb418bb7ece8", "runtime_class"),
     "agent_version": ("property", False, "bb418bb7ece8", "runtime_class"),
@@ -237,7 +244,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "saw_sandbox_init_failure": ("function", False, "a6632a57e602", "runtime_liveness"),
     "send_error": ("function", True, "f8eeeb44db9e", "runtime_wire"),
     "send_notification": ("function", True, "78b195a50312", "runtime_wire"),
-    "send_request": ("function", True, "60d06c03f35b", "runtime_wire"),
+    "send_request": ("function", True, "5d6b16e9d26f", "runtime_wire"),
     "send_request_for_answer": ("function", True, "f3fe127a3feb", "runtime_wire"),
     "send_response": ("function", True, "74f287d889d6", "runtime_wire"),
     "session_activity_at": ("function", False, "8912ecd7f5d6", "runtime_session_registry"),
@@ -569,11 +576,6 @@ def _class_only_constructs(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[s
         if isinstance(spelled, str) and spelled.startswith("__") and not spelled.endswith("__"):
             found.append(spelled)
     return found
-
-
-def test_the_class_only_scan_can_fail() -> None:
-    tree = ast.parse("def f(self):\n    super().g()\n    return __class__, self.__hidden\n")
-    assert sorted(_class_only_constructs(tree.body[0])) == ["__class__", "__hidden", "super()"]
 
 
 @pytest.mark.parametrize("owner", _OWNERS)
@@ -978,26 +980,18 @@ def test_every_base_import_stays_bound_on_the_facade() -> None:
     assert sorted(_BASE_IMPORTS - set(vars(runtime))) == []
 
 
-def test_leaf_test_scope_derives_this_file_as_a_corpus_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """It reads the whole test tree, so a leaf-only diff must still run it."""
-    import source_corpus
-
-    root = source_corpus.repo_root()
-    monkeypatch.syspath_prepend(str(root / "scripts"))
-    leaf_test_scope = importlib.import_module("leaf_test_scope")
-    this_file = Path(__file__).resolve()
-    assert this_file.relative_to(root).as_posix() in leaf_test_scope.corpus_gates(root)
-
-
 #: ``typing.get_type_hints(AcpRuntime.__init__)`` before the class left ``runtime.py``.
 _INIT_HINTS = {
     "acp_backend": "<class 'str'>",
     "agent": "<class 'str'>",
+    "agent_env": "dict[str, str] | None",
     "crew_agent": "<class 'str'>",
     "expect_mcp_reports": "<class 'bool'>",
     "extra_env": "dict[str, str] | None",
+    "forward_ssh_auth_sock": "bool | None",
+    "governance_scope": "tuple[str, str] | None",
+    "harness_pin": "<class 'str'>",
+    "kas_telemetry": "bool | None",
     "max_age_secs": "<class 'float'>",
     "max_rss_mb": "<class 'float'>",
     "mcp_gateway_overlay": "str | pathlib.Path | None",

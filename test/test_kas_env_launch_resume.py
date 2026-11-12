@@ -1,9 +1,9 @@
 """A KAS session's hoisted launch snapshots go with the session.
 
-``session/new`` hoists a builtin app server the same way. ``session/load`` hoists a launcher entry out of the agent batch into the
-session-level array (``kas_agents.hoist_servers_for_session(...,
-include_user_servers=True)``), and the batch the handle registers then lacks the
-snapshot that projection wrote. These tests drive the real ``load_session``
+``session/new`` and ``session/load`` hoist a builtin app server out of the agent
+batch into the session-level array (``kas_agents.hoist_servers_for_session``),
+and the batch the handle registers then lacks the snapshot that projection
+wrote. A user launcher entry stays in the batch. These tests drive the real ``load_session``
 and the provider's MCP re-injection, and check that shutdown still removes every
 snapshot this session's projections wrote.
 """
@@ -64,7 +64,9 @@ def runtime(tmp_path, monkeypatch, home):
             return {"modes": {"currentModeId": "kirocrew"}, "models": []}
         return {}
 
-    async def _fake_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
+    async def _fake_agents(
+        agent, *, member_dispatch=False, crew_panel=False, session_key="", **_kw
+    ):
         return SessionExtras(
             custom_agents=[to_client_custom_agent(agent, spec, "p", session_key=SESSION)]
         )
@@ -102,14 +104,12 @@ async def _reinject(provider: AcpSessionProvider) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_resumed_sessions_hoisted_snapshot_is_removed_at_shutdown(
-    home, runtime, monkeypatch
-):
+async def test_a_resumed_sessions_snapshot_is_removed_at_shutdown(home, runtime, monkeypatch):
     handle = await _load(runtime)
     written = _snapshots(home)
     assert len(written) == 1
     registered = [a.get("mcpServers", {}) for a in handle.kas_registered_agents]
-    assert all(SERVER not in servers for servers in registered), "the resume hoisted it"
+    assert any(SERVER in servers for servers in registered), "a user server stays in the block"
     await _shutdown(_provider(runtime, handle), monkeypatch)
     assert _snapshots(home) == set()
 
@@ -119,7 +119,7 @@ async def test_every_resume_of_one_session_is_removed_at_shutdown(home, runtime,
     provider = _provider(runtime, await _load(runtime))
     await _reinject(provider)
     await _reinject(provider)
-    assert len(_snapshots(home)) == 3, "each load wrote its own snapshot"
+    assert len(_snapshots(home)) == 1, "every load of one launch shares one file"
     await _shutdown(provider, monkeypatch)
     assert _snapshots(home) == set()
 
@@ -161,7 +161,9 @@ async def test_a_new_sessions_hoisted_app_server_snapshot_is_removed_at_shutdown
             return {"sessionId": "sid-new", "modes": {"currentModeId": "kirocrew"}}
         return {}
 
-    async def _fake_agents(agent, *, member_dispatch=False, crew_panel=False, session_key=""):
+    async def _fake_agents(
+        agent, *, member_dispatch=False, crew_panel=False, session_key="", **_kw
+    ):
         return SessionExtras(
             custom_agents=[to_client_custom_agent(agent, spec, "p", session_key=SESSION)],
             app_launches={APP_SERVER: {"command": sys.executable, "args": [str(script)]}},

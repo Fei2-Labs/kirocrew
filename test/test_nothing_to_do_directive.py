@@ -88,6 +88,42 @@ class TestNothingToDoTool:
         assert set(_DIRECTIVE_NOT_APPLIED_OUTCOMES) == set(session_directive.DIRECTIVE_TOOLS)
 
 
+class TestQuietEndAfterText:
+    """The result tells the model its text was shown only when the gateway says
+    the running turn already streamed reply text."""
+
+    @staticmethod
+    def _call(monkeypatch, reply):
+        from kiro_crew import mcp_core
+
+        def _post(path, body=None, **_kw):
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        monkeypatch.setattr(mcp_core, "current_call_name", lambda: "nothing_to_do")
+        monkeypatch.setattr(mcp_core, "current_call_raw_args", lambda: {"note": "n"})
+        monkeypatch.setattr(mcp_core, "_post", _post)
+        return control.nothing_to_do("nothing_to_do", {"note": "n"})
+
+    def test_a_turn_that_wrote_text_gets_the_reminder_and_keeps_its_marker(self, monkeypatch):
+        from kiro_crew.mcp_tools.control_parts.directive import QUIET_END_AFTER_TEXT_REMINDER
+
+        plain = self._call(monkeypatch, {"ok": True, "turn_wrote_text": False})
+        out = self._call(monkeypatch, {"ok": True, "turn_wrote_text": True})
+        assert QUIET_END_AFTER_TEXT_REMINDER not in plain
+        assert session_directive.strip_marker(out).endswith(QUIET_END_AFTER_TEXT_REMINDER)
+        assert session_directive.decode(out, "nothing_to_do") == {"note": "n"}
+        assert session_directive.is_vouched(out)
+
+    @pytest.mark.parametrize(
+        "reply", [{"ok": True}, {"error": "x"}, {"turn_wrote_text": "yes"}, OSError("down")]
+    )
+    def test_no_text_or_no_answer_leaves_the_result_unchanged(self, monkeypatch, reply):
+        plain = self._call(monkeypatch, {"ok": True, "turn_wrote_text": False})
+        assert self._call(monkeypatch, reply) == plain
+
+
 # ── the frontend mirror ──────────────────────────────────────────────────────
 
 
@@ -614,6 +650,30 @@ class TestDashboardRunnerHonoursTheSignal:
         assert list(await _pending_reports(state, mate)) == [worker.key]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(("text", "wrote"), [("Nothing to do.", True), ("  \n", False)])
+    async def test_the_slot_says_whether_the_running_turn_wrote_text(
+        self, tmp_path, monkeypatch, text, wrote
+    ):
+        """What ``POST /api/session-directive`` reads while the tool runs: set by
+        visible reply text, not by whitespace, and cleared when the turn ends."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("wrote-text")
+        slot._titled = True
+        slot._turn_wrote_text = True  # left over from an earlier turn
+        seen: list[bool] = []
+
+        def _events():
+            seen.append(slot._turn_wrote_text)
+            yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=text)
+            yield _core_call("nothing_to_do")
+            seen.append(slot._turn_wrote_text)
+            yield from _quiet_turn_events()[1:]
+
+        await _drive_turn(state, slot, _events(), monkeypatch)
+        assert seen == [False, wrote]
+        assert slot._turn_wrote_text is False
+
+    @pytest.mark.asyncio
     async def test_quiet_end_skips_the_empty_response_ladder(self, tmp_path, monkeypatch):
         """The acceptance: a tool-only turn that ends on
         ``nothing_to_do`` gets no notice card, no synthetic continuation and no
@@ -943,6 +1003,99 @@ class TestDashboardRunnerHonoursTheSignal:
             assert len(violations) == 1 and "1 model event(s)" in violations[0].getMessage()
         else:
             assert violations == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("echo", ["before_reply", "at_terminal", "none"])
+    async def test_a_reply_to_a_steer_keeps_its_text_and_tool_rows_in_order(
+        self, tmp_path, monkeypatch, echo
+    ):
+        """Text, a tool call, then more text after a quiet end, with a person's
+        steer pending: the transcript keeps the model's order in every echo order
+        (kiro-cli echoes before the reply, codex only at the terminal). Text written
+        before a tool call is the model's work, so it goes out with that call even
+        when the echo never comes; only the text after the last tool call is then
+        dropped, as a held placeholder is."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("steer-order-" + echo)
+        slot._titled = True
+        steer = "are you still there?"
+        admit = object()
+        consumed = AcpEvent(kind=EVENT_STEER_CONSUMED, text=steer)
+        events = [
+            _core_call("nothing_to_do", "tc-quiet"),
+            _result(
+                session_directive.encode("nothing_to_do", {}, "Quiet end requested."), "tc-quiet"
+            ),
+            admit,
+            *([consumed] if echo == "before_reply" else []),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="Let me look."),
+            _core_call("read", "tc-read"),
+            _result("file body", "tc-read"),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="Found it."),
+            *([consumed] if echo == "at_terminal" else []),
+            AcpEvent(
+                kind=EVENT_COMPLETE, stop_reason="cancelled" if echo == "none" else "end_turn"
+            ),
+        ]
+
+        def _stream():
+            for ev in events:
+                if ev is admit:
+                    slot._pending_steers.append(steer)
+                    continue
+                yield ev
+
+        await _drive_turn(state, slot, _stream(), monkeypatch)
+        rows = [
+            (m["role"], m["content"])
+            for m in slot.messages
+            if m.get("role") in ("assistant", "tool")
+        ]
+        reply = [("assistant", "Let me look."), ("tool", "🔧 read"), ("assistant", "Found it.")]
+        assert rows == [
+            ("tool", "🔧 nothing_to_do"),
+            *reply[: 2 if echo == "none" else 3],
+        ], slot.messages
+
+    @pytest.mark.asyncio
+    async def test_text_held_for_a_requeued_steer_is_dropped(self, tmp_path, monkeypatch, caplog):
+        """A person steered into a quiet-ended turn, the model wrote the filler,
+        and the turn ended cancelled with no consumption echo. The steer is
+        requeued and answered by its own turn, so the filler held for it is no
+        answer: not streamed, not saved as an assistant row, only counted."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("steer-requeued")
+        slot._titled = True
+        steer = "are you still there?"
+        admit = object()
+        events = [
+            _core_call("nothing_to_do", "tc-quiet"),
+            _result(
+                session_directive.encode("nothing_to_do", {}, "Quiet end requested."), "tc-quiet"
+            ),
+            admit,
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="(No assistant response was recorded.)"),
+            AcpEvent(kind=EVENT_COMPLETE, stop_reason="cancelled"),
+        ]
+
+        def _stream():
+            for ev in events:
+                if ev is admit:
+                    slot._pending_steers.append(steer)
+                    continue
+                yield ev
+
+        with caplog.at_level("WARNING", logger="kiro_crew.dashboard.chat_runner"):
+            queue_calls = await _drive_turn(state, slot, _stream(), monkeypatch)
+        assert [m for m in slot.messages if m.get("role") == "assistant"] == [], slot.messages
+        assert not any("No assistant response" in str(m.get("content", "")) for m in slot.messages)
+        assert not any(
+            c.args and c.args[0] == "chat_chunk" for c in state.broadcast_ws.call_args_list
+        )
+        assert slot._pending_steers == []
+        assert any(steer in args for args, _kwargs in queue_calls), queue_calls
+        violations = [r for r in caplog.records if "Turn-end contract violation" in r.getMessage()]
+        assert len(violations) == 1 and "1 model event(s)" in violations[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_a_compacted_quiet_end_queues_no_continuation(self, tmp_path, monkeypatch):

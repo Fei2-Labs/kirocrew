@@ -279,8 +279,20 @@ never relabel it success in the friction report.
    live work needs a larger or renewed bound, raise `max_cycles` and
    `max_runtime_secs` together with `monitor_update` before either expires, under
    the same rule; `max_cycles` counts the loop's whole life and the server caps it
-   at 1000. `monitor_start` is create-only. Call `autonudge_stop` yourself when
-   the exit condition fires — coasting into a bound is a failure, not a finish.
+   at 1000. `monitor_start` is create-only. So one loop lasts at most 1000
+   cycles, renewals included, and only a fresh loop goes further. **Never stop
+   and re-arm from a patrol wake:** while the loop runs `monitor_start` is
+   refused, and once a wake stops it the server refuses the replacement, which
+   leaves no patrol at all. When a cycle's `[patrol budget: ...]` line says
+   `10% or less left` and live work remains, ask once in your reply text (not
+   with `ask_question`, whose answer comes back inside the wake) for one message
+   in this chat to renew the patrol, and record the owed re-arm in
+   `conductor_tasks`. In the next turn the person's own message starts, never a
+   wake or an injected message, call `autonudge_stop`, then `monitor_start` with
+   the same interval, bounds and standing instruction; if that start is refused,
+   say so, because no patrol is running. With no reply the patrol ends at its
+   bound. Call `autonudge_stop` yourself when the exit condition fires —
+   coasting into a bound is a failure, not a finish.
    That ~90s interval is also what sizes your panel's stale window:
    `BOARD_STALE_AFTER_SECONDS` in `kiro_crew.dashboard.handlers.agent_panel` is
    about ten of these intervals, so a board reads stale only after the log has
@@ -316,9 +328,10 @@ via `monitor_update`, see "Live steering"):
 > of the run, because by then the reasoning is what has been lost.
 > Check budgets on items with open sessions every ~5 cycles. Admission per the
 > delivery counters first, load/memory second, and never pad the fleet — an idle
-> slot is a supply reading, not a gap to fill. Quiet cycle = one line, end
-> turn. EXIT when queue empty and fleet drained: final tally, then
-> `autonudge_stop`.
+> slot is a supply reading, not a gap to fill. `10% or less left` on the
+> budget line with live work → ask once for a renewal (Startup step 4).
+> Quiet cycle = one line, end turn. EXIT when queue empty and fleet drained:
+> final tally, then `autonudge_stop`.
 
 ## Your panel: publish JUDGMENTS, never numbers
 
@@ -523,7 +536,9 @@ Then **claim atomically** — the lock label and the assignee in ONE call, never
 two. The forge is the cross-operator lock and your ledger is only a cache of
 it; a claim written as two calls is a window another operator dispatches into.
 Only after the claim lands: `session_create` (titled `{id}: {item}`), seed it with the work-order brief, record
-`{state: dispatched, session, ts}` in the ledger.
+`{state: dispatched, session, ts}` in the ledger. The seed is a `session_send`
+when your prompt carries this line: "`session_create`'s `message` is refused
+for this agent (`message_needs_send_approval`): create, then `session_send`."
 
 **The claim is only valid while a worker holds it.** If ANY post-claim step
 fails — session create refused, create rate limit hit, seed rejected, trust grant
@@ -1452,9 +1467,9 @@ same read, expects it to fail, and declines to guess an owner when it does.
 
 What the pytest rule flags is **a run whose worker pool bypasses the budget**:
 an explicit numeric `-n` of two or more (`-n 4`, `-n=4`, `-n4`, `-n 32`,
-`--numprocesses 2`), because `xdist_budget.py`'s hook only ever sizes `auto`, so
-a number is a count the host's memory and the other runs on it are never
-consulted about. `-n auto`, `-n logical` and a bare `pytest` are quiet: the
+`--numprocesses 2`), because `xdist_budget.py`'s memory hook only ever sizes
+`auto`: a number still claims the host's shared slots, but the host's live free
+memory is never consulted about it. `-n auto`, `-n logical` and a bare `pytest` are quiet: the
 bare form inherits the project's `addopts`, which supply `-n auto`, so its pool
 is budgeted by the same hook. `-n0` and `-n 1` are quiet too, as single-process
 runs with xdist inactive. Where `-n` is given twice the last one wins, as pytest

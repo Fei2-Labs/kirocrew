@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 
 import { autoOpenRows } from '../../lib/crewMode'
 import { unwrapResult } from '@reduxjs/toolkit'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import type { NavigateFunction, NavigationType } from 'react-router-dom'
+import { matchPath, type NavigateFunction, type NavigationType } from 'react-router-dom'
 
 import { api } from '../../api/client'
 import type { ChatLaunchOptions } from '../../app-sdk'
@@ -32,6 +32,7 @@ import { shouldReplaceSessionUrl, popMaySwitchSession } from '../../utils/sessio
 import { sessionShortNameFrom, shortNameMatches, type ShortNameMatch } from '../../utils/sessionKeys'
 import { toSlug } from '../../utils/shareUrl'
 import { focusComposer } from './composerFocus'
+import { useLaunchedDraftDiscard } from './useLaunchedDraftDiscard'
 import { PENDING_OPEN_LEASE_MS, resumeStillOpening } from '../../store/chatSlice'
 
 /** Read a URL-derived key from the close-hold record without traversing its prototype. */
@@ -45,6 +46,10 @@ export function closeHoldForUrl<T>(closing: Record<string, T>, key: string | nul
 // the banner false — but it no longer proves the user is waiting for that link,
 // so it may only retire the notice, never move them.
 const SID_RECOVERY_WINDOW_MS = 30_000
+// How long an app's launch into a session the list does not show yet waits for
+// the list before it switches anyway. The deep-link deadline below, and well
+// inside the 10s a launch intent stays claimable.
+const APP_LAUNCH_LIST_WAIT_MS = 5_000
 export { PENDING_OPEN_LEASE_MS }
 
 /** The key of the history entry the browser stands on, which can be ahead of
@@ -85,6 +90,8 @@ interface UseChatPageSessionControllerArgs {
   saveDrafts: () => void
   searchParams: URLSearchParams
   slots: ChatSlot[]
+  /** Whether split view is showing (an app's draft launch shown there is kept). */
+  splitMode: boolean
   tokenConsumingRef: MutableRefObject<boolean>
 }
 
@@ -124,6 +131,7 @@ export function useChatPageSessionController({
   saveDrafts,
   searchParams,
   slots,
+  splitMode,
   tokenConsumingRef,
 }: UseChatPageSessionControllerArgs) {
   // Older-sessions history is fetched lazily, not on mount: the
@@ -267,7 +275,12 @@ export function useChatPageSessionController({
   // it. Zeroing the ref here neutralizes the mount-activation effect AND the 5s
   // "session not found" timeout that keys off it; the POP effect reads
   // searchParams live and is gated separately below.
-  const initialSidRef = useRef(noUrlSync ? null : (searchParams.get('sid') || searchParams.get('slot')))
+  // A bare `/embed/chat/<key>` names its session in the path, as EmbedTabStrip
+  // reads it. The strip adds `?sid=<key>` on mount, but the router commits that
+  // in a transition, so this mount can see the slot list first: reading only
+  // `?sid=` there opened the default chat and then stripped the strip's `?sid=`.
+  const initialSidRef = useRef(noUrlSync ? null : (searchParams.get('sid') || searchParams.get('slot')
+    || matchPath('/embed/chat/:slug', locationPathname)?.params.slug || null))
   // The active slot as of MOUNT. Redux outlives this component, so `activeSlot`
   // being set says nothing about whether the USER chose it during this visit —
   // only a change away from this snapshot does.
@@ -283,6 +296,9 @@ export function useChatPageSessionController({
   // The claimed launch's new-session shape (`openChat`'s `memoryMode` /
   // `sessionFolder`), spent with the create exactly like the agent above.
   const appDraftSlotOptionsRef = useRef<{ memory_mode?: string; sessionFolder?: false }>({})
+  // Whether the pending create is an app's draft launch, whose session is
+  // discarded if the user leaves it untouched (useLaunchedDraftDiscard).
+  const appDraftLaunchRef = useRef(false)
   /**
    * A prompt to seed the new session's composer with, carried by the SAME cold
    * URL that asks for the session: `/chat?new=1&prefill=<text>`. This is the deep
@@ -370,6 +386,10 @@ export function useChatPageSessionController({
   const [highlightTs, setHighlightTs] = useState<string | null>(null)
   const [appSlotLaunch, setAppSlotLaunch] = useState<ChatLaunchOptions | null>(null)
   const appSlotLaunchRef = useRef<ChatLaunchOptions | null>(null)
+  // A launch whose target is not in the session list yet, and the session that
+  // was on screen when its wait began (see the claim below).
+  const appLaunchListWaitRef = useRef<{ intent: ChatLaunchOptions & { ts: number }; activeSlot: string | null } | null>(null)
+  const [appLaunchListWaitTick, setAppLaunchListWaitTick] = useState(0)
 
   // An app's explicit target is a session-entry action, not an ordinary PUSH
   // URL to ignore. Claim it before URL sync can restore the outgoing slot.
@@ -378,13 +398,53 @@ export function useChatPageSessionController({
     const launchWindow = window as Window & {
       __mc_chat_launch?: ChatLaunchOptions & { ts: number }
     }
-    const intent = launchWindow.__mc_chat_launch
-    if (!intent || Date.now() - intent.ts > 10_000) return
+    const staged = launchWindow.__mc_chat_launch
+    const fresh = staged && Date.now() - staged.ts <= 10_000 ? staged : undefined
+    // A launch waiting for the list (below) stays claimed here until it switches
+    // or is abandoned, however long that takes: a disconnect can outlast the 10s
+    // a staged intent stays claimable, and the intake drops the staged copy then.
+    // A newer launch supersedes the wait, as it does a pending activation.
+    if (appLaunchListWaitRef.current && fresh && fresh !== appLaunchListWaitRef.current.intent) {
+      appLaunchListWaitRef.current = null
+      popInFlightRef.current = false
+    }
+    const waiting = appLaunchListWaitRef.current
+    const intent = fresh ?? waiting?.intent
+    if (!intent) return
     // A newer launch, including a new-session request, supersedes a pending
     // target activation so its later completion cannot release an old message.
     appSlotLaunchRef.current = intent
     setAppSlotLaunch(null)
-    if (!intent.slotKey || intent.slotKey !== searchParams.get('sid')) return
+    // A wait the user walks away from (another session, or an address that no
+    // longer names the target) ends here. It hands the launch to the intake,
+    // which tells the user an unsent message was cancelled, and frees URL sync.
+    // Picking the target itself is no walk-away: it falls through to the switch.
+    const sid = searchParams.get('sid')
+    if (waiting && (intent.slotKey !== sid
+      || (activeSlot !== waiting.activeSlot && activeSlot !== intent.slotKey))) {
+      appLaunchListWaitRef.current = null
+      if (launchWindow.__mc_chat_launch === intent) delete launchWindow.__mc_chat_launch
+      popInFlightRef.current = false
+      setAppSlotLaunch(intent)
+      return
+    }
+    if (!intent.slotKey || intent.slotKey !== sid) return
+    // An app that created the session moments ago (POST /api/chat/slots) opens it
+    // before the create broadcast lists it here, and switching then can 404 on
+    // the fresh slot and unwind to the outgoing chat. Hold URL sync and wait for
+    // the list, up to APP_LAUNCH_LIST_WAIT_MS from the launch, then switch either
+    // way. The address bar names the target throughout, so the page's
+    // auto-select waits.
+    const waitedMs = Date.now() - intent.ts
+    if (!filteredSlots.some(slot => slot.key === intent.slotKey) && waitedMs < APP_LAUNCH_LIST_WAIT_MS) {
+      if (!waiting) appLaunchListWaitRef.current = { intent, activeSlot }
+      initialSidRef.current = null
+      pendingSidRef.current = false
+      popInFlightRef.current = true
+      const timer = setTimeout(() => setAppLaunchListWaitTick(n => n + 1), APP_LAUNCH_LIST_WAIT_MS - waitedMs)
+      return () => clearTimeout(timer)
+    }
+    appLaunchListWaitRef.current = null
     delete launchWindow.__mc_chat_launch
     initialSidRef.current = null
     pendingSidRef.current = false
@@ -407,8 +467,9 @@ export function useChatPageSessionController({
         setSidError(intent.message ? i18nT('appChatLaunch.unsent', { error: failure, message: intent.message }) : failure)
       }
     })
-  }, [connected, dispatch, embedded, filteredSlots, locationKey, searchParams])
+  }, [connected, dispatch, embedded, filteredSlots, locationKey, searchParams, activeSlot, appLaunchListWaitTick])
 
+  const { track: trackLaunchedDraft, interacted: launchedDraftInteracted } = useLaunchedDraftDiscard(activeSlot, splitMode)
   // ?new=1: create a blank slot for an embed or a fresh desktop window.
   const newSlotMutation = useMutation({
     // The launcher's prompt rides the create itself: the thunk stages it before
@@ -417,9 +478,11 @@ export function useChatPageSessionController({
     // onSuccess would land after that read, so nothing would consume it.
     mutationFn: async () => {
       const prompt = initialPrefillRef.current
+      const appDraftLaunch = appDraftLaunchRef.current
       const action = await dispatch(createSlot({ mode, agent: appDraftAgentRef.current, ...appDraftSlotOptionsRef.current, prefill: prompt || undefined }))
       // A rejected create throws here and keeps the prompt for the retry.
       const slot = unwrapResult(action)
+      if (appDraftLaunch && slot?.key) trackLaunchedDraft(slot, prompt)
       // Spent once: a retry of a failed create still carries the same intent, but
       // must not re-seed a session the user has since typed into.
       if (prompt && slot?.key) {
@@ -475,6 +538,7 @@ export function useChatPageSessionController({
     const launch = launchWindow.__mc_chat_launch
     appDraftAgentRef.current = undefined
     appDraftSlotOptionsRef.current = {}
+    appDraftLaunchRef.current = false
     // A launch that shapes the NEW session (memory mode, no session folder) is a
     // draft too: its message is staged, never sent, so the session's mode is
     // settled before a first turn could read or write memory.
@@ -486,6 +550,7 @@ export function useChatPageSessionController({
       // mutation is the single owner of the prefill handoff.
       initialPrefillRef.current = launch.message ?? ''
       appDraftAgentRef.current = launch.agent
+      appDraftLaunchRef.current = true
       appDraftSlotOptionsRef.current = {
         ...(launchMemoryMode ? { memory_mode: launchMemoryMode } : {}),
         ...(launchNoSessionFolder ? { sessionFolder: false as const } : {}),
@@ -1294,7 +1359,7 @@ export function useChatPageSessionController({
       // Agent-less: the server stamps the default custom agent (a template),
       // never the default crewmate alias. `automatic`: the page's own move,
       // which leaves a create or fork the user started free to open.
-      dispatch(createSlot({ mode, automatic: true }))
+      dispatch(createSlot({ mode, automatic: true, crewModeDefault: true }))
     }
   }, [activeSlot, filteredSlots, searchParams, dispatch, slotStorageKey, connected, slotsLoaded, mode, newSlotFailed, newSessionRef, tokenConsumingRef, popout, openPending, openWaitLapsed, durablyRemoved])
 
@@ -1343,6 +1408,7 @@ export function useChatPageSessionController({
     appSlotLaunch,
     setAppSlotLaunch,
     highlightTs,
+    launchedDraftInteracted,
     initialMidRef,
     initialMsgRef,
     initialSidRef,

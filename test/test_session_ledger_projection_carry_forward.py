@@ -97,6 +97,51 @@ def test_the_carry_names_what_it_could_not_bring():
     assert "1 event(s)" in note
 
 
+def test_a_carry_over_the_entry_ceiling_drops_artifacts_instead_of_wedging_the_slot():
+    """Every field is within its own clamp, yet together they overflow one crew log entry.
+
+    The carry drops the oldest artifacts until the entry fits and names them in its note,
+    so the slot can record again instead of refusing every update with a retry hint.
+    """
+    text = "\u6587" * sl._MAX_TEXT  # 6 bytes each once the store escapes it
+    _legacy_document(
+        SLOT,
+        goal=text,
+        phase="implementing",
+        next=text,
+        tried=[{"approach": text, "rejected_because": text, "at": ""}],
+        artifacts={"spec": text, "design": text, "pr": "12027"},
+    )
+    _unit()
+    outcomes = []
+    for step in ("first", "second"):
+        try:
+            sl.record(SLOT, session_id=SESSION, next_step=step)
+            outcomes.append("recorded")
+        except sl.LedgerUnavailable as exc:
+            outcomes.append(f"refused: {exc}")
+    assert outcomes == ["recorded", "recorded"]
+
+    state = sl.read_state(SLOT)
+    assert state["goal"] == text
+    assert state["phase"] == "implementing"
+    assert state["next"] == "second"
+    assert state["artifacts"]["pr"] == "12027"
+    assert "spec" not in state["artifacts"]
+    note = state["events"][0]["text"]
+    dropped = 3 - len(state["artifacts"])
+    assert f"{dropped} artifact(s)" in note
+
+
+def test_the_carry_keeps_at_most_the_artifact_cap():
+    """The carry applies the same artifact cap as an ordinary update."""
+    artifacts = {f"a{i:02d}": "v" for i in range(sl._MAX_ARTIFACTS + 3)}
+    payload = sl._legacy_carry_payload(SLOT, {"goal": "g", "artifacts": artifacts})
+
+    assert list(payload["artifacts"]) == list(artifacts)[3:]
+    assert "3 artifact(s)" in payload["event"]
+
+
 def test_the_carry_happens_once_and_never_again_for_that_slot():
     """It is consumed, not consulted: a second update adds no second carry."""
     _legacy_document(SLOT, goal="carried")
@@ -529,6 +574,86 @@ def test_a_record_written_under_the_caller_key_keeps_reading():
     state = sl.read_state("cron:42", LATER_SESSION)
     assert state["goal"] == "written under the alias"
     assert state["next"] == "written canonically"
+
+
+def test_a_channel_key_read_without_a_session_finds_the_units_its_writer_used():
+    """A nudge cycle reads a Slack loop's ledger by ``slack:<ts>`` with no live session.
+
+    Both writers of a channel conversation head its unit with the key folded to the
+    filename charset (``slack_<ts>``), so a read of the raw key found only units an
+    older build headed ``slack:<ts>`` and injected that stale snapshot every cycle.
+    """
+    key = "slack:1785370133.085469"
+    _unit(SESSION, slot=key)  # an older build's header spelling
+    sl.record(key, session_id=SESSION, goal="old goal")
+    crew_log.forget_slot_folds()
+    _unit(LATER_SESSION, slot="slack_1785370133.085469")  # what writers record now
+    sl.record(key, session_id=LATER_SESSION, goal="current goal")
+    crew_log.forget_slot_folds()
+
+    assert sl.read_state(key)["goal"] == "current goal"
+    assert "current goal" in sl.render_snapshot(key)
+    assert sl.canonical_slot(key, "") == "slack_1785370133.085469"
+    # A key that is not a channel session keeps its own spelling.
+    assert sl.canonical_slot("cron:42", "") == "cron:42"
+
+    # A delete excludes each unit under the slot its header names; the alias unit's
+    # exclusion must still hold once the read is keyed by the folded spelling.
+    sl.exclude_units(key, (SESSION,))
+    sl.exclude_units("slack_1785370133.085469", (LATER_SESSION,))
+    crew_log.forget_slot_folds()
+    assert sl.read_state(key)["goal"] == ""
+
+
+CHANNEL_KEY = "slack:1785370133.085469"
+CHANNEL_FOLD = "slack_1785370133.085469"
+
+
+def _carries() -> int:
+    return sum(
+        1
+        for e in _entries(LATER_SESSION)
+        if e.type == sl.LEDGER_ENTRY_TYPE and "carried forward" in e.data.get("event", "")
+    )
+
+
+def test_a_channel_key_previews_the_document_its_raw_spelling_wrote():
+    """A pre-fold document sits under ``slack:<ts>``; the read is keyed by the fold."""
+    _legacy_document(CHANNEL_KEY, goal="pre-fold goal", phase="implementing")
+
+    state = sl.read_state(CHANNEL_KEY)
+    assert state["goal"] == "pre-fold goal"
+    assert state["phase"] == "implementing"
+
+
+def test_a_channel_key_carries_the_raw_spelling_document_once():
+    """The carry claims the raw key's document and names the folded slot."""
+    _legacy_document(CHANNEL_KEY, goal="pre-fold goal")
+    _unit(LATER_SESSION, slot=CHANNEL_FOLD)
+    sl.record(CHANNEL_KEY, session_id=LATER_SESSION, next_step="one")
+    sl.record(CHANNEL_KEY, session_id=LATER_SESSION, next_step="two")
+
+    assert _carries() == 1
+    carried = [e for e in _entries(LATER_SESSION) if "carried forward" in e.data.get("event", "")]
+    assert carried[0].data["slot"] == CHANNEL_FOLD
+    crew_log.forget_slot_folds()
+    state = sl.read_state(CHANNEL_KEY)
+    assert state["goal"] == "pre-fold goal"
+    assert state["next"] == "two"
+
+
+@pytest.mark.parametrize("deleted_under", [CHANNEL_KEY, CHANNEL_FOLD])
+def test_a_deleted_channel_conversation_never_previews_or_carries_its_raw_document(
+    deleted_under,
+):
+    """A delete tombstones one spelling; neither spelling may bring the document back."""
+    _legacy_document(CHANNEL_KEY, goal="deleted conversation")
+    assert sl.exclude_units(deleted_under, ()).carry_tombstoned is True
+
+    assert sl.read_state(CHANNEL_KEY)["goal"] == ""
+    _unit(LATER_SESSION, slot=CHANNEL_FOLD)
+    assert sl.record(CHANNEL_KEY, session_id=LATER_SESSION, next_step="n")["goal"] == ""
+    assert _carries() == 0
 
 
 def test_a_caller_that_is_not_the_carrier_refuses_instead_of_recording_first():

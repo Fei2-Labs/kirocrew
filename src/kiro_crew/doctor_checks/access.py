@@ -3,9 +3,11 @@ auto-approve, credentials.
 
 Three are advisory: each fail-closed answer is the intended posture, so none of
 them joins the issues that decide the exit code. The dashboard signing-key row is
-the exception: its ``short`` state is the one the gateway boot preflight refuses,
-so it joins ``issues`` and ``kirocrew doctor && kirocrew gateway`` stops where the
-boot would.
+the exception, for three states. A ``short`` key is what the gateway boot preflight
+refuses, so one this process is not refused opening joins ``issues`` and
+``kirocrew doctor && kirocrew gateway`` stops where the boot would. A whole key this
+process may not open, or one it cannot stat, joins too: the gateway can then start
+on an ephemeral secret that logs every dashboard session out at each restart.
 """
 
 from __future__ import annotations
@@ -259,11 +261,21 @@ def _doctor_credentials(issues: list[str]) -> None:
         elif profiles is None:
             # No aws CLI to ask, and the config file is not ours to read — so the
             # honest report is that the files exist and the profile set is unknown.
-            # Which of the three causes it was decides the sentence; see the note
-            # where `declined_cli` and `resolved_cli` are resolved.
+            # Which of the four causes it was decides the sentence; see the note
+            # where `declined_cli`, `resolved_cli` and `outside_cli` are resolved.
             if declined_cli:
                 print(
                     f"  profiles:    ℹ️  ~/.aws present; {render._safe_display(declined_cli)} is not a trusted local copy, so it is not asked"
+                )
+            elif resolved_cli and cli_doctor._aws_cli_is_v1():
+                # AWS CLI v1 has no `configure list-profiles` and refuses it on
+                # every call, so "did not answer" would read like a passing hiccup.
+                print(
+                    f"  profiles:    ⚠️  ~/.aws present; {render._safe_display(resolved_cli)} is AWS CLI v1, which cannot list profiles"
+                )
+                render._print_wrapped(
+                    "listing profiles needs AWS CLI v2: install it in place of this copy, and "
+                    "make it the first aws on the gateway's PATH."
                 )
             elif resolved_cli:
                 print(
@@ -338,3 +350,35 @@ def _doctor_credentials(issues: list[str]) -> None:
             "With nothing configured, an agent reporting no AWS access is reporting "
             "the truth — configure a profile first, then re-run this check."
         )
+    _doctor_kerberos_ccache()
+
+
+def _doctor_kerberos_ccache() -> None:
+    """Say when agent children are left on a Kerberos cache the sandbox hides.
+
+    The Linux sandbox starts each agent child in its own user namespace, where a
+    ``KEYRING:`` ticket cache is a different, empty keyring. Without a usable
+    ``/tmp/krb5cc_<uid>`` file, every Kerberos-gated MCP server an agent starts
+    reports no ticket while ``klist`` in the user's terminal shows one, and
+    nothing else says why. Advisory, like the rest of this section: a host that
+    does not use Kerberos has the same default cache. Silent off Linux and when
+    the cache is not a ``KEYRING:`` one.
+    """
+    crew_env = cli_doctor.env
+    try:
+        keyring = crew_env.krb5_keyring_ccache(cli_doctor.os.environ)
+        file_cache = None if keyring is None else crew_env.usable_file_ccache()
+    except Exception as exc:  # noqa: BLE001 — an advisory row must not end the report
+        print(f"  kerberos:    ⚠️  could not check the ticket cache ({type(exc).__name__})")
+        return
+    if keyring is None:
+        return
+    if file_cache is not None:
+        print(f"  kerberos:    ✅ agents use the file cache {render._safe_display(file_cache)}")
+        render._print_wrapped("`klist -c FILE:<that path>` shows whether its ticket is current.")
+        return
+    print(f"  kerberos:    ⚠️  ticket cache {render._safe_display(keyring)} is not visible")
+    render._print_wrapped(
+        "to sandboxed agents, so MCP servers they start that need a Kerberos ticket "
+        f"report none. If you use Kerberos, {crew_env.KRB5_KEYRING_REMEDY}."
+    )

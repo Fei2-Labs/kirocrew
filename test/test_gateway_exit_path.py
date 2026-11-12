@@ -619,3 +619,95 @@ async def test_an_unclaimed_force_exit_leaves_the_graceful_exit_as_it_was(
     gw.flush_audit_queue_before_hard_exit.assert_awaited_once_with()
     cli_mod.drain_log_queue_before_hard_exit.assert_awaited_once_with()
     no_exit._exit.assert_called_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_the_exit_path_marks_the_clean_exit_last_before_its_hard_exit(
+    monkeypatch, seams
+) -> None:
+    # A teardown that wedges and is then killed never reaches the mark, so its
+    # header-only crash dump is kept as the trace of that death.
+    from kiro_crew.dashboard import crash_dump_store
+
+    order: list[str] = []
+    no_exit = _graceful_exit_seams(monkeypatch)
+    no_exit._exit.side_effect = lambda _code: order.append("exit")
+    cli_mod.drain_log_queue_before_hard_exit.side_effect = lambda: order.append("log drain")
+    monkeypatch.setattr(crash_dump_store, "record_clean_exit", lambda *_: order.append("marked"))
+    orch = _bare_orchestrator()
+    orch._shutdown = AsyncMock(side_effect=lambda: order.append("shutdown"))
+
+    await orch._shutdown_and_exit()
+
+    assert order[0] == "shutdown"
+    assert order[-3:] == ["log drain", "marked", "exit"]
+
+
+@pytest.mark.asyncio
+async def test_a_force_exit_claimed_during_the_clean_exit_mark_still_owns_the_exit(
+    monkeypatch, seams
+) -> None:
+    # The mark is awaited off the loop, so a second signal can land while it is
+    # written; the graceful exit must then park instead of exiting over the force
+    # thread's drains.
+    from kiro_crew.dashboard import crash_dump_store
+
+    no_exit = _graceful_exit_seams(monkeypatch)
+    orch = _bare_orchestrator()
+    orch._force_exit_claimed = threading.Event()
+    monkeypatch.setattr(
+        crash_dump_store, "record_clean_exit", lambda *_: orch._force_exit_claimed.set()
+    )
+    parked = asyncio.Event()
+    real_park = orch._park_if_force_exit_claimed
+
+    async def _park() -> None:
+        # The mark is the only thing that claims, so a claimed park comes after it.
+        if orch._force_exit_claimed.is_set():
+            parked.set()
+        await real_park()
+
+    orch._park_if_force_exit_claimed = _park
+
+    task = asyncio.create_task(orch._shutdown_and_exit())
+    try:
+        # Unparked, the mocked os._exit returns, the task ends, and _reached fails.
+        await _reached(parked, task)
+        await asyncio.sleep(0)
+        assert not task.done()
+        no_exit._exit.assert_not_called()
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("test_mode", [False, True])
+async def test_the_teardown_awaits_one_skill_view_prune_after_the_sessions_close(
+    monkeypatch, test_mode
+) -> None:
+    # Each closed runtime prunes its views on a daemon thread the hard exit can cut,
+    # and a home stopped then deleted has no next boot drain. So the
+    # teardown awaits one more prune once every session has ended and the cut turns
+    # have saved; test mode skips it, like the boot drain.
+    from slack_gateway_helpers import _make_orchestrator, _mock_sessions
+
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    order: list[str] = []
+
+    async def _unwound(_state: Any) -> None:
+        order.append("unwound")
+
+    monkeypatch.setattr(gw, "wait_for_unwinding_turns", _unwound)
+    monkeypatch.setattr(
+        acp_driver, "prune_skill_view_aliases_at_stop", lambda: order.append("prune") or 0
+    )
+    orch = _make_orchestrator(test_mode=test_mode)
+    orch.sessions = _mock_sessions()
+    orch.sessions.close_all = AsyncMock(side_effect=lambda: order.append("close_all"))
+
+    await orch._stop_services_and_sessions()
+
+    assert order == ["close_all", "unwound"] + ([] if test_mode else ["prune"])

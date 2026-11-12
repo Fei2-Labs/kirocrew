@@ -3,7 +3,8 @@
  *  signal, and the tool-call / approval / tool-result frames that fill the
  *  log. */
 import type { PayloadAction } from '@reduxjs/toolkit'
-import type { ChatMessage, ToolActivity } from '../../types'
+import type { ApprovalTarget, ChatMessage, ToolActivity } from '../../types'
+import { permissionRowTarget, sameApprovalTarget } from '../../types/approvalTarget'
 import { SPAWN_LAUNCH_MARKER } from '../../pages/chat/types'
 import { isAskAnsweredOutput } from '../../utils/askQuestionAnswers'
 import { ASK_QUESTION_SERVER, isAskQuestionToolName, MAX_TOOL_RESULT_CHARS } from '../../utils/askQuestionTool'
@@ -85,6 +86,20 @@ function applyToolOutputToMessages(
   patch(state.slotMessages[safeKey(slot)])
 }
 
+/** Set `meta.done` on every tool row carrying `tid`, in the live list and the
+ *  per-slot cache, as `applyToolOutputToMessages` writes `output`. */
+function markToolRowsDone(state: ChatState, slot: string, tid: string): void {
+  const mark = (msgs: ChatMessage[] | undefined): void => {
+    if (!Array.isArray(msgs)) return
+    for (const m of msgs) {
+      if (m.role === 'tool' && m.meta?.tool_call_id === tid && m.meta.done !== true) m.meta = { ...m.meta, done: true }
+    }
+  }
+  if (slot === state.activeSlot) mark(state.messages)
+  // Optional for the same reason as the status map below.
+  mark(state.slotMessages?.[safeKey(slot)])
+}
+
 /** A tool call's return, as far as surfaces that do not render its tool log see
  *  it: the scrollback copy of a spawn launch or an answered ask, and the status
  *  line moving off the call. Shared by `sseToolResult` and `markToolReturned`. */
@@ -96,7 +111,7 @@ function noteToolReturn(state: ChatState, slot: string, tid: string | undefined,
   // sees nothing until the slot is refetched, since `chatSlotDetail` would
   // be the only source carrying this field — a reload-only artifact. Mirrors
   // the server, which writes the same redacted string to the same field
-  // (chat_runner.py EVENT_TOOL_RESULT), so live and reloaded state agree.
+  // (`_on_tool_result` in chat_turn/tool_results.py), so live and reloaded state agree.
   //
   // Restricted to launch results on purpose. `state.messages` has no entry
   // cap and a single output can reach the server's 1 MB cap, so copying
@@ -128,6 +143,9 @@ function noteToolReturn(state: ChatState, slot: string, tid: string | undefined,
   // (`final: false`) is not a return. Runs before the tool-log lookup below,
   // which returns early for a slot with no log yet.
   if (tid && final !== false && !isUnsafeKey(slot)) {
+    // Record the return on the row itself (the server stores `done` too): a
+    // row with no log entry (a transcript read mid-call, a trimmed log) reads it.
+    markToolRowsDone(state, slot, tid)
     const statusKey = safeKey(slot)
     // Optional: a store built from a partial chat state carries no status map.
     const status = state.slotStatusDetail?.[statusKey]
@@ -228,14 +246,19 @@ export const activityReducers = {
     log.push(entry)
     if (log.length > 100) log.splice(0, log.length - 100)
   },
-  sseActivityEvent(state: ChatState, action: PayloadAction<{ slot: string; kind: string; text: string; approval_id?: string; approval_type?: string }>) {
+  sseActivityEvent(state: ChatState, action: PayloadAction<{ slot: string; kind: string; text: string; approval_id?: string; approval_type?: string; approval_target?: ApprovalTarget }>) {
     if (isUnsafeKey(action.payload.slot)) return
     const log = action.payload.slot !== state.activeSlot
       ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).toolLog
       : state.toolLog
     if (action.payload.kind === 'approval_resolved') {
       const id = action.payload.approval_id
-      const entry = log.find(e => e.type === 'approval' && e.approval_id === id)
+      // With a target, only the request it names: the id recurs, and a chat
+      // runner's row can share it.
+      const target = action.payload.approval_target
+      const entry = log.find(e => e.type === 'approval' && (target
+        ? sameApprovalTarget(e.approval_target, target)
+        : e.approval_id === id))
       if (entry) entry.type = 'approval_resolved'
       // Resolve against the OWNING slot's message array — active slot uses
       // state.messages, a background slot its slotMessages entry. Reading only
@@ -245,7 +268,9 @@ export const activityReducers = {
       const msgs = action.payload.slot !== state.activeSlot
         ? (state.slotMessages[safeKey(action.payload.slot)] ?? [])
         : state.messages
-      const msg = msgs.findLast(m => m.role === 'permission' && (m.meta as Record<string,unknown>)?.approval_id === id)
+      const msg = msgs.findLast(m => m.role === 'permission' && (target
+        ? sameApprovalTarget(permissionRowTarget(m.meta, action.payload.slot), target)
+        : (m.meta as Record<string,unknown>)?.approval_id === id))
       if (msg && !(msg.meta as Record<string,unknown>).resolved) (msg.meta as Record<string,unknown>).resolved = 'approved'
       // Stamp execution_started_at on the EXACT tool entry linked to this
       // approval via the permission message's tool_call_id. This persists in
@@ -261,6 +286,7 @@ export const activityReducers = {
     const entry: ToolActivity = { type: action.payload.kind, text: action.payload.text, ts: Date.now() }
     if (action.payload.approval_id) entry.approval_id = action.payload.approval_id
     if (action.payload.approval_type) entry.approval_type = action.payload.approval_type
+    if (action.payload.approval_target) entry.approval_target = action.payload.approval_target
     log.push(entry)
   },
   /** `tool_status` with `returned: true`: a call returned on a slot this tab

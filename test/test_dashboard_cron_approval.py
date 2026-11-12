@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from body_stream_helpers import attach_body
+from dashboard_owner_helpers import owner_claims
 
 from kiro_crew.cron import CronJob, CronSchedule
 from kiro_crew.dashboard.handlers import api_crons, api_crons_create
@@ -32,6 +33,9 @@ class TestCronCreateApprovalMode:
         request = self._make_request(
             {"name": "t", "message": "m", "every": 300, "approval_mode": "auto"}
         )
+        # Only the owner may set ``auto``; an app token is refused.
+        owner_claims(request)
+        request.app["state"].owner_id = ""
         resp = await api_crons_create(request)
         assert resp.status == 200
         _, kwargs = request.app["state"].crons.add_job_async.call_args
@@ -289,11 +293,13 @@ class TestCronListFields:
         mock_job.hide_in_chat = False
         mock_job.minimal_context = False
         mock_job.persistent_session = True
+        mock_job.new_chat_per_run = False
         mock_job.auto_pause_after_failures = 5
         mock_job.alert_after_failures = 1
         mock_job.schedule = CronSchedule(kind="every", every_secs=300)
         mock_job.last_run_ts = None
         mock_job.last_result = None
+        mock_job.last_result_ts = 0.0
         mock_job.last_retry_count = 0
         # Set explicitly, like every other field here: an unset attribute on a
         # MagicMock answers with a MagicMock, which the JSON response cannot
@@ -339,6 +345,7 @@ class TestCronListFields:
         assert job_data["hide_in_chat"] is False
         assert job_data["minimal_context"] is False
         assert job_data["persistent_session"] is True
+        assert job_data["new_chat_per_run"] is False
         assert job_data["channel"] == "C123"
         assert job_data["skip_dates"] is None
         # server_tz top-level field exposes the dashboard's local TZ for client rendering

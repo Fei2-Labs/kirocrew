@@ -4,6 +4,8 @@ import { renderHook, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider, type Query } from '@tanstack/react-query'
 import { KIRO_USAGE_STEADY_POLL_MS, KIRO_USAGE_WARMING_POLL_MS } from '../api/kiroUsage'
 import { useKiroUsageReadout } from '../shell/topbar/kiroUsageReadout'
+import { Provider } from 'react-redux'
+import { createTestStore } from './helpers'
 
 /**
  * The credit pill's query must poll at `kiroUsageRefetchInterval`'s cadence.
@@ -32,7 +34,7 @@ const KIRO_USAGE_KEY = ['kiro-usage']
 function mount() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   function Wrapper({ children }: { children: React.ReactNode }) {
-    return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    return <Provider store={createTestStore()}><QueryClientProvider client={queryClient}>{children}</QueryClientProvider></Provider>
   }
   const view = renderHook(() => useKiroUsageReadout(), { wrapper: Wrapper })
   return { queryClient, ...view }

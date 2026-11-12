@@ -29,6 +29,10 @@ from kiro_crew.messaging import commands as mc
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.slack import handler as h
 
+#: These tests start background helper turns, which are skipped while the host's
+#: memory posture is critical (see ``ample_host_free_memory``).
+pytestmark = pytest.mark.usefixtures("ample_host_free_memory")
+
 # ──────────────────────────────────────────────────────────────────────
 # doubles
 # ──────────────────────────────────────────────────────────────────────
@@ -156,6 +160,7 @@ def sessions():
     sm._session_map = None
     sm.try_acquire = AsyncMock(return_value=True)
     sm.has_session = MagicMock(return_value=False)
+    sm.is_retiring = MagicMock(return_value=False)
     sm.release = MagicMock()
     sm.destroy = AsyncMock()
     sm.discard_conversation = AsyncMock()

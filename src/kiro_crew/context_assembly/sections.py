@@ -115,7 +115,7 @@ def _runtime_display_name(session_key: str, runtime_source: str | None = None) -
 
 # Slug → prompt-ready description maps for the [USER PROFILE] block. Slugs are
 # the values enforced by the dashboard.user_role / dashboard.user_technical_level
-# enums in handlers/core.py _EDITABLE_CONFIG; keep the three places in sync.
+# enums in handlers/core_config_schema.py _EDITABLE_CONFIG; keep the three places in sync.
 # "" role and "" level contribute nothing — the block only names what the user
 # actually told us. "other" has no entry here on purpose: it routes to the
 # free-text dashboard.user_role_other instead (see _role_description).
@@ -134,7 +134,7 @@ _TECHNICAL_LEVEL_DESCRIPTIONS: dict[str, str] = {
 }
 
 #: Longest free-text role rendered into the prompt. Mirrors the ``max_len`` on
-#: ``dashboard.user_role_other`` in handlers/core.py, re-applied here because the
+#: ``dashboard.user_role_other`` in handlers/core_config_schema.py, re-applied here because the
 #: writer's validation is not the only way a value reaches this field — a
 #: hand-edited config.json bypasses the PATCH allowlist entirely.
 _ROLE_OTHER_MAX_LEN = 60
@@ -322,6 +322,34 @@ def _reply_style_rules(level: str) -> str:
     return ""
 
 
+def _reply_language_rule(code: object) -> str:
+    """Return the rule text for one ``dashboard.preferred_language`` code.
+
+    ``""`` for auto and for any code the setting does not list, so a
+    hand-edited config never puts free text into this trusted block: the
+    language name comes from the fixed table, never from the config value.
+    The rule names itself as outranking the style levels' "user's language"
+    line, which is written for the auto case.
+    """
+    from kiro_crew.config.sections import PREFERRED_LANGUAGES
+
+    name = PREFERRED_LANGUAGES.get(code) if isinstance(code, str) else None
+    if not name:
+        return ""
+    return (
+        "## Reply language\n\n"
+        f"The user reads replies best in {name}, so reply in {name}. A "
+        "reader who mixes languages wants one steady reply language, not "
+        "one that follows each message, tool output or file. Use another "
+        "language only when the user asks for it in this conversation. This "
+        'outranks any "user\'s language" rule above and the reply sentence '
+        "in [UI LANGUAGE]. Code, commands, paths, identifiers, error strings "
+        "and quoted text keep their original form. Text written for other readers -- commit "
+        "messages, pull request text, code comments, public posts -- keeps "
+        "the project's own language."
+    )
+
+
 def _response_preferences_apply(session_key: str, runtime_source: str | None = None) -> bool:
     """Whether the reply-style block belongs in this session's context.
 
@@ -338,7 +366,8 @@ def _response_preferences_apply(session_key: str, runtime_source: str | None = N
 
 
 def _build_response_preferences_section(cfg: "KiroCrewConfig") -> str:
-    """Build the [RESPONSE PREFERENCES] block from ``dashboard.verbosity``.
+    """Build the [RESPONSE PREFERENCES] block from ``dashboard.verbosity`` and
+    ``dashboard.preferred_language``.
 
     The setting describes how the PERSON wants replies to read, so it is
     chrome for every person-facing agent — built-in, custom, and cron — rather
@@ -357,10 +386,14 @@ def _build_response_preferences_section(cfg: "KiroCrewConfig") -> str:
     that carries its own style guidance; a bare ``##`` heading in the middle of
     the context would have no stated rank against it.
 
-    Returns ``""`` when the level is ``default`` or unrecognised.
+    Returns ``""`` when the level is ``default`` or unrecognised and no
+    preferred language is set.
     """
-    level = getattr(getattr(cfg, "dashboard", None), "verbosity", "default")
+    dashboard = getattr(cfg, "dashboard", None)
+    level = getattr(dashboard, "verbosity", "default")
     rules = _reply_style_rules(level if isinstance(level, str) else "default")
+    language = _reply_language_rule(getattr(dashboard, "preferred_language", ""))
+    rules = "\n\n".join(part for part in (rules, language) if part)
     if not rules:
         return ""
     return (
@@ -373,6 +406,21 @@ def _build_response_preferences_section(cfg: "KiroCrewConfig") -> str:
         f"{rules}\n"
         f"{_RESPONSE_PREFERENCES_FOOTER}\n\n"
     )
+
+
+def reply_language_refresh(cfg: "KiroCrewConfig") -> str:
+    """The follow-up turn's short ``## Reply language`` reminder, or ``""``.
+
+    The full frame rides only session start, resume and post-compaction. A long
+    session's later turns -- auto-nudge and monitor cycles, work-ledger wakes,
+    worker reports, crons -- carry English nudge text and tool output, and the
+    model drifts to English without this line. Only the language half repeats:
+    the style rules are long and their loss is not the reported failure.
+    """
+    rule = _reply_language_rule(getattr(getattr(cfg, "dashboard", None), "preferred_language", ""))
+    if not rule:
+        return ""
+    return f"{_RESPONSE_PREFERENCES_HEADER}\n{rule}\n{_RESPONSE_PREFERENCES_FOOTER}\n\n"
 
 
 def runtime_identity_block(agent_label: str, runtime: str) -> str:
@@ -661,19 +709,37 @@ _CONDUCTOR_DELEGATION = (
     "small edit you may do here, and longer work goes to a worker.\n"
 )
 
+# The conductor outside the bot's own thread (the agent picker, a folder default,
+# an agent channel): no session tools are mounted there and both blocks named
+# above are withheld, so it does the work in the chat itself.
+_CONDUCTOR_ELSEWHERE_DELEGATION = (
+    "\n### Delegation\n"
+    "\n"
+    "This chat is not your own thread, so it has no worker and no session tools: do\n"
+    "the work here yourself. You also have no `spawn_run`, `task_run` or\n"
+    "`workflow_run`, and a spawn from this session is refused. Abilities added to\n"
+    "you reach only your worker, so they are not available here. When it would help\n"
+    "the person, you may mention that your own thread on the Bots page can hand\n"
+    "longer work to your worker; that is an option for them, never a step they\n"
+    "must take.\n"
+)
 
-def subagent_section(prompt: str, *, conductor: bool) -> str:
+
+def subagent_section(prompt: str, *, conductor: bool, own_thread: bool = True) -> str:
     """*prompt* with its marked sub-agent span resolved for one agent.
 
     Every agent but a crewmate's conductor keeps the span word for word and loses
-    only the markers. The conductor gets :data:`_CONDUCTOR_DELEGATION` instead. An
-    unpaired marker is dropped and the text around it kept, as for the Browser span.
+    only the markers. The conductor gets :data:`_CONDUCTOR_DELEGATION` in its own
+    thread and :data:`_CONDUCTOR_ELSEWHERE_DELEGATION` anywhere else. An unpaired
+    marker is dropped and the text around it kept, as for the Browser span.
     """
 
     def _resolve(match: re.Match[str]) -> str:
         section = match.group("section")
         if section is None:
             return ""
-        return _CONDUCTOR_DELEGATION if conductor else section
+        if not conductor:
+            return section
+        return _CONDUCTOR_DELEGATION if own_thread else _CONDUCTOR_ELSEWHERE_DELEGATION
 
     return _SUBAGENTS_SPAN.sub(_resolve, prompt)

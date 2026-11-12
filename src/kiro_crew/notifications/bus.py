@@ -81,10 +81,9 @@ SYSTEM_CHANNELS: dict[str, str] = {
     "system.apps": _DEFAULT_PRIORITY,
     # A chat turn that DIED with an error the user must act on -- a provider
     # 5xx / throttle, a content-filter refusal, or a terminal transport death
-    # ("start a new chat" / "please retry"). Until this channel existed the
-    # only trace of a dead turn was the inline error card in the transcript,
-    # so an operator working in another session would learn work has stopped
-    # only by opening it. Its own channel, not system.agent, so the
+    # ("start a new chat" / "please retry"). Without it the only trace of a
+    # dead turn is the inline error card in the transcript, which an operator
+    # in another session never sees. Its own channel, not system.agent, so the
     # user can mute dead-turn alerts without muting the notes agents write for
     # a human decision. Default priority: the note lands in the bell with the
     # channel's configured sound/banner but blocks no turn -- the prompt that
@@ -105,6 +104,7 @@ _FALLBACK_CHANNEL = "system.agent"
 
 _MAX_TITLE_LEN = 500
 _MAX_BODY_LEN = 20000
+_MAX_KEY_LEN = MAX_SHORT_STRING
 # Actions are rendered as buttons on every notification surface -- caps keep
 # a single note from expanding the feed layout or bloating the store (the
 # 64 KB request limit alone would admit thousands of actions).
@@ -130,6 +130,10 @@ _RESERVED_NOTE_KEYS = frozenset(
         "body",
         "ts",
         "group_key",
+        # The caller-chosen identity a later publish or dismiss names the note by.
+        # Only a producer that validated it may set it: a key smuggled through
+        # meta would let a note replace another of the same source.
+        "key",
         "actions",
         "url",
         "icon",
@@ -150,6 +154,8 @@ _RESERVED_NOTE_KEYS = frozenset(
         # pre-suppress or pre-acknowledge a note it is pushing.
         "silenced",
         "acked",
+        "quiet",
+        "replaced",
     }
 )
 
@@ -204,7 +210,7 @@ class NotificationPayload:
     """Schema v2 notification (RFC "Notification payload").
 
     The full field set is carried so persistence and the wire format stay
-    stable; ``actions``/``url``/``icon``/``ttl`` are optional and are omitted
+    stable; ``key``/``actions``/``url``/``icon``/``ttl`` are optional and are omitted
     from the note dict entirely when unset.
     """
 
@@ -215,6 +221,9 @@ class NotificationPayload:
     priority: str | None = None  # None = use the channel default
     kind: str | None = None  # legacy kind override; None = derive from channel
     group_key: str | None = None
+    # A note carrying a key replaces the stored note with the same source and
+    # key, so the bell holds one note per key (see NotificationCoordinator).
+    key: str | None = None
     actions: list[dict[str, Any]] | None = None
     url: str | None = None
     icon: str | None = None
@@ -262,6 +271,12 @@ class NotificationPayload:
             or self.ttl <= 0
         ):
             raise NotificationValidationError("ttl must be a positive integer")
+        if self.key is not None and (
+            not isinstance(self.key, str) or not self.key.strip() or len(self.key) > _MAX_KEY_LEN
+        ):
+            raise NotificationValidationError(
+                f"key must be a non-empty string of at most {_MAX_KEY_LEN} chars"
+            )
         if self.actions is not None:
             # isinstance BEFORE len(): a non-list (e.g. `42`) would raise
             # TypeError out of len() rather than NotificationValidationError,
@@ -524,6 +539,7 @@ class NotificationBus:
         }
         for key, value in (
             ("group_key", payload.group_key),
+            ("key", payload.key),
             ("actions", payload.actions),
             ("url", payload.url),
             ("icon", payload.icon),

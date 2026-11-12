@@ -7,6 +7,7 @@ import type { ChatMessage, ToolActivity } from '../../types'
 import { slotIsRemoteBound } from '../dashboardSlice'
 import { isSystemNoticeKind } from '../../lib/systemNotice'
 import { isStopEvent } from '../../lib/stopEvent'
+import { isModelUnavailable } from '../../lib/modelUnavailable'
 import type { InjectKind } from '../../pages/chat/RecoveryCard'
 import type { SendAttempt, SlotState } from './state'
 import { safeKey } from './wire'
@@ -59,6 +60,10 @@ export const selectSlotStreamState = (state: RootState, slot: string): SlotState
  *  settlement captures so a late answer about one turn cannot idle the next. */
 export const selectSlotRunEpoch = (state: RootState, slot: string): number =>
   state.chat.runEpoch?.[safeKey(slot)] ?? 0
+/** Whether `slot` has a local send still awaiting server confirmation, on
+ *  screen (`pendingTurnSlot`) or not (its run entry's `pendingTurn`). */
+export const selectPendingTurn = (state: RootState, slot: string): boolean =>
+  state.chat.pendingTurnSlot === slot || !!state.chat.slotRun?.[safeKey(slot)]?.pendingTurn
 
 const EMPTY_TOOLLOG: ToolActivity[] = []
 /** Per-slot tool log, falling back to the global active mirror. */
@@ -134,6 +139,8 @@ const TURN_INJECT_DISPATCHED: Readonly<Record<InjectKind, boolean>> = {
   synthesis: true,
   user_replay: true,
   automation_notice: true,
+  workflow: true,
+  heartbeat: true,
 }
 const TURN_INJECT_KINDS: ReadonlySet<unknown> = new Set<string>(
   (Object.keys(TURN_INJECT_DISPATCHED) as InjectKind[]).filter((k) => TURN_INJECT_DISPATCHED[k]),
@@ -197,7 +204,7 @@ export const selectContinuable = (state: RootState, slot?: string | null): boole
   const other = key && key !== c.activeSlot ? key : null
   const dashSlot = slotRowByKey(state.dashboard.slots, key)
   if (other) {
-    if (selectSlotStreamState(state, other) !== 'idle' || c.pendingTurnSlot === other || dashSlot?.running || dashSlot?.stopping) return false
+    if (selectSlotStreamState(state, other) !== 'idle' || selectPendingTurn(state, other) || dashSlot?.running || dashSlot?.stopping) return false
   } else if (c.slotRunning || c.slotStopping || c.pendingTurnSlot) return false
   if (dashSlot?.subagents_running) return false
   // A relay archive has NO continue: `relay_archive_refusal` rejects
@@ -229,6 +236,10 @@ export const selectContinuable = (state: RootState, slot?: string | null): boole
       if ((m.meta as { restored?: boolean } | undefined)?.restored && selectTurnInterrupted(state, key)) continue
       return false
     }
+    // A heartbeat prompt delivered to an unused chat is the only request there,
+    // so a first turn that fails to start stays resumable from it. Mirrors
+    // `_has_conversation` (`src/kiro_crew/dashboard/chat_handlers.py`).
+    if (m.role === 'inject' && m.content && (m.meta as { injectKind?: unknown } | undefined)?.injectKind === 'heartbeat') return true
     if (CONTINUE_SCAN_SKIP.has(m.role)) continue
     if ((m.role === 'user' || m.role === 'assistant') && m.content) {
       // System notices (compaction, session reload) are assistant-role status
@@ -303,8 +314,12 @@ export const selectTurnInterrupted = (state: RootState, slot?: string | null): b
   let sawTrailingError = false
   let sawCompactionResult = false
   let sawLaterTool = false
+  // A drained sub-agent completion (role `subagent`) opens a turn of its own,
+  // so a refused-model card older than it settles only its own turn.
+  let sawLaterOpener = false
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
+    if (m.role === 'subagent') sawLaterOpener = true
     // A deliberate Stop ENDS the turn; it does not interrupt it. This must be
     // tested before the user/assistant check, because pressing Stop before the
     // reply produced any text leaves `[user, stop_event]` — shape-identical to
@@ -322,6 +337,10 @@ export const selectTurnInterrupted = (state: RootState, slot?: string | null): b
     // past it; mirrors `saw_later_tool` in state_parts/transcript_rows.py).
     if (isQuietEndRow(m)) { if (!sawLaterTool) return false }
     else if (m.role === 'tool') sawLaterTool = true
+    // The card a refused model's spent ladder ends on settles the turn, like a
+    // Stop: Resume would send it to the same refused model again. Mirrors
+    // `is_model_unavailable_row` in state_parts/transcript_rows.py.
+    if (isModelUnavailable(m) && !sawLaterOpener) return false
     if (m.role === 'error') { sawTrailingError = true; continue }
     // An inject row that DISPATCHED a turn (a queued continuation, a recovery,
     // a synthesis, a cron prompt) opens it exactly as a user row does, so one

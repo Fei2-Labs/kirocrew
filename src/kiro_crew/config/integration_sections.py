@@ -37,6 +37,7 @@ from kiro_crew.instances.constants import (
     RECOVER_BACKOFF_MAX_CEILING_SECS as _RECOVER_BACKOFF_CEILING,
 )
 from kiro_crew.instances.constants import WARM_SET_CAP_AUTO as _WARM_SET_CAP_AUTO
+from kiro_crew.remote_control.defaults import REMOTE_CONTROL_ON_BY_DEFAULT
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
@@ -812,11 +813,12 @@ class McpConfig:
         default=True,
         metadata=_meta(
             "Honour MCP autoApprove",
-            "Keep an ``autoApprove`` list you wrote yourself -- one hand-added to "
-            "``mcp.json`` or to an agent file -- in the agent config Kiro Crew "
-            "writes. On by default: an ``autoApprove`` is a deliberate choice about "
-            "your own tools and is respected, so those verbs run without an approval "
-            "card. Know what it costs before writing one: the agent runtime approves "
+            "Keep an ``autoApprove`` list in ``mcp.json`` or in an agent file when "
+            "Kiro Crew writes the agent config, so those verbs run without an "
+            "approval card. On by default. Kiro Crew does not check who wrote a "
+            "list: one the agent wrote into ``mcp.json`` is honoured the same as "
+            "yours. An app's own ``autoApprove`` lists are never kept. Know what "
+            "it costs: the agent runtime approves "
             "such a call locally and emits no permission request, so Kiro Crew's "
             "own tool gate never runs for it. Turn this OFF to drop every verb no "
             "server spec declares, which puts those tools back through the gate. A "
@@ -938,7 +940,9 @@ class InstancesConfig:
             "ssh transport as the tunnel, so a host behind a ProxyCommand or "
             "jump host pays the proxy handshake here too. An explicit value "
             "applies to both transports, so size it for the slowest transport "
-            "you use. Clamped to [10, 120].",
+            "you use. A value below 10, or one that is not a number, is "
+            "discarded with a warning and the transport default is used; a "
+            "value above 120 is clamped to 120.",
         ),
     )
     max_recovery_attempts: int = field(
@@ -1100,52 +1104,20 @@ class TunnelConfig:
         ),
     )
     relay_enabled: bool = field(
-        default=False,
+        default=REMOTE_CONTROL_ON_BY_DEFAULT,
         metadata=_meta(
             "Kiro Relay",
             "Let this Crew dial the Kiro relay and serve the requests it delivers, with "
             "the caller named by the relay. Off by default. It connects only when "
             "Relay Lease Service URL and Relay Lease Credential are set, so the Crew "
             "can hold a lease. Without them no relay client starts and the tunnel "
-            "status names the missing setting. The one exception is no Relay Lease "
-            "Service URL with Relay Host URL and Relay Crew Domain both set: then the "
-            "client starts and reports that it has no host token. While it is off, "
+            "status names the missing setting. While it is off, "
             "Crew starts no "
             "relay client, strips every x-kiro-relay-* header from every request and "
             "trusts none of them. To reach the relay and the lease service through a "
             "proxy, Remote Control uses only the HTTPS_PROXY and NO_PROXY environment "
             "variables (ALL_PROXY when HTTPS_PROXY is unset), so a proxy set only in "
             "macOS System Settings is not used.",
-            restart=True,
-        ),
-    )
-    relay_host_url: str = field(
-        default="",
-        metadata=_meta(
-            "Relay Host URL",
-            "The relay's host dial URL. Empty means the relay address from the lease "
-            "service; with no lease service it must be set. Must be wss:// (ws:// only "
-            "for a loopback test relay).",
-            restart=True,
-        ),
-    )
-    relay_crew_domain: str = field(
-        default="",
-        metadata=_meta(
-            "Relay Crew Domain",
-            "The domain this Crew's relay URL sits under, as https://<endpoint>.<domain>. "
-            "Empty means the relay address from the lease service; with no lease service "
-            "it must be set.",
-            restart=True,
-        ),
-    )
-    relay_move_grace_seconds: float = field(
-        default=1.0,
-        metadata=_meta(
-            "Relay Move Grace (secs)",
-            "When the relay moves this Crew to a new connection, how long the old one "
-            "stays open with no request in flight before it closes, so a request already "
-            "on its way there is still answered. 0 to 30.",
             restart=True,
         ),
     )
@@ -1183,6 +1155,62 @@ class TunnelConfig:
             "API_KEY for a team Crew's crew API key. Any other value keeps Remote "
             "Control from starting.",
             restart=True,
+        ),
+    )
+    relay_handle_email_domains: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Relay Handle Email Domains",
+            "Email domains, for example example.com, whose addresses label a relayed "
+            "person by the part before the @ when the relay sent no name. The whole "
+            "domain must match, ignoring case, so a subdomain or a longer domain keeps "
+            "the full address. Empty (the default) labels everyone by their full "
+            "address. Display only: it never changes who a person is or what they may do.",
+            restart=True,
+        ),
+    )
+    relay_viewer_enabled: bool = field(
+        default=False,
+        metadata=_meta(
+            "Relay Viewer",
+            "Let the desktop app list the remote Crews you can reach through the Kiro "
+            "relay and open them. Off by default. This is the viewer side only: a Crew "
+            "you open still needs Kiro Relay on where it runs.",
+        ),
+    )
+    relay_viewer_cps_url: str = field(
+        default="",
+        metadata=_meta(
+            "Relay Viewer Control Plane URL",
+            "The base URL of the control plane the viewer lists remote Crews from and "
+            "gets access tokens from. Empty (the default) means not set up. Must be "
+            "https:// (http:// only for a loopback port-forward). A value that breaks "
+            "that rule is ignored with a warning.",
+        ),
+    )
+    relay_viewer_credential: str = field(
+        default="",
+        metadata=_meta(
+            "Relay Viewer Credential",
+            "For testing only: where the viewer reads a test credential to use instead "
+            "of your Kiro sign-in, as secret://NAME for a secret stored under Settings "
+            "> Secrets or the absolute path of a file holding it. Never the credential "
+            "itself. Empty (the default) uses your Kiro sign-in. A value that is not a "
+            "reference is ignored with a warning that does not repeat it.",
+            # Masked like a secret, in case the credential itself is pasted in.
+            sensitive=True,
+        ),
+    )
+    relay_viewer_relay_domain: str = field(
+        default="",
+        metadata=_meta(
+            "Relay Viewer Relay Domain",
+            "The relay's domain, for example us-east-1.relay.example.invalid. When set, the "
+            "viewer lists a remote Crew, and sends its access token, only when the Crew's "
+            "address is exactly https://<endpoint ID>.<this domain> with no port. Empty (the "
+            "default) keeps the check without a domain: the address's host must start with "
+            "the Crew's endpoint ID. Any other value matches no Crew address, so no Crew "
+            "is listed.",
         ),
     )
 

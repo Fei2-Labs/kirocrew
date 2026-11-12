@@ -249,7 +249,7 @@ unauthenticated surface beyond the three token-free liveness probes
 A governance policy can narrow both: the `bind_address` list refuses a
 `KIROCREW_BIND` address it does not name (the gateway then binds `127.0.0.1`),
 and the `dashboard_origins` list drops an extra origin it does not name. An
-enterprise build allows neither until a policy names it. Tailnet access there
+LTS build allows neither until a policy names it. Tailnet access there
 follows the policy's `capabilities.tailnet_origin` alone: until a policy turns it
 on, `kirocrew tailnet up` and the dashboard card say "Tailnet is off by policy".
 
@@ -286,11 +286,14 @@ Works on macOS, Linux, and Windows (OpenSSH ships with Windows 10+; the config
 file is at `%USERPROFILE%\.ssh\config`).
 
 A hand-rolled tunnel dies whenever the laptop sleeps. The desktop app can hold
-it for you instead: tick **Keep an SSH tunnel to this crew open** in the
-**Add/Edit Remote Crew** form the "no gateway is answering" dialog opens, or in
-**Set Remote Host…** on the app's own launch tab (where you can also turn it off
-later), and the app keeps the forward up and rebuilds it after sleep
-(macOS and Linux; see `website/electron/README.md`).
+it for you instead: **Keep an SSH tunnel to this crew open** starts ticked when
+you add a crew in the **Add/Edit Remote Crew** form the "no gateway is answering"
+dialog opens, or in **Set Remote Host…** on the app's own launch tab (where you
+can also turn it off later), and the app keeps the forward up and rebuilds it
+after sleep (macOS and Linux; see `website/electron/README.md`). With the local
+gateway off, the app also opens it for a crew saved unticked when nothing else
+answers or listens on that port at launch, until you quit or save the crew
+unticked again.
 
 If your browser reaches the dashboard on a *different* local port than the
 remote one (`ssh -L 8777:localhost:5476`), the browser sends Origin
@@ -308,7 +311,9 @@ The pane's error then says it cannot reach the port and names it. It also gives
 one `ssh -L` line that forwards every crew's pane port, each with the same
 number on both sides. Run it beside your dashboard forward, with your gateway
 host in place of `<gateway-host>`, or open the dashboard on the gateway host
-itself.
+itself. The desktop app does this for you when it holds the tunnel (**Keep an SSH
+tunnel to this crew open**, above): it forwards each pane's port as the pane
+opens, and again after Retry moves it.
 
 ### Named HTTPS tunnel (phone)
 
@@ -775,6 +780,17 @@ the worker never caches. After a build that changes those hashes, the cached she
 references bundle URLs nothing has downloaded yet. Sessions, history, and
 notifications are never served from disk.
 
+**The worker's retry covers only a page it already controls.** It registers once
+the page has started loading, so a first visit, a fresh browser profile and the
+load after **Clear cache and reload** reach the network without it. For those the
+shell in `index.html` recovers on its own: when a boot module fails to load on a
+top-level page (a dropped connection, or Chromium's `ERR_NETWORK_CHANGED` while a
+network interface comes or goes), it reloads the page after a short, jittered
+delay, up to three times, counting each reload in `sessionStorage` so it can never
+loop. If the page still does not start, it shows **Kiro Crew did not load** with a
+**Clear cache and reload** button. A dashboard embedded in another page does not
+reload itself; it reports the failure to the page around it.
+
 **Two current limits**, documented here so they read as boundaries rather than
 bugs:
 
@@ -1208,7 +1224,13 @@ restart). No kirocrew, MCP, or LLM code path runs under sudo. Once started the
 gateway runs as `User=$USER Group=$(id -gn)`, not root. The unit also caps
 crash-looping with `StartLimitBurst=3` / `StartLimitIntervalSec=300` and pins
 `LimitNOFILE=65536`, because a stock 1024 FD limit fails the frontend
-production build with `EMFILE`.
+production build with `EMFILE`. It sets `LimitCORE=0` too: where crashes go
+to `systemd-coredump`, a core of the multi-GB gateway can hold a crashed
+gateway's exit, and its restart, for up to 5 minutes. Processes the gateway
+starts inherit that limit; for core files, set `LimitCORE=infinity` in a
+drop-in (`sudo systemctl edit kirocrew`, or `systemctl --user edit kirocrew`
+for a user unit). An installed unit keeps its text until
+`kirocrew service install` re-renders it.
 
 The install also seeds `/etc/kirocrew/kirocrew.env`, which the unit reads as its
 `EnvironmentFile=`, so a port or environment change needs no reinstall (see
@@ -1333,6 +1355,7 @@ ExecStart=$KIROCREW_BIN gateway
 Restart=always
 RestartSec=10
 LimitNOFILE=65536
+LimitCORE=0
 WorkingDirectory=$HOME
 Environment=HOME=$HOME
 Environment=PATH=$(dirname $KIROCREW_BIN):$HOME/.local/bin:$HOME/.nvm/versions/node/$(node -v 2>/dev/null || echo v20.0.0)/bin:/usr/local/bin:/usr/bin

@@ -166,7 +166,8 @@ canonical path. Missing, uncheckable, or refused fallback directories stay off
 the child `PATH`. This lets the CLI find a bare `credential_process` helper by
 name when a desktop-launched gateway's minimal `PATH` holds neither fallback.
 Per-user dirs such as `~/.local/bin` are reached only through the inherited
-`PATH`.
+`PATH`. The child gets none of the gateway's Python interpreter settings
+(`sandbox.without_python_env`), because aws-cli v1 is a Python program.
 
 ## Drive and destructive operations
 
@@ -1848,7 +1849,14 @@ density), so the remove flow, the Reconnect disclosure and the hand-off gating
 exist once. A row carries two controls, the select surface and its overflow
 menu; Reconnect (offered on a degraded resolved row) and Remove are items in
 that menu, and the health word on the row is the cue that the menu holds
-something to do. The bare `/aws-control` path and an unknown pane segment both land on
+something to do. A failing key's Reconnect leads with that key's own probe
+error (`profiles[].detail`, redacted server-side) as an `AwsErrorNotice`, so
+the cause is on screen before any generic guidance. The Refresh button on the
+Overview and Accounts panes re-probes every key (`GET /accounts?refresh=1`,
+which also skips the identity probe's 30-second cache) into the list's one
+cache entry: a plain read is answered from the five-minute snapshot, so a key
+fixed after the page loaded would keep its failure. The bare
+`/aws-control` path and an unknown pane segment both land on
 Overview; every named pane path is unchanged. The month-to-date figure shares the
 Usage pane's cost cache entry and, like it, settles to a dash with a visible
 reason (consent missing, or the read failed) rather than a tooltip. A read that
@@ -2049,7 +2057,13 @@ ledger, the local profile scan) and every mutation whose error was never read
 A failed read must not fall through to the surface's empty state — a failed
 listing is not an empty folder, a failed profile scan is not "nothing left to
 add" — and the tests for each state assert the empty state's absence alongside
-the notice. Two states are deliberately NOT errors: a 403 whose code is
+the notice. A profile scan that fails because the gateway's `aws` is AWS CLI v1,
+which has no `configure list-profiles`, is answered 501 `unsupported_aws_cli_v1`
+by both the listing and the register route (`deploy.profiles.aws_cli_is_v1` asks
+`aws --version` once the scan failed), and its notice names the version and the
+remedy, AWS CLI v2 first on the gateway's PATH, with no Try again, because no
+retry clears it; `kirocrew doctor` names the same cause on its profiles line.
+Two states are deliberately NOT errors: a 403 whose code is
 `app_disabled` renders the disabled-app copy (any other 403 — a non-owner
 caller's `dashboard_owner_required` — is an error to diagnose and goes to the
 notice), and a costs 409 `aws_consent_required` is answered by the Cost Explorer

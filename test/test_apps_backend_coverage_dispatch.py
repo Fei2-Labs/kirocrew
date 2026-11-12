@@ -1,12 +1,8 @@
 """Unit coverage for :mod:`kiro_crew.apps.backend`: what the spawn body launches.
 
-Node / npm binary resolution and the entry-point heuristics, the shared interpreter
-resolution in ``apps/interpreter.py`` (which venv or deps-dir interpreter and console
-script a backend runs under, and the probe that judges it usable), the Node and ASGI
-dispatch branches, and the environment and ``Popen`` tail of a spawn.
-
-One topic of the ``test_apps_backend_coverage*.py`` family; the doubles and fixtures
-the family shares come from ``apps_backend_coverage_helpers.py``.
+Covers Node / npm resolution, interpreter resolution in ``apps/interpreter.py``, the
+Node and ASGI dispatch and the spawn's ``Popen`` tail. Shared doubles and fixtures
+come from ``apps_backend_coverage_helpers.py``.
 """
 
 from __future__ import annotations
@@ -30,11 +26,10 @@ from apps_backend_coverage_helpers import (
 )
 
 import kiro_crew.apps.backend as bmod
+from conftest import requires_symlinks
 from kiro_crew.testing.wait import wait_until
 
-# ---------------------------------------------------------------------------
 # Node / npm binary resolution
-# ---------------------------------------------------------------------------
 
 
 class TestNvmResolution:
@@ -155,9 +150,7 @@ class TestNvmResolution:
         assert bmod._find_npm_binary() == "/usr/bin/npm"
 
 
-# ---------------------------------------------------------------------------
 # Entry-point heuristics
-# ---------------------------------------------------------------------------
 
 
 class TestEntryHeuristics:
@@ -192,9 +185,7 @@ class TestEntryHeuristics:
         assert bmod._shebang_argv(entry) == ["/usr/bin/env", "bash"]
 
 
-# ---------------------------------------------------------------------------
 # Shared interpreter resolution (apps/interpreter.py)
-# ---------------------------------------------------------------------------
 
 
 def _write_runnable(path: Any) -> None:
@@ -206,13 +197,9 @@ def _write_runnable(path: Any) -> None:
 def _create_real_venv(root: Any) -> None:
     """Build a REAL ``.venv`` under ``root`` the way ``python -m venv`` does.
 
-    The CLI symlinks the interpreter on POSIX and copies it only on Windows;
-    the ``venv.create`` API defaults to copying everywhere. A copied binary
-    breaks on a relocatable base interpreter (python-build-standalone, which
-    ``uv`` installs): its ``@rpath/libpython`` is resolved relative to the
-    binary's own location, so the copy aborts at load and
-    ``_venv_is_usable``'s probe reads it as "not a venv". Mirror the CLI so
-    the fixture is the venv production expects on every host.
+    The CLI symlinks on POSIX; ``venv.create`` copies. A copied python-build-standalone
+    binary (as ``uv`` installs) resolves ``@rpath/libpython`` beside itself and aborts,
+    so ``_venv_is_usable`` would read it as "not a venv".
     """
     import venv as _venv
 
@@ -379,7 +366,7 @@ class TestInterpreterResolution:
         with mock.patch.object(imod, "_venv_is_usable", return_value=True):
             assert imod.resolve_app_python(tmp_path) != _sys.executable
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="dangling-symlink semantics are POSIX-only")
+    @requires_symlinks
     def test_a_dangling_requirements_symlink_surfaces_as_a_failure(self, spawn_root: Any) -> None:
         """is_file() answers False for a DANGLING requirements.txt link the
         same as for absence - but a present-yet-unreadable entry must NOT be
@@ -490,9 +477,7 @@ class TestInterpreterResolution:
         assert venv_provided_command(tmp_path, "my-tool") == str(deps_script)
 
 
-# ---------------------------------------------------------------------------
 # Spawn body: dispatch branches
-# ---------------------------------------------------------------------------
 
 
 class TestNodeDispatch:
@@ -757,9 +742,7 @@ class TestAsgiDispatch:
         assert str(app_deps_dir(spawn_root)) not in child_pp, child_pp
 
 
-# ---------------------------------------------------------------------------
 # Spawn body: environment construction and the Popen tail
-# ---------------------------------------------------------------------------
 
 
 class TestSpawnEnvironment:
@@ -769,7 +752,10 @@ class TestSpawnEnvironment:
         """minimal_env() strips these, so the explicit forwards are the contract."""
 
         (spawn_root / "server.py").write_text("x = 1\n")
-        (spawn_root / ".app_secret").write_text("  s3cr3t  \n")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.token_auth.replace_legacy_app_secret",
+            lambda name: "s3cr3t" if name == "envapp" else "",
+        )
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", "/checkout")
         monkeypatch.setenv("KIROCREW_EDITION_DIR", "/edition")
         monkeypatch.setenv("KIROCREW_DEVFLEET_REPO", "/opt/kirocrew")

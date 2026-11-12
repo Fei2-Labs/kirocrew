@@ -33,11 +33,13 @@ def _governance_denial(
     deny_aliases: tuple[str, ...] = (),
     spawn_target: str = "",
     own_scopes: tuple[str, ...] = (),
+    shell_command: str = "",
 ) -> str | None:
     """Return a denial reason if governance forbids *tool_name*, else None.
 
     *own_scopes* is ``gate_decision``'s: the scopes a proven non-shell call is
-    judged in (``GateFacts.governance_own_scopes``), or ``()``.
+    judged in (``GateFacts.governance_own_scopes``), or ``()``. *shell_command* is
+    ``gate_decision``'s too: a shell call's recovered command, or ``""``.
 
     *spawn_target* is the agent a backend-stated sub-agent spawn will start (set
     only from KAS's own ``_meta.kiro.consent``; see ``AcpEvent.spawn_target``).
@@ -99,6 +101,7 @@ def _governance_denial(
             alias_groups=alias_groups,
             deny_aliases=deny_aliases,
             own_scopes=own_scopes,
+            shell_command=shell_command,
         )
         if not decision.permitted:
             # The denied identity when the decision names one -- with the title,
@@ -208,8 +211,8 @@ def _script_hooks_capability_denied(session_key: str = "") -> str | None:
             return getattr(decision, "reason", "script_hooks capability disabled")
         from kiro_crew.edition_locks import UNNAMED_REASON, follows_policy
 
-        # Enterprise: every hook, by any name, follows this key and is off by default
-        # (RFC enterprise edition, Red "Hooks by name").
+        # LTS: every hook, by any name, follows this key and is off by default
+        # (RFC LTS edition, Red "Hooks by name").
         if not follows_policy(decision):
             return f"script_hooks {UNNAMED_REASON}"
         return None
@@ -228,7 +231,7 @@ def _script_hooks_capability_denied(session_key: str = "") -> str | None:
             logger.debug("governance degrade audit unavailable", exc_info=True)
         from kiro_crew.edition_locks import locked_off
 
-        # Enterprise: hooks are off by default, so an unreadable answer keeps them off.
+        # LTS: hooks are off by default, so an unreadable answer keeps them off.
         if locked_off():
             return "script_hooks governance unavailable (fail-closed)"
         return None

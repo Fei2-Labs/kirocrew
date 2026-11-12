@@ -1,4 +1,4 @@
-"""Crew-owned OAuth MVP: GitHub on KAS behind ``connections.crew_oauth`` (default off).
+"""Crew-owned OAuth MVP: GitHub on KAS behind the ``crew_oauth`` feature preview (off).
 
 What must hold (RFC "Crew-owned OAuth for Connections", phase 1):
 
@@ -85,7 +85,7 @@ def _github_spec() -> dict:
 
 def _project(monkeypatch, *, on: bool) -> dict:
     monkeypatch.setattr(crew_oauth, "enabled", lambda: on)
-    monkeypatch.setattr(crew_oauth, "_chat_backend_is_kas", lambda: True)
+    monkeypatch.setattr(crew_oauth, "_chat_backend_bridged", lambda: True)
     monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
     return kas_agents.to_client_custom_agent("kirocrew", _github_spec(), "p", session_key=SESSION)
 
@@ -107,31 +107,58 @@ def test_set_if_revision_writes_only_over_the_revision_it_read(tmp_path):
 # --- flag and platform ------------------------------------------------------
 
 
-def test_the_flag_is_off_unless_config_says_true(monkeypatch):
-    import kiro_crew.config.loader as loader
+_PREVIEW_ON = {"dashboard": {"feature_previews": {"crew_oauth": True}}}
+_PREVIEW_OFF = {"dashboard": {"feature_previews": {"crew_oauth": False}}}
 
+
+def _write_config(home, doc, *, local=None) -> None:
+    from kiro_crew.config.loader_locations import config_dir, config_local_path
+
+    config_dir().mkdir(parents=True, exist_ok=True)
+    (config_dir() / "config.json").write_text(json.dumps(doc))
+    if local is not None:
+        config_local_path().write_text(json.dumps(local))
+
+
+def test_the_flag_is_off_unless_config_says_true(home, monkeypatch):
     monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
-    monkeypatch.setattr(loader, "read_config_for_update", lambda: {})
+    _write_config(home, {})
     assert crew_oauth.enabled() is False
-    monkeypatch.setattr(
-        loader, "read_config_for_update", lambda: {"connections": {"crew_oauth": "yes"}}
-    )
-    assert crew_oauth.enabled() is False
-    monkeypatch.setattr(
-        loader, "read_config_for_update", lambda: {"connections": {"crew_oauth": True}}
-    )
+    _write_config(home, _PREVIEW_ON)
     assert crew_oauth.enabled() is True
-    assert crew_oauth.manages("asana") is False
+    assert crew_oauth.manages("slack") is False
 
 
-def test_windows_reads_the_flag_as_off(monkeypatch):
-    import kiro_crew.config.loader as loader
+@pytest.mark.parametrize(
+    "doc, on",
+    [
+        (_PREVIEW_ON, True),
+        (_PREVIEW_OFF, False),
+        ({"dashboard": {"feature_previews": {"crew_oauth": "yes"}}}, False),
+        ({"dashboard": {"feature_previews": ["not", "an", "object"]}}, False),
+        # A hand-edited ``connections.crew_oauth`` turns nothing on.
+        ({"connections": {"crew_oauth": True}}, False),
+    ],
+)
+def test_only_the_feature_preview_turns_it_on(home, monkeypatch, doc, on):
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+    _write_config(home, doc)
+    assert crew_oauth.enabled() is on
 
-    monkeypatch.setattr(
-        loader, "read_config_for_update", lambda: {"connections": {"crew_oauth": True}}
-    )
+
+@pytest.mark.parametrize(
+    "base, local, on", [(_PREVIEW_ON, _PREVIEW_OFF, False), ({}, _PREVIEW_ON, True)]
+)
+def test_the_config_local_overlay_decides_like_the_dashboard(home, monkeypatch, base, local, on):
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+    _write_config(home, base, local=local)
+    assert crew_oauth.enabled() is on
+
+
+def test_windows_reads_the_flag_like_posix(home, monkeypatch):
+    _write_config(home, _PREVIEW_ON)
     monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    assert crew_oauth.enabled() is False
+    assert crew_oauth.enabled() is True
 
 
 # --- KAS projection ---------------------------------------------------------
@@ -160,7 +187,7 @@ def test_flag_on_projects_a_gateway_bridge_and_forces_ask(home, monkeypatch):
     asks = [r for r in out["permissions"]["rules"] if r["effect"] == "ask"]
     assert {"capability": "mcp", "match": ["github/*"], "effect": "ask"} in asks
     names = kas_env_launch.batch_snapshot_names([out])
-    doc = json.loads((home / "kas-mcp-launch" / names[0]).read_text())
+    doc = json.loads((home / "crew-oauth-bridge" / names[0]).read_text())
     assert doc["connection"] == "github" and doc["port"] == 8123
     assert set(doc) >= {"bridge_token", "version", "session"}
     assert CANARY_SECRET not in json.dumps(doc) and GITHUB_URL not in json.dumps(doc)
@@ -170,7 +197,7 @@ def test_flag_on_projects_a_gateway_bridge_and_forces_ask(home, monkeypatch):
 def test_a_hand_authored_github_name_elsewhere_is_not_bridged(home, monkeypatch):
     monkeypatch.setattr(crew_oauth, "enabled", lambda: True)
     entry = {"url": "https://example.invalid/mcp"}
-    assert kas_env_launch.crew_connection_slug("github", entry) == ""
+    assert kas_env_launch.crew_connection_slug("github", entry, "kas") == ""
 
 
 # --- tokens and refresh -----------------------------------------------------
@@ -395,7 +422,7 @@ def test_a_pin_moves_only_after_the_pinned_process_is_gone(monkeypatch):
     assert crew_oauth_proxy.admit_bridge("v1", "tok", 4343)[0] is not None
 
 
-def test_disconnect_drops_every_bridge_of_the_slug():
+def test_a_failed_disconnect_drops_every_bridge_of_the_slug():
     _register()
     crew_oauth_proxy.drop_slug("github")
     assert crew_oauth_proxy.admit_bridge("v1", "tok", os.getpid())[0] is None
@@ -442,6 +469,7 @@ def proxy_env(monkeypatch):
     monkeypatch.setattr(origin, "request_is_unix_socket", lambda request: True)
     monkeypatch.setattr(socketsec, "get_peer_pid", lambda sock: os.getpid())
     monkeypatch.setattr(crew_oauth, "manages", lambda slug: True)
+    monkeypatch.setattr(crew_oauth, "custody_on", lambda slug: True)
     forced: list[bool] = []
 
     async def _token(slug, *, force=False, store=None):
@@ -490,6 +518,66 @@ async def test_the_proxy_injects_the_bearer_and_gates_tool_calls(proxy_env):
             denied = await _post(client, call, token="bad")
             assert denied.status == 403
     assert "Authorization" not in json.dumps(dict(resp.headers))
+
+
+@pytest.mark.asyncio
+async def test_a_bridge_survives_disconnect_and_works_again_after_reconnect(tmp_path, monkeypatch):
+    """Disconnect blocks a live bridge's calls until reconnect, then it works again."""
+    import kiro_crew.dashboard.origin as origin
+    import kiro_crew.mcp_gateway.socketsec as socketsec
+
+    monkeypatch.setattr(origin, "request_is_unix_socket", lambda request: True)
+    monkeypatch.setattr(socketsec, "get_peer_pid", lambda sock: os.getpid())
+    flag = {"on": True}
+    monkeypatch.setattr(crew_oauth, "manages", lambda slug: flag["on"])
+    monkeypatch.setattr(crew_oauth, "custody_on", lambda slug: flag["on"])
+    store = _store(tmp_path, Tokens("a1", "r1", time.time() + 3600, ""))
+    monkeypatch.setattr(crew_oauth, "TokenStore", lambda *_a: store)
+
+    async def _revoked(_slug, _access):
+        return True
+
+    monkeypatch.setattr(crew_oauth, "_revoke", _revoked)
+    call = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {"name": "get_me", "arguments": {"a": 1}},
+    }
+    seen: list = []
+    async with TestServer(_upstream_app(seen, [])) as upstream:
+        crew_oauth_proxy.register_bridge(
+            version="v1",
+            token="tok",
+            session_key=SESSION,
+            server="github",
+            slug="github",
+            mcp_url=str(upstream.make_url("/mcp")),
+        )
+        async with TestClient(TestServer(_proxy_app())) as client:
+            crew_oauth_proxy.note_approval(SESSION, _event())
+            assert (await (await _post(client, call)).json())["result"] == {"ok": True}
+
+            assert (await crew_oauth.disconnect("github"))["removed"] is True
+            crew_oauth_proxy.note_approval(SESSION, _event())
+            gone = await _post(client, call)
+            assert gone.status == 409
+            assert gone.headers[crew_oauth_proxy.REFUSAL_HEADER] == "needs_auth"
+            assert len(seen) == 1, "a call with no grant reached the provider"
+
+            store.replace("github", Tokens("a2", "r2", time.time() + 3600, ""))
+            crew_oauth_proxy.note_approval(SESSION, _event())
+            back = await (await _post(client, call)).json()
+            assert back["result"] == {"ok": True} and len(seen) == 2
+            assert seen[-1]["Authorization"] == "Bearer a2"
+
+            # Flag turned off later: the same bridge is refused, nothing is sent.
+            flag["on"] = False
+            crew_oauth_proxy.note_approval(SESSION, _event())
+            off = await _post(client, call)
+            assert off.status == 409
+            assert off.headers[crew_oauth_proxy.REFUSAL_HEADER] == "crew_oauth_off"
+            assert len(seen) == 2
 
 
 @pytest.mark.asyncio
@@ -578,26 +666,46 @@ def test_the_launcher_runs_the_gateway_bridge_on_posix(home, monkeypatch):
     assert done.value.code == 0 and ran[0]["connection"] == "github"
 
 
-def test_the_launcher_refuses_a_connection_on_windows(home, monkeypatch, capsys):
+def test_the_launcher_runs_the_gateway_bridge_on_windows(home, monkeypatch):
     argv = _connection_snapshot(home, monkeypatch)
+    ran: list[dict] = []
+    import kiro_crew.kas_connection_bridge as bridge_mod
+
+    monkeypatch.setattr(
+        bridge_mod, "run_connection_bridge", lambda doc, server: ran.append(doc) or 0
+    )
     monkeypatch.setenv("KIROCREW_HOME", str(home))
     monkeypatch.setattr(kas_env_shim.os, "name", "nt")
     with pytest.raises(SystemExit) as done:
         kas_env_shim.main(argv)
-    assert done.value.code == 78
-    assert "Unix socket" in capsys.readouterr().err
+    assert done.value.code == 0 and ran[0]["connection"] == "github"
 
 
 # --- custody, warm process, gate edges --------------------------------------
 
 
-def test_crew_custody_needs_kas_as_the_chat_backend(monkeypatch):
+def test_crew_custody_needs_a_bridged_chat_backend(monkeypatch):
     """On kiro-cli the native grant keeps working, so Crew does not take custody."""
     monkeypatch.setattr(crew_oauth, "enabled", lambda: True)
-    monkeypatch.setattr(crew_oauth, "_chat_backend_is_kas", lambda: False)
+    monkeypatch.setattr(crew_oauth, "_chat_backend_bridged", lambda: False)
     assert crew_oauth.manages("github") is False
-    monkeypatch.setattr(crew_oauth, "_chat_backend_is_kas", lambda: True)
+    monkeypatch.setattr(crew_oauth, "_chat_backend_bridged", lambda: True)
     assert crew_oauth.manages("github") is True
+
+
+def test_every_audit_also_reaches_the_gateway_log(monkeypatch, caplog):
+    """An operator reading gateway.log sees Crew's sign-in, never a value."""
+    import logging
+
+    monkeypatch.setattr(
+        "kiro_crew.sel.sel", lambda: types.SimpleNamespace(log_api_access=lambda **_k: None)
+    )
+    caplog.set_level(logging.INFO, logger=crew_oauth.logger.name)
+    crew_oauth._audit("connections_crew_oauth_sign_in", "error", "github", "crew_oauth_denied")
+    lines = [r.getMessage() for r in caplog.records if r.name == crew_oauth.logger.name]
+    assert lines == [
+        "Crew OAuth connections_crew_oauth_sign_in for github: error (crew_oauth_denied)"
+    ]
 
 
 def test_a_stored_pair_is_found_whatever_the_flag_says(tmp_path, monkeypatch):
@@ -608,7 +716,7 @@ def test_a_stored_pair_is_found_whatever_the_flag_says(tmp_path, monkeypatch):
     assert crew_oauth.holds_grant("github") is False
     TokenStore(vault).replace("github", Tokens("a", "r", None, ""))
     assert crew_oauth.holds_grant("github") is True
-    assert crew_oauth.holds_grant("asana") is False
+    assert crew_oauth.holds_grant("slack") is False
 
 
 def test_the_warm_universe_leaves_a_crew_owned_provider_out(monkeypatch):
@@ -618,8 +726,10 @@ def test_the_warm_universe_leaves_a_crew_owned_provider_out(monkeypatch):
     monkeypatch.setattr(warm, "_disabled_provider_slugs", lambda: set())
     monkeypatch.setattr(warm, "_warm_mintable_entry", lambda provider, _x: {})
     monkeypatch.setattr(crew_oauth, "manages", lambda slug: True)
+    monkeypatch.setattr(crew_oauth, "custody_on", lambda slug: True)
     assert "github" not in {p["slug"] for p in warm.warm_spec_providers()}
     monkeypatch.setattr(crew_oauth, "manages", lambda slug: False)
+    monkeypatch.setattr(crew_oauth, "custody_on", lambda slug: False)
     assert "github" in {p["slug"] for p in warm.warm_spec_providers()}
 
 
@@ -642,7 +752,7 @@ def test_a_full_table_makes_the_projected_bridge_refuse_to_start(home, monkeypat
         port="8123",
     )
     assert "unwritten" in entry["args"]
-    leaf = home / "kas-mcp-launch"
+    leaf = home / "crew-oauth-bridge"
     assert not leaf.exists() or not list(leaf.iterdir())
 
 
@@ -837,12 +947,12 @@ def test_kas_transport_metadata_never_breaks_an_approved_call(raw):
 def test_an_entry_with_its_own_auth_header_keeps_its_header_bridge(home, monkeypatch):
     """A personal-access-token GitHub entry never borrows Crew's sign-in."""
     monkeypatch.setattr(crew_oauth, "enabled", lambda: True)
-    monkeypatch.setattr(crew_oauth, "_chat_backend_is_kas", lambda: True)
+    monkeypatch.setattr(crew_oauth, "_chat_backend_bridged", lambda: True)
     monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
     spec = _github_spec()
     spec["mcpServers"]["github"]["headers"] = {"Authorization": "Bearer ghp-canary-pat"}
     out = kas_agents.to_client_custom_agent("kirocrew", spec, "p", session_key=SESSION)
-    assert kas_env_launch.crew_connection_slug("github", spec["mcpServers"]["github"]) == ""
+    assert kas_env_launch.crew_connection_slug("github", spec["mcpServers"]["github"], "kas") == ""
     assert not crew_oauth_proxy._bridges
     asks = [r for r in (out.get("permissions") or {}).get("rules", []) if r["effect"] == "ask"]
     assert {"capability": "mcp", "match": ["github/*"], "effect": "ask"} not in asks
@@ -878,19 +988,20 @@ def test_an_approval_without_trusted_arguments_authorizes_no_arguments_at_all():
 )
 def test_only_a_credential_header_keeps_an_entry_off_crew_auth(monkeypatch, headers, crew):
     monkeypatch.setattr(crew_oauth, "enabled", lambda: True)
-    monkeypatch.setattr(crew_oauth, "_chat_backend_is_kas", lambda: True)
+    monkeypatch.setattr(crew_oauth, "_chat_backend_bridged", lambda: True)
     entry = {"url": GITHUB_URL, "headers": headers}
-    assert (kas_env_launch.crew_connection_slug("github", entry) == "github") is crew
+    assert (kas_env_launch.crew_connection_slug("github", entry, "kas") == "github") is crew
 
 
 def test_a_session_outside_the_gateway_keeps_the_native_path(monkeypatch):
     """``kirocrew chat`` projects in its own process: no proxy there, so no bridge."""
     monkeypatch.setattr(crew_oauth, "manages", lambda slug: True)
+    monkeypatch.setattr(crew_oauth, "custody_on", lambda slug: True)
     entry = {"url": GITHUB_URL}
     monkeypatch.delenv("KIROCREW_BOUND_PORT", raising=False)
-    assert kas_env_launch.crew_connection_slug("github", entry) == ""
+    assert kas_env_launch.crew_connection_slug("github", entry, "kas") == ""
     monkeypatch.setenv("KIROCREW_BOUND_PORT", "8765")
-    assert kas_env_launch.crew_connection_slug("github", entry) == "github"
+    assert kas_env_launch.crew_connection_slug("github", entry, "kas") == "github"
 
 
 @pytest.mark.asyncio
@@ -928,16 +1039,39 @@ async def test_the_proxy_forwards_the_message_the_gate_judged(proxy_env):
     assert raw and b"tools/call" not in raw[0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag, status", [(True, 200), (False, 409)])
+async def test_the_proxy_recheck_reads_the_flag_not_the_chat_backend(
+    proxy_env, monkeypatch, flag, status
+):
+    """A claude crewmate's bridge keeps working while chats run on kiro-cli."""
+    monkeypatch.setattr(crew_oauth, "manages", lambda slug: False)
+    monkeypatch.setattr(crew_oauth, "custody_on", lambda slug: flag)
+    seen: list = []
+    async with TestServer(_upstream_app(seen, [])) as upstream:
+        crew_oauth_proxy.register_bridge(
+            version="v1",
+            token="tok",
+            session_key=SESSION,
+            server="github",
+            slug="github",
+            mcp_url=str(upstream.make_url("/mcp")),
+        )
+        async with TestClient(TestServer(_proxy_app())) as client:
+            resp = await _post(client, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            assert resp.status == status
+
+
 def test_a_non_auth_header_entry_is_bridged_and_keeps_its_header(home, monkeypatch):
     """A User-Agent-only entry still gets Crew's bearer; its header rides the gateway."""
     monkeypatch.setattr(crew_oauth, "enabled", lambda: True)
-    monkeypatch.setattr(crew_oauth, "_chat_backend_is_kas", lambda: True)
+    monkeypatch.setattr(crew_oauth, "_chat_backend_bridged", lambda: True)
     monkeypatch.setenv("KIROCREW_BOUND_PORT", "8123")
     spec = _github_spec()
     spec["mcpServers"]["github"]["headers"] = {"User-Agent": "my-client"}
     out = kas_agents.to_client_custom_agent("kirocrew", spec, "p", session_key=SESSION)
     names = kas_env_launch.batch_snapshot_names([out])
-    doc = json.loads((home / "kas-mcp-launch" / names[0]).read_text())
+    doc = json.loads((home / "crew-oauth-bridge" / names[0]).read_text())
     assert doc["connection"] == "github" and "headers" not in doc
     (bridge,) = crew_oauth_proxy._bridges.values()
     assert bridge.extra_headers == {"User-Agent": "my-client"}

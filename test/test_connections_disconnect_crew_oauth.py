@@ -1,4 +1,4 @@
-"""Disconnect when Kiro Crew holds the sign-in (``connections.crew_oauth``).
+"""Disconnect when Kiro Crew holds the sign-in (``dashboard.feature_previews.crew_oauth``).
 
 Reuses the handler harness of ``test_connections_disconnect.py``: every side
 effect but the decision under test is neutralized there.
@@ -7,7 +7,14 @@ effect but the decision under test is neutralized there.
 from __future__ import annotations
 
 import pytest
-from test_connections_disconnect import _SLUG, _client, _entry, _provider_url, _wire
+from test_connections_disconnect import (
+    _SLUG,
+    _client,
+    _disconnect,
+    _entry,
+    _provider_url,
+    _wire,
+)
 
 
 @pytest.mark.asyncio
@@ -31,8 +38,12 @@ async def test_a_failed_crew_held_cleanup_is_a_coded_failure_not_a_disconnect(
     async def _vault_broken(_slug: str) -> dict:
         raise OSError("vault unreadable")
 
+    from kiro_crew.connections import crew_oauth_proxy
+
+    dropped: list[str] = []
     monkeypatch.setattr(crew_oauth, "manages", lambda _slug: True)
     monkeypatch.setattr(crew_oauth, "disconnect", _vault_broken)
+    monkeypatch.setattr(crew_oauth_proxy, "drop_slug", dropped.append)
     client = await _client()
     try:
         resp = await client.post("/api/connections/disconnect", json={"slug": _SLUG})
@@ -43,6 +54,7 @@ async def test_a_failed_crew_held_cleanup_is_a_coded_failure_not_a_disconnect(
     assert resp.status == 502
     assert body["code"] == "crew_cleanup_failed" and body["entryRemoved"] is True
     assert purged == [_SLUG], "the rest of Disconnect still ran"
+    assert dropped == [_SLUG], "a pair that may survive must not stay reachable"
     assert [a["outcome"] for a in audits if a.get("operation") == "connections_disconnect"] == [
         "partial"
     ]
@@ -86,7 +98,8 @@ async def test_disconnect_always_revokes_the_crew_grant(
     assert body["grantCensusIncomplete"] is False
     assert body["crewGrantRemoved"] is True and body["upstreamRevoked"] is True
     assert "crewGrantKept" not in body
-    assert called == ["drop", "disconnect"], "Crew's grant was not revoked and cut"
+    # Live bridges stay registered, so a reconnect revives them.
+    assert called == ["disconnect"], "Crew's grant was not revoked, or bridges were cut"
 
 
 class _UnreadableVault:
@@ -188,7 +201,7 @@ async def test_connect_uses_crews_sign_in_only_where_routing_does(
 
     started: list[str] = []
 
-    async def _crew_start(slug: str) -> str:
+    async def _crew_start(slug: str, project_dirs=None) -> str:
         started.append(slug)
         return "crew-tok"
 
@@ -212,3 +225,27 @@ async def test_connect_uses_crews_sign_in_only_where_routing_does(
         await client.close()
     assert resp.status == 200
     assert (body["token"] == "crew-tok") is crew and (started == ["github"]) is crew
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surviving", [["token", "registration"], []])
+async def test_the_kept_grant_line_names_kiro_clis_pair_only_when_it_exists(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, surviving: list[str]
+) -> None:
+    """The line is about kiro-cli's native pair, so it is silent when none exists."""
+    _wire(
+        monkeypatch,
+        removed=[],
+        surviving=surviving,
+        inventory=[_entry(_SLUG, _provider_url()), _entry("notion-work", _provider_url())],
+        purged=[],
+    )
+    caplog.set_level("INFO", logger="kiro_crew.connections.ownership")
+
+    await _disconnect()
+
+    kept = [r.getMessage() for r in caplog.records if "Disconnect kept" in r.getMessage()]
+    if surviving:
+        assert len(kept) == 1 and "kiro-cli's native grant" in kept[0]
+    else:
+        assert kept == []

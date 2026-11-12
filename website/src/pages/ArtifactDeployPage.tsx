@@ -18,8 +18,9 @@ import { copyToClipboard, copyCode } from '../utils/clipboard'
 import { formatCost } from '../utils/formatCost'
 
 import { i18nT } from '../i18n/t'
+import { Trans } from 'react-i18next'
 import { fmtNumber, fmtRelative } from '../i18n/format'
-import { ApiError, toApiError } from '../api/apiError'
+import { ApiError, statusErrText, toApiError } from '../api/apiError'
 import { errMessage } from '../utils/thunkError'
 const BASE = '/api/deploy'
 
@@ -116,7 +117,7 @@ async function pendingActionError(
   failedKey: 'pages.artifactDeployPage.pending_deploy_failed_status' | 'pages.artifactDeployPage.dismiss_failed_status',
 ): Promise<ApiError> {
   const err = await toApiError(r)
-  if (err.message === `HTTP ${r.status}`) err.message = i18nT(failedKey, { status: r.status })
+  if (err.message === statusErrText(r.status, err.body)) err.message = i18nT(failedKey, { status: r.status })
   return err
 }
 // The top-level fields of a JSON object body, or `{}` for any other body.
@@ -418,9 +419,9 @@ export default function ArtifactDeployPage() {
 
       {/* StatCard row — mirrors AgentsPage/ArtifactsPage pattern */}
       <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] mb-6">
-        <StatCard label={i18nT('pages.artifactDeployPage.profiles')} value={profiles.length} />
-        <StatCard label={i18nT('pages.artifactDeployPage.active_deployments')} value={totalDeployments} accent />
-        <StatCard label={i18nT('pages.artifactDeployPage.ready_to_deploy')} value={draftWebapps.length} delay={60} />
+        <StatCard label={i18nT('pages.artifactDeployPage.profiles')} value={fmtNumber(profiles.length)} />
+        <StatCard label={i18nT('pages.artifactDeployPage.active_deployments')} value={fmtNumber(totalDeployments)} accent />
+        <StatCard label={i18nT('pages.artifactDeployPage.ready_to_deploy')} value={fmtNumber(draftWebapps.length)} delay={60} />
         <StatCard label={i18nT('pages.artifactDeployPage.est_cost_not_a_bill')} value={estCost > 0 ? `≤ ${formatCost(estCost)}` : formatCost(0)} delay={120} />
       </div>
 
@@ -471,14 +472,18 @@ export default function ArtifactDeployPage() {
               <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--warn-border, #fde68a)', background: 'var(--warn-subtle, #fffbeb)', color: 'var(--warn)', fontSize: 11.5, lineHeight: 1.5 }}>
                 <b>{i18nT('pages.artifactDeployPage.two_things_that_trip_people_up')}</b>
                 <ul style={{ margin: '4px 0 0', paddingLeft: 16 }}>
-                  <li>{i18nT('pages.artifactDeployPage.configure_the_profile_on_the')} <b>{i18nT('pages.artifactDeployPage.machine_running_the_gateway')}</b> {i18nT('pages.artifactDeployPage.your_host_not_your_laptop_artifact_deploy_shells')} <code>{i18nT('pages.artifactDeployPage.aws')}</code> {i18nT('pages.artifactDeployPage.from_the_gateway_process')}</li>
-                  <li>{i18nT('pages.artifactDeployPage.sso_needs')} <b>{i18nT('pages.artifactDeployPage.aws_cli_v2')}</b>{i18nT('pages.artifactDeployPage.v1_fails_with')} <code>{i18nT('pages.artifactDeployPage.missing_sso_start_url_sso_region')}</code>{i18nT('pages.artifactDeployPage.make_sure_the_gateway_s')} <code>{i18nT('pages.artifactDeployPage.path')}</code> {i18nT('pages.artifactDeployPage.resolves_v2_before_any_v1')}</li>
+                  <li><Trans i18nKey="pages.artifactDeployPage.configure_profile_on_gateway_host" components={{ b: <b />, aws: <code>{i18nT('pages.artifactDeployPage.aws')}</code> }} /></li>
+                  <li><Trans i18nKey="pages.artifactDeployPage.sso_needs_cli_v2" components={{ b: <b />, error: <code>{i18nT('pages.artifactDeployPage.missing_sso_start_url_sso_region')}</code>, path: <code>{i18nT('pages.artifactDeployPage.path')}</code> }} /></li>
                 </ul>
               </div>
             </div>
             <div><b>{i18nT('pages.artifactDeployPage.2_enter_the_profile_name_region_below')}</b> {i18nT('pages.artifactDeployPage.and_click')} <b>{i18nT('pages.artifactDeployPage.save')}</b>{i18nT('pages.artifactDeployPage.then')} <b>{i18nT('pages.artifactDeployPage.verify_access')}</b>.</div>
             <div>
-              <b>{i18nT('pages.artifactDeployPage.3_apply_the_iam_policy')}</b> {i18nT('pages.artifactDeployPage.click')} <b>{i18nT('pages.artifactDeployPage.get_iam_policy')}</b>{i18nT('pages.artifactDeployPage.then_apply_it_yourself_to_a_dedicated_role_ident')} <code>{i18nT('pages.artifactDeployPage.aws_iam')}</code> {i18nT('pages.artifactDeployPage.command_kirocrew_never_edits_your_iam_the_first')}
+              <b>{i18nT('pages.artifactDeployPage.3_apply_the_iam_policy')}</b>{' '}
+              <Trans
+                i18nKey="pages.artifactDeployPage.apply_iam_policy_yourself"
+                components={{ action: <b>{i18nT('pages.artifactDeployPage.get_iam_policy')}</b>, iam: <code>{i18nT('pages.artifactDeployPage.aws_iam')}</code> }}
+              />
             </div>
             {/* Step 4 exists because its absence was a trap: the deploy TTL
                 defaults to a finite window, a finite window needs this stack, and
@@ -520,18 +525,28 @@ export default function ArtifactDeployPage() {
         {showSecurity && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10, fontSize: 12.5, lineHeight: 1.55 }}>
             <div>
-              <b>{i18nT('pages.artifactDeployPage.your_credentials_never_touch_kirocrew')}</b> {i18nT('pages.artifactDeployPage.only_the')} <b>{i18nT('pages.artifactDeployPage.profile_name')}</b> {i18nT('pages.artifactDeployPage.is_stored_every_aws_call_runs_through_the')} <code>{i18nT('pages.artifactDeployPage.aws')}</code> {i18nT('pages.artifactDeployPage.cli_with')} <code>{i18nT('pages.artifactDeployPage.profile')}</code> {i18nT('pages.artifactDeployPage.never_boto3_so_credential_resolution_stays_in_yo')}
+              <b>{i18nT('pages.artifactDeployPage.your_credentials_never_touch_kirocrew')}</b>{' '}
+              <Trans
+                i18nKey="pages.artifactDeployPage.only_profile_name_is_stored"
+                components={{ b: <b />, aws: <code>{i18nT('pages.artifactDeployPage.aws')}</code>, profile: <code>{i18nT('pages.artifactDeployPage.profile')}</code> }}
+              />
             </div>
             <div>
-              <b>{i18nT('pages.artifactDeployPage.the_origin_bucket_is_private')}</b> {i18nT('pages.artifactDeployPage.it_is_created_with_block_public_access_on')}
-              <code>{i18nT('pages.artifactDeployPage.bucketownerenforced')}</code> {i18nT('pages.artifactDeployPage.ownership_and_sse_aes256_with')} <b>{i18nT('pages.artifactDeployPage.no_public_bucket_policy')}</b>{i18nT('pages.artifactDeployPage.only_cloudfront_can_read_it_via_an_origin_access')}
-              <code>{i18nT('pages.artifactDeployPage.aws_sourcearn')}</code> {i18nT('pages.artifactDeployPage.pins_your_specific_distribution_the_bucket_name')}
+              <b>{i18nT('pages.artifactDeployPage.the_origin_bucket_is_private')}</b>{' '}
+              <Trans
+                i18nKey="pages.artifactDeployPage.bucket_created_private"
+                components={{ b: <b />, ownership: <code>{i18nT('pages.artifactDeployPage.bucketownerenforced')}</code>, arn: <code>{i18nT('pages.artifactDeployPage.aws_sourcearn')}</code> }}
+              />
             </div>
             {/* The exposure claim itself lives in the always-visible banner above;
                 this line carries only the facts that banner does not state. */}
             <div>{i18nT('pages.artifactDeployPage.random_domain_note')}</div>
             <div>
-              <b>{i18nT('pages.artifactDeployPage.pre_publish_scan_sensitive_path_guard')}</b> {i18nT('pages.artifactDeployPage.content_is_scanned_for_secrets_and_internal_data')}<code>{i18nT('pages.artifactDeployPage.aws_2')}</code>, <code>{i18nT('pages.artifactDeployPage.ssh')}</code>{i18nT('pages.artifactDeployPage.before_any_upload')}
+              <b>{i18nT('pages.artifactDeployPage.pre_publish_scan_sensitive_path_guard')}</b>{' '}
+              <Trans
+                i18nKey="pages.artifactDeployPage.content_scanned_before_upload"
+                components={{ aws: <code>{i18nT('pages.artifactDeployPage.aws_2')}</code>, ssh: <code>{i18nT('pages.artifactDeployPage.ssh')}</code> }}
+              />
             </div>
             <div>
               <b>{i18nT('pages.artifactDeployPage.confirm_gate_audit')}</b> {i18nT('pages.artifactDeployPage.deploy_recall_destroy_each_require_explicit_conf')} <b>{i18nT('pages.artifactDeployPage.recall')}</b> {i18nT('pages.artifactDeployPage.takes_a_site_down_fast_url_404_reversible')} <b>{i18nT('pages.artifactDeployPage.destroy')}</b> {i18nT('pages.artifactDeployPage.tears_down_all_infra_irreversible')}
@@ -608,8 +623,14 @@ export default function ArtifactDeployPage() {
                   </td>
                   <td className="px-2.5 py-2 border-b border-border text-sm">
                     <span style={{ display: 'flex', gap: 6 }}>
-                      {/* Locked while this row's own check runs; another row stays free to check. */}
-                      <Btn disabled={verifying.has(p.name)} onClick={() => verify.mutate(p.name)}><ShieldCheck size={11} /> {i18nT('pages.artifactDeployPage.verify')}</Btn>
+                      {/* Locked while this row's own check runs; another row stays free to check.
+                          `aria-disabled` plus the guard, NOT `disabled`, which leaves the tab
+                          order and drops a keyboard user's focus while the check runs. */}
+                      <Btn
+                        aria-disabled={verifying.has(p.name) || undefined}
+                        className="aria-disabled:opacity-30 aria-disabled:cursor-default"
+                        onClick={() => { if (!verifying.has(p.name)) verify.mutate(p.name) }}
+                      ><ShieldCheck size={11} /> {i18nT('pages.artifactDeployPage.verify')}</Btn>
                       <Btn aria-label={i18nT('pages.artifactDeployPage.remove_from_registry', { name: p.name })}
                         onClick={async () => {
                           if (await confirm({
@@ -652,7 +673,7 @@ export default function ArtifactDeployPage() {
             </div>
             <div style={{ fontSize: 12, display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
               <Toggle checked={npCreate} onChange={setNpCreate} label={i18nT('pages.artifactDeployPage.also_create_in_aws_config')} />
-              <span style={{ color: 'var(--muted)', fontSize: 11 }}>{i18nT('pages.artifactDeployPage.writes_only_region_credential_process_via')} <code>{i18nT('pages.artifactDeployPage.aws_configure_set')}</code> {i18nT('pages.artifactDeployPage.never_credentials')}</span>
+              <span style={{ color: 'var(--muted)', fontSize: 11 }}><Trans i18nKey="pages.artifactDeployPage.writes_only_region_via_command" components={{ cmd: <code>{i18nT('pages.artifactDeployPage.aws_configure_set')}</code> }} /></span>
             </div>
             {npCreate && (
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
@@ -860,8 +881,16 @@ export default function ArtifactDeployPage() {
         {/* Account-level total */}
         {(sites.length + deployedWebapps.length > 0) && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, paddingTop: 12, fontSize: 12.5, fontWeight: 600 }}>
-            <span>{i18nT('pages.artifactDeployPage.estimated_total')} {i18nT('pages.artifactDeployPage.static_site', { count: sites.length })} + {i18nT('pages.artifactDeployPage.webapp', { count: deployedWebapps.length })}:</span>
-            <span style={{ color: 'var(--accent)' }}>~${totalWebappUsd.toFixed(4)}</span>
+            <span>
+              <Trans
+                i18nKey="pages.artifactDeployPage.estimated_total_line"
+                values={{
+                  sites: i18nT('pages.artifactDeployPage.static_site', { count: sites.length }),
+                  webapps: i18nT('pages.artifactDeployPage.webapp', { count: deployedWebapps.length }),
+                }}
+                components={{ cost: <span style={{ color: 'var(--accent)' }}>~${totalWebappUsd.toFixed(4)}</span> }}
+              />
+            </span>
             <span style={{ color: 'var(--muted)', fontWeight: 400, fontSize: 11 }}>
               {i18nT('pages.artifactDeployPage.worst_case_tiers_over_each_ttl_window_estimate_n')}
             </span>
@@ -1115,7 +1144,13 @@ function PendingConfirmations({ qc, askAgent }: { qc: ReturnType<typeof useQuery
                 <div style={{ flex: 1 }}>
                   <div style={{ fontWeight: 500 }}>{e.site_id}</div>
                   <div style={{ color: 'var(--muted)', fontSize: 11 }}>
-                    {i18nT('pages.artifactDeployPage.source')} {source} {i18nT('pages.artifactDeployPage.profile_2')} {e.profile || i18nT('pages.artifactDeployPage.default')} {i18nT('pages.artifactDeployPage.ttl')} {e.ttl_hours}{i18nT('pages.artifactDeployPage.h_scan')} {e.scan_summary} &middot; {age}{i18nT('pages.artifactDeployPage.m_ago')}
+                    {i18nT('pages.artifactDeployPage.pending_site_line', {
+                      source,
+                      profile: e.profile || i18nT('pages.artifactDeployPage.default'),
+                      ttl: e.ttl_hours,
+                      scan: e.scan_summary,
+                      age,
+                    })}
                   </div>
                   {/* Clamped like the age above: a gateway clock behind the
                       browser's must read "now", never a deadline "ago". */}

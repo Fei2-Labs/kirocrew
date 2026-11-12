@@ -253,10 +253,12 @@ test.describe('E2E: sidebar tag columns', () => {
     const input = page.locator(`[data-testid="tag-create-${col.id}"]`)
     await input.fill(uniq)
     await input.press('Enter')
-    await page.waitForTimeout(400)
-    const tags = await (await request.get('/api/chat/tags')).json()
-    const created = tags.find((t: { name: string }) => t.name === uniq)
-    expect(created).toBeTruthy()
+    const findCreated = async () => {
+      const tags = await (await request.get('/api/chat/tags')).json()
+      return tags.find((t: { name: string }) => t.name === uniq)
+    }
+    await expect.poll(findCreated).toBeTruthy()
+    const created = await findCreated()
     expect(created.status).toBe(false)
     await request.delete(`/api/chat/tags/${created.id}`)
   })
@@ -291,8 +293,9 @@ test.describe('E2E: sidebar tag columns', () => {
     await page.goto('/chat')
     await page.waitForSelector(`[data-testid="column-${col.id}"]`)
     await page.locator(`[data-testid="column-edit-${col.id}"]`).click()
-    page.once('dialog', d => d.accept())
     await page.locator(`[data-testid="tag-delete-${created.id}"]`).click()
+    // The in-app dialog asks, not a native one.
+    await page.getByRole('dialog', { name: 'Delete tag' }).locator('[data-guide-confirm]').click()
     await expect.poll(async () => {
       const tags = await (await request.get('/api/chat/tags')).json()
       return tags.find((t: { id: string }) => t.id === created.id)
@@ -738,10 +741,10 @@ test.describe('E2E: sidebar tag columns', () => {
     const picker = page.locator('[data-testid="slot-tag-picker"]')
     await expect(picker).toBeVisible()
     await picker.getByRole('menuitemcheckbox', { name: /Review/ }).click()
-    await page.waitForTimeout(400)
-    const updated = await (await request.get('/api/chat/slots')).json()
-    const slot = updated.find((x: { key: string }) => x.key === s.key)
-    expect(slot.tags).toContain('review')
+    await expect.poll(async () => {
+      const updated = await (await request.get('/api/chat/slots')).json()
+      return updated.find((x: { key: string }) => x.key === s.key)?.tags ?? []
+    }).toContain('review')
   })
 
   test('17b. right-click on ANOTHER row while the Tags picker is open closes the picker and opens that row\'s menu', async ({ page, request }) => {

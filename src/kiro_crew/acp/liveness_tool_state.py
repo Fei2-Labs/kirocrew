@@ -65,9 +65,16 @@ class ToolCallState:
             self.tool_name = self.tool_name[:MAX_RETAINED_NAME_CHARS]
         if len(self.mcp_server_name) > MAX_RETAINED_NAME_CHARS:
             self.mcp_server_name = self.mcp_server_name[:MAX_RETAINED_NAME_CHARS]
+        if len(self.silence_server) > MAX_RETAINED_NAME_CHARS:
+            self.silence_server = self.silence_server[:MAX_RETAINED_NAME_CHARS]
 
     dispatch_ts: float = 0.0  # time.monotonic() at EVENT_TOOL_CALL
     is_shell: bool = False
+    # Sticky denial of process-cleanup authority for this call. Liveness may
+    # still track a likely child, but a shared runtime, a program-only match,
+    # or overlap with another shell call can never later become safe merely
+    # because an oracle generation was retired or a sibling exited.
+    shell_cleanup_disqualified: bool = False
     # ``boottime_now()`` at EVENT_TOOL_CALL — the SAME clock /proc dates process
     # start times against, so a child's start can be compared to its dispatch
     # without mixing clocks (see :func:`boottime_now`). Separate from
@@ -113,6 +120,18 @@ class ToolCallState:
     # classification see the same value the dispatch computed, and so a
     # detached consult never re-derives it from a different command string.
     interactive_risk: str = INTERACTIVE_NONE
+    # The per-call silence timer (``acp.tool_silence``). ``silence_class`` is the
+    # bound this call gets, "" for none (a shell call keeps the oracle's rules).
+    # ``silence_server`` is the MCP server the harness's frame named, kept only so
+    # Kiro Crew's own keepalive can be matched to a call it served; it is never an
+    # identity anything trusts. ``last_activity_ts`` is when a frame attributable
+    # to this call last arrived (monotonic; the dispatch instant until one does),
+    # and ``activity_parked`` is the turn's consumer park banked at that moment,
+    # so the timer subtracts only parks that came after it.
+    silence_class: str = ""
+    silence_server: str = ""
+    last_activity_ts: float = 0.0
+    activity_parked: float = 0.0
 
     @staticmethod
     def identity_of(event: object) -> tuple[str, str]:
@@ -349,6 +368,17 @@ class InFlightToolTracker:
         """
         return self._evicted_count
 
+    def states(self) -> list[tuple[str, ToolCallState]]:
+        """Every call still open as ``(toolCallId, state)``, in dispatch order.
+
+        The id-less judged call is included under ``""``: a per-call timer has to
+        see it too, and it is the one call ``active_calls`` leaves out.
+        """
+        out = [(call_id, state) for call_id, (state, _aux) in self._calls.items()]
+        if self._idless is not None:
+            out.append(("", self._idless[0]))
+        return out
+
     @property
     def active_calls(self) -> dict[str, tuple[ToolCallState, object]]:
         """The live ``{toolCallId: (state, aux)}`` map, read-only by convention.
@@ -361,14 +391,33 @@ class InFlightToolTracker:
         """
         return self._calls
 
+    @staticmethod
+    def _may_run_shell(state: object) -> bool:
+        """Whether *state* may be a shell call; one that cannot say counts as one."""
+        return getattr(state, "is_shell", True) is not False
+
     def dispatch(self, call_id: str, state: ToolCallState, aux: object = None) -> bool:
         """Record *state* under *call_id* and make it the judged call.
 
         A falsy *call_id* is judged but not stored (see the class docstring):
         it takes the id-less slot, which the next dispatch overwrites and which
-        never appears in ``active_calls``. Returns True — a dispatch always
+        never appears in ``active_calls``. Calls that overlap and may each run a
+        shell lose cleanup authority: the latch is set on every one of them that
+        carries ``shell_cleanup_disqualified``. Returns True — a dispatch always
         changes the judged call.
         """
+        if self._may_run_shell(state):
+            active_shells = [
+                existing
+                for existing_id, (existing, _aux) in self._calls.items()
+                if existing_id != (call_id or "") and self._may_run_shell(existing)
+            ]
+            if self._idless is not None and self._may_run_shell(self._idless[0]):
+                active_shells.append(self._idless[0])
+            if active_shells:
+                for shell in (state, *active_shells):
+                    if hasattr(shell, "shell_cleanup_disqualified"):
+                        shell.shell_cleanup_disqualified = True
         self._current_id = call_id or ""
         if call_id:
             self._idless = None

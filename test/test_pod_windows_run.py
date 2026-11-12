@@ -339,7 +339,7 @@ def test_public_up_prepares_home_only_after_start_reservation(
     monkeypatch.setattr(rt.prov, "venv_bin", lambda *_a: binary)
     monkeypatch.setattr(rt, "allocate_port", lambda *_a: (8611, None))
     monkeypatch.setattr(rt, "_seed_pod_os_home", lambda *_a: None)
-    monkeypatch.setattr(rt, "_probe_pod_child_bootstrap", lambda *_a: None)
+    monkeypatch.setattr(rt, "_probe_pod_child_bootstrap", lambda *_a, **_kw: None)
     monkeypatch.setattr(rt, "target_supports_flag", lambda *_a: False)
     monkeypatch.setattr(rt, "mint_token", lambda *_a: "test-token")
     monkeypatch.setattr(cli, "_wait_healthy", lambda *_a, **_kw: 200)
@@ -424,10 +424,10 @@ def test_sidecar_unlink_failure_retains_receipt_until_retry_and_next_start(
     def scheduler(*args):
         state.events.append(args[0])
         if args[0] == "/Query":
-            # Bare `/Query` (no /TN) reports service reachability, which holds
+            # The plane-folder query reports service reachability, which holds
             # throughout this scenario; the per-task `/Query /TN` reports task
             # presence. `task_absent` needs both, so they must not be conflated.
-            if len(args) == 1:
+            if args == ("/Query", "/TN", win.TASK_FOLDER_ROOT + "\\"):
                 return subprocess.CompletedProcess([], 0, "", "")
             return subprocess.CompletedProcess([], int(not scheduler_state["exists"]), "", "")
         if args[0] == "/Delete":

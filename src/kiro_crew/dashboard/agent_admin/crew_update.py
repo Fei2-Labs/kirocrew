@@ -93,9 +93,16 @@ async def _apply_member_approval_to_live_thread(request: web.Request, name: str,
     if slot is None:
         # No live thread: the next thread open seeds from the record.
         return
-    await apply_approval_mode(
+    from kiro_crew.approval_mode_policy import clamp_session_mode, ensure_resolved
+    from kiro_crew.config.sections import MEMBER_APPROVAL_MODE_UNSET_EFFECTIVE
+
+    # A final policy answer first: a passing deny must not refuse the saved choice.
+    await asyncio.to_thread(ensure_resolved)
+    # The thread lands on what the policy allows, as its workers and the open-time
+    # seed do (``clamp_session_mode``); a stored mode it now denies is not refused.
+    resp = await apply_approval_mode(
         state,
-        mode=mode,
+        mode=clamp_session_mode(mode or MEMBER_APPROVAL_MODE_UNSET_EFFECTIVE),
         slot=slot,
         slot_key=slot.key,
         request_app="",
@@ -103,16 +110,28 @@ async def _apply_member_approval_to_live_thread(request: web.Request, name: str,
         audit_caller=lambda label: "dashboard:member_profile",
     )
     # The thread now holds the record's choice; the open-time seed must not redo it.
-    slot._member_approval_seeded = True
+    # A refused apply leaves it unseeded, so a later open or turn seeds it.
+    if resp.status < 400:
+        slot._member_approval_seeded = True
 
 
 async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
-    """PUT /api/agents/{name} — update a Kiro Crew agent."""
+    """PUT /api/agents/{name} or PUT /api/agents — update a Kiro Crew agent.
+
+    In the first form the crew name comes from the URL path segment.  In the
+    second form (the proxy-safe alternative) it comes from a ``name`` field in
+    the JSON body: a reverse proxy that normalises percent-encoded paths decodes
+    ``%20`` to a literal space, which is the HTTP request-line delimiter and
+    produces a 502; putting the name in the body avoids that path entirely.
+    Both forms share the same handler; the route without ``{name}`` is
+    registered first so aiohttp's literal-path preference resolves it without
+    ambiguity.
+    """
 
     denied = await _require_owner(request, "agent.update")
     if denied is not None:
         return denied
-    name = request.match_info["name"]
+    url_name = request.match_info.get("name", "")
     try:
         body = await request.json()
     except Exception:
@@ -121,6 +140,18 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "body must be an object", "code": "body_not_object"}, status=400
         )
+    # Body-form route: extract the name from the body BEFORE the mask-removal
+    # pass below so it is never treated as a crew-record field to persist.
+    if url_name:
+        name = url_name
+    else:
+        body_name = body.pop("name", None)
+        # Use verbatim: stripping would mismatch a stored key that differs only by
+        # edge whitespace. .strip() here checks only that the value is non-empty,
+        # not the key itself.
+        name = body_name if isinstance(body_name, str) and body_name.strip() else ""
+    if not name:
+        return web.json_response({"error": "name is required", "code": "name_required"}, status=400)
     # WRITE-SIDE HALF of the roster mask, and it runs FIRST -- immediately after
     # the body-object check, before any validation. `GET /api/agents` replaces a
     # value it cannot show verbatim with `_SENSITIVE_MASK` (`_roster_mask`), and
@@ -318,6 +349,14 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 {"error": f"{_text_field} must be a string", "code": f"invalid_{_text_field}"},
                 status=400,
             )
+    if "dashboard_card_send" in body and not isinstance(body["dashboard_card_send"], bool):
+        return web.json_response(
+            {
+                "error": "dashboard_card_send must be a boolean",
+                "code": "invalid_dashboard_card_send",
+            },
+            status=400,
+        )
     if "memory_store" in body:
         memory_store_reason = _crew_memory_store_rejected(body["memory_store"])
         if memory_store_reason:
@@ -354,6 +393,11 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
     prior = None
     if "model" in body or "worker_model" in body:
         prior = (await asyncio.to_thread(KiroCrewConfig.load)).agents.get(name)
+    # The Bot's harness can depend on its files on disk; read that answer fresh,
+    # off the loop, before any model below is judged on it.
+    from kiro_crew.crewmate_harness import refresh_crew_verdict
+
+    await refresh_crew_verdict(name)
     prior_moves = prior is None or (
         pending_backend is not None and pending_backend != (prior.acp_backend or "")
     )
@@ -392,9 +436,6 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         harness_moves = pending_backend is not None and pending_backend != (
             cfg.agents[name].acp_backend or ""
         )
-        harness_pinned = bool(
-            pending_backend if pending_backend is not None else cfg.agents[name].acp_backend
-        )
         try:
             # The editor sends `model` with every save. Without a harness move an
             # inherit value or the stored value judges nothing, so a stored pin that
@@ -408,7 +449,6 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     request,
                     cfg.agent.provider,
                     backend=_pin_entitlement_backend(cfg, name, pending_backend),
-                    harness_pinned=harness_pinned,
                 )
                 if model_reason:
                     return web.json_response(
@@ -427,7 +467,6 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     request,
                     cfg.agent.provider,
                     backend=_pin_entitlement_backend(cfg, name, pending_backend, for_workers=True),
-                    harness_pinned=harness_pinned,
                 )
                 if model_reason:
                     return web.json_response(
@@ -586,6 +625,22 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     },
                     status=409,
                 )
+            from kiro_crew.approval_mode_policy import session_mode_permitted
+
+            # A NEW mode the ``permission_mode`` policy denies is refused; resending
+            # the stored one saves, and its live grant is clamped where it is seeded.
+            if body["approval_mode"] != agent.approval_mode and not session_mode_permitted(
+                body["approval_mode"]
+            ):
+                return web.json_response(
+                    {
+                        "error": f"approval mode {body['approval_mode']!r} is disabled by "
+                        "your organization's policy",
+                        "code": "mode_disabled_by_policy",
+                        "mode": body["approval_mode"],
+                    },
+                    status=403,
+                )
             # Validated above. Only ever a real choice: the profile never sends
             # "" back, so a pinned mode cannot fall back to the trust default.
             agent.approval_mode = body["approval_mode"]
@@ -737,6 +792,10 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             agent.star_order = 0
             if "star_order" not in changed:
                 changed.append("star_order")
+        if "dashboard_card_send" in body:
+            # Already validated above, before any mutation.
+            agent.dashboard_card_send = body["dashboard_card_send"]
+            changed.append("dashboard_card_send")
         effort_inputs_after = _effort_inputs(agent)
         # Avatar rollback applies only to ordinary failure: cancellation may
         # arrive after the drained worker published the new avatar pin. Store

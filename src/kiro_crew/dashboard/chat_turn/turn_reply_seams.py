@@ -6,9 +6,8 @@ stream watchdogs post, and the whole reply read back from its rows (``_turn_full
 from __future__ import annotations
 
 import asyncio
-import string
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import quote
 
 from kiro_crew.constants import reflow_and_label_glued_option_marker
@@ -16,6 +15,7 @@ from kiro_crew.dashboard.chat_utils import TRANSIENT_RETRY_KIND, chunk_generatio
 from kiro_crew.dashboard.state import row_mid
 from kiro_crew.notifications.bus import NotificationValidationError, payload_from_legacy
 from kiro_crew.security import redact
+from kiro_crew.security.text_redaction import ends_plain_sentence as _ends_plain_sentence
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
@@ -23,10 +23,12 @@ if TYPE_CHECKING:
         TurnUsage,
         crew_log_emit,
         logger,
+        mcp_apps_render,
         provider_last_turn_usage,
         read_turn_model,
         run_to_completion,
         save_slot_off_loop,
+        session_directive,
     )
     from kiro_crew.dashboard.chat_turn.file_changes import _note_reply_row
     from kiro_crew.dashboard.chat_turn.segment_flush import (
@@ -239,6 +241,7 @@ async def _record_abnormal_turn_usage(
         stop_reason=reason or turn._stop_reason or STOP_REASON_CANCELLED,
         since=turn._turn_stats0,
         usage=_usage,
+        delivered=turn._saw_text_chunk,
     ):
         turn._turn_usage_persisted = True
 
@@ -277,6 +280,7 @@ def _stamp_abnormal_turn_footer(turn) -> tuple[bool, tuple[TurnUsage, int] | Non
             turn._turn_elapsed_ms,
             model=turn._turn_model,
             ttft_ms=_ttft_visible.ms,
+            cache_rewrite=turn._turn_cache_rewrite,
         )
         return stamped, None
     if slot._acp_client is None:
@@ -301,7 +305,13 @@ def _stamp_abnormal_turn_footer(turn) -> tuple[bool, tuple[TurnUsage, int] | Non
 
 
 def _attach_abnormal_turn_stats(
-    turn, usage: TurnUsage, elapsed_ms: int, *, model: str | None = None, ttft_ms: int = 0
+    turn,
+    usage: TurnUsage,
+    elapsed_ms: int,
+    *,
+    model: str | None = None,
+    ttft_ms: int = 0,
+    cache_rewrite: bool = False,
 ) -> bool:
     """Put ``meta.turn_stats`` on the last reply row of a turn that ended abnormally.
 
@@ -314,12 +324,14 @@ def _attach_abnormal_turn_stats(
     can inject an envelope mid-turn. Scoped to this turn's rows by
     ``_turn_start_mid`` and ``_turn_msg_boundary``, which the caller only
     trusts once dispatch has set it; a turn that ended before it wrote any
-    reply row gets no footer, because there is no row to carry one. ``model``
-    and ``ttft_ms`` are the served model and first-output latency
-    EVENT_COMPLETE already read, when it did: a cut after the completion keeps
-    the footer the completion would have written, both included. A turn the
-    seam bills itself reads the model here and, as before, records no
-    ``ttft_ms``. Returns whether a row received the footer.
+    reply row gets no footer, because there is no row to carry one. ``model``,
+    ``ttft_ms`` and ``cache_rewrite`` are the served model, the first-output
+    latency and the prompt-cache rewrite flag EVENT_COMPLETE already read, when
+    it did: a cut after the completion keeps the footer the completion would
+    have written, all three included. A turn the seam bills itself reads the
+    model here and, as before, records no ``ttft_ms``; it was never judged
+    against the previous turn's cache, so it carries no rewrite flag either.
+    Returns whether a row received the footer.
 
     The row is mutated in place, so this marks the slot dirty itself, as every
     in-place row edit must: the periodic flush writes only a dirty slot, and
@@ -343,6 +355,7 @@ def _attach_abnormal_turn_stats(
                 else model
             )
             or "",
+            cache_rewrite=cache_rewrite,
         )
         row = _last_reply_row(slot, turn._turn_msg_boundary, turn._turn_start_mid)
         if stats is None or row is None:
@@ -402,36 +415,6 @@ def _flush_text_stream(turn) -> None:
 # crew-log model call the row's text came from -- so a run held over several
 # cuts goes back piece by piece. The Slack stream carries its held run across a
 # `wait` the same way (slack/handler_runtime/stream.py: move_back, _give_back).
-
-
-#: The letters of one short plain word closing a sentence ("settled.", "they've.").
-#: The text before a tool call usually ends this way, and holding the word made
-#: every such row show without its last word until the model wrote again, often
-#: minutes later. No credential can start in or run through such a word: a
-#: credential's run either begins with a mixed-case, digit or symbol prefix this
-#: shape excludes (``AKIA``, ``eyJ``, ``SG.``, ``ghp_``, ``?token=``), or is an
-#: unbroken base64-class run, which a ``.`` ends. The length cap keeps the
-#: Discord shape ([MNO] then 22 or more characters, then ``.``) out as well.
-_ASCII_LETTERS = frozenset(string.ascii_letters)
-_ASCII_LOWERCASE = frozenset(string.ascii_lowercase)
-
-
-def _ends_plain_sentence(run: str) -> bool:
-    """Whether *run*, the raw run the redactor withholds at a boundary, is one
-    plain word ending a sentence, which no text after the boundary can turn into
-    part of a credential, so the cut saves and streams it at once: an ASCII
-    letter, at most 18 lowercase letters, optionally ``'`` and 1 to 3 lowercase
-    letters, then one ``.``."""
-    stem, apostrophe, suffix = run[:-1].partition("'")
-    return (
-        run.endswith(".")
-        and 0 < len(stem) < 20
-        and stem[0] in _ASCII_LETTERS
-        and _ASCII_LOWERCASE.issuperset(stem[1:])
-        and (not apostrophe or 0 < len(suffix) < 4)
-        and _ASCII_LOWERCASE.issuperset(suffix)
-        and redact(run) == run
-    )
 
 
 def _held_continued(turn) -> bool:
@@ -503,12 +486,16 @@ def _cut_segment(turn, *, broadcast: bool = True) -> None:
     before = "".join(piece for _, piece, _, _ in turn._held_runs)
     own = run[len(before) :] if run.startswith(before) else ""
     raw = slot.segment_raw_text
+    if raw:
+        raw = mcp_apps_render.strip_quoted_markers(raw)
     kept = None
     if (
         own
         and (before or not _ends_plain_sentence(own))
         and raw is not None
-        and redact(reflow_and_label_glued_option_marker(raw)[0]).endswith(own)
+        and redact(
+            session_directive.strip_quoted_markers(reflow_and_label_glued_option_marker(raw)[0])
+        ).endswith(own)
     ):
         kept = _hold_segment_tail(slot, turn.assistant_text, own)
     if kept is None:
@@ -738,13 +725,50 @@ _TURN_DIED_CHANNEL = "system.turn"
 #: ``system.monitor`` and ``system.member`` notes use for the same reason; the
 #: mute/priority that actually govern this note travel on the channel.
 _TURN_DIED_KIND = "agent"
+#: Why a terminal arm says the turn died: the copy id the bell renders the note
+#: from in the reader's language (``SYSTEM_NOTE_BODY_KEY`` in ``notifMeta.tsx``).
+_TurnDiedNote = Literal[
+    "chat_stopped_signed_out",
+    "chat_stopped_error",
+    "chat_stopped_connection_dropped",
+    "chat_stopped_agent_restarting",
+    "chat_stopped_unrecovered",
+    "chat_stopped_busy",
+    "chat_stopped_refused",
+    "chat_stopped_stalled",
+]
+#: Each one's English body, kept on the note for every reader with no catalog.
+_TURN_DIED_BODIES: dict[_TurnDiedNote, str] = {
+    "chat_stopped_signed_out": (
+        "The chat stopped because the agent is signed out. Open the chat to sign in."
+    ),
+    "chat_stopped_error": "The chat stopped with an error. Open the chat to see what happened.",
+    "chat_stopped_connection_dropped": (
+        "The connection to the agent kept dropping. Open the chat to start a new one."
+    ),
+    "chat_stopped_agent_restarting": (
+        "The agent process kept restarting and the turn did not finish. Open the chat to retry."
+    ),
+    "chat_stopped_unrecovered": (
+        "The chat stopped and could not recover. Open the chat to start a new one."
+    ),
+    "chat_stopped_busy": (
+        "The chat stayed busy and could not recover. Open the chat to start a new one."
+    ),
+    "chat_stopped_refused": (
+        "The model declined to answer and the chat stopped. Open the chat to see why."
+    ),
+    "chat_stopped_stalled": (
+        "The chat stalled and could not recover. Open the chat to start a new one."
+    ),
+}
 
 
-def _notify_turn_died(turn, body: str) -> None:
+def _notify_turn_died(turn, note: _TurnDiedNote) -> None:
     """Raise a notification-bell entry for a turn that DIED and needs the user.
 
-    When a turn ends in an error the user must
-    act on -- a provider 5xx / throttle, a content-filter refusal, or a
+    *note* names why, as a key of :data:`_TURN_DIED_BODIES`. When a turn ends in
+    an error the user must act on -- a provider 5xx / throttle, a content-filter refusal, or a
     terminal transport death -- the transcript shows the inline error card with
     its Resume/Continue control, but nothing reaches the bell, so an operator
     working in another session learns work has stopped only by opening it. This
@@ -796,7 +820,7 @@ def _notify_turn_died(turn, body: str) -> None:
         payload = payload_from_legacy(
             _TURN_DIED_KIND,
             "⚠️ A chat stopped",
-            body,
+            _TURN_DIED_BODIES[note],
             # Name the dying slot so the banner gate scopes to it: a banner is
             # suppressed only while the operator is viewing THAT slot
             # (targetsCurrentView's n.slot === activeSlot branch), not whenever
@@ -812,6 +836,7 @@ def _notify_turn_died(turn, body: str) -> None:
             # (`dashboard:slack_<ts>`), which would read as unmuted. Same key
             # member_message_notes publishes under.
             publisher_session=slot.key or None,
+            i18n={"id": note},
         )
         # One stacked bell row per session, not one per death.
         if session_key:

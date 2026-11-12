@@ -14,6 +14,7 @@ import json
 import signal
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -407,7 +408,7 @@ class TestTeardownUsesPortableSignalConstant:
                 "kiro_crew.platform_compat.kill_process_group", return_value=True
             ) as mock_group,
         ):
-            await manager._reap_orphaned_backends()
+            await manager._reap_orphaned_backends("test")
 
         assert mock_group.call_args.args == (111, 9)
         # The reap ran to its end: the record of the gone generation is removed.
@@ -451,7 +452,7 @@ class TestOrphanReapIsPlatformCorrect:
             patch("os.getpgid", side_effect=_forbid, create=True),
             patch("os.killpg", side_effect=_forbid, create=True),
         ):
-            await manager._reap_orphaned_backends()
+            await manager._reap_orphaned_backends("test")
 
         assert calls == [(111, True), (222, True)]
 
@@ -499,6 +500,9 @@ class TestDetachOnCancelFailure:
             supports_caller_identity = True
             control_plane = False
             quarantined = False
+            # What ``launch.bound_to_owner_port`` reads before each forward.
+            pool_key = SimpleNamespace(server_name="")
+            owner_port = 0
 
             def __init__(self) -> None:
                 self.detach_called = False

@@ -98,7 +98,7 @@ from kiro_crew.browser_harness.live_hub import (
     LiveHub,
     get_live_hub,
 )
-from kiro_crew.browser_harness.supervisor import IPC_LEAF
+from kiro_crew.browser_harness.supervisor import IPC_LEAF, HelperError
 from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.handlers.browser_policy import browse_refusal
 from kiro_crew.dashboard.state import _normalize_slot_key
@@ -159,6 +159,38 @@ _OP_LOCK = LoopBoundLock()
 def _ledgered_targets(supervisor: Any) -> list[str]:
     relay = getattr(supervisor, "relay", None)
     return list(relay.agent_targets()) if relay is not None else []
+
+
+def close_chat_tabs(state: Any, session_key: str) -> None:
+    """Close, in the background, the agent tabs an ended chat session owned.
+
+    Every other chat keeps its own, and nothing is started: a chat that never
+    browsed, or a browser that is not up, has no tab to close. The close queues on
+    :data:`_OP_LOCK` behind the ops already holding or awaiting it, so a tab one of
+    them opens for this chat closes too.
+    """
+    key = live_session_key(session_key)
+    if get_live_hub().get(key) is None:
+        return
+    task = asyncio.create_task(_close_tabs_of(state, key))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+async def _close_tabs_of(state: Any, key: str) -> None:
+    hub = get_live_hub()
+    try:
+        async with _OP_LOCK:
+            if key in state._slots:
+                # A chat reopened on this key (a resume) since the close: the tabs
+                # under the key are its own now.
+                return
+            await hub.stop_stream(key)
+            relay = _live_handlers()._current_relay()
+            if relay is not None:
+                await relay.close_agent_targets(hub.targets_of(key))
+    except Exception:  # noqa: BLE001 - best effort beside a close that already committed
+        logger.debug("browser: closing the tabs of %s failed", key, exc_info=True)
 
 
 def caller_checked_call(supervisor: Any, caller_key: str) -> Any:
@@ -353,7 +385,7 @@ class _StartStopped(RuntimeError):
 def _end_allow_wait(hub: LiveHub, key: str) -> None:
     """A start parked on Chrome's Allow sheet put the card in waiting_allow: end it."""
     sess = hub.get(key)
-    if sess is not None and sess.state == STATE_WAITING_ALLOW:
+    if sess is not None and STATE_WAITING_ALLOW in (sess.state, sess.queued_state):
         hub.set_state(key, STATE_ERROR)
 
 
@@ -388,7 +420,12 @@ async def _bind_target(hub: LiveHub, key: str, supervisor: Any, call: Any = None
     """
     call = supervisor.call if call is None else call
     ledgered = set(_ledgered_targets(supervisor))
-    tab = await call("current_tab")
+    try:
+        tab = await call("current_tab")
+    except HelperError:
+        # The daemon's tab is gone (an ended chat closed it, or the person did):
+        # there is no current tab, so this session binds or opens its own.
+        tab = None
     current = ""
     if isinstance(tab, dict):
         current = str(tab.get("targetId") or tab.get("target_id") or "")
@@ -683,8 +720,23 @@ async def api_browser_handback(request: web.Request) -> web.Response:
         # The parked op's own hand-back choices, shown on the card's hand-back bar.
         hub.set_handback_options(key, body.get("options"))
     released = await hub.wait_for_release(key, HANDBACK_WAIT_S)
+    if hub.hold_over(key):
+        # The hub's hold ended first: any hand-back since went to chat, so the op
+        # stops here instead of running behind what the person said there. A note
+        # given to this op before it was taken back again still reaches it here.
+        # The end is left in place, so every call parked in this session hears it.
+        said = hub.take_handback(key)
+        return web.json_response(
+            {
+                "released": False,
+                "hold_over": True,
+                "hold_timeout_s": HOLD_TIMEOUT_S,
+                "handed_back": said,
+            }
+        )
     answer: dict[str, Any] = {"released": released, "hold_timeout_s": HOLD_TIMEOUT_S}
     if released:
+        hub.handback_seen(key)
         # What the person said as they handed back: their own words, never page content.
         answer["handed_back"] = hub.take_handback(key)
     return web.json_response(answer)

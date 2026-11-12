@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 from aiohttp import web
 
 from kiro_crew import _facade_mirror, platform_compat
-from kiro_crew.dashboard import terminal_commands
+from kiro_crew.dashboard import terminal_commands, ws_heartbeat
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.handlers.files import _PathProbeBusy, _run_path_probe
 from kiro_crew.dashboard.handlers.terminal_complete import (
@@ -54,6 +54,7 @@ from kiro_crew.dashboard.handlers.terminal_lifecycle import (
     _sess_alive,
     _sess_pid,
     _take_shell_to_evict,
+    apply_terminal_enabled,
 )
 from kiro_crew.dashboard.handlers.terminal_placement import (
     _CHAT_NOT_LOADED,
@@ -74,6 +75,7 @@ from kiro_crew.dashboard.handlers.terminal_session import (
     _get_registry,
     _is_enabled,
     _sel,
+    _terminal_enabled,
     _TerminalSession,
 )
 from kiro_crew.dashboard.handlers.terminal_shell import (
@@ -660,7 +662,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         registry[session_id] = None
 
     try:
-        ws = web.WebSocketResponse(heartbeat=30, timeout=300)
+        ws = ws_heartbeat.LagTolerantWebSocketResponse(heartbeat=30, timeout=300)
         cwd = ""
         if placeholder:
             try:
@@ -990,6 +992,13 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         # displaced shell untouched: it goes back unless its id was opened afresh.
         if evicted is not None and not _restore_evicted_shell(registry, evicted):
             await _end_evicted_shell(request.app, evicted, max_sessions)
+
+    # A switch-off applied while this open awaited skipped its reservation: read the
+    # switch again now that the shell is published, so this read or the applier ends it.
+    cfg = _get_config(request)
+    if registry.get(session_id) is sess and not _terminal_enabled(cfg):
+        await apply_terminal_enabled(registry, cfg)
+        return ws
 
     # The placement check above ran before this shell was published, and a bind
     # in between skipped the then-unpublished reservation: read it again now
@@ -1548,7 +1557,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _orphan_timeout_s,
         _record_orphan_reap,
         _shell_failure_note,
+        _shell_to_evict,
         _sweep_terminals,
+        end_shells_if_policy_refuses,
         reap_orphaned_terminals,
     )
     from kiro_crew.dashboard.handlers.terminal_placement import (  # noqa: F401
@@ -1562,6 +1573,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.terminal_session import (  # noqa: F401
         _ConptyBackend,
         _enabled_cache,
+        _policy_refuses_terminal,
         _read_terminal_config,
     )
     from kiro_crew.dashboard.handlers.terminal_transport import (  # noqa: F401

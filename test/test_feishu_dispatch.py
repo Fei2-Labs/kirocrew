@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import inspect
+import json
 import os
 from types import SimpleNamespace
 
@@ -14,6 +16,7 @@ from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
 from kiro_crew.feishu.client import LarkInbound
 from kiro_crew.feishu.transport_dispatch import FeishuDispatcher
 from kiro_crew.messaging.attachments import Attachment
+from kiro_crew.messaging.commands import COMPACT_ACCOUNT_CHANGED_REPLY_ZH
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import (
     CHAT_TYPE_DIRECT,
@@ -22,6 +25,11 @@ from kiro_crew.messaging.link import (
     build_dm_session_key,
 )
 from kiro_crew.session_allocation import SessionClosingError
+
+#: A real 2x2 PNG: outbound extraction admits a file on its byte signature.
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP8zwACTGCSAQANHQEDgslx/wAAAABJRU5ErkJggg=="
+)
 
 # Fakes
 
@@ -126,6 +134,13 @@ class FakeSessions:
         self.acquired.append(key)
         return self._acquire
 
+    #: True models a session the Kiro account check flagged: ``try_acquire``
+    #: refuses it while it stays registered.
+    retiring = False
+
+    def is_retiring(self, key) -> bool:
+        return self.retiring
+
     def has_session(self, key) -> bool:
         return self._has_session
 
@@ -195,6 +210,7 @@ class FakeClient:
     def __init__(self) -> None:
         self.replies: list[tuple[str, str]] = []
         self.downloads: list[tuple[str, str, str]] = []
+        self.images: list[tuple[str, bytes]] = []
 
     async def send_reply(self, message_id: str, content: str) -> bool:
         # Mirrors the real LarkClient contract: True on delivery.
@@ -208,6 +224,10 @@ class FakeClient:
         with open(dest, "wb") as fh:
             fh.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
 
+    async def send_image_reply(self, message_id: str, data: bytes) -> bool:
+        self.images.append((message_id, data))
+        return True
+
 
 class FakeConvLog:
     def __init__(self) -> None:
@@ -218,7 +238,7 @@ class FakeConvLog:
         self.agents: list[str | None] = []
         self.titles: dict[str, str] = {}
 
-    def append(self, key, role, text, *, agent=None, mid=None) -> None:
+    def append(self, key, role, text, *, agent=None, mid=None, ingested_images=()) -> None:
         self.appended.append((key, role, text))
         self.agents.append(agent)
 
@@ -629,6 +649,47 @@ class TestTurn:
         ]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "chat_type, restricted, sent",
+        [("p2p", False, True), ("group", False, False), ("p2p", True, False)],
+    )
+    async def test_an_image_in_the_sessions_cwd_is_sent_only_in_an_unrestricted_dm(
+        self, tmp_path, monkeypatch, chat_type: str, restricted: bool, sent: bool
+    ) -> None:
+        """The upload root is the provider's own cwd, bound once the session exists.
+
+        A group keeps the path (its members are not all on the allow-list), and so
+        does a conversation the shared restricted-session ceiling refuses.
+        """
+
+        async def _ceiling(*_args, **_kwargs) -> bool:
+            return restricted
+
+        monkeypatch.setattr("kiro_crew.feishu.transport_dispatch.uploads_restricted", _ceiling)
+        chart = tmp_path / "chart.png"
+        chart.write_bytes(_PNG)
+        provider = FakeProvider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text=f"Plotted.\n\n![chart]({chart})"),
+                AcpEvent(kind=EVENT_COMPLETE),
+            ]
+        )
+        provider.cwd = str(tmp_path)
+        client = FakeClient()
+        d = _dispatcher(FakeSessions(provider), FakeCtx(), client)
+
+        await d.handle_message(
+            _inbound("plot it", message_id="m1", chat_type=chat_type, chat_id="oc_group")
+        )
+
+        if sent:
+            assert ("m1", "Plotted.") in client.replies
+            assert client.images == [("m1", _PNG)]
+        else:
+            assert ("m1", f"Plotted.\n\n![chart]({chart})") in client.replies
+            assert client.images == []
+
+    @pytest.mark.asyncio
     async def test_latch_is_per_route_so_a_group_warns_independently(self) -> None:
         """A group's latch is its own; a DM latch must not silence it."""
         provider = FakeProvider(
@@ -905,6 +966,22 @@ class TestCommands:
         assert provider.compacted is False
         assert sessions.released == []
         assert client.replies == [("msg1", "⏳ 正在处理上一条消息，请稍后再试 /compact。")]
+
+    @pytest.mark.asyncio
+    async def test_compact_on_a_flagged_session_says_the_account_changed(self) -> None:
+        # The Kiro account check flagged the session without retiring it: try_acquire
+        # refuses it while has_session still answers True, and no reply is running.
+        provider = FakeProvider([])
+        sessions = FakeSessions(provider, acquire=False, has_session=True)
+        sessions.retiring = True
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        assert provider.compacted is False
+        assert sessions.released == []
+        assert client.replies == [("msg1", COMPACT_ACCOUNT_CHANGED_REPLY_ZH)]
 
     @pytest.mark.asyncio
     async def test_compact_without_active_session(self) -> None:
@@ -1289,6 +1366,35 @@ class TestInboundFiles:
         assert "is saved in the folder" in user_text
         assert not os.path.exists(saved)  # removed when the turn ended
         assert any(content == "a cat" for _, content in client.replies)
+
+    @pytest.mark.asyncio
+    async def test_a_picture_still_shows_after_the_turn(self, tmp_path) -> None:
+        """The row names a copy kept with the session, not the temp file the turn deletes.
+
+        A path the user typed is theirs: it stays as written and is not copied.
+        """
+        from kiro_crew.chat_attachments import attachments_dir
+        from kiro_crew.history import ConversationLog
+
+        typed = tmp_path / "mine.png"
+        typed.write_bytes(b"\x89PNG\r\n\x1a\n")
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="a cat"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        d = _dispatcher(FakeSessions(provider), FakeCtx(), FakeClient(), conv_log=log)
+        inbound = dataclasses.replace(_image_inbound(), text=f"![mine]({typed})")
+
+        await d.handle_message(inbound)
+
+        path = log._path(d._session_key(d._route(inbound)))
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        user_text = next(row["content"] for row in rows if row.get("role") == "user")
+        store = attachments_dir(path.parent, path.stem)
+        assert store.is_dir(), user_text
+        (stored,) = store.iterdir()
+        stored_dest = str(stored).replace(os.sep, "/")
+        assert user_text.splitlines() == [f"![mine]({typed})", f"![image]({stored_dest})"]
 
     @pytest.mark.asyncio
     async def test_a_governance_deny_fetches_nothing(self, monkeypatch) -> None:

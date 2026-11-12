@@ -130,6 +130,7 @@ from kiro_crew.config.loader import (
 )
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
     LEAKED_TOOL_CALL_NOTE,
     NO_TOOL_CALLS_NOTE,
     SUBAGENT_COMPLETION_META_KEY,
@@ -148,6 +149,11 @@ from kiro_crew.cron import (
     effective_wake_budget,
 )
 from kiro_crew.cron_script import delivery_fingerprint, run_command_sandboxed, run_script_sandboxed
+from kiro_crew.cron_service.fields import (  # noqa: F401
+    auto_job_approver,
+    effective_job_approval_mode,
+)
+from kiro_crew.cron_service.grant_resurface import resurface_stale_grant
 from kiro_crew.dashboard import cautious_boot, start_dashboard, token_secret
 from kiro_crew.dashboard.chat_persistence import (
     rehydrate_slot_from_history_async,
@@ -156,7 +162,6 @@ from kiro_crew.dashboard.chat_persistence import (
 from kiro_crew.dashboard.chat_runner import (
     _auto_approve_reason,
     _resolve_channel_target,
-    _retire_sessions_on_identity_change,
     _run_chat,
     _slot_is_trusted,
     _start_next_queued_turn,
@@ -182,6 +187,8 @@ from kiro_crew.dashboard.cron_inject import (
 from kiro_crew.dashboard.handlers import MAX_PROMPT_BYTES
 from kiro_crew.dashboard.handlers.autonudge import (
     _redact_monitor_value,
+    _scrub_serialized_field,
+    _withhold_serialized_field,
     compose_nudge_body,
     render_nudge_message,
 )
@@ -249,7 +256,7 @@ from kiro_crew.executors import (
     subprocess_executor,
 )
 from kiro_crew.frontend import build_frontend_async
-from kiro_crew.gateway_restart import resolve_restart_launcher, supervisor_reentry
+from kiro_crew.gateway_restart import resolve_restart_launcher
 from kiro_crew.gateway_shutdown_budget import (
     GRACEFUL_SHUTDOWN_SECS,
     PERSISTENCE_DRAIN_GRACE_SECS,
@@ -279,6 +286,7 @@ from kiro_crew.llm_helpers import (
     acp_error_after_tool_activity,
     acp_error_is_session_not_found,
     acp_error_is_transient,
+    acp_error_needs_sign_in,
     annotate_model_fallback,
     append_fallback_story,
     configured_fallback_chain,
@@ -365,8 +373,8 @@ from kiro_crew.monitoring.models import (
     monitor_state_public_dict,
 )
 from kiro_crew.notifications.bus import MONITOR_CHANNEL
-from kiro_crew.parent_turns import ledger_of, note_turn_landed, settle_turn, settles_at_release
-from kiro_crew.platform import boot_platform, release_apply
+from kiro_crew.parent_turns import ledger_of, note_turn_landed, settle_turn
+from kiro_crew.platform import boot_platform
 from kiro_crew.platform.bootstrap import apply_kas_cli_floor
 from kiro_crew.platform.context import (
     PlatformCompositionError,
@@ -395,8 +403,7 @@ from kiro_crew.platform.update_capability import (
     AutoUpdateEffect,
     auto_update_effect,
 )
-from kiro_crew.platform.update_fetch import fetch_and_pin_upstream
-from kiro_crew.platform.update_governance import (
+from kiro_crew.platform.update_governance import (  # noqa: F401
     commits_ahead,
     git_command_env,
     hidden_worktree_edits,
@@ -409,7 +416,8 @@ from kiro_crew.platform.update_governance import (
 )
 from kiro_crew.pre_exec_stops import run_pre_exec_stops
 from kiro_crew.providers.base import LLMEvent
-from kiro_crew.safety_override import flush_breadcrumb_writes, safety_override
+from kiro_crew.recovery.ladder import L4_GATEWAYD, LADDER
+from kiro_crew.safety_override import flush_breadcrumb_writes, safety_override  # noqa: F401
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
@@ -426,7 +434,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.security.readonly_bash import command_invokes_git, is_read_only_bash
 from kiro_crew.sel import flush_audit_queue, flush_audit_queue_before_hard_exit, sel
-from kiro_crew.service.common import restart_command_hint
+from kiro_crew.service.common import restart_command_hint  # noqa: F401
 from kiro_crew.session import (
     HEARTBEAT_KEY,
     SessionBusyError,
@@ -560,6 +568,7 @@ from kiro_crew.slack.gateway_runtime.result_egress import (
 from kiro_crew.slack.gateway_runtime.runtime_charge import (
     _apply_gate_verdict,
     _charge_failure,
+    _cron_auth_expiry,
     _cron_failure_attribution,
     _streak_after_charge,
 )
@@ -625,6 +634,7 @@ from kiro_crew.subagent import (
     DIGEST_HOLD_SECS,
     INJECTION_TIMEOUT,
     ORPHAN_NOTICE_OWED,
+    HostSpawnDecision,
     SpawnApprovalUnreachable,
     SubagentDelivery,
     SubagentInfo,
@@ -660,6 +670,7 @@ if TYPE_CHECKING:
     from kiro_crew.memory_startup import MemoryStartup
     from kiro_crew.messaging.registry import ChannelDescriptor
     from kiro_crew.providers.base import LLMProvider
+    from kiro_crew.slack.events import SeenCache
     from kiro_crew.subagent_scale import SubagentEventCoalescer
     from kiro_crew.task_models import Task
     from kiro_crew.teams.client import TeamsClient
@@ -733,6 +744,14 @@ class GatewayOrchestrator:
     _tracking_channels: set[str]
     _open_channels: set[str]
     _slack_enabled: bool
+    _slack_seen: SeenCache | None
+    _slack_team_id: str
+    _slack_workspace_pinned: bool
+    _slack_pin_token: str
+    _slack_reconnect_task: asyncio.Task[dict[str, Any]] | None
+    _slack_reconnecting: bool
+    _slack_client_lost: bool
+    _slack_give_up_task: asyncio.Task[None] | None
     slack_command: str
     _channel_restart_lock: asyncio.Lock
     _channel_transports_started: bool
@@ -766,6 +785,7 @@ class GatewayOrchestrator:
     channel_history: ChannelHistory | None
     dashboard_state: DashboardState | None
     _background_tasks: set[asyncio.Task]
+    _skills_sync_task: "asyncio.Task[list[tuple[str, Path]]] | None"
     _mcp_launch_approval_ready: asyncio.Event
     _memory_startup: MemoryStartup | None
     _memory_startup_task: asyncio.Task | None
@@ -791,16 +811,14 @@ class GatewayOrchestrator:
     _update_check_task: "asyncio.Task[None] | None"
     _profile_watch_task: "asyncio.Task[None] | None"
     _update_apply_deferred: bool
-    _restart_gate_hold: "asyncio.Task[None] | None"
     _update_pause_holder: str | None
-    _pending_update_respawn: Callable[[], str] | None
-    _pending_update_mandatory: bool
-    _pending_update_mandatory_key: str
-    _pending_update_version: str
-    _mandatory_update_deferred_at: float | None
-    _mandatory_update_deferred_key: str | None
     _wheel_update_noticed: set[str]
     _mcp_gateway_manager: GatewayManager | None
+    # A manager whose start failed, held while ``_mcp_gateway_start_retry``
+    # starts it again (gateway_runtime/mcp_broker.py). Defaulted on the class
+    # so the ``__new__`` fixtures that never run ``__init__`` read "no retry".
+    _mcp_gateway_pending: GatewayManager | None = None
+    _mcp_gateway_start_retry: asyncio.Task[None] | None = None
     _mcp_resolve_prefetch: asyncio.Task[None] | None
     _mcp_target_env: dict[str, str]
     _mcp_overlay_refresh_lock: asyncio.Lock | None = None
@@ -905,6 +923,7 @@ class GatewayOrchestrator:
 
     # gateway_runtime/delivery.py
     _open_dm_with_retry = _delivery._open_dm_with_retry
+    _cron_dm_user = _delivery._cron_dm_user
     _record_cron_delivery = _delivery._record_cron_delivery
     _remember_options = _delivery._remember_options
     # gateway_runtime/delivery.py
@@ -920,7 +939,10 @@ class GatewayOrchestrator:
     # legitimately differ in control flow (one re-raises), in who owns
     # `record_failure()`, and in wording. What they must NOT differ in is the
     # mechanism below -- the dedup window, the Slack-sink hardening, the
-    # one-surface delivery rule, and when the dedup anchor advances.
+    # one-surface delivery rule, and when the dedup anchor advances. The notice
+    # for a run the cron service's stop cut short (`_alert_cron_interrupted`) is
+    # not a failure and leaves the dedup alone, but it takes the same Slack-sink
+    # hardening and one-surface delivery rule.
     #
     # A docstring promising the two "cannot drift" is prose, not a mechanism:
     # nothing in it stops one surface's DM saying only "check logs" while the
@@ -934,6 +956,7 @@ class GatewayOrchestrator:
     _deliver_failure_alert = _cron_failure._deliver_failure_alert
     _advance_failure_dedup = _cron_failure._advance_failure_dedup
     _alert_cron_failure = _cron_failure._alert_cron_failure
+    _alert_cron_interrupted = _cron_failure._alert_cron_interrupted
     _cron_single_failure = _cron_failure._cron_single_failure
     # gateway_runtime/delivery.py
     _cron_job_is_silent = _delivery._cron_job_is_silent
@@ -973,6 +996,7 @@ class GatewayOrchestrator:
     _report_monitor_completion = _nudge_chan._report_monitor_completion
     # gateway_runtime/nudge_dashboard_fire.py
     _fire_dashboard_nudge = _nudge_dash._fire_dashboard_nudge
+    _start_dashboard_wake_turn = _nudge_dash._start_dashboard_wake_turn
     _work_ledger_wake_loop = _nudge_dash._work_ledger_wake_loop
     _work_ledger_wake_text = _nudge_dash._work_ledger_wake_text
     _steer_work_ledger_wake = _nudge_dash._steer_work_ledger_wake
@@ -994,6 +1018,8 @@ class GatewayOrchestrator:
     _parent_tab = _subagent_injection._parent_tab
     _route_completion = _subagent_injection._route_completion
     _reset_cron_parent_when_idle = _subagent_injection._reset_cron_parent_when_idle
+    _route_cron_parent_to_tab = _subagent_injection._route_cron_parent_to_tab
+    _drop_cron_injection = _subagent_injection._drop_cron_injection
 
     @staticmethod
     def _notif_meta(parent_key: str | None) -> dict[str, str] | None:
@@ -1066,6 +1092,9 @@ class GatewayOrchestrator:
     # gateway_runtime/mcp_broker.py
     _schedule_mcp_launch_approval_persist = _mcp_broker._schedule_mcp_launch_approval_persist
     _init_mcp_gateway = _mcp_broker._init_mcp_gateway
+    _mark_mcp_broker_ready = _mcp_broker._mark_mcp_broker_ready
+    _mcp_gateway_start_retry_delay = _mcp_broker._mcp_gateway_start_retry_delay
+    _retry_mcp_gateway_start = _mcp_broker._retry_mcp_gateway_start
 
     #: Floor on the gap between timed pre-resolve passes. ``refresh_hours = 0``
     #: legitimately means "always stale" for the freshness check, but it must not
@@ -1087,11 +1116,6 @@ class GatewayOrchestrator:
     # Auto-update
     # ------------------------------------------------------------------
 
-    @update_ownership.owning(update_ownership.Step.RESTART)
-    async def _restart_after_update(self, respawn: Callable[[], str]) -> None:
-        """Restart into an applied update, owning the restart step while it runs."""
-        await GatewayOrchestrator._restart_after_update_body(self, respawn)
-
     # gateway_runtime/install_repair.py
     _DEP_INSTALL_TIMEOUT_SECS = _install._DEP_INSTALL_TIMEOUT_SECS
     _KIRO_CLI_VERSION_TIMEOUT_SECS = _install._KIRO_CLI_VERSION_TIMEOUT_SECS
@@ -1108,27 +1132,17 @@ class GatewayOrchestrator:
     _live_update_handler_tasks = _upd_sched._live_update_handler_tasks
     _drain_update_callback_work = _upd_sched._drain_update_callback_work
     _UPDATE_BUSY_RETRY_SECS = _upd_sched._UPDATE_BUSY_RETRY_SECS
-    _MANDATORY_UPDATE_MAX_DEFER_SECS = _upd_sched._MANDATORY_UPDATE_MAX_DEFER_SECS
     _UPDATE_DRAIN_TIMEOUT_SECS = _upd_sched._UPDATE_DRAIN_TIMEOUT_SECS
-    _prepare_auto_update_apply = _upd_sched._prepare_auto_update_apply
     _finish_auto_update_apply = _upd_sched._finish_auto_update_apply
-    _RESTART_GATE_HOLD_SECS = _upd_sched._RESTART_GATE_HOLD_SECS
-    _restart_gate_when_idle = _upd_sched._restart_gate_when_idle
-    _release_restart_gate_hold = _upd_sched._release_restart_gate_hold
     _wheel_apply_module = staticmethod(_upd_sched._wheel_apply_module)
-    _dashboard_policy_applies = staticmethod(_upd_sched._dashboard_policy_applies)
     _settle_update_work = _upd_sched._settle_update_work
     _run_update_checks = _upd_sched._run_update_checks
-    _retry_pending_update_restart = _upd_sched._retry_pending_update_restart
     _check_for_updates = _upd_sched._check_for_updates
     _auto_update_effect = _upd_sched._auto_update_effect
     _publish_provider_update_state = _upd_sched._publish_provider_update_state
     _check_for_updates_via_provider = _upd_sched._check_for_updates_via_provider
-    _restart_after_update_claimed = _upd_sched._restart_after_update_claimed
     _check_for_updates_legacy = _upd_sched._check_for_updates_legacy
-    _restart_after_update_body = _upd_sched._restart_after_update_body
     # gateway_runtime/update_apply.py
-    _auto_apply_update = _upd_apply._auto_apply_update
     _auto_apply_wheel_update = _upd_apply._auto_apply_wheel_update
     _notice_wheel_update_once = _upd_apply._notice_wheel_update_once
 

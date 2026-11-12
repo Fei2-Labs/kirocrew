@@ -17,6 +17,10 @@ from consolidation_lease_helpers import lease_aware_log
 
 from kiro_crew.history import _CONSOLIDATION_THRESHOLD, ConversationLog, HistoryConsolidator
 
+#: These tests start background helper turns, which are skipped while the host's
+#: memory posture is critical (see ``ample_host_free_memory``).
+pytestmark = pytest.mark.usefixtures("ample_host_free_memory")
+
 # Tests for consolidation offset only advances on success
 
 
@@ -866,6 +870,7 @@ class TestConsolidationEmbedBreaker:
             return vec
 
         store.embed_fn = fast_embed
+        store.set_embedding_dim(8)
         try:
             self._consolidator(store)._write_structured_memory(
                 {"episodic": self._episodes(5)}, "sess-1"

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew import acp_tool_gate, mediated_request_capability, permission_floor
 from kiro_crew import sel as sel_module
@@ -59,14 +59,17 @@ from kiro_crew.acp.types import (
     UPDATE_CURRENT_MODE,
     AcpEvent,
     JsonRpcMessage,
+    rejection_reason_meta,
 )
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_FORBIDDEN_MODES,
     ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS,
     ACP_BACKENDS_DIRECT_CLIENT_CHILD_CALLS_MARKED,
     ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL,
+    permission_value_for,
     session_config_drift_issue,
 )
+from kiro_crew.constants import DENY_CAUSE_POLICY
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.security.deny_waiver import child_calls_marked
 from kiro_crew.trust_patterns import GrantDeadline, GrantEnded, grant_deadline_guard
@@ -78,11 +81,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("kiro_crew.acp.client")
 
 
-# No CODEX_PATH constant: the adapter ships a compatible Codex binary as an npm
-# dependency and reads CODEX_PATH itself only to run a DIFFERENT one. An operator
-# who sets it reaches the child through the ambient environment copy, so naming it
-# here would imply a wiring that does not exist (its claude counterpart,
-# CLAUDE_CODE_EXECUTABLE, IS explicitly forwarded — the asymmetry is deliberate).
+# No CODEX_PATH constant here: the codex harness owns it
+# (``acp.harness.codex.CODEX_PATH_ENV``) and fills it on the runtime spawn with the
+# host's ``codex`` when that is at least the version of the Codex the adapter
+# bundles, as the claude host fills CLAUDE_CODE_EXECUTABLE.
 
 
 # The adapter release the gate contract was OBSERVED on: the frame corpus
@@ -147,7 +149,8 @@ async def _apply_session_permission_routing(self: AcpClient) -> None:
     decision, so the scope lives in one place instead of being re-derived here.
     """
     backend = self.backend
-    option_id, value = acp_tool_gate.permission_config_for(backend)
+    option_id, _required = acp_tool_gate.permission_config_for(backend)
+    value = permission_value_for(backend, self._acp_config_options)
     issue = acp_tool_gate.session_config_issue(backend, self._acp_config_options)
     if issue:
         # Not advertised: INDETERMINATE, never BYPASSED. The adapter may well
@@ -364,8 +367,9 @@ async def approve_tool(
     pi_gate_tool = getattr(self, "_pi_gate_request_tool", {}).pop(str(request_id), None)
     resolved_id = option_id
     recorded: dict[str, str] | None = None
-    # Read before the pop below: the Copilot downgrade needs the offered ids.
-    offered = (self._permission_options.get(request_id) or {}) if self._is_copilot else {}
+    # Read before the pop below: the allow-always downgrade needs the offered ids.
+    once_only = self._is_copilot or capability.for_connection
+    offered = (self._permission_options.get(request_id) or {}) if once_only else {}
     if resolved_id is None:
         recorded = self._permission_options.pop(request_id, None)
         # A recorded entry may carry only a "reject" id (a request that
@@ -374,15 +378,14 @@ async def approve_tool(
         resolved_id = (recorded or {}).get("always" if always else "once")
         if resolved_id is None:
             resolved_id = OPTION_ALLOW_ALWAYS if always else OPTION_ALLOW_ONCE
-    if self._is_copilot and resolved_id in (OPTION_ALLOW_ALWAYS, offered.get("always")):
+    if once_only:
         # Copilot CLI's allow-always stops it asking about that tool for the rest
         # of the session, so every later call -- each later file of a patch
         # included -- would run with no permission frame for Crew's gates to
-        # judge. Crew keeps its own approval memory; Copilot is answered once,
-        # with its own once id, or the canonical one when the frame recorded
-        # allow-always in that slot too.
-        once = offered.get("once")
-        resolved_id = once if once and once != offered.get("always") else OPTION_ALLOW_ONCE
+        # judge. Any harness does the same for a Crew-owned Connection's tool,
+        # whose later calls the gateway proxy then refuses for want of an
+        # approval. Crew keeps its own approval memory; the harness is answered once.
+        resolved_id = once_for_always(resolved_id, offered)
     # The wait for the write lock is the last await before the answer goes
     # out, so the withdrawal is read again under that lock.
     # The approval mints the single-use mediated-secret capability for this call
@@ -431,6 +434,32 @@ async def approve_tool(
     return True
 
 
+def _bridged_servers(client: AcpClient) -> tuple[str, ...]:
+    """The placed servers this session reaches through a Crew-owned Connection bridge."""
+    session_key = getattr(client, "_session_key", None) or ""
+    if not session_key:
+        return ()
+    from kiro_crew.connections import crew_oauth_proxy
+
+    return tuple(
+        n
+        for n in client._placed_mcp_server_names()
+        if crew_oauth_proxy.is_connection_server(session_key, n)
+    )
+
+
+def once_for_always(resolved_id: str, offered: dict[str, str]) -> str:
+    """*resolved_id*, or the once id when it would answer allow-always.
+
+    The frame's own once id, or the canonical one when the frame recorded
+    allow-always in that slot too.
+    """
+    if resolved_id not in (OPTION_ALLOW_ALWAYS, offered.get("always")):
+        return resolved_id
+    once = offered.get("once")
+    return once if once and once != offered.get("always") else OPTION_ALLOW_ONCE
+
+
 def _restore_withdrawn(
     client: AcpClient,
     request_id: str | int,
@@ -460,8 +489,12 @@ def _note_pi_gate_denied(self: AcpClient, request_id: str | int) -> None:
         self._pi_gate_denied_ids.add(tool_call_id)
 
 
-async def reject_tool(self: AcpClient, request_id: str | int) -> None:
+async def reject_tool(self: AcpClient, request_id: str | int, reason: str = "") -> None:
     """Reject a pending session/request_permission.
+
+    *reason* is what the person typed with the rejection; on KAS it rides the
+    one-time Deny as ``_meta.kiro.rejectionReason`` (see
+    ``AcpSessionHandle.reject_tool``). Every other backend sends none.
 
     Prefers a clean ``selected`` reject using the reject optionId the agent
     advertised (claude-agent-acp offers ``reject`` → behavior:"deny",
@@ -484,9 +517,13 @@ async def reject_tool(self: AcpClient, request_id: str | int) -> None:
     self._turn_permission_denied = True
     reject_id = recorded.get("reject") if recorded else None
     if reject_id:
-        await self._send_response(
-            request_id, {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": reject_id}}
+        response: dict[str, Any] = {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": reject_id}}
+        reason_meta = (
+            rejection_reason_meta(reason) if reason and self.backend == ACP_BACKEND_KAS else None
         )
+        if reason_meta is not None:
+            response["_meta"] = reason_meta
+        await self._send_response(request_id, response)
     else:
         # Last resort, and not a per-tool signal: kiro-cli maps a
         # `cancelled` outcome to cancelling the TURN, so every later tool
@@ -578,6 +615,12 @@ async def _handle_permission(self: AcpClient, msg: JsonRpcMessage) -> None:
         await asyncio.to_thread(
             permission_floor.audit_refusal, event, reason, request_id=request_id
         )
+        # No consumer answers this request, so the host notice is steered here
+        # first: the reject alone reaches the model as a user's denial.
+        # circular import: llm_helpers_parts.tool_approval imports kiro_crew.acp as it loads.
+        from kiro_crew.llm_helpers_parts.tool_approval import _steer_host_deny
+
+        await _steer_host_deny(self, event, reason, cause=DENY_CAUSE_POLICY)
         await self.reject_tool(request_id)
         return
 
@@ -1406,6 +1449,7 @@ def _build_permission_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | 
             kas_consent_meta=self.backend == ACP_BACKEND_KAS,
             harness_backend=self.backend,
             harness_mcp_servers=self._harness_mcp_server_names(),
+            bridged_mcp_servers=_bridged_servers(self),
             side_read_only=getattr(self, "_side_read_only", False),
             deepseek_read_only_issue=getattr(
                 self, "_deepseek_read_only_issue", "the harness composition was not read back"

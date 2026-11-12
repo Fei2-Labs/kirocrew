@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import { X, MailOpen, Check, MessageSquare, CheckCircle, Ban, Clock, ClipboardList, ArrowUpRight, Sparkles } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { shallowEqual } from 'react-redux'
+import { useQuery } from '@tanstack/react-query'
 import { useGuardedLeave } from '../NavigationLeaveGuard'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { ackNotification, unackNotification, decideApprovalRow, rowPhase } from '../../store/notificationsSlice'
@@ -18,7 +19,8 @@ import { KIND_META, DEFAULT_META, fmtFull, noteText, safeInternalUrl, decisionFa
 import { CrewmateNoteFace, CrewmateNoteName, CrewmateRosterError, noteMember } from './CrewmateNoteFace'
 import { safeHttpUrl } from '../../lib/safeUrl'
 import { isGatewayConnected, sendErrorToChat, subscribeGatewayConnected } from '../../utils/errorReport'
-import { buildNotificationPrompt } from './notificationHandoff.prompt'
+import { buildNotificationPrompt, isCutCronResult, wholeCronResult } from './notificationHandoff.prompt'
+import { cronJobsQuery } from '../../api/cronJobsQuery'
 import { isMemberThreadSlot } from '../../hooks/unreadOnAttention'
 
 import { i18nT } from '../../i18n/t'
@@ -100,7 +102,7 @@ export default function NotificationDetailPanel({ n, onClose, onLeave }: { n: No
   // A retired row says "no longer pending", so its failed DELETE shows no
   // recorded decision; the feed reads the same rule.
   const decidedDismissFailed = phase === 'decided'
-  const refusalCopy = failureHere && !buttonsWithdrawn ? decisionFailedCopy(failureHere.reason, { targeted: !!n.approval_instance })
+  const refusalCopy = failureHere && !buttonsWithdrawn ? decisionFailedCopy(failureHere.reason)
     : endedFailure !== null ? decisionFailedCopy(endedFailure, { ended: true }) : null
   // Withdrawing the buttons unmounts the one the user just pressed, which
   // drops keyboard focus to <body>. Move it to the panel's Close, which only
@@ -137,8 +139,12 @@ export default function NotificationDetailPanel({ n, onClose, onLeave }: { n: No
   // notification, through the same channel "Ask the agent" uses. Hidden while the
   // gateway is down: the composer it lands in could not send.
   const gatewayConnected = useSyncExternalStore(subscribeGatewayConnected, isGatewayConnected)
+  // A cron note whose body the store cut hands over the job's whole result,
+  // read ahead so the click stays synchronous inside the leave guard.
+  const { data: cronJobs } = useQuery({ ...cronJobsQuery, enabled: isCutCronResult(n) })
   const fixWithCrew = () => leave(() => {
-    const prompt = buildNotificationPrompt(n, i18nT('components.notifications.notificationDetailPanel.fix_with_crew_ask'))
+    const whole = wholeCronResult(n, cronJobs?.find(j => j.id === n.job_id))
+    const prompt = buildNotificationPrompt(n, i18nT('components.notifications.notificationDetailPanel.fix_with_crew_ask'), whole)
     // `leaveGranted`: the guard above already asked the host page.
     if (sendErrorToChat(prompt, { leaveGranted: true })) onClose()
   })
@@ -320,10 +326,10 @@ export default function NotificationDetailPanel({ n, onClose, onLeave }: { n: No
                 testId="notif-approval-refusal"
                 message={refusalCopy}
               />
-              {/* A refused decide failed, so it is an error; see the no
-                  hand-off note above. */}
-              <ErrorNotice
-                variant="inline"
+              {/* A decide that found the approval gone is status, not an
+                  error: nothing the user did failed. */}
+              <StatusNotice
+                tone="info"
                 className={refusalCopy !== null ? 'mt-2' : 'mt-4'}
                 testId="notif-approval-retired"
                 message={retired ? i18nT('components.approvalCard.approval_no_longer_pending') : null}
@@ -338,12 +344,11 @@ export default function NotificationDetailPanel({ n, onClose, onLeave }: { n: No
                 testId="notif-decision-recorded"
                 message={decidedDismissFailed ? i18nT('components.notifications.notificationFeed.decision_recorded') : null}
               />
-              {/* Boxed beside the boxed StatusNotice above it, so the two
-                  read as one pair; on a retired row it stays inline under
-                  "no longer pending". */}
+              {/* Boxed beside the boxed StatusNotice above it (decision
+                  recorded, or no longer pending), so the two read as one
+                  pair. */}
               <ErrorNotice
-                variant={decidedDismissFailed ? 'block' : 'inline'}
-                className={decidedDismissFailed ? 'mt-1' : retired ? 'mt-2' : 'mt-4'}
+                className="mt-1"
                 testId="notif-dismiss-failed"
                 message={dismissFailed ? decidedClearFailedCopy() : null}
               />

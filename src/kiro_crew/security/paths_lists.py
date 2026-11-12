@@ -16,6 +16,7 @@ gates read these lists, and this module imports no other part of the path floor.
 from __future__ import annotations
 
 from kiro_crew.agent_sdk import host_auth, native_allow_stores
+from kiro_crew.apps import credential_masks
 from kiro_crew.identity_stores import AUTH_SQLITE_DB, AUTH_SQLITE_SIDECAR_SUFFIXES, fenced_home_dirs
 from kiro_crew.memory_stores import MEMORY_STORES_DIR_NAME
 
@@ -584,6 +585,10 @@ _CREW_SECRET_LEAVES: list[str] = [
     # shell. The dashboard PUT handler is the only writer and it opens the path
     # directly, not through this gate, so the operator's Settings toggle still works.
     "computer_use.json",
+    # Verbatim endorsed copies of the two leaves above (``config.loosening_provenance``);
+    # no OS mask: their directory is a read-only bind that in-sandbox loaders read.
+    "config-provenance/endorsed/denied_commands.json",
+    "config-provenance/endorsed/computer_use.json",
     # Browser Mode's durable ENABLE gate. Same class of control as
     # ``computer_use.json`` directly above: while it is present the browse proxy
     # is registered and the ``browser_*`` tools are in the agent's tool list,
@@ -652,13 +657,13 @@ _CREW_SECRET_LEAVES: list[str] = [
     # opens the path directly, not through this gate.
     "shared_crew_preview.json",
     "ssh_auth_sock_consent.json",
+    "project_hooks_consent.json",
     # The owner's credential-redaction switch. Same class of control as the
     # consent records above: the record is what AUTHORIZES the credential scrubber
     # to stand down in the owner's dashboard file viewer (the one surface it
     # governs), so an agent that could write it would switch off the pass that
-    # keeps the secrets it can read out of that view. A missing or unreadable
-    # file reads as ENABLED, so fencing the
-    # write is what keeps the switch the owner's. The owner-gated dashboard
+    # keeps the secrets it can read out of that view. A missing or unreadable file
+    # reads as ENABLED, so fencing the write is what keeps the switch the owner's. The owner-gated dashboard
     # ``/api/security/credential-redaction`` handler is the only writer and opens
     # the path directly, not through this gate.
     "credential_redaction.json",
@@ -685,6 +690,11 @@ _CREW_SECRET_LEAVES: list[str] = [
     # opens these paths directly rather than through this gate, so publishing keeps
     # working.
     "auth-store-staging",
+    # The self-update engine's wheel download directory: the wheel sits here between its
+    # SHA-256 check and pip's install. Same top-level whole-directory shape as the entry
+    # above; the engine opens it directly. Also sandbox-masked
+    # (``sandbox_leaves._UPDATE_STAGING_LEAF``).
+    "update-staging",
     # Mediated-secret owner-signed egress policy: writable, it would let an agent try
     # to authorize its own origin. Only the gateway and owner CLI open it, directly.
     "secret-request-policy",
@@ -768,6 +778,9 @@ _CREW_SECRET_LEAVES: list[str] = [
     # KAS MCP launch snapshots hold servers' env values (``acp.kas_env_launch``); the
     # ``pi-gate`` split: readable in the sandbox for the launcher, fenced from file tools.
     "kas-mcp-launch",
+    # Connection bridge snapshots (per-bridge tokens): the same split, and readable by
+    # an enforced harness's child too (``sandbox_leaves._CREW_CHILD_READABLE_LEAVES``).
+    "crew-oauth-bridge",
     # Encrypted secret vault directory — denylists the entire subdirectory so
     # the key file, ciphertext store, lock, and atomic-write temp files are all
     # unreadable to the agent through any Kiro Crew-mediated channel.
@@ -829,13 +842,12 @@ _CREW_SECRET_LEAVES: list[str] = [
     # services open their captured store directly. Global V1 retains its existing
     # file access behavior. See docs/system-specs/modules/security.md.
     MEMORY_STORES_DIR_NAME,
+    *credential_masks.declared_crew_leaves(installed=False),  # built-ins' credentialMasks
 ]
-
 
 _SENSITIVE_HOME_DIRS += [
     f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in _CREW_SECRET_LEAVES
 ]
-
 
 # ── Publish artifacts of a keystone leaf ──
 # Every leaf above is published through ``atomic_write``, which writes a
@@ -873,7 +885,6 @@ _SENSITIVE_HOME_DIRS += [
 # Not included: ``deploy/pending-deploys.lock``. Its directory holds no keystone leaf, so
 # there is no keystone payload beside it for the fence to protect.
 _KEYSTONE_ARTIFACT_SUFFIXES: tuple[str, ...] = (".tmp", ".lock")
-
 
 _KEYSTONE_ARTIFACT_PARENTS: list[str] = sorted(
     {
@@ -938,6 +949,7 @@ _WRITE_PROTECTED_HOME_PATHS: list[str] = [
         "config.local.json",
         "subagents",
         "app-agent-launch",
+        "update_next_start.json",
     )
 ] + [
     # Ops Mission Control's on-call schedule. WRITE-protected, not read+write
@@ -1322,9 +1334,9 @@ _WRITE_PROTECTED_HOME_PATHS += list(_KIRO_MATE_STATE_LEAVES)
 # ── kiro-cli global MCP registry (~/.kiro/settings/mcp.json) ──
 # The sibling of the agents dir above, and an INPUT TO A SECURITY DECISION by the
 # same route: an ``autoApprove`` on an entry here is honoured by default
-# (``mcp.honour_auto_approve``), and kiro-cli approves an autoApproved MCP tool
-# LOCALLY and emits no permission request -- so those verbs skip
-# ``hooks.on_tool_call`` and the tool gate never runs for them.
+# (``mcp.honour_auto_approve``), and each kept verb is granted in the skill view's
+# ``allowedTools``, which kiro-cli approves LOCALLY with no permission request -- so
+# those verbs skip ``hooks.on_tool_call`` and the tool gate never runs for them.
 # ``governance._is_owner_written`` admits an entry on its NAME SHAPE (no ``:``, no
 # provenance marker), never on who wrote the file, so a plainly-named entry an agent
 # appended is indistinguishable from one the owner typed. The opt-in's own wording is

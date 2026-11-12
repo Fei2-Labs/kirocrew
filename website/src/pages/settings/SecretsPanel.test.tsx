@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router-dom'
 
 import { SecretsPanel } from './SecretsPanel'
 import { SECRETS_AUTHORIZE_COMMAND, SECRETS_SERVER_GRANT } from './secretsAuthorizeCommand'
@@ -11,16 +12,6 @@ import en from '../../i18n/locales/en.json'
 // catalog rather than in the codemod-regenerated `en.json`. A repo guard keeps a
 // key out of both files at once, so this is the one place it can be read from.
 import enManual from '../../i18n/locales/en.manual.json'
-
-// The Custom-secrets section gates its authorize command on the gateway
-// platform: on Windows the mediated call route refuses every call, so the
-// command is replaced by a notice. Drive the platform from a mutable the tests
-// set, defaulting to a non-Windows host so every other case renders the command
-// exactly as it did before this gate existed.
-const platformEnv = vi.hoisted(() => ({ value: 'other' as 'darwin' | 'windows' | 'other' }))
-vi.mock('../../hooks/useGatewayPlatform', () => ({
-  useGatewayPlatform: () => platformEnv.value,
-}))
 
 /** Resolve a held request inside act: the panel's state changes land on resolve. */
 const settle = (resolve: (r: Response) => void, response: Response) =>
@@ -175,7 +166,6 @@ beforeEach(() => {
   listUnused = []
   listManagedError = false
   listShouldFail = false
-  platformEnv.value = 'other'
   localStorage.setItem('kiro_crew_token', 'test-token')
   installFetch()
 })
@@ -559,6 +549,31 @@ describe('SecretsPanel', () => {
     )
   })
 
+  it('lists the WakaTime sign-in tokens read-only, managed from the WakaTime panel', async () => {
+    // The vault routes refuse this name with 409, so no Save or Delete may be offered.
+    listNames = ['WAKATIME_OAUTH_TOKENS']
+    listManaged = [
+      { name: 'WAKATIME_API_KEY', kind: 'wakatime_api_key' },
+      { name: 'WAKATIME_OAUTH_TOKENS', kind: 'wakatime_oauth' },
+    ] as unknown as ManagedSecret[]
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter>
+          <SecretsPanel />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    )
+
+    expect(await screen.findByText('WAKATIME_OAUTH_TOKENS')).toBeInTheDocument()
+    expect(screen.getByText(/Managed in the WakaTime panel/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Manage in WakaTime' })).toHaveAttribute(
+      'href',
+      '/settings/overview?view=wakatime',
+    )
+    expect(screen.queryByRole('button', { name: /WAKATIME_OAUTH_TOKENS/ })).not.toBeInTheDocument()
+  })
+
   it('opens the add form and keeps Save disabled until both fields are filled', async () => {
     const user = userEvent.setup()
     mount()
@@ -863,23 +878,6 @@ describe('SecretsPanel custom secrets card', () => {
     expect(screen.queryByText(/No custom secrets stored yet/)).not.toBeInTheDocument()
     // Value is masked, never rendered in plaintext.
     expect(screen.getByText('••••••••')).toBeInTheDocument()
-  })
-
-  it('shows the Windows notice instead of the authorize command on a Windows gateway', async () => {
-    // On Windows the mediated call route refuses every call, so the authorize
-    // command would only sign a grant the host can never use. The panel shows
-    // the notice in its place rather than the command.
-    platformEnv.value = 'windows'
-    mount()
-    expect(await screen.findByText('Custom secrets')).toBeInTheDocument()
-    expect(
-      screen.getByText(enManual.settings.secrets.custom_authorize_windows),
-    ).toBeInTheDocument()
-    // The command and its own authorize sentence are gone on Windows.
-    expect(screen.queryByText(SECRETS_AUTHORIZE_COMMAND)).not.toBeInTheDocument()
-    expect(
-      screen.queryByText(/then run the command below in a shell or on the Terminal page/),
-    ).not.toBeInTheDocument()
   })
 
   it('adds a custom secret through the write-only vault contract', async () => {

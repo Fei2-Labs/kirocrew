@@ -24,14 +24,18 @@ import time
 from typing import TYPE_CHECKING, Any, cast
 
 from kiro_crew import runtime_death
-from kiro_crew.agent_sdk.drivers.acp_vocab import is_user_worded_failure
+from kiro_crew.agent_sdk.drivers.acp_vocab import STOP_REASON_CANCELLED, is_user_worded_failure
 from kiro_crew.context import session_store_for_turn
 from kiro_crew.dashboard.chat_utils import (
     expire_slack_options,
     mint_options_token,
     remember_slack_options,
 )
-from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.executors import (
+    TURN_BUILD_ADMISSION_TIMEOUT_SECS,
+    EmbedAdmissionTimeout,
+    run_in_embed_pool,
+)
 from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, hook_gate_kwargs
 from kiro_crew.llm_helpers import save_conversation_turn_off_loop
 from kiro_crew.memory_stores import UnknownMemoryStore
@@ -45,11 +49,13 @@ from kiro_crew.messaging.dispatch import (
     driver_turn_landed,
     rearm_reinjection,
     rollback_skill_bodies,
+    session_stop_generation,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.inbound_spool import InboundRoute, spool_refused_turn
 from kiro_crew.messaging.link import SLACK_NAMESPACE, canonical_key
+from kiro_crew.messaging.renderer import DONE, OutputEvent
 from kiro_crew.messaging.script_hooks import ScriptHookTurn
 from kiro_crew.messaging.turn_ceiling import TurnCeilingExceeded
 from kiro_crew.parent_turns import note_turn_landed
@@ -68,6 +74,7 @@ from kiro_crew.slack.handler import (
     _hydrate_thread_overrides,
     _is_slack_restricted,
     _maybe_auto_title_slack,
+    _route_bang_command,
     _should_auto_approve_spawn,
     _thread_agents,
     get_dashboard_state,
@@ -99,6 +106,7 @@ from kiro_crew.slack.thread_replies import (
     note_turn,
     replies_since_last_turn,
 )
+from kiro_crew.slack.transport_voice import speak_finished_turn
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.stats import Stats
 
@@ -161,7 +169,7 @@ def _transport_error_text(exc: BaseException) -> str:
     refusal. Every other failure, including an unclassified ``AcpError``, keeps
     the generic retry text, because its message is internal detail.
     """
-    if isinstance(exc, UnknownMemoryStore):
+    if isinstance(exc, (UnknownMemoryStore, EmbedAdmissionTimeout)):
         return _redacted_error_detail(exc)
     if is_user_worded_failure(exc):
         return f"❌ {_redacted_error_detail(exc)}"
@@ -306,6 +314,7 @@ async def handle_message_transport(
     start_priority: StartPriority = StartPriority.BACKGROUND,
     spool_text: str | None = None,
     spool_attachments: int = 0,
+    had_voice_input: bool = False,
 ) -> None:
     """Drive a Slack message through the new transport path end-to-end.
 
@@ -314,6 +323,9 @@ async def handle_message_transport(
 
     ``spool_text`` / ``spool_attachments``: as for ``handler.handle_message`` --
     the pre-ingestion message the shutdown spool records instead of *text*.
+
+    ``had_voice_input``: as for ``handler.handle_message`` -- the message carried a
+    transcribed voice memo, answered in kind under ``voice_reply.auto_reply_to_voice``.
 
     This replaces handle_message when the feature flag is on. It uses
     TurnDriver + SlackRenderer instead of the inline stream loop.
@@ -555,6 +567,24 @@ async def handle_message_transport(
         # Message was nothing but the modifier(s) — no LLM turn.
         return
 
+    # ── !compact, the owner / allowed-user ``!`` commands and /agent <name> ──
+    # The SAME router and sender gate the native path runs at this point, on the
+    # text with the mention and modifiers already stripped. A message it answers
+    # (run, denied, or replied to) never reaches the model. reply_ts, as for the
+    # keyword commands below: !title and !dashboard key the thread by it.
+    if await _route_bang_command(
+        _cmd_text,
+        slack,
+        sessions,
+        channel,
+        reply_ts,
+        msg_ts,
+        session_key,
+        user_id,
+        conversation_log,
+    ):
+        return
+
     # ── Path-independent keyword commands: sessions / spawn / run / cron ──
     # These need no LLM session (they dispatch to the subagent/task/cron
     # services or render the sessions view), so they run here alongside the
@@ -613,10 +643,14 @@ async def handle_message_transport(
     # handling the original error.
     _logged_user_turn = False
     _stamped_turn = False
+    # Whether a re-projection left this turn holding the replay gap.
+    _reprojected = False
     # Post-compaction re-injection bookkeeping for the finally: whether this
     # turn consumed the one-shot flag, and whether it landed (recorded success).
     _needs_reinjection = False
     _turn_landed = False
+    # The settle call for the tab notices THIS turn's build read, settled in the finally.
+    _tab_notices: list[Any] = []
     # The turn's driver, for the finally: it records whether the backend
     # compacted the session, on every exit path.
     driver: TurnDriver | None = None
@@ -723,16 +757,55 @@ async def handle_message_transport(
         _alloc: dict[str, Any] = (
             _channel_crew.allocation_kwargs() if _channel_crew else {"agent": _agent}
         )
-        client, is_new, resumed = await sessions.get_or_create(
-            session_key, channel_id=channel, start_priority=start_priority, **_alloc
+        # The claim token is minted inside the acquire, the instant get_or_create
+        # returns and before any await, so the fenced re-projection reads this
+        # turn's session and never a successor; the Stop count it carries cancels
+        # the turn before it streams.
+        from kiro_crew.agent_sdk.spec_hooks import (
+            acquire_with_token,
+            reproject_unattended_claim,
+            running_agent,
+        )
+
+        (client, is_new, resumed), _claim_token = await acquire_with_token(
+            sessions, session_key, channel_id=channel, start_priority=start_priority, **_alloc
         )
         _acquired = True
-        # Taken on acquisition: a Stop from here on cancels the turn before it streams.
+        _stop_gen_at_entry = _claim_token.stop_gen
         hook_turn = (
             ScriptHookTurn.stoppable(sessions, session_key, text)
             if runs_script_hooks(channel, user_id)
             else None
         )
+        # A KAS batch that auto-approves what a PreToolUse hook now covers is reset
+        # and claimed again under the replay gap, which the ``finally`` closes after
+        # the release.
+
+        async def _reclaim() -> tuple[tuple[Any, bool, bool], Any]:
+            got, tok = await acquire_with_token(
+                sessions, session_key, channel_id=channel, start_priority=start_priority, **_alloc
+            )
+            return got, tok.entry
+
+        _reprojection = await reproject_unattended_claim(
+            sessions,
+            session_key,
+            running_agent(client, _agent),
+            (client, is_new, resumed),
+            _reclaim,
+            _claim_token,
+        )
+        client, is_new, resumed = _reprojection.claimed
+        assert client is not None
+        _reprojected = _reprojection.reprojected
+        if _reprojection.superseded or (
+            _reprojection.reprojected
+            and session_stop_generation(sessions, session_key) != _stop_gen_at_entry
+        ):
+            # A Stop while the session was re-projected, or a hard Stop that
+            # replaced it with a successor another turn owns: nothing ran.
+            await renderer.dispatch(OutputEvent(kind=DONE, stop_reason=STOP_REASON_CANCELLED))
+            return
         # Authorize the outbound-image root, which only exists once the provider
         # does. Unauthorized, `_upload_root` stays empty and `_uploads_enabled()`
         # is permanently False, so the whole extract-and-upload path is dead while
@@ -943,6 +1016,8 @@ async def handle_message_transport(
                 # history fallback replays it as the thread's history, ahead of
                 # the same text as the current request.
                 exclude_last_n=1 if _logged_user_turn else 0,
+                tab_notices=_tab_notices,
+                _admission_timeout=TURN_BUILD_ADMISSION_TIMEOUT_SECS,
             )
         else:
             full_message = text
@@ -1016,6 +1091,8 @@ async def handle_message_transport(
             undelivered_watch_key=session_key,
             event_tap=_live.observe if _live is not None else None,
             script_hooks=hook_turn,
+            hook_agent=str(_alloc.get("agent") or ""),
+            is_new_session=is_new,
         )
         # The thread's owner as of the moment the turn starts producing output.
         # A dashboard link landing during the run moves the conversation to a
@@ -1251,6 +1328,20 @@ async def handle_message_transport(
                 exc_info=True,
             )
 
+        # ── Voice reply (fire-and-forget, as native delivery runs it; never raises) ──
+        await speak_finished_turn(
+            slack,
+            renderer,
+            driver,
+            channel=channel,
+            thread_ts=post_thread_ts or "",
+            user_id=user_id,
+            session_key=session_key,
+            accumulated=accumulated,
+            had_voice_input=had_voice_input,
+            unfinished=_unfinished,
+        )
+
         # ── Auto-title the conversation (fire-and-forget) ──
         # The native loop has always titled a thread after its first successful
         # turn, and this path never did — while ``messaging.use_transport``
@@ -1386,6 +1477,11 @@ async def handle_message_transport(
             await _live.settle()
         logger.exception("transport_dispatch: error handling message")
         Stats().inc_message_failed()
+        if client and _acquired and isinstance(exc, EmbedAdmissionTimeout):
+            # Probed: the session manager's own hand-back (`turn_bracket.rearm_first_turn`).
+            _rearm = getattr(sessions, "rearm_first_turn", None)
+            if is_new and callable(_rearm):
+                _rearm(session_key, client, resumed=resumed)
         if client and _acquired:
             # A dying runtime reaches this generic handler as one more exception,
             # so without the attribution question every tenant of one process
@@ -1515,7 +1611,9 @@ async def handle_message_transport(
         # read; a cancelled or failed turn discarded the prompt that carried them.
         if _turn_landed and _thread_replies is not None and _thread_replies.read_ok:
             note_turn(session_key, thread_ts or msg_ts, msg_ts)
-        rollback_skill_bodies(context_builder, session_key, landed=_turn_landed)
+        rollback_skill_bodies(
+            context_builder, session_key, landed=_turn_landed, tab_notices=_tab_notices
+        )
         # Tear the renderer down even if TurnDriver.run() raised before on_done,
         # so the 30s tool-elapsed timer cannot keep hitting a dead stream.
         # Teardown must never block the release: the semaphore is keyed by
@@ -1535,6 +1633,11 @@ async def handle_message_transport(
         finally:
             if _acquired:
                 sessions.release(session_key)
+                if _reprojected:
+                    # After the release, as the shared pipeline closes its own.
+                    from kiro_crew.agent_sdk.spec_hooks import close_reprojection_gap
+
+                    close_reprojection_gap(sessions, session_key)
                 # The release is what ends the turn for an open dashboard tab
                 # bound to this thread (it reads the lease as the turn running),
                 # and a release raises no slots push of its own. Refresh once

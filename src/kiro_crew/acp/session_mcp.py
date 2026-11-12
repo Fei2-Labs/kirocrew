@@ -84,13 +84,13 @@ from typing import Any, NamedTuple
 
 from kiro_crew import agent as _agent_mod
 from kiro_crew import hooks as _hooks
-from kiro_crew import kiro_cli as _kiro_cli
 from kiro_crew import mcp_provenance
 from kiro_crew.acp.claude_mcp_names import claude_mcp_tool_name
 from kiro_crew.acp.mcp_session_report import sanitize_sink_text
 from kiro_crew.acp.session_label import SESSION_LABEL_MARKER
 from kiro_crew.acp.session_mcp_crewmate import _crewmate_worker_spec
 from kiro_crew.acp.session_mcp_env_refs import expand_entry_env
+from kiro_crew.acp.session_mcp_restricted import session_mcp_restricted_servers
 from kiro_crew.acp.session_mcp_settings_read import (  # noqa: F401 -- re-exported
     _NATIVE_NAMED_PATH_CHARS,
     _UNREADABLE_CHURN,
@@ -100,7 +100,6 @@ from kiro_crew.acp.session_mcp_settings_read import (  # noqa: F401 -- re-export
     _UNREADABLE_TOO_DEEP,
     _UNREADABLE_TOO_LARGE,
     _UNREADABLE_UNOPENABLE,
-    _WIDE_BOMS,
     NativeSettingsUnreadable,
     SettingsReadRefusal,
     _named_path,
@@ -121,8 +120,11 @@ from kiro_crew.mcp_cleanup import (
     KIROCREW_BIN_MCP_SERVERS,
     mcp_entry_is_muted,
 )
+from kiro_crew.platform.governance import (
+    registry_local_control_plane_permitted as _registry_local_control_plane_permitted,
+)
 from kiro_crew.template_mcp_additions import MERGED_MARK, merge_at_spawn
-from kiro_crew.user_json import loads_user_jsonc
+from kiro_crew.user_json import loads_user_jsonc, wide_bom_reason
 
 logger = logging.getLogger(__name__)
 
@@ -371,12 +373,11 @@ def _read_mcp_settings(path: Path) -> dict[str, Any]:
         raise SettingsReadRefusal(*refusal)
     # A UTF-16 or UTF-32 mark (Windows PowerShell 5.1's ``>`` and ``Out-File``
     # default) is refused, not decoded, but with the one repair that fixes it.
-    for bom, family in _WIDE_BOMS:
-        if raw.startswith(bom):
-            raise SettingsReadRefusal(
-                f"MCP settings are saved as {family}",
-                f"it is saved as {family}; re-save it as UTF-8",
-            )
+    # The mark table and the reason wording live once in ``user_json`` so the
+    # default backend's readers and this kiro-cli path name the same cause.
+    _wide_reason = wide_bom_reason(raw)
+    if _wide_reason is not None:
+        raise SettingsReadRefusal("MCP settings cannot be read as UTF-8", _wide_reason)
     # Windows editors commonly save UTF-8 with a byte-order mark. Drop it before
     # the emptiness test so a BOM-only file reads as the empty file it is.
     raw = raw.removeprefix(codecs.BOM_UTF8)
@@ -433,37 +434,6 @@ def _global_settings(*, strict: bool = False) -> dict[str, Any]:
             raise
         logger.debug("session MCP: global settings unreadable")
         return {}
-
-
-def settings_server_names(work_dir: str | Path | None) -> frozenset[str]:
-    """Names of MCP servers declared in the settings files kiro-cli reads.
-
-    The user's global ``~/.kiro/settings/mcp.json`` and, when *work_dir* is
-    given, the checkout's ``.kiro/settings/mcp.json`` -- the same two sources
-    :func:`native_settings_sources` enumerates, read once each with no bracketing
-    because a name set is advisory here, not a restriction to fail closed on.
-
-    Used by :func:`~kiro_crew.acp.kas_agents.hoist_servers_for_session` as
-    ``reserved_names`` on the ``session/load`` path: a user-declared server whose
-    name a settings file also declares stays in the agent block, so the resumed
-    session resolves that name exactly as ``session/new`` did -- by kiro-cli's own
-    precedence between its settings files and the agent block -- instead of by a
-    session-level injection that would outrank both. Covering the workspace file
-    as well as the global one is what keeps new and resumed sessions agreeing
-    whichever file the colliding entry lives in. A file that is absent or
-    unreadable contributes no names.
-    """
-    names: set[str] = set(_global_settings().get("mcpServers", {}))
-    if work_dir:
-        try:
-            project = _read_mcp_settings(Path(work_dir) / ".kiro" / "settings" / "mcp.json")
-        except (OSError, ValueError):
-            logger.debug("session MCP: project settings unreadable")
-            project = {}
-        declared = project.get("mcpServers", {}) if isinstance(project, dict) else {}
-        if isinstance(declared, dict):
-            names.update(declared)
-    return frozenset(names)
 
 
 class ToolsAllowlist(NamedTuple):
@@ -1000,61 +970,6 @@ def session_mcp_server_is_disabled(
     return name in session_mcp_disabled_servers(spec, _global_settings())
 
 
-def session_mcp_restricted_servers(disabled_tools: Collection[tuple[str, str]]) -> frozenset[str]:
-    """Servers whose per-TOOL narrowing no transport can carry as an element.
-
-    The sibling of :func:`session_mcp_deny_rules`, for a backend that has no file
-    to put deny rules in. Same input, same reason to exist: ``disabledTools`` is a
-    RESTRICTION, and a backend that forwards the server while dropping it widens
-    the session's tool surface behind the user's back -- the dashboard writes that
-    key on an ordinary tool-off action, and this repo already treats losing it as a
-    defect ("dropping ``disabledTools`` on a save would silently widen the agent's
-    tool surface").
-
-    Claude re-applies the restriction as ``permissions.deny`` rules and so may keep
-    the server. A backend with no deny channel has only one faithful option, which
-    is to not mount the server at all -- so this returns the NAMES and lets that
-    backend omit them. Withholding a server is an availability cost; forwarding an
-    un-narrowed one is a capability the user switched off.
-
-    **Crew's own control plane is exempt from WITHHOLDING, not from the
-    restriction.** ``kirocrew-core`` / ``kirocrew-cron`` are re-derived from
-    ``managed_mcp_spec_entry``, which emits only command/args/env, so a
-    ``disabledTools`` on their spec entry never reaches the element -- and
-    withholding the whole server on the strength of it would leave the session
-    unable to report back to its channel at all, which is the exact defect this
-    module exists to fix. The restriction itself is still honoured, on the one
-    channel this transport does have: every call to one of these servers reaches
-    Crew as a ``session/request_permission`` (their tools carry no annotations, so
-    codex prompts for each), and the client answers a call to a switched-off tool
-    with the adapter's reject option before anything runs. The pairs it checks
-    come from :func:`session_mcp_disabled_tools`, on the same parse as this set.
-    That channel is complete for the control plane and NOT for a third-party
-    server -- a tool annotated ``readOnlyHint`` is auto-approved inside codex and
-    never prompts -- which is why the two are treated differently here rather
-    than both being mounted.
-
-    ``disabled`` is deliberately NOT part of this. A disabled server is already
-    absent from the array by a different mechanism: ``agent.build_agent_config``
-    strips its ``@alias`` from ``tools``, and the allowlist filter in
-    :func:`session_mcp_servers` mounts nothing ``tools`` does not name. Re-checking
-    it here would be a second spelling of a rule that already holds.
-
-    Derived from the ``(server, tool)`` PAIRS :func:`session_mcp_disabled_tools`
-    resolved, never from the spec on its own, so the two decisions a restriction
-    drives -- withhold the server, or refuse the call -- read the same sources. The
-    dashboard's tool-off action writes to the global settings file and not to the
-    spec, so a withhold set read from the spec alone would miss a third-party server
-    narrowed the ordinary way; that server would mount, and the per-call refusal
-    cannot reach it (a tool annotated ``readOnlyHint`` is approved inside codex
-    without asking), so the switched-off tool would run. Its one caller is
-    :func:`session_mcp_projection`, which hands in the pairs it already resolved
-    from one read of each source. A server named only in the global file and not in
-    the spec lands here too and is harmless: nothing mounts it. Free of I/O.
-    """
-    return frozenset(server for server, _tool in disabled_tools) - frozenset(CONTROL_PLANE_SERVERS)
-
-
 def _registry_mode() -> bool:
     """Whether the operator declared this install registry-governed.
 
@@ -1124,6 +1039,7 @@ def session_mcp_projection(
     worker_tool_limits_honoured: bool = False,
     spec_policy_honoured: bool = False,
     worker_mcp_tool_limits_honoured: bool = False,
+    worker_native_tool_limits_honoured: bool = False,
 ) -> SessionMcpProjection:
     """The array, the withhold set AND the per-tool restrictions, from ONE parse.
 
@@ -1154,6 +1070,7 @@ def session_mcp_projection(
         tool_limits_honoured=worker_tool_limits_honoured,
         spec_policy_honoured=spec_policy_honoured,
         mcp_tool_limits_honoured=worker_mcp_tool_limits_honoured,
+        native_tool_limits_honoured=worker_native_tool_limits_honoured,
     )
     settings = _global_settings()
     disabled_tools = session_mcp_disabled_tools(
@@ -1766,7 +1683,8 @@ def _native_restriction(
     # never stamped by any Crew writer -- so mounting the element for it would
     # launch a server kiro-cli refuses, and the declaration stays native. The
     # mount reaches this predicate with the flag on only when no admin registry
-    # can govern the sign-in (``kiro_control_plane_servers``); a marker still on
+    # can govern the sign-in or the admin's security policy opts the control
+    # plane past the registry (``kiro_control_plane_servers``); a marker still on
     # the spec there is Crew's own, so the exemption applies. The projection,
     # which judges the spec at preparation, is the other reader it is for.
     transports = ("stdio", _KIRO_REGISTRY_TYPE) if crews_registry_marker else ("stdio",)
@@ -1856,6 +1774,25 @@ def native_mount_withholding(
     return None
 
 
+def registry_withholds_control_plane() -> bool:
+    """Whether the registry ceiling keeps the control plane's identity element off.
+
+    True when the spec writer marks ``kirocrew-core`` for the admin's catalog
+    (``managed_mcp._registry_marker_for``: registry mode declared and governance not
+    known unreachable) and the admin's security policy does not opt Crew's own
+    servers past the registry (:func:`_registry_local_control_plane_permitted`).
+    The mount gate (:func:`kiro_control_plane_servers`) and the native skill
+    projection (``skill_projection_parts.preparation``) both ask this one question,
+    so the projection only promises ``skill_search`` where the shared runtime will
+    mount its element. Each name is read at call time so a test patch of
+    ``_registry_mode`` or the opt-in reaches both callers.
+    """
+    return bool(
+        _agent_mod._registry_marker_for("kirocrew-core", _registry_mode())
+        and not _registry_local_control_plane_permitted()
+    )
+
+
 def kiro_control_plane_servers(
     agent: str | None,
     *,
@@ -1869,7 +1806,8 @@ def kiro_control_plane_servers(
     restrictions stay in the native declaration instead of being discarded by
     ACP shaping. Registry entries remain the enterprise catalog's responsibility,
     except the control plane when it is known that no admin registry can govern
-    this sign-in (:func:`kiro_crew.kiro_cli.registry_governance_known_unreachable`).
+    this sign-in (:func:`kiro_crew.kiro_cli.registry_governance_known_unreachable`)
+    or the admin's security policy opts it in.
     The element's ``env`` is owned by :func:`_managed_element_env`, which holds it to
     the rule the disk-writing consumer applies to this same population.
 
@@ -1899,13 +1837,24 @@ def kiro_control_plane_servers(
     element does -- and it has to come from this read. A second read for it
     would be the window in which a toggle undone in between answers ``None``
     and the session falls back to a guard that names the wrong file.
+
+    Under registry mode an injected element launches past the admin's catalog, so
+    nothing is mounted unless no admin registry can govern this sign-in or the
+    admin's security policy opts in (:func:`_registry_local_control_plane_permitted`),
+    and then only :data:`CONTROL_PLANE_SERVERS`.
     """
+    if not agent:
+        return NativeControlPlaneMount([], {})
     # Under a declared registry the catalog owns every launch, except when no
     # registry can govern this sign-in: the spec then carries the control plane
     # unmarked (``managed_mcp._registry_marker_for``), so it gets its element too.
     registry_declared = _registry_mode()
-    if not agent or (registry_declared and not _kiro_cli.registry_governance_known_unreachable()):
+    if registry_withholds_control_plane():
         return NativeControlPlaneMount([], {})
+    identity_servers: tuple[str, ...] = (
+        CONTROL_PLANE_SERVERS if registry_declared else IDENTITY_BOUND_SERVERS
+    )
+    app_launches = {} if registry_declared else builtin_app_identity_launches()
     spec = spec_override if spec_override is not None else _agent_spec_for(agent, work_dir)
     if not isinstance(spec, dict) or not isinstance(spec.get("mcpServers"), dict):
         return NativeControlPlaneMount([], {})
@@ -1927,7 +1876,7 @@ def kiro_control_plane_servers(
         )
         # The verdict covers the whole population this function mounts, the
         # builtin app servers included, so a withheld one is named as such.
-        unreadable = (*IDENTITY_BOUND_SERVERS, *builtin_app_identity_launches())
+        unreadable = (*identity_servers, *app_launches)
         return NativeControlPlaneMount([], {name: exc for name in unreadable})
     out: list[dict[str, Any]] = []
     withheld_by_name: dict[str, NativeMountWithholding | NativeSettingsUnreadable] = {}
@@ -1937,10 +1886,9 @@ def kiro_control_plane_servers(
     # the env its pinned launch needs (PYTHONPATH and KIROCREW_HOME).
     candidates: list[tuple[str, dict[str, Any] | None, dict[str, str]]] = [
         (name, managed_mcp_spec_entry(name, include_opt_in=True), {})
-        for name in (CONTROL_PLANE_SERVERS if registry_declared else IDENTITY_BOUND_SERVERS)
+        for name in identity_servers
         if allow.grants(name)
     ]
-    app_launches = {} if registry_declared else builtin_app_identity_launches()
     candidates.extend(
         (name, launch, dict(launch.get("env") or {}))
         for name, launch in app_launches.items()

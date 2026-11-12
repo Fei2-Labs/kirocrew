@@ -10,7 +10,7 @@ Orchestrator fields read: ``_adaptive_controller``, ``_auto_migrate_task``,
 ``_inbound_replay_task``, ``_marker_clear_pending``, ``_marker_write_task``,
 ``_memory_repair_stop``, ``_memory_repair_task``, ``_memory_startup``,
 ``_model_download_task``, ``_profile_watch_task``, ``_sign_in_refresher_task``,
-``_socket_client``, ``_update_check_task``, ``cron_svc``, ``dashboard_state``,
+``_socket_client``, ``_test_mode``, ``_update_check_task``, ``cron_svc``, ``dashboard_state``,
 ``heartbeat_svc``, ``sessions``, ``subagent_mgr``, ``task_runner``.
 Orchestrator fields written: ``_force_exit_claimed`` (by the signal-handler install).
 
@@ -73,12 +73,8 @@ async def _shutdown(self: GatewayOrchestrator) -> None:
     # alongside the steps below, which do not touch the install, and is
     # awaited before the handler and service teardown, bounded by
     # UPDATE_INSTALLER_STOP_SECS.
-    # A policy apply the dashboard started (``POST /api/update``) is the same
-    # installer shape, so it is stopped and awaited here with the coordinator,
-    # inside the same budget: aiohttp cancels its request handler only after
-    # its own shutdown timeout, which the graceful cap exits ahead of.
     update_task = self._update_check_task
-    installer_tasks: set[asyncio.Task[Any]] = set(self._dashboard_policy_applies())
+    installer_tasks: set[asyncio.Task[Any]] = set()
     if update_task is not None:
         installer_tasks.add(update_task)
     installer_tasks = {task for task in installer_tasks if not task.done()}
@@ -260,12 +256,15 @@ async def _shutdown(self: GatewayOrchestrator) -> None:
             drain_task.result()
     if not autonudge_shutdown_interrupted:
         autonudge_svc = self.autonudge_svc
-        await self._stop_services_and_sessions(eager_spawns=eager_spawns)
-        if autonudge_svc:
-            # A cut made above frees the teardown; it does not make the drained
-            # work durable. Whatever it left in flight gets the rest of the
-            # graceful budget before the hard exit that follows this method.
-            await autonudge_svc.settle_admitted_writes(graceful_deadline)
+        try:
+            await self._stop_services_and_sessions(eager_spawns=eager_spawns)
+        finally:
+            if autonudge_svc:
+                # A cut made above frees the teardown; it does not make the drained
+                # work durable. Whatever it left in flight gets the rest of the
+                # graceful budget before the hard exit that follows this method,
+                # and is still named when the graceful bound cuts the teardown.
+                await autonudge_svc.settle_admitted_writes(graceful_deadline)
         return
     # The absorbed cancellation was the graceful bound itself, or arrived
     # before it. Run the rest of teardown in its own task and wait only for
@@ -297,9 +296,10 @@ async def _stop_services_and_sessions(
     """The teardown ``_shutdown`` runs once AutoNudge has drained.
 
     Cancelled handlers first, then cron and heartbeat, the MCP broker, the
-    session, channel and dashboard closes, and last the subagent store and
-    memory startup those closes release. Only then is the closed AutoNudge
-    service withdrawn from its process-wide singleton. ``eager_spawns`` are the
+    session, channel and dashboard closes, then the subagent store and memory
+    startup those closes release and the unwinding dashboard turns. Only then is
+    the closed AutoNudge service withdrawn from its process-wide singleton, and
+    last comes one prune of this home's unused skill views. ``eager_spawns`` are the
     speculative session starts ``_shutdown`` stopped before its first await;
     they are awaited here with the session closes.
     """
@@ -386,8 +386,8 @@ async def _stop_services_and_sessions(
 
     # close_all() above ended every ACP session, so a dashboard turn that was
     # mid-reply is now unwinding, and it saves the text its user watched stream
-    # before it ends; the hard exit after this method would beat the save. Last,
-    # so the steps above keep their share of the shutdown deadline.
+    # before it ends; the hard exit after this method would beat the save. After
+    # the closes, so the steps above keep their share of the shutdown deadline.
     await wait_for_unwinding_turns(self.dashboard_state)
     # Keep the closed service reachable until every dashboard handler and
     # connection is gone. A slot close admitted during teardown must reach
@@ -397,6 +397,16 @@ async def _stop_services_and_sessions(
     # both withdraw the singleton only after the same teardown boundary.
     if self.autonudge_svc:
         self.autonudge_svc._unpublish()
+    # Last, as it is best-effort: a runtime whose kill completed released its
+    # skill views, but each release prunes on a daemon thread that the hard exit
+    # can cut, and a data home stopped and then deleted has no next boot to drain
+    # them. One more prune, awaited and bounded by the projection's own lock
+    # ceiling. Skipped in test mode like the boot drain, so the offline E2E gate
+    # never touches the real agents directory.
+    if not getattr(self, "_test_mode", False):
+        from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+        await asyncio.to_thread(acp_driver.prune_skill_view_aliases_at_stop)
 
 
 def _write_marker_worker(self: GatewayOrchestrator, run_marker: Any, port: int) -> None:
@@ -739,6 +749,13 @@ async def _shutdown_and_exit(
             logger.warning("the session's log did not fully drain before exit")
     except Exception:  # noqa: BLE001 - shutdown must not raise
         logger.debug("the session's log drain failed during shutdown", exc_info=True)
+    # Queued trace spans, for the same reason: the batch processor's own atexit
+    # flush never runs past os._exit, and the turns cancelled by the shutdown
+    # above have just ended theirs. Bounded and off-loop inside the module; a
+    # no-op when tracing was never on.
+    from kiro_crew.tracing import provider as tracing_provider
+
+    await tracing_provider.flush_for_exit()
     # The member event log's queued appends, for the same reason and on the same
     # terms. Its appends are ORDERED on one executor, so the tail sitting there
     # at exit is the newest transitions -- a patrol stop, a slot close -- and
@@ -775,6 +792,13 @@ async def _shutdown_and_exit(
     await flush_audit_queue_before_hard_exit()
     await self._park_if_force_exit_claimed()
     await drain_log_queue_before_hard_exit()
+    # Marked once every teardown step above has returned: a teardown that wedges
+    # and is then killed never gets here, so its header-only dump is kept as the
+    # trace of that death. Bounded, so a stalled data home cannot hold the exit,
+    # and before the last park, so a force exit claimed meanwhile still owns it.
+    from kiro_crew.dashboard import crash_dump_store
+
+    await crash_dump_store.mark_clean_exit()
     await self._park_if_force_exit_claimed()
     os._exit(exit_code)
 

@@ -21,6 +21,8 @@ import { MORE_BELOW_MASK } from '../../components/ModelEffortDropdown'
 import { useProvider } from '../../providers'
 
 import { i18nT } from '../../i18n/t'
+import { Trans } from 'react-i18next'
+import { queryReadFailed } from '../../utils/queryReadFailed'
 interface Prompt {
   name: string
   fullName: string
@@ -93,10 +95,11 @@ export default function PromptsTab() {
   const [filter, setFilter] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
 
-  const { data: prompts = [], isLoading: loading, isFetching, error, refetch } = useQuery<Prompt[]>({
+  const promptsQuery = useQuery<Prompt[]>({
     queryKey: ['prompts'],
     queryFn: api.prompts,
   })
+  const { data: prompts = [], isLoading: loading, isFetching, error, refetch } = promptsQuery
 
   const EMPTY_FORM: PromptFormData = { name: '', description: '', scope: 'global', body: '' }
   const [creating, setCreating] = useState(false)
@@ -517,9 +520,12 @@ export default function PromptsTab() {
 
   return (<>
     <Card>
-      <CardTitle><ScrollText className="lucide-inline" /> {i18nT('pages.overview.promptsTab.prompts')} <InfoTip text={i18nT('pages.overview.promptsTab.saved_prompts_from', { registry: provider.labels.pluginRegistryName.toLowerCase() })} /> <span className="ml-auto"><Btn primary onClick={() => { setMutationError(''); setCreateForm(EMPTY_FORM); setCreating(true) }}>{i18nT('pages.overview.promptsTab.create_new_prompt')}</Btn></span></CardTitle>
+      <CardTitle><ScrollText className="lucide-inline" /> {i18nT('pages.overview.promptsTab.prompts')} <InfoTip text={i18nT('pages.overview.promptsTab.saved_prompts_from', { registry: provider.labels.pluginRegistryName })} /> <span className="ml-auto"><Btn primary onClick={() => { setMutationError(''); setCreateForm(EMPTY_FORM); setCreating(true) }}>{i18nT('pages.overview.promptsTab.create_new_prompt')}</Btn></span></CardTitle>
       <p className="text-muted text-[13px] mb-3 leading-relaxed">
-        {i18nT('pages.overview.promptsTab.invoke_in_chat')} <code className="text-[12px]">{i18nT('pages.overview.promptsTab.agent_sop_name')}</code> {i18nT('pages.overview.promptsTab.or')} <code className="text-[12px]">{i18nT('pages.overview.promptsTab.prompts_get_name')}</code>{i18nT('pages.overview.promptsTab.prompts_are_loaded_on_demand_they_don_t_consume')}
+        <Trans
+          i18nKey="pages.overview.promptsTab.invoke_prompts_in_chat"
+          components={{ sop: <code className="text-[12px]">{i18nT('pages.overview.promptsTab.agent_sop_name')}</code>, get: <code className="text-[12px]">{i18nT('pages.overview.promptsTab.prompts_get_name')}</code> }}
+        />
       </p>
       {prompts.length > 0 && (
         <div className="mb-3">
@@ -532,13 +538,17 @@ export default function PromptsTab() {
           recovers the journal report from the message and carries the agent
           hand-off (askAgent is safe here -- the list read holds no draft), and
           the retry refetches the same query. */}
-      {error && (
+      {/* queryReadFailed, not `error`: a retry with no cached prompts clears
+          `error` while it reads, which would unmount the Retry the user just
+          pressed. The busy Retry is aria-disabled, not disabled, so it keeps
+          keyboard focus. */}
+      {queryReadFailed(promptsQuery) && (
         <div className="px-3 py-4 flex flex-col items-start gap-2">
-          <ErrorNotice
+          {error && <ErrorNotice
             message={error.message || i18nT('pages.overview.promptsTab.failed_to_load_prompts')}
             askAgent
-          />
-          <Btn disabled={isFetching} onClick={() => void refetch()}>
+          />}
+          <Btn className="aria-disabled:opacity-30 aria-disabled:cursor-default" aria-disabled={isFetching || undefined} onClick={() => { if (!isFetching) void refetch() }}>
             {i18nT('pages.overview.promptsTab.retry_read')}
           </Btn>
         </div>

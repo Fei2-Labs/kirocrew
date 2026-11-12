@@ -4,7 +4,7 @@ On a backend that is not handed ``toolsSettings`` (every one but kiro-cli and
 KAS), the field is applied nowhere with one exception:
 ``toolsSettings.subagent.availableAgents``, which Crew's own spawn gate reads
 from the parent's spec on every backend
-(:func:`kiro_crew.subagent_parts.agent_policy.spawn_allowlist`). A session-start
+(:func:`kiro_crew.subagent_parts.spawn_allowlists.spawn_allowlist`). A session-start
 notice that names ``toolsSettings`` as having no effect must leave that entry
 out, or it tells the author a restriction Crew enforces does nothing. On a backend
 in ``ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS`` Crew's gate also applies the
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from kiro_crew.platform.tools_settings_aliases import canonical_tools_settings
+from kiro_crew.platform.tools_settings_aliases import as_authored, canonical_tools_settings
 
 #: The ``toolsSettings`` tool key whose ``availableAgents`` Crew's spawn gate reads.
 _SPAWN_GATE_TOOL = "subagent"
@@ -26,6 +26,10 @@ _SPAWN_GATE_KEY = "availableAgents"
 _SHELL_ALLOWLIST_KEYS = ("denyByDefault", "allowedCommands")
 #: The write keys Crew's gate reads as the ``fallbackAction: "deny"`` allowlist.
 _WRITE_ALLOWLIST_KEYS = ("fallbackAction", "allowedPaths")
+#: Appended to an allowlist key the session does not approve from but Crew's gate
+#: still refuses outside of, under its deny-by-default switch, so the
+#: session-start notice never says it has no effect (``spec_keys_notice``).
+GATE_READ_MARK = " (read by Crew's gate)"
 
 
 def _gate_applied_keys(tools_settings: dict[str, Any]) -> set[tuple[str, str]]:
@@ -52,18 +56,22 @@ def _gate_applied_keys(tools_settings: dict[str, Any]) -> set[tuple[str, str]]:
 
 
 def _unapplied_beside_gate(
-    tools_settings: dict[str, Any], applied: set[tuple[str, str]]
+    tools_settings: dict[str, Any], applied: set[tuple[str, str]], raw: dict[str, Any]
 ) -> list[str]:
-    """Each set ``toolsSettings`` entry but the *applied* allowlist keys."""
+    """Each set ``toolsSettings`` entry but the *applied* allowlist keys.
+
+    *tools_settings* is the folded form of the spec's *raw* field; each name uses
+    the spelling *raw* wrote.
+    """
     lost: list[str] = []
     for tool, entry in tools_settings.items():
         if not entry:
             continue
         if not isinstance(entry, dict):
-            lost.append(f"toolsSettings.{tool}")
+            lost.append(f"toolsSettings.{as_authored(raw, tool)}")
             continue
         lost.extend(
-            f"toolsSettings.{tool}.{key}"
+            f"toolsSettings.{as_authored(raw, tool)}.{key}"
             for key, value in entry.items()
             if value
             and not (tool == _SPAWN_GATE_TOOL and key == _SPAWN_GATE_KEY)
@@ -89,28 +97,31 @@ def tools_settings_unapplied(tools_settings: Any, *, gate_allowlists: bool = Fal
 
     Read with one key per kiro-cli alias group, as the gates read it
     (:func:`~kiro_crew.platform.tools_settings_aliases.canonical_tools_settings`);
-    each dropped spelling is named as ``toolsSettings.<key>``.
+    each dropped spelling is named as ``toolsSettings.<key>``, and a kept one
+    under the spelling the spec wrote (``toolsSettings.use_subagent.<key>``, not
+    the ``subagent`` it is read as).
     """
     if not tools_settings:
         return []
     if not isinstance(tools_settings, dict):
         return ["toolsSettings"]
-    tools_settings, dropped = canonical_tools_settings(tools_settings)
+    raw = tools_settings
+    tools_settings, dropped = canonical_tools_settings(raw)
     applied = _gate_applied_keys(tools_settings) if gate_allowlists else set()
     if applied:
-        lost = _unapplied_beside_gate(tools_settings, applied)
+        lost = _unapplied_beside_gate(tools_settings, applied, raw)
         return sorted({*lost, *(f"toolsSettings.{key}" for key in dropped)})
     gated = tools_settings.get(_SPAWN_GATE_TOOL)
     if not isinstance(gated, dict) or _SPAWN_GATE_KEY not in gated:
         return ["toolsSettings"]
     lost = [f"toolsSettings.{key}" for key in dropped]
     lost += [
-        f"toolsSettings.{tool}"
+        f"toolsSettings.{as_authored(raw, tool)}"
         for tool, entry in tools_settings.items()
         if entry and tool != _SPAWN_GATE_TOOL
     ]
     lost.extend(
-        f"toolsSettings.{_SPAWN_GATE_TOOL}.{key}"
+        f"toolsSettings.{as_authored(raw, _SPAWN_GATE_TOOL)}.{key}"
         for key, value in gated.items()
         if value and key != _SPAWN_GATE_KEY
     )

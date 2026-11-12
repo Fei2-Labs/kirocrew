@@ -6,6 +6,7 @@ import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { MotionGlobalConfig } from 'framer-motion'
 import type { ChatMessage, ChatSlot } from '../../types'
 
 const sendTurn = vi.hoisted(() => vi.fn())
@@ -17,6 +18,7 @@ vi.mock('../../hooks/sharedCrew/sendRevisionSeed', () => ({ baseRevisionForPress
 
 const api = vi.hoisted(() => ({
   approveChatSlot: vi.fn(),
+  decideApproval: vi.fn(),
   resolveApproval: vi.fn(),
   sessionSummary: vi.fn(),
   chatSlotDetail: vi.fn(),
@@ -104,7 +106,7 @@ beforeEach(() => {
       ? [permission({ approval_id: 'req-9', mid: 'mid-9', deny_override_rule: 'rm-rf' })]
       : [permission()],
   }))
-  api.approveChatSlot.mockResolvedValue({ ok: true })
+  api.decideApproval.mockResolvedValue({ ok: true })
   sendTurn.mockResolvedValue({ status: 'dispatched' })
 })
 afterEach(() => {
@@ -220,7 +222,7 @@ describe('NeedsMeHoverCard', () => {
 
   it('names the verdict when another tab answered first', async () => {
     const { ApiError } = await vi.importActual<typeof import('../../api/client')>('../../api/client')
-    api.approveChatSlot.mockRejectedValue(new ApiError(409, 'already resolved', JSON.stringify({ code: 'already_resolved', decision: { decision_id: 'd1', outcome: 'rejected' } })))
+    api.decideApproval.mockRejectedValue(new ApiError(409, 'already resolved', JSON.stringify({ code: 'already_resolved', decision: { decision_id: 'd1', outcome: 'rejected' } })))
     mount()
     hover('gate')
     fireEvent.click(await screen.findByRole('button', { name: 'Approve Shell' }))
@@ -294,13 +296,26 @@ describe('NeedsMeHoverCard', () => {
     hover('gate')
     fireEvent.click(await screen.findByRole('button', { name: 'Approve Shell' }))
     await screen.findByText('Approved')
-    expect(api.approveChatSlot).toHaveBeenCalledTimes(1)
-    const [slot, action, extra] = api.approveChatSlot.mock.calls[0]
-    expect(slot).toBe('gate')
-    expect(action).toBe('approved')
-    expect(extra).toMatchObject({ origin: 'native', request_id: 'req-1', request_mid: 'mid-1' })
-    expect(typeof extra.response_id).toBe('string')
+    expect(api.decideApproval).toHaveBeenCalledTimes(1)
+    const [target, action, responseId] = api.decideApproval.mock.calls[0]
+    expect(target).toEqual({ origin: 'native', id: 'req-1', slot: 'gate', mid: 'mid-1' })
+    expect(action).toBe('approve')
+    expect(typeof responseId).toBe('string')
     expect(api.resolveApproval).not.toHaveBeenCalled()
+    expect(api.approveChatSlot).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: 'Approve Shell' })).toBeNull()
+  })
+
+  it('a press refused as no longer pending shows the refusal as status, not the muted expired label (#18203)', async () => {
+    const { ApiError } = await vi.importActual<typeof import('../../api/client')>('../../api/client')
+    api.decideApproval.mockRejectedValue(new ApiError(404, 'not pending'))
+    mount()
+    hover('gate')
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve Shell' }))
+    const notice = await screen.findByText(/no longer waiting on it/)
+    expect(notice.closest('[role="status"]')).not.toBeNull()
+    expect(notice.closest('[role="alert"]')).toBeNull()
+    expect(screen.queryByText('Expired')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Approve Shell' })).toBeNull()
   })
 
@@ -309,8 +324,8 @@ describe('NeedsMeHoverCard', () => {
     hover('gate')
     fireEvent.click(await screen.findByRole('button', { name: 'Deny Shell' }))
     await screen.findByText('Denied')
-    expect(api.approveChatSlot.mock.calls[0][1]).toBe('rejected_once')
-    expect(api.approveChatSlot.mock.calls[0][2]).toMatchObject({ origin: 'native', request_mid: 'mid-1' })
+    expect(api.decideApproval.mock.calls[0][1]).toBe('reject_once')
+    expect(api.decideApproval.mock.calls[0][0]).toMatchObject({ origin: 'native', mid: 'mid-1' })
   })
 
   it('shows a Crew Mode worker approval without decision buttons', async () => {
@@ -415,6 +430,66 @@ describe('NeedsMeHoverCard', () => {
     fireEvent.pointerLeave(container.firstElementChild!)
     act(() => { vi.advanceTimersByTime(CLOSE_GRACE_MS + 10) })
     await waitFor(() => expect(screen.queryByTestId('needs-me-card')).toBeNull())
+  })
+
+  it('stays open when the pointer moves from the row onto the card, and closes after leaving both', async () => {
+    // No exit animation, so a closed card is gone at once rather than fading out.
+    MotionGlobalConfig.skipAnimations = true
+    try {
+      const { container } = mount()
+      hover('gate')
+      const card = await screen.findByTestId('needs-me-card')
+      // A browser's order for one move off the row onto the card: the row's out (which
+      // React turns into the card's pointer-enter), then the sidebar's own leave. The
+      // leave is dispatched raw: RTL's pointerLeave also fires a pointerout, which would
+      // run the card's pointer-enter a second time, after the leave, as no browser does.
+      fireEvent.pointerOut(screen.getByTestId('row-gate'), { relatedTarget: card })
+      container.firstElementChild!.dispatchEvent(new PointerEvent('pointerleave', { relatedTarget: card }))
+      await act(async () => { vi.advanceTimersByTime(CLOSE_GRACE_MS * 3) })
+      expect(screen.getByTestId('needs-me-card')).toBe(card)
+      fireEvent.pointerOut(card, { relatedTarget: document.body })
+      await act(async () => { vi.advanceTimersByTime(CLOSE_GRACE_MS * 3) })
+      expect(screen.queryByTestId('needs-me-card')).toBeNull()
+    } finally {
+      MotionGlobalConfig.skipAnimations = false
+    }
+  })
+
+  it('keeps the card when the pointer crosses another needs-me row on its way onto it', async () => {
+    MotionGlobalConfig.skipAnimations = true
+    try {
+      const { container } = mount()
+      hover('gate')
+      const card = await screen.findByTestId('needs-me-card')
+      // Crossing the 'ask' row arms a swap to its card; landing on this card cancels it.
+      fireEvent.pointerOver(screen.getByTestId('row-ask'))
+      fireEvent.pointerOut(screen.getByTestId('row-ask'), { relatedTarget: card })
+      container.firstElementChild!.dispatchEvent(new PointerEvent('pointerleave', { relatedTarget: card }))
+      await act(async () => { vi.advanceTimersByTime(OPEN_DELAY_MS + CLOSE_GRACE_MS) })
+      expect(screen.getByTestId('needs-me-card')).toBe(card)
+      expect(api.chatSlotDetail).not.toHaveBeenCalledWith('ask', expect.anything())
+    } finally {
+      MotionGlobalConfig.skipAnimations = false
+    }
+  })
+
+  it('renders the ask body as markdown, the way the chat does', async () => {
+    api.chatSlotDetail.mockResolvedValue({
+      key: 'choice', running: false, total: 1, has_more: false, next_before: 0,
+      messages: [{ role: 'assistant', cls: '', content: 'Choose a target:\nprod first\n\nPick **one**:\n\n| Plan | Cost |\n| --- | --- |\n| Upgrade both | 2h |\n\nSee [the notes](https://example.com/notes).\n\n[OPTIONS: Upgrade both | Pin until next week]' } as ChatMessage],
+    })
+    mount()
+    hover('choice')
+    const body = await screen.findByTestId('needs-me-ask-body')
+    await waitFor(() => expect(body.querySelector('table')).not.toBeNull())
+    expect(body.querySelector('td')?.textContent).toBe('Upgrade both')
+    expect(body.querySelector('strong')?.textContent).toBe('one')
+    expect(body.querySelector('a')?.getAttribute('href')).toBe('https://example.com/notes')
+    expect(body.textContent).not.toContain('|')
+    expect(body.textContent).not.toContain('**')
+    expect(body.textContent).not.toContain('[OPTIONS')
+    // A single line break stays a break, as in the plain text this replaced.
+    expect(body.querySelector('p')?.innerHTML).toMatch(/Choose a target:<br\s*\/?>/)
   })
 })
 

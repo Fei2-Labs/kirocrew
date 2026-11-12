@@ -400,6 +400,8 @@ class TestStopTurnSlotState:
         WS-echoed stop_state, which lags on a slow connection; the backend's
         own soft_pending state is authoritative, so any second press escalates.
         """
+        import json
+
         state = self._make_state(tmp_path, monkeypatch)
         slot = state.get_or_create_slot("s1")
         slot.task = asyncio.ensure_future(asyncio.sleep(999))
@@ -423,10 +425,56 @@ class TestStopTurnSlotState:
             resp = await client.post("/api/chat/slots/s1/stop")
             assert resp.status == 200
 
-        # Backend escalated to a hard kill anyway.
+        # Backend escalated to a hard kill anyway, and the card says it was forced.
         assert force_called == [True]
         assert slot._stop_state == "idle"
+        cards = [json.loads(m["cls"]) for m in slot.messages if "stop_event" in m.get("cls", "")]
+        assert [(c["state"], c["outcome"]) for c in cards] == [("force_stopped", "hard")]
         slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_older_stop_idle_outcome_keeps_newer_stop_posture(self, tmp_path, monkeypatch):
+        """A late "idle" from an older stop must not reset a newer stop's posture.
+
+        Stop #1 awaits ``stop_turn``; the turn ends and stop #2 claims a new
+        generation; then #1 answers "idle". #2 still owns ``soft_pending``, so
+        the third press escalates to the hard kill instead of starting over.
+        """
+        from kiro_crew.dashboard.chat_api.turn_stop import stop_slot_turn
+        from kiro_crew.testing.wait import await_until
+
+        state = self._make_state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot._turn_admission_reserved = True
+        calls: asyncio.Queue[tuple[bool, asyncio.Future]] = asyncio.Queue()
+
+        async def fake_stop_turn(
+            key, *, force=False, preserve_queue=False, on_soft=None, on_hard=None
+        ):
+            gate = asyncio.get_running_loop().create_future()
+            await calls.put((force, gate))
+            return await gate
+
+        state.sessions.stop_turn = fake_stop_turn
+
+        async def next_call() -> tuple[bool, asyncio.Future]:
+            return await await_until(asyncio.ensure_future(calls.get()), what="a stop_turn call")
+
+        first = asyncio.create_task(stop_slot_turn(state, slot, cancel_key="s1"))
+        force1, gate1 = await next_call()
+        slot._stopping = False  # the turn ends; the next one runs
+        second = asyncio.create_task(stop_slot_turn(state, slot, cancel_key="s1"))
+        force2, gate2 = await next_call()
+        gate1.set_result("idle")
+        await await_until(first, what="stop #1")
+
+        assert slot._stop_state == "soft_pending"
+        third = asyncio.create_task(stop_slot_turn(state, slot, cancel_key="s1"))
+        force3, gate3 = await next_call()
+        assert (force1, force2, force3) == (False, False, True)
+        gate2.set_result("soft")
+        gate3.set_result("hard")
+        await await_until(asyncio.gather(second, third), what="stops #2 and #3")
 
     @pytest.mark.asyncio
     async def test_stop_turn_first_press_preserves_queue(self, tmp_path, monkeypatch):

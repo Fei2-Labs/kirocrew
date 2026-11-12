@@ -357,6 +357,8 @@ class TerminalCoordinator(ManagerComponent):
         then; ``False`` when the claim went to another path, which reports, and
         this task returns without a word (its caller disowns it from
         ``_report_owners`` before releasing it, so its exit latches nothing).
+        A single Stop of a queued run passes one too: it resolves once the
+        row's unlanded cancel is durably settled (``_report_queued_stop``).
 
         The two call sites (reap vs. ``_run``'s ``finally``) differ only in the
         injection-timeout reason string, the log ``source`` prefix, and whether
@@ -629,9 +631,21 @@ class TerminalCoordinator(ManagerComponent):
             )
             # Kill the parent session's kiro-cli process so the next agent's
             # injection gets a clean provider instead of hitting "Prompt already
-            # in progress" on the stuck one.
+            # in progress" on the stuck one. The cancelled injection has released
+            # any lease it held by now, so a turn still holding the session is the
+            # parent's own, which the injection was only waiting behind: that one
+            # is left running. A permit that release just handed to a queued
+            # claimant names no holder yet, and that claimant gets the clean one.
             try:
-                await self._manager._sessions.reset(info.parent_session_key)
+                if self._manager._sessions.turn_holder(info.parent_session_key) is None:
+                    await self._manager._sessions.reset(info.parent_session_key)
+                else:
+                    logger.info(
+                        "%s: left parent %s running after the injection timeout: "
+                        "its own turn holds the session",
+                        source,
+                        info.parent_session_key,
+                    )
             except Exception:
                 logger.debug(
                     "Failed to reset parent session %s after injection timeout",

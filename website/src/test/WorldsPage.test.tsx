@@ -135,6 +135,16 @@ describe('WorldsPage', () => {
       const officeWrapper = screen.getByTestId('scene-office').parentElement!
       expect(officeWrapper.style.display).not.toBe('none')
     })
+
+    it('falls back to office when the saved scene is not one this build has', () => {
+      // A key saved by another build (a scene added later, then a downgrade)
+      // matched no scene, so every scene stayed hidden and no chip was checked.
+      localStorage.setItem('mc-agent-scene', 'retired-scene')
+      renderWithProviders(<WorldsPage />)
+      const officeWrapper = screen.getByTestId('scene-office').parentElement!
+      expect(officeWrapper.style.display).not.toBe('none')
+      expect(screen.getByRole('radio', { name: /Office/ })).toHaveAttribute('aria-checked', 'true')
+    })
   })
 
   describe('collapse toggle', () => {
@@ -199,12 +209,14 @@ describe('WorldsPage', () => {
 })
 
 describe('WorldsPage: localized scene buttons', () => {
-  it('names a scene button in the active language', async () => {
+  it('names, labels and titles a scene button in the active language', async () => {
     const previous = i18next.language
     await i18next.changeLanguage('de')
     try {
       renderWithProviders(<WorldsPage />)
-      expect(screen.getByRole('radio', { name: 'Szene Office: Classic pixel office' })).toBeInTheDocument()
+      const office = screen.getByRole('radio', { name: 'Szene Büro: Klassisches Pixel-Büro' })
+      expect(office).toHaveTextContent('Büro')
+      expect(office).toHaveAttribute('title', 'Klassisches Pixel-Büro')
     } finally {
       await i18next.changeLanguage(previous)
     }

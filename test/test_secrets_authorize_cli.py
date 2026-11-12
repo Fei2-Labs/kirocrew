@@ -65,20 +65,9 @@ def _gateway_owned_policy_directory(tmp_path, _floor_monkeypatch):
     Pinned to the namespace backend (the CLI never creates the directory there), so
     no test here probes the host's real sandbox backend. Tests of the other
     backends override the pin.
-
-    ``_windows_authorize_unavailable`` is pinned False too: every
-    ``authorize``-the-add test here exercises the Unix authorize transaction, and on
-    a real Windows runner the add path refuses before that transaction (that is the
-    behaviour under test in the Windows cases below). Pinning only this predicate
-    turns the refusal off without touching ``platform_compat.IS_WINDOWS`` itself,
-    which the real publish path reads to take its own Windows branch. The Windows
-    cases set the predicate back to True themselves, after this fixture.
     """
     from kiro_crew import cli_commands_secrets
 
-    _floor_monkeypatch.setattr(
-        cli_commands_secrets, "_windows_authorize_unavailable", lambda: False
-    )
     _floor_monkeypatch.setattr(
         cli_commands_secrets, "_spawn_precreates_policy_directory", lambda: True
     )
@@ -108,6 +97,30 @@ def test_authorize_publishes_only_inside_the_hidden_policy_directory(tmp_path, m
     doc = json.loads(policy_path(tmp_path).read_text(encoding="utf-8"))
     assert set(doc["authorizations"]) == {"L"}
     assert verify_secret_authorizations(doc["authorizations"], doc[SIGNATURE_FIELD])
+
+
+def test_remove_of_an_absent_name_reports_nothing_removed_and_does_not_publish(
+    tmp_path, monkeypatch, capsys
+):
+    """`--remove` of a name that was never authorized says so and writes no policy.
+
+    Before this fix it printed "Removed ... for 'X'." and audited action=remove
+    even though nothing was removed. Now it reports nothing was removed, exits 0
+    (idempotent `--remove` still succeeds), and leaves no signed policy behind.
+    """
+    # First authorize one real name so the policy exists and is validly signed.
+    _run_authorize(monkeypatch, tmp_path, secret_name="REAL", origin="https://api.example.com")
+    before = policy_path(tmp_path).read_text(encoding="utf-8")
+    capsys.readouterr()  # drop the authorize output
+
+    # Removing an absent name is a no-op: accurate message, exit 0, policy untouched.
+    _run_authorize(monkeypatch, tmp_path, secret_name="NEVER_SET", remove=True)
+    out = capsys.readouterr().out
+    assert "nothing removed" in out
+    assert "NEVER_SET" in out
+    assert "Removed" not in out
+    # The signed policy is byte-identical: no re-sign, no dropped entry.
+    assert policy_path(tmp_path).read_text(encoding="utf-8") == before
 
 
 def test_authorize_refuses_without_the_gateway_owned_directory(tmp_path, monkeypatch):
@@ -206,6 +219,23 @@ def test_authorize_reset_recovers_a_torn_policy(tmp_path, monkeypatch):
         monkeypatch, tmp_path, secret_name="K", origin="https://api.example.com", reset=True
     )
     assert load_authorization(tmp_path, "K").origin == "https://api.example.com"
+
+
+def test_remove_reset_on_a_torn_policy_publishes_a_fresh_signed_empty_policy(tmp_path, monkeypatch):
+    """`--remove --reset` on a damaged policy must repair the file, not exit early.
+
+    The no-op early return for a `--remove` of an absent name must not swallow a
+    pending `--reset` that discarded a damaged policy: the reset still has to
+    write, sign and audit a fresh empty policy, or the bad file stays on disk and
+    every later authorize keeps refusing.
+    """
+    policy = policy_path(tmp_path)
+    policy.write_text('{"version": 1, "authoriz', encoding="utf-8")
+    _run_authorize(monkeypatch, tmp_path, secret_name="GONE", remove=True, reset=True)
+    # The torn bytes are gone, replaced by a validly owner-signed empty policy.
+    doc = json.loads(policy.read_text(encoding="utf-8"))
+    assert doc["authorizations"] == {}
+    assert verify_secret_authorizations(doc["authorizations"], doc[SIGNATURE_FIELD])
 
 
 def test_authorize_discards_a_key_present_but_invalidly_signed_policy(tmp_path, monkeypatch):
@@ -525,53 +555,14 @@ def test_authorize_without_origin_and_without_remove_exits_2(tmp_path, monkeypat
     assert not (policy_path(tmp_path)).exists()
 
 
-def test_authorize_refuses_on_windows_and_writes_nothing(tmp_path, monkeypatch, capsys):
-    """On Windows the mediated call route refuses every call, so signing a grant
-    there only produces one the host can never use. Adding an authorization must
-    refuse at this first surface, exit 1, name the platform, and create neither
-    the hidden directory nor ``policy.json``.
-
-    The seam is Windows with the namespace precreate OFF, which is exactly the
-    arrangement that would otherwise have the CLI create the directory itself
-    (``_spawn_precreates_policy_directory`` false) and write the policy."""
-    from kiro_crew import cli_commands
-    from kiro_crew.secrets_mediation.provenance import REQUEST_POLICY_DIRNAME
-
-    # Start from a host with nothing precreated, so a failure to refuse would
-    # leave the directory + policy behind for the assertions to catch.
-    policy_path(tmp_path).parent.rmdir()
-    monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
-    # Drive the refusal through its own predicate, so the case runs the same on a
-    # non-Windows host (and on Windows) without patching the real platform flag the
-    # publish path reads.
-    monkeypatch.setattr(cli_commands_secrets, "_windows_authorize_unavailable", lambda: True)
-    monkeypatch.setattr(cli_commands_secrets, "_spawn_precreates_policy_directory", lambda: False)
-
-    args = argparse.Namespace(
-        name="K", origin="https://api.example.com", header=None, remove=False, reset=False
-    )
-    with pytest.raises(SystemExit) as exc_info:
-        cli_commands._handle_secrets_authorize(args)
-    assert exc_info.value.code == 1
-    err = capsys.readouterr().err
-    assert "Windows" in err
-    assert not (tmp_path / REQUEST_POLICY_DIRNAME).exists()
-    assert not policy_path(tmp_path).exists()
-
-
-def test_authorize_remove_still_works_on_windows(tmp_path, monkeypatch):
-    """``--remove`` under Windows is unchanged: an owner whose entry was signed on
-    another host (or before an upgrade) can still clear it. The Windows add-refuse
-    guard must not catch the remove path."""
+def test_authorize_remove_clears_an_entry(tmp_path, monkeypatch):
+    """``--remove`` clears an entry by name alone; origin=None mirrors the omitted
+    optional positional."""
     from kiro_crew import cli_commands
 
-    # Seed an entry while the add refusal is off (the autouse fixture pins it).
     _run_authorize(monkeypatch, tmp_path, secret_name="GONE", origin="https://api.example.com")
     load_authorization(tmp_path, "GONE")  # present before removal
 
-    # Now turn the Windows add-refusal on and remove: --remove must not trip it.
-    # origin=None mirrors the omitted optional positional.
-    monkeypatch.setattr(cli_commands_secrets, "_windows_authorize_unavailable", lambda: True)
     args = argparse.Namespace(name="GONE", origin=None, header=None, remove=True, reset=False)
     cli_commands._handle_secrets_authorize(args)  # must NOT raise SystemExit
 

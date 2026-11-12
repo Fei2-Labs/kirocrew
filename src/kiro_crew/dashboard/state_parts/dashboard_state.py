@@ -39,9 +39,12 @@ from kiro_crew.dashboard.state_parts.dashboard_services import (
 from kiro_crew.dashboard.state_parts.notification_log import _load_notifications
 from kiro_crew.dashboard.state_parts.session_events import _record_crew_log_class
 from kiro_crew.dashboard.state_parts.slots_frame import _SLOTS_BROADCAST_INTERVAL_S
+from kiro_crew.keepalive_route import serve_keepalive_route
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging import turn_ceiling
+from kiro_crew.notifications.bridge import BridgeDispatcher, composite_sink
+from kiro_crew.notifications.bridge_actions import BridgeActionRegistry
 from kiro_crew.notifications.bus import NotificationBus
 from kiro_crew.notifications.push_store import PushSubscriptionStore
 from kiro_crew.notifications.rate_limit import AppRateLimiter
@@ -51,6 +54,8 @@ from kiro_crew.owner_only_files import mkdirs_owner_only
 from kiro_crew.safety_override import safety_override
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
+
     from kiro_crew.dashboard._types import (
         ContextBuilder,
         ConversationLog,
@@ -66,6 +71,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog
     from kiro_crew.dashboard.state_parts.chat_slot import _ChatSlot
     from kiro_crew.dashboard.state_parts.refresh_coalesce import RefreshCoalescer
+    from kiro_crew.dashboard.state_parts.slot_turns import _ConsumedMergeCard
     from kiro_crew.messaging.transport import MessagingTransport
     from kiro_crew.power import SleepInhibitor
     from kiro_crew.slack.outbound import PostedOptions
@@ -109,6 +115,8 @@ class DashboardState:
 
     # Typed here for the owner functions that read them through ``self``.
     notification_bus: NotificationBus
+    notification_bridge: BridgeDispatcher
+    bridge_actions: BridgeActionRegistry
     notification_channel_settings: ChannelSettings
     resource_pressure_notifier: ResourcePressureNotifier
     file_indexes: FileIndexRegistry
@@ -245,6 +253,11 @@ class DashboardState:
     # unreadable or remote-only seed is not. Same frozenset baseline as above.
     deferred_member_slot_keys: "frozenset[str] | set[str]" = frozenset()
 
+    # Those deferred keys as the restore reported them, kept after the retry empties
+    # the set above: ``slot_list_held_keys`` holds each one while it is still in the
+    # reopen seed, so a complete slot list cannot drain its unread mark first.
+    restore_deferred_slot_keys: frozenset[str] = frozenset()
+
     # Whether the last open-tab restore could READ the registry at all. False means
     # every generation that might hold the set was refused by the OS, so this process
     # has no basis for treating ``_slots`` as the authoritative open-tab set and
@@ -289,6 +302,9 @@ class DashboardState:
         owner_id: str = "",
     ):
         self.sessions = sessions
+        # ``/api/session-keepalive`` looks a session up in this registry, so the
+        # providers it publishes are the ones a Kiro Crew tool's heartbeat reaches.
+        serve_keepalive_route(sessions)
         # The decisions seam's LLM lane needs ONE callable that runs a prompt on a
         # tool-less background session, and ``decisions/`` deliberately imports
         # nothing above itself -- so the wiring happens here, where the session
@@ -348,9 +364,20 @@ class DashboardState:
         # Read by the restart handler: stops the broker this gateway owns before
         # the exec, so a successor never meets a daemon still owned by this pid.
         self._mcp_gateway_stop: Any = None  # async () -> None
-        # Read by POST /api/restart/when-idle: the gateway's idle check before
-        # a restart, async () -> (idle, turns, background). None until wired.
-        self._restart_idle_gate: Any = None
+        # Read by ``_restart_gateway`` before it touches a session: the gateway's
+        # pause, drain and fence, ``async (*, force) -> RestartAdmission``, and the
+        # release that reopens admission when the restart stops short of the exec,
+        # ``async () -> None``. None where no orchestrator runs.
+        self._restart_admission: Any = None
+        self._restart_preflight: Any = None
+        self._restart_release: Any = None
+        # POST /api/restart/when-idle with ``commit``: the timer that reopens admission if
+        # the caller never restarts or releases, and the release it started.
+        self._restart_commit_hold: Any = None
+        self._restart_commit_release_task: Any = None
+        # Read by POST /api/restart/when-idle and the restart confirm: the shared quiescence
+        # census, ``(*, quiet_window_secs) -> Quiescence``. None until wired.
+        self._quiescence_probe: Any = None
         # Secretary subsystem removed; kept as permanent None for apps/routes_enable.py
         # builtin-service restart lookup (getattr-based, no-op when None).
         self._secretary_restart: Any = None  # restart callback (always None — service removed)
@@ -394,6 +421,10 @@ class DashboardState:
         # Short reason from the failed connect attempt (e.g. "invalid_auth"),
         # empty when connected or never attempted. Read by the settings badge.
         self.slack_connect_error: str = ""
+        # Re-runs the Slack handshake from the saved credentials (POST
+        # /api/slack/reconnect). Set by the gateway that owns the Slack socket;
+        # None on a server with no socket owner.
+        self.slack_reconnect: Callable[[], Awaitable[dict[str, Any]]] | None = None
         # True once the Discord channel's Gateway WebSocket transport started
         # this session (set by maybe_start_discord). Read by the Discord
         # settings status badge.
@@ -523,7 +554,30 @@ class DashboardState:
         self.push_subscription_store = PushSubscriptionStore()
         # Notification bus (schema v2) — notify() adapts legacy calls onto it;
         # _deliver_note is the delivery sink (log, count, broadcast, persist).
-        self.notification_bus = NotificationBus(sink=self._deliver_note)
+        # The bridge runs after it, so a chat transport never delays the
+        # dashboard (notifications/bridge.py).
+        # Bindings from bridged notes to the decisions a chat app may answer
+        # (notifications/bridge_actions.py); in-process, so a restart drops them.
+        self.bridge_actions = BridgeActionRegistry()
+        self.notification_bridge = BridgeDispatcher(
+            settings=lambda: self.notification_channel_settings,
+            subjects=lambda note, publisher: _dashboard_services.bridge_subjects(
+                self, note, publisher
+            ),
+            # A keyed note's replacement is written and committed asynchronously,
+            # and the write can fail: the bridge waits for that commit.
+            committed=lambda note: self.last_notification_persist if note.get("key") else None,
+        )
+        # Lazy: the sink pulls in the Slack formatter, which a state import skips.
+        from kiro_crew.notifications.bridge_slack import SlackBridgeSink
+        from kiro_crew.notifications.bridge_transport import TRANSPORT_SINKS, TransportBridgeSink
+
+        self.notification_bridge.register_sink(SlackBridgeSink(self))
+        for transport in TRANSPORT_SINKS:
+            self.notification_bridge.register_sink(TransportBridgeSink(self, transport))
+        self.notification_bus = NotificationBus(
+            sink=composite_sink(self._deliver_note, self._bridge_note)
+        )
         # Future of the most recent delivery-sink persist job (None when the
         # last persist ran inline). The app push handler awaits it to give a
         # durability guarantee; legacy producers ignore it (best-effort).
@@ -562,6 +616,12 @@ class DashboardState:
         # Slot key -> (owning slot, its armed deferred-reset retry task); see
         # ``chat_turn.session_reset._arm_pending_reset_retry``.
         self._pending_reset_retries: dict[str, tuple[_ChatSlot, asyncio.Task[None]]] = {}
+        # Process-local guard for copies queued before a durable consumption
+        # stamp lands, and for a hydration that read the hold before it. An
+        # entry is kept once its stamp is proven, marked stamped so eviction
+        # takes it before any still-unstamped guard; the registry is
+        # count-bounded by _MAX_CONSUMED_MERGE_CARDS.
+        self._consumed_merge_cards: dict[str, _ConsumedMergeCard] = {}
         # Sandbox kind -> monotonic time of the last notification for it. Keyed on
         # the sandbox layer's own closed kind set (three values), NEVER on request
         # data: auto-speak synthesises one request per sentence, so a key carrying
@@ -780,6 +840,11 @@ class DashboardState:
         # read by the guards' lifecycle hooks, which withdraw the claim while the
         # address is not held and re-publish it once a rebind lands.
         self._listener_sidecars: dict[str, tuple[int, str, str]] = {}
+        # The TCP port the primary listener actually bound (the OS-assigned one
+        # under ``--port auto``), recorded once it listens; 0 before that. The
+        # gateway announces it to the MCP gateway daemon it owns, which binds
+        # pooled control-plane backends to it. Never read from os.environ.
+        self._listener_bound_port: int = 0
         # Prevent-sleep inhibitor + its poll task. Held to prevent GC and
         # released/cancelled on shutdown; annotated here so the assignments in
         # start_dashboard type-check under mypy.
@@ -911,6 +976,10 @@ class DashboardState:
             self.context_builder.memory_mode_for_session = lambda key: resolve_session_memory_mode(
                 self, key
             )
+            # A channel turn's build reads the sub-agent notices queued on its tab.
+            from kiro_crew.dashboard.chat_runner import read_tab_notices
+
+            self.context_builder.tab_notices_for_session = lambda key: read_tab_notices(self, key)
 
     def note_crew_log_class(self, slot: Any) -> None:
         """Record *slot*'s current class in its crew log, if it has moved.
@@ -1100,6 +1169,7 @@ class DashboardState:
     source_link_urls_for_slot = _source_links.source_link_urls_for_slot
     push_source_status = _source_links.push_source_status
     refresh_slot_source_status = _source_links.refresh_slot_source_status
+    refresh_source_status_now = _source_links.refresh_source_status_now
 
     # state_parts/dashboard_services.py
     approval_timeout_for = _dashboard_services.approval_timeout_for
@@ -1110,6 +1180,7 @@ class DashboardState:
     enable_yolo = _dashboard_services.enable_yolo
     disable_yolo = _dashboard_services.disable_yolo
     is_yolo_active = _dashboard_services.is_yolo_active
+    yolo_reaches = _dashboard_services.yolo_reaches
     request_approval = _dashboard_services.request_approval
     pending_coordinator_approvals = _dashboard_services.pending_coordinator_approvals
     linked_session_busy = _dashboard_services.linked_session_busy
@@ -1140,10 +1211,12 @@ class DashboardState:
     _fan_out_web_push = _dashboard_services._fan_out_web_push
     _send_web_push_all = _dashboard_services._send_web_push_all
     _deliver_note = _dashboard_services._deliver_note
+    _bridge_note = _dashboard_services._bridge_note
     register_sse = _dashboard_services.register_sse
     unregister_sse = _dashboard_services.unregister_sse
     _rewrite_notifications_async = _dashboard_services._rewrite_notifications_async
     delete_notification = _dashboard_services.delete_notification
+    dismiss_notification = _dashboard_services.dismiss_notification
     ack_notification = _dashboard_services.ack_notification
     unack_notification = _dashboard_services.unack_notification
     resolve_skill_review_notifications = _dashboard_services.resolve_skill_review_notifications

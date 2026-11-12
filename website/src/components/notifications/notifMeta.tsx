@@ -111,12 +111,30 @@ const SYSTEM_NOTE_TITLE_KEY = {
   turn_limit: 'components.notifications.systemNote.turn_limit_title',
   default_model_applied: 'components.notifications.systemNote.default_model_applied_title',
   default_model_failed: 'components.notifications.systemNote.default_model_failed_title',
+  chat_stopped_signed_out: 'components.notifications.systemNote.chat_stopped_title',
+  chat_stopped_error: 'components.notifications.systemNote.chat_stopped_title',
+  chat_stopped_connection_dropped: 'components.notifications.systemNote.chat_stopped_title',
+  chat_stopped_agent_restarting: 'components.notifications.systemNote.chat_stopped_title',
+  chat_stopped_unrecovered: 'components.notifications.systemNote.chat_stopped_title',
+  chat_stopped_busy: 'components.notifications.systemNote.chat_stopped_title',
+  chat_stopped_refused: 'components.notifications.systemNote.chat_stopped_title',
+  chat_stopped_stalled: 'components.notifications.systemNote.chat_stopped_title',
+  folder_agent_label: 'components.notifications.systemNote.folder_agent_label_title',
 } as const
 type SystemNoteId = keyof typeof SYSTEM_NOTE_TITLE_KEY
 const SYSTEM_NOTE_BODY_KEY: Record<SystemNoteId, string> = {
   turn_limit: 'components.notifications.systemNote.turn_limit_body',
   default_model_applied: 'components.notifications.systemNote.default_model_applied_body',
   default_model_failed: 'components.notifications.systemNote.default_model_failed_body',
+  chat_stopped_signed_out: 'components.notifications.systemNote.chat_stopped_signed_out_body',
+  chat_stopped_error: 'components.notifications.systemNote.chat_stopped_error_body',
+  chat_stopped_connection_dropped: 'components.notifications.systemNote.chat_stopped_connection_dropped_body',
+  chat_stopped_agent_restarting: 'components.notifications.systemNote.chat_stopped_agent_restarting_body',
+  chat_stopped_unrecovered: 'components.notifications.systemNote.chat_stopped_unrecovered_body',
+  chat_stopped_busy: 'components.notifications.systemNote.chat_stopped_busy_body',
+  chat_stopped_refused: 'components.notifications.systemNote.chat_stopped_refused_body',
+  chat_stopped_stalled: 'components.notifications.systemNote.chat_stopped_stalled_body',
+  folder_agent_label: 'components.notifications.systemNote.folder_agent_label_body',
 }
 
 /** The note's title and body, in the dashboard's language when the gateway
@@ -305,17 +323,15 @@ export const MAC_ACTION_BTN_CLASS = 'bg-[color-mix(in_srgb,var(--bg-hover)_80%,t
 
 /** The sentence a failed Approve/Reject press shows, on a feed row and in the
  *  detail panel alike. A quoted reason is the decide route's own sentence.
- *  Anything else (a 5xx, or no response) may have landed. A row that names
- *  its request (`targeted`: slot and instance) is refused once that request
- *  is settled, so it says pressing again is safe. A row decided by id alone
- *  could reach a later request under a recurring id, so it keeps the chat
- *  card's plain hedge. After a frame ended the request (`ended`, shown
+ *  Anything else (a 5xx, or no response) may have landed. Every decide names
+ *  its request (slot and instance; a row that names none is refused with
+ *  nothing sent), and is refused once that request is settled, so it says
+ *  pressing again is safe. After a frame ended the request (`ended`, shown
  *  beside "no longer pending") there is nothing to retry, so an unquoted
  *  failure adds nothing beside that line. */
-export function decisionFailedCopy(reason: string, opts: { ended?: boolean; targeted?: boolean } = {}): string | null {
+export function decisionFailedCopy(reason: string, opts: { ended?: boolean } = {}): string | null {
   if (reason) return i18nT('components.approvalCard.decision_not_recorded_error', { error: reason })
   if (opts.ended) return null
-  if (!opts.targeted) return i18nT('components.approvalCard.decision_failed')
   return i18nT('components.notifications.notificationFeed.decision_failed_retry')
 }
 

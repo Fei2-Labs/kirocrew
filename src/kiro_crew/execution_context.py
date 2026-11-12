@@ -7,12 +7,18 @@ boundary and do not grant transport, app, owner or governance permissions.
 from __future__ import annotations
 
 import logging
+import sys
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from threading import RLock
 from typing import Any, Literal, Mapping, overload
 
 from kiro_crew.constants import MAX_SHORT_STRING
+from kiro_crew.history_metadata_line import (
+    METADATA_LINE_CORRUPT,
+    METADATA_LINE_READABLE,
+    METADATA_LINE_TRANSIENT,
+)
 
 EXECUTION_CONTEXT_KEY = "execution_context"
 MEMORY_MODES = ("persistent", "incognito", "temporary")
@@ -337,6 +343,14 @@ class ExecutionContext:
     def with_mode(self, mode: str) -> ExecutionContext:
         return replace(self, memory_mode=stricter_memory_mode(self.memory_mode, mode))
 
+    def promoted_to_persistent(self) -> ExecutionContext:
+        """The one way to loosen a record's mode: "Keep this chat" on an ephemeral session.
+
+        ``with_mode`` only tightens. The sole caller is ``chat_fork._bind_fork_execution``,
+        for a promotion the dashboard owner confirmed.
+        """
+        return replace(self, memory_mode="persistent")
+
     def with_template(self, template_id: str, selection_name: str) -> ExecutionContext:
         """Run this record's store under an explicitly selected TEMPLATE.
 
@@ -555,6 +569,54 @@ def execution_for_store(
     return ExecutionContext(
         None, MemoryStoreRef(name), "template", template_id, memory_mode, app, template_id
     )
+
+
+def recordless_parent_execution(
+    inherited: object, *, agent: str, memory_store: str, memory_mode: str, app: str
+) -> ExecutionContext:
+    """The execution a spawn inherits from a parent session with no execution record.
+
+    A parent with no record yet (a channel conversation whose first turn is not
+    saved) hands its child its live selection
+    (``SessionManager.get_agent_selection``) instead: *inherited* is
+    that ``(kind, name)`` pair, ``("template", "")`` when there is no parent or an
+    explicit *agent* is named. The spawn gate (``resolve_spawn_execution``) and
+    ``POST /api/spawn`` both build the child from it, so they agree on what such a
+    parent hands down. Reads config, so an event-loop caller runs it off the loop.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig, member_template_id
+
+    if (
+        not isinstance(inherited, tuple)
+        or len(inherited) != 2
+        or inherited[0] not in ("template", "member")
+        or not isinstance(inherited[1], str)
+    ):
+        raise ValueError("effective agent template is invalid")
+    execution = execution_for_store(
+        memory_store, memory_mode=memory_mode, app=app, template_id=agent or inherited[1]
+    )
+    if inherited[0] == "member":
+        from kiro_crew.crewmate_prune_migration import removed_crewmate_names
+
+        selected = KiroCrewConfig.load().agents.get(inherited[1])
+        if selected is not None:
+            execution = replace(
+                execution,
+                selection_kind="member",
+                selection_name=inherited[1],
+                template_id=member_template_id(selected),
+            )
+        elif (
+            execution.store.store_id != "default"
+            or execution.member_id is not None
+            or inherited[1] not in removed_crewmate_names()
+        ):
+            raise ValueError("selected member is unavailable")
+        # Otherwise the member is a synced crewmate the startup prune removed:
+        # same rule ``adopt_removed_synced_crewmate`` applies to records, so the
+        # run keeps its template on the shared store.
+    return execution
 
 
 def validate_execution(
@@ -885,6 +947,32 @@ def rollback_live_session_tightening(
         return True
 
 
+def _session_record_state(session_key: str) -> tuple[dict[str, Any], str]:
+    """This session's metadata record, read fresh, and its ``METADATA_LINE_*`` state.
+
+    Through ``kiro_crew.history`` when that module is loaded, so whatever stands in
+    for its ``ConversationLog`` still answers. Where it is not loaded, the record is
+    read by the rules the store itself uses (``history_metadata_line``,
+    ``history_files.transcript_stems``) without loading the store: a stdio MCP server
+    reads its session's record for a tool description before it has imported the
+    code that runs its tools.
+    """
+    history = sys.modules.get("kiro_crew.history")
+    if history is None:
+        from kiro_crew.history_files import _sessions_dir, transcript_stems
+        from kiro_crew.history_metadata_line import read_metadata_state
+
+        return read_metadata_state(_sessions_dir(), transcript_stems(session_key))
+    log = history.ConversationLog()
+    record, readable = log.get_metadata_status(session_key)
+    if readable:
+        return record, METADATA_LINE_READABLE
+    # The state comes from a second read. One that finds the line readable again does
+    # not turn the failed read's empty record into a record, so it stays unreadable.
+    state = log.metadata_line_state(session_key)
+    return record, METADATA_LINE_TRANSIENT if state == METADATA_LINE_READABLE else state
+
+
 @overload
 def read_session_execution(session_key: str, *, required: Literal[True]) -> ExecutionContext: ...
 
@@ -900,8 +988,6 @@ def read_session_execution(session_key: str, *, required: bool) -> ExecutionCont
 
 
 def read_session_execution(session_key: str, *, required: bool = False) -> ExecutionContext | None:
-    from kiro_crew.history import ConversationLog
-
     with _EXECUTION_LOCK:
         live = _LIVE_EXECUTIONS.get(_live_key(session_key))
     if live is not None:
@@ -916,9 +1002,9 @@ def read_session_execution(session_key: str, *, required: bool = False) -> Execu
         record = read_state(session_key.split(":", 1)[1])
         if record is not None:
             return read_run_execution(session_key.split(":", 1)[1])
-    record, readable = ConversationLog().get_metadata_status(session_key)
-    if not readable:
-        reason = _unreadable_record_reason(ConversationLog(), session_key)
+    record, line_state = _session_record_state(session_key)
+    if line_state != METADATA_LINE_READABLE:
+        reason = _unreadable_reason_for(line_state)
         raise _unavailable(reason)
     execution = execution_from_record(record, required=required)
     if execution is not None:
@@ -1028,11 +1114,14 @@ def _unreadable_record_reason(log: Any, session_key: str) -> str:
     held are unknowable, so nothing runs as an ordinary or Global chat in its
     place.
     """
-    from kiro_crew.history import METADATA_LINE_CORRUPT
+    return _unreadable_reason_for(log.metadata_line_state(session_key))
 
-    if log.metadata_line_state(session_key) == METADATA_LINE_CORRUPT:
-        return _DAMAGED_RECORD_REASON
-    return _UNREADABLE_RECORD_REASON
+
+def _unreadable_reason_for(line_state: str) -> str:
+    """The refusal reason for a metadata line in *line_state* (not readable)."""
+    return (
+        _DAMAGED_RECORD_REASON if line_state == METADATA_LINE_CORRUPT else _UNREADABLE_RECORD_REASON
+    )
 
 
 def _missing_identity(remedy: str):

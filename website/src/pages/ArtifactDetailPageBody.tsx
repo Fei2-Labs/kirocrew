@@ -453,6 +453,7 @@ export function ArtifactDetailPageBody({
           <span className="min-w-0 flex-1">{i18nT(publishNoticeKey({
             rolling_out: 'pages.artifactDetailPage.publication_still_rolling_out',
             distribution_disabled: 'pages.artifactDetailPage.publication_distribution_disabled',
+            origin_mismatch: 'pages.artifactDetailPage.publication_origin_mismatch',
             notice_generic: 'pages.artifactDetailPage.publication_notice_generic',
           }, artifact.publication.notice_code))}</span>
           {/* A notice is recorded once, at publish time, and the ordinary happy path
@@ -620,8 +621,10 @@ export function ArtifactDetailPageBody({
             {/* IN THIS COLUMN, its only mount: the remedy names the composer below it, and a
                 page-top banner puts that instruction a column away from the control it means. */}
             {contextNotice}
+            {/* Not until the create returns: the gateway lists the new session before it
+                answers, and a chat mounted from that frame never reads the prompt staged after. */}
             <ArtifactChatPanel
-              slotKey={boundSlot?.key ?? null}
+              slotKey={chatCreating ? null : boundSlot?.key ?? null}
               creating={chatCreating}
               onNewChat={() => { void newCompanionChat() }}
               onOpenFull={openChatFull}

@@ -41,10 +41,12 @@ from kiro_crew.dashboard.chat_utils import (
     slack_options_owner_keys_snapshot,
     slack_options_slot,
 )
+from kiro_crew.http_proxy import resolve_proxy
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.queue_drain import entries_queued_by
 from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
+from kiro_crew.messaging.session_trust import is_session_trusted, trust_permitted
 from kiro_crew.security import (
     redact_and_truncate,
     redact_credentials,
@@ -176,11 +178,22 @@ async def dispatch(payload: dict) -> None:
             resources=action_id,
             error="unauthorized user",
         )
+        from kiro_crew.slack.code_channels import agent_picker, approval_picker
+
+        refusal = "⛔ You are not authorized to use these buttons."
+        if action_id == agent_picker.AGENT_SELECT_ACTION_ID:
+            # Slack Code's agent picker records each change decision as its own.
+            agent_picker.audit_refused_pick(payload, "unauthorized user")
+            refusal = agent_picker.OWNER_ONLY_TEXT
+        elif action_id in (
+            approval_picker.APPROVAL_SELECT_ACTION_ID,
+            approval_picker.APPROVAL_CONFIRM_ACTION_ID,
+        ):
+            approval_picker.audit_refused_pick(payload, "unauthorized user")
+            refusal = approval_picker.OWNER_ONLY_TEXT
         if _orch and _orch.slack and channel and user_id:
             try:
-                await _orch.slack.post_ephemeral(
-                    channel, user_id, "⛔ You are not authorized to use these buttons."
-                )
+                await _orch.slack.post_ephemeral(channel, user_id, refusal)
             except Exception:
                 logger.debug("Failed to send ephemeral rejection", exc_info=True)
         return
@@ -191,6 +204,44 @@ async def dispatch(payload: dict) -> None:
     # fall through to the tool-approval handler (which would look up a nonexistent
     # approval). No server work, so no channels-governance gate is needed.
     if action_id == SESSION_LINK_ACTION:
+        return
+
+    # ── Slack Code channel: the wrap-up's Archive button ──
+    # Answered there while slack.code_channels is on (origin-inherited
+    # authorization, SEL-audited); otherwise it falls through as before.
+    from kiro_crew.slack.code_channels.wrapup import ARCHIVE_ACTION_ID, handle_archive_click
+
+    if action_id == ARCHIVE_ACTION_ID:
+        if not (
+            await channel_inbound_permitted("slack")
+            and not channel_refusal(channel, operation="slack.interactive", caller=user_id)
+        ):
+            logger.info("slack code channel archive dropped: denied by channels governance policy")
+            return
+        if await handle_archive_click(_orch, payload):
+            return
+
+    # ── Slack Code channel: the kickoff's agent picker ──
+    # Same shape: answered there while slack.code_channels is on (owner-only,
+    # SEL-audited, switched through the dashboard's agent-switch path).
+    from kiro_crew.slack.code_channels.agent_picker import AGENT_SELECT_ACTION_ID, handle_select
+
+    if action_id == AGENT_SELECT_ACTION_ID:
+        if not (
+            await channel_inbound_permitted("slack")
+            and not channel_refusal(channel, operation="slack.interactive", caller=user_id)
+        ):
+            logger.info(
+                "slack code channel agent pick dropped: denied by channels governance policy"
+            )
+            return
+        if await handle_select(_orch, payload):
+            return
+
+    # ── Slack Code: approval-card controls (owner-only, audited there) ──
+    from kiro_crew.slack.code_channels.worker_approvals import dispatch_card_click
+
+    if await dispatch_card_click(_orch, payload, action_id):
         return
 
     # ── OPTIONS choice buttons / "Choose several..." menu ──
@@ -301,6 +352,7 @@ async def dispatch(payload: dict) -> None:
             async with aiohttp.ClientSession() as sess:
                 await sess.post(
                     response_url,
+                    proxy=resolve_proxy(response_url),
                     json={
                         "replace_original": False,
                         "response_type": "ephemeral",
@@ -402,6 +454,7 @@ async def dispatch(payload: dict) -> None:
                 async with aiohttp.ClientSession() as sess:
                     await sess.post(
                         response_url,
+                        proxy=resolve_proxy(response_url),
                         json={
                             "replace_original": False,
                             "response_type": "ephemeral",
@@ -424,6 +477,7 @@ async def dispatch(payload: dict) -> None:
             async with aiohttp.ClientSession() as sess:
                 await sess.post(
                     response_url,
+                    proxy=resolve_proxy(response_url),
                     json={
                         "replace_original": False,
                         "response_type": "ephemeral",
@@ -547,8 +601,8 @@ async def dispatch(payload: dict) -> None:
                 error="unauthorized user",
             )
             return
-        is_trust = action_id.startswith(TOOL_TRUST_ACTION_PREFIX)
-        approved = is_trust or action_id.startswith(TOOL_APPROVE_ACTION_PREFIX)
+        pressed_trust = action_id.startswith(TOOL_TRUST_ACTION_PREFIX)
+        approved = pressed_trust or action_id.startswith(TOOL_APPROVE_ACTION_PREFIX)
         # value / action_id suffix carry the session-namespaced approval token
         # (session_key:request_id) so a click resolves ONLY its own session's
         # pending tool — kiro-cli request ids restart at 1 per session — plus the
@@ -584,12 +638,17 @@ async def dispatch(payload: dict) -> None:
             return
         # Trust grants per-session auto-approve BEFORE resolving, so subsequent
         # tools in this session are auto-approved (mirrors native trust_tool).
-        if is_trust:
+        # The policy is read here, after the channels await, and the label and audit
+        # say "trusted" only when the grant really took: under a ``permission_mode``
+        # deny of ``trust`` the press approves this one tool.
+        is_trust = False
+        if pressed_trust and trust_permitted():
             sess_key = SlackApprovalDecider.session_for(approval_key, nonce=press_nonce)
             # No live prompt answers to this press, so there is no session to widen.
             # Granting on the empty key would escalate whatever later reads it.
             if sess_key:
                 add_trusted_session(sess_key, _orch.sessions if _orch else None)
+                is_trust = is_session_trusted(sess_key)
         resolved = SlackApprovalDecider.resolve_global(approval_key, approved, nonce=press_nonce)
         if not resolved:
             label = "⏱ This approval already expired."
@@ -615,6 +674,13 @@ async def dispatch(payload: dict) -> None:
                 await _orch.slack.update_message(channel, msg_ts, text=label)
             except Exception:
                 logger.debug("Failed to update transport approval message", exc_info=True)
+        return
+
+    # ── A bridged notification's action button (RFC bridge actions) ──
+    # Routed before the generic approval fallthrough, which would look this id up
+    # as a native approval it never was.
+    if action_id.startswith(BRIDGE_SLACK_ACTION_PREFIX):
+        await _handle_bridge_action(payload, action, action_id, channel, user_id)
         return
 
     # ── Tool approval buttons (approve / trust / reject) ──
@@ -687,7 +753,9 @@ async def _handle_resume_choice(
                 try:
                     async with aiohttp.ClientSession() as sess:
                         await sess.post(
-                            response_url, json={"replace_original": True, "text": label}
+                            response_url,
+                            proxy=resolve_proxy(response_url),
+                            json={"replace_original": True, "text": label},
                         )
                 except Exception:
                     pass
@@ -897,6 +965,7 @@ async def _handle_resume_choice(
                 async with aiohttp.ClientSession() as sess:
                     await sess.post(
                         response_url,
+                        proxy=resolve_proxy(response_url),
                         json={"replace_original": True, "text": label},
                     )
             except Exception:
@@ -953,7 +1022,12 @@ from kiro_crew.slack.interactions_approvals import _handle_review_approve  # noq
 from kiro_crew.slack.interactions_approvals import _handle_review_cancel  # noqa: E402
 from kiro_crew.slack.interactions_approvals import _handle_review_edit  # noqa: E402
 from kiro_crew.slack.interactions_approvals import _handle_review_revise  # noqa: E402
+from kiro_crew.slack.interactions_approvals import BRIDGE_ACTION_STALE_NOTICE  # noqa: E402
+from kiro_crew.slack.interactions_approvals import _handle_bridge_action  # noqa: E402
 from kiro_crew.slack.interactions_approvals import _handle_tool_approval  # noqa: E402
+from kiro_crew.notifications.bridge_actions import (  # noqa: E402
+    SLACK_ACTION_PREFIX as BRIDGE_SLACK_ACTION_PREFIX,
+)
 
 # isort: on
 #: Owner modules, lowest layer first: the first holder of a name answers its reads.
@@ -985,6 +1059,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.slack.interactions_modals import _handle_config_submission  # noqa: F401
     from kiro_crew.slack.interactions_modals import _handle_voice_config_submission  # noqa: F401
     from kiro_crew.slack.interactions_settings import _refresh_channels_modal  # noqa: F401
+    from kiro_crew.slack.interactions_settings import _save_then_apply  # noqa: F401
     from kiro_crew.slack.interactions_options import _ACTION_PAYLOAD_CAP  # noqa: F401
     from kiro_crew.slack.interactions_options import _ACTION_PREFIX  # noqa: F401
     from kiro_crew.slack.interactions_options import _ALREADY_ANSWERED  # noqa: F401
@@ -1004,12 +1079,14 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.slack.interactions_sessions import _clear_session_dismissed  # noqa: F401
     from kiro_crew.slack.interactions_sessions import _record_session_dismissed  # noqa: F401
     from kiro_crew.slack.interactions_approvals import _REVIEW_AUTH_DENIED_MSG  # noqa: F401
+    from kiro_crew.slack.interactions_approvals import _REVIEW_ROOT_SUFFIX  # noqa: F401
     from kiro_crew.slack.interactions_approvals import _can_act_on_review_draft  # noqa: F401
     from kiro_crew.slack.interactions_approvals import _delete_review_placeholder  # noqa: F401
     from kiro_crew.slack.interactions_approvals import _handle_review_edit_submit  # noqa: F401
     from kiro_crew.slack.interactions_approvals import _handle_review_revise_submit  # noqa: F401
     from kiro_crew.slack.interactions_approvals import _parse_draft_key  # noqa: F401
     from kiro_crew.slack.interactions_approvals import _post_review_auth_error  # noqa: F401
+    from kiro_crew.slack.interactions_approvals import _restore_review_card  # noqa: F401
     from kiro_crew.slack.format import OPTIONS_SEVERAL_BLOCK  # noqa: F401
     from kiro_crew.slack.format import OPTIONS_SEVERAL_CALLBACK  # noqa: F401
     from kiro_crew.slack.format import OPTIONS_SEVERAL_INPUT  # noqa: F401

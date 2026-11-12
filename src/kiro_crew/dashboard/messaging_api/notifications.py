@@ -203,6 +203,8 @@ async def api_notification_channels(request: web.Request) -> web.Response:
     stored settings, and whether it is protected (approval cannot be muted).
     Channels with stored settings but no live registration (e.g. app
     currently disabled) are included so mutes remain visible and editable.
+    ``bridge_transports`` lists the transports the notification bridge has a
+    sink for, which is what the Settings route control may offer.
     """
     from kiro_crew.notifications.settings import PROTECTED_CHANNELS
 
@@ -230,15 +232,21 @@ async def api_notification_channels(request: web.Request) -> web.Response:
         )
     if withheld:
         audit_teammate_withheld("notification_channel_settings")
-    return web.json_response({"channels": channels})
+    # The transports a bridge route can actually deliver to (those with a
+    # registered sink), so Settings offers no destination that would be skipped.
+    bridge = getattr(state, "notification_bridge", None)
+    bridge_transports = list(getattr(bridge, "transports", ()) or ())
+    return web.json_response({"channels": channels, "bridge_transports": bridge_transports})
 
 
 async def api_notification_channel_settings(request: web.Request) -> web.Response:
     """PUT /api/notifications/channels/settings — update one channel's settings.
 
-    Body: ``{"channel": str, "muted"?: bool, "priority"?: str|null}`` —
-    ``priority: null`` clears the override. Protected channels reject mute
-    and priority-lowering with 400.
+    Body: ``{"channel": str, "muted"?: bool, "priority"?: str|null,
+    "deliver_to"?: list[str]|null, "deliver_min_priority"?: str}`` —
+    ``priority: null`` clears the override; ``deliver_to: null`` or ``[]`` clears
+    the bridge route. Protected channels reject mute and priority-lowering, and
+    an unknown transport or floor is refused, with 400.
     """
     from kiro_crew.notifications.settings import ChannelSettingsError
 
@@ -270,6 +278,24 @@ async def api_notification_channel_settings(request: web.Request) -> web.Respons
     priority = body.get("priority")
     if has_priority and priority is not None and not isinstance(priority, str):
         return web.json_response({"error": "priority must be a string or null"}, status=400)
+    # The bridge route: deliver_to null clears it like [] does; the values are
+    # validated in update(), which refuses unknown transports and floors.
+    deliver_to = body.get("deliver_to")
+    if "deliver_to" in body and deliver_to is None:
+        deliver_to = []
+    if deliver_to is not None and not isinstance(deliver_to, list):
+        return web.json_response(
+            {"error": "deliver_to must be a list or null", "code": "invalid_deliver_to"}, status=400
+        )
+    deliver_min_priority = body.get("deliver_min_priority")
+    if deliver_min_priority is not None and not isinstance(deliver_min_priority, str):
+        return web.json_response(
+            {
+                "error": "deliver_min_priority must be a string",
+                "code": "invalid_deliver_min_priority",
+            },
+            status=400,
+        )
     try:
         # update() persists via atomic_write (blocking file I/O) -- keep it
         # off the event loop. ChannelSettings serializes internally with its
@@ -280,6 +306,8 @@ async def api_notification_channel_settings(request: web.Request) -> web.Respons
             muted=muted,
             priority=priority if has_priority and priority is not None else None,
             clear_priority=has_priority and priority is None,
+            deliver_to=deliver_to,
+            deliver_min_priority=deliver_min_priority,
         )
     except ChannelSettingsError as exc:
         return web.json_response({"error": str(exc)}, status=400)

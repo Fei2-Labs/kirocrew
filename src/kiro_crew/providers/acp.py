@@ -71,6 +71,7 @@ from kiro_crew.acp.types import (  # noqa: F401
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_MATE_WORKER_KIT,
     ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS,
+    ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS,
     ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
     ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
@@ -87,13 +88,14 @@ from kiro_crew.acp.types import (  # noqa: F401
     effort_config_option_id,
     effort_config_option_value,
 )
-from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND
+from kiro_crew.acp_backends import POLICY_ID_BY_BACKEND  # noqa: F401
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backend_identity import is_claude_backend_name
 from kiro_crew.agent_sdk.backends import model_registry_namespace  # noqa: F401
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_EFFORT_AT_LAUNCH,
     ACP_BACKENDS_MODEL_AT_LAUNCH,
+    ACP_BACKENDS_SESSION_EVICTION,
 )
 from kiro_crew.agent_sdk.capabilities import SessionCapabilities, capabilities_for
 from kiro_crew.agent_sdk.tool_search import (  # noqa: F401
@@ -121,7 +123,6 @@ from kiro_crew.providers import acp_lifecycle as _acp_lifecycle
 from kiro_crew.providers import acp_model_effort as _acp_model_effort
 from kiro_crew.providers import acp_runtime_start as _acp_runtime_start
 from kiro_crew.providers import acp_turns as _acp_turns
-from kiro_crew.providers.acp_cli_overlay import _read_cli_overlay
 from kiro_crew.providers.base import (  # noqa: F401
     CancelOutcome,
     LLMEvent,
@@ -162,6 +163,7 @@ class AcpProvider(LLMProvider):
         channel_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         acp_backend: str = "",
+        harness_pin: str = "",
         effort_per_model: dict[str, str] | None = None,
         unbound_effort: str = "",
         inherited_effort: str = "",
@@ -180,6 +182,7 @@ class AcpProvider(LLMProvider):
         on_gate_queued: Callable[..., None] | None = None,
         disposable_work_dir: bool = False,
         side_read_only: bool = False,
+        include_memory: bool = True,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
@@ -209,11 +212,21 @@ class AcpProvider(LLMProvider):
             # A Side Chat session that may run read-only tools; the claude client
             # starts it confined (AcpClient._claude_session_meta). Inert on kiro-cli.
             "side_read_only": side_read_only,
+            # A sub-agent spawned with ``include_memory=false``; the claude client
+            # keeps Claude Code's auto-memory out of it. Inert on kiro-cli.
+            "include_memory": include_memory,
         }
         if agent:
             kwargs["agent"] = agent
         self.member_context = member_context
         self.memory_mode = memory_mode
+        # The account era this start read and the reader it came from, written by
+        # the allocator immediately before ``start()``. The chat-sharing placement
+        # keys a shared process on the era and re-reads it after acquiring
+        # (``providers.chat_share``). Empty / None on an entry point that wires
+        # no identity reader (the CLI, tests), where sharing is not eligible.
+        self.pre_spawn_identity: str = ""
+        self.spawn_identity_reader: Any = None
         # The name kiro-cli is asked for in place of ``agent`` (an app's launch
         # copy, ``apps.agent_launch``), set by session allocation; ``agent``
         # stays the session's identity. Read by the Kiro runtime start only.
@@ -232,6 +245,9 @@ class AcpProvider(LLMProvider):
         # ``AcpRuntime`` it constructs itself, and a dedicated subagent's
         # inherited work directory has to reach THAT process.
         self._shared_scratch: Path | None = shared_scratch
+        # The Bot pin the factory's selection used (``crewmate_harness.route_pin``),
+        # for the runtimes this provider builds.
+        self._harness_pin = harness_pin
         # Start-queue exit/entry callbacks, forwarded to BOTH ``runtime.spawn`` calls
         # (the first spawn and the resume-died respawn: the cold-start admission)
         # and to ``runtime.create_session`` on the fresh-session path
@@ -263,6 +279,8 @@ class AcpProvider(LLMProvider):
         self._child_fidelity_aware: bool = False
         # Same shape for the MCP elicitation opt-in (see accepts_elicitation).
         self._accepts_elicitation: bool = False
+        # And for the mark the keepalive route's registry sets (mark_keepalive_routed).
+        self._keepalive_routed: bool = False
         # Canonical Kiro Crew identity (a cfg.agents key), resolved by the
         # factory at provider-creation time — ``agent`` above is the bound kiro
         # template, a different namespace. Threaded into the kiro-shared
@@ -315,26 +333,11 @@ class AcpProvider(LLMProvider):
             if tool_search_min_tokens is None
             else tool_search_min_tokens
         )
-        if self._client.backend in ACP_BACKENDS_EFFORT_OVERLAY:
-            # Read back the levels the overlay already holds, so after a gateway
-            # restart the map names what kiro-cli will run. Caller-provided
-            # overrides win — only fill gaps.
-            #
-            # The overlay's own readers only. The file is keyed by work dir, so
-            # every session in one project shares it; read back by a harness that
-            # never opens it (KAS), it would start a new chat at whatever level
-            # another chat in the same work dir picked last. Such a harness takes
-            # its level from the factory alone.
-            try:
-                for m, lvl in _read_cli_overlay(self._client._work_dir).items():
-                    self._effort_per_model.setdefault(m, lvl)
-            except Exception:
-                logger.debug("ACP effort overlay recovery failed", exc_info=True)
-        if self._client.backend in ACP_BACKENDS_KIRO_FAMILY:
-            # Write the overlay BEFORE the first spawn so kiro-cli reads it on
-            # session/new. Each writer is scoped to the harnesses that read its keys.
-            self._apply_effort_overlay()
-            self._apply_tool_search_overlay()
+        # The workspace ``cli.json`` is not touched here. This constructor runs on
+        # the gateway event loop, and the file is the user's own settings file that
+        # a repository can track at any size. ``start()`` recovers the levels the
+        # overlay holds and writes the effort and Tool Search keys, off the loop.
+        self._effort_overlay_recovered = False
 
     @property
     def client(self) -> AcpClient:
@@ -540,6 +543,29 @@ class AcpProvider(LLMProvider):
         """The upgrade notice when the KAS this session runs drops its agent's prompt,
         else ``""``. Recorded when the session registered its ``customAgents``."""
         notice = getattr(self._client, "kas_agent_prompt_notice", "")
+        return notice if isinstance(notice, str) else ""
+
+    @property
+    def mode_pinned_notice(self) -> str:
+        """The notice when this claude session runs in ``default`` instead of the
+        ``auto`` it asked for, because its folder's settings file is not Crew's,
+        else ``""``. Recorded when the settings seed ran."""
+        notice = getattr(self._client, "claude_mode_pinned_notice", "")
+        return notice if isinstance(notice, str) else ""
+
+    @property
+    def kiro_cli_model_notice(self) -> str:
+        """The notice naming kiro-cli's ``chat.defaultModel`` when this KAS session did
+        not start on it, else ``""``. Recorded at the cold start."""
+        notice = getattr(self._client, "kas_default_model_notice", "")
+        return notice if isinstance(notice, str) else ""
+
+    @property
+    def telemetry_unconfirmed_notice(self) -> str:
+        """The notice that this KAS session's engine was asked to turn telemetry off
+        and cannot confirm it, or that this folder's opt-out was not applied, else ``""``.
+        Recorded when the session was created or loaded."""
+        notice = getattr(self._client, "kas_telemetry_notice", "")
         return notice if isinstance(notice, str) else ""
 
     @property
@@ -848,6 +874,11 @@ class AcpProvider(LLMProvider):
         return self._client.backend in ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS
 
     @property
+    def mate_worker_native_tool_limits_supported(self) -> bool:
+        """A crewmate worker's native-tool excludes, by opt-in (H6)."""
+        return self._client.backend in ACP_BACKENDS_MATE_WORKER_NATIVE_TOOL_LIMITS
+
+    @property
     def loaded_capability_template(self) -> str:
         return self._client.loaded_capability_template
 
@@ -935,10 +966,19 @@ class AcpProvider(LLMProvider):
         """
         return self._client.get_valid_effort_levels()
 
+    def advertised_commands(self) -> list[dict[str, str]]:
+        """The commands this session's ``available_commands_update`` last listed."""
+        return self._client.advertised_commands()
+
     @property
     def tool_search_settings(self) -> ToolSearchSettings | None:
         """The resolved Tool Search choice this provider spawns runtimes with (H14 capability)."""
         return self._tool_search_settings()
+
+    @property
+    def harness_pin(self) -> str:
+        """The Bot pin this provider's runtimes carry for KAS's route rule 2 (H14 capability)."""
+        return self._harness_pin
 
     def _tool_search_settings(self) -> ToolSearchSettings | None:
         """The operator's Tool Search choice, for the runtime's wire channel.
@@ -973,6 +1013,16 @@ class AcpProvider(LLMProvider):
         # client gets the engine's own OAuth requests and has no trigger.
         if isinstance(self._client, AcpSessionProvider):
             self._sign_in_ask: str = text
+
+    def set_mcp_sign_in_ended_hook(self, hook: Callable[[str], None]) -> None:
+        # Only the shared runtime's session starts a KAS sign-in, as above.
+        if isinstance(self._client, AcpSessionProvider):
+            self._client.set_mcp_sign_in_ended_hook(hook)
+
+    def mcp_sign_in_ended(self, server_name: str) -> bool:
+        return isinstance(self._client, AcpSessionProvider) and self._client.mcp_sign_in_ended(
+            server_name
+        )
 
     @property
     def member_dispatch_mounted(self) -> bool | None:
@@ -1020,8 +1070,13 @@ class AcpProvider(LLMProvider):
         """The client's batch-guard refusal reason for *request_id*, taken once."""
         return self._client.take_batch_refusal(request_id)
 
-    async def reject_tool(self, request_id: str | int) -> None:
-        await self._client.reject_tool(request_id)
+    async def reject_tool(self, request_id: str | int, reason: str = "") -> None:
+        # *reason*: what the person typed with the rejection, sent only when given
+        # (see ``AcpClient.reject_tool``), so a bare reject reaches the client as before.
+        if reason:
+            await self._client.reject_tool(request_id, reason=reason)
+        else:
+            await self._client.reject_tool(request_id)
 
     def context_usage_pct(self) -> float:
         return self._client.last_prompt_stats.context_pct
@@ -1099,29 +1154,80 @@ class AcpProvider(LLMProvider):
             return False
         return await discard() is True
 
+    async def kas_command_call(self, command: str, params: dict[str, Any]) -> dict[str, Any] | None:
+        """The inner client's KAS ``/context``, ``/knowledge`` or ``/code`` verb, or None.
+
+        Only the session provider (KAS through the shared runtime) carries one.
+        """
+        call = getattr(self._client, "kas_command_call", None)
+        if call is None:
+            return None
+        return await call(command, params)
+
     async def new_conversation(self) -> None:
         """Clean-slate reset on the SAME warm process (no cold start).
 
-        Delegates to the backing client. Only ``AcpSessionProvider`` has one: a
-        member of ``ACP_BACKENDS_ACP_RUNTIME`` gets it as ``self._client`` from
-        ``start()``, and it issues a fresh ``session/new`` on the already-running
-        process, skipping subprocess spawn + the ``initialize`` handshake. This is
-        the primitive a warm session pool uses to reuse one worker across
-        independent tasks without leaking context between them.
+        Delegates to the backing client, which issues a fresh ``session/new`` on the
+        already-running process, skipping subprocess spawn + the ``initialize``
+        handshake. This is the primitive a warm session pool uses to reuse one worker
+        across independent tasks without leaking context between them. A member of
+        ``ACP_BACKENDS_ACP_RUNTIME`` gets ``AcpSessionProvider`` as ``self._client``
+        from ``start()``; any other backend keeps its own ``AcpClient``, whose reset
+        runs only for a member of ``ACP_BACKENDS_CLIENT_NEW_CONVERSATION`` (claude).
+        On that arm the steps ``start()`` runs after the client is ready follow: the
+        resolved effort, and, for a session that keeps no transcript, the deletion of
+        the replaced session's files, as ``shutdown`` deletes them.
 
-        A backend on its own ``AcpClient`` (claude and every other per-session
-        adapter) has no such reset, so this raises ``NotImplementedError`` naming
-        the backend, and the caller falls back to killing and respawning the
-        process (``WorkerPool.reset``, ``_start_fresh_conversation``).
+        Every other backend on its own ``AcpClient`` raises ``NotImplementedError``
+        naming it, and the caller falls back to killing and respawning the process
+        (``WorkerPool.reset``, ``_start_fresh_conversation``).
         """
-        new_conversation = getattr(self._client, "new_conversation", None)
-        if new_conversation is None:
-            backend = POLICY_ID_BY_BACKEND.get(self._client.backend, self._client.backend)
-            raise NotImplementedError(
-                f"the {backend!r} backend has no fresh-conversation reset on its live "
-                "process; it is reset by kill and respawn"
+        if isinstance(self._client, AcpClient):
+            replaced = self.session_id
+            try:
+                await self._client.new_conversation()
+            finally:
+                # Once the client has left the old session, by a reset or by a failure
+                # that ended its process, no other id names it for ``shutdown``.
+                if self.session_id != replaced and self.memory_mode != "persistent":
+                    await self.cleanup_session(replaced)
+            await self._apply_initial_effort()
+            return
+        if isinstance(self._client, AcpSessionProvider):
+            # The steps a cold start's session start takes that the fresh session
+            # needs too: the member DM mount and channel ride ``session/new``
+            # (``_start_kiro_runtime``), the essentials delivered to the old
+            # conversation are not in the new one, and an effort pushed as a
+            # per-session config option (KAS, codex) is back at the default.
+            await self._client.new_conversation(
+                member_session_key=self._member_session_key(),
+                channel_id=self._owning_channel_id() or "",
             )
-        await new_conversation()
+            self.essential_delivery.invalidate()
+            await self._apply_initial_effort()
+            return
+        await self._client.new_conversation()
+
+    @property
+    def swaps_conversation_in_place(self) -> bool:
+        """Whether a fresh conversation can start on this session's live process now.
+
+        True on the shared runtime of a backend whose session teardown evicts
+        (``ACP_BACKENDS_SESSION_EVICTION``), and not for a session placed on a remote
+        or cloud workspace, whose session start records its placement
+        (``record_cloud_session``) where :meth:`new_conversation` does not. A dead
+        process is not read here: ``AcpSessionProvider.new_conversation`` refuses it
+        with ``AcpProcessDied`` before it creates anything, and
+        ``SessionLifecycleService.swap_conversation`` falls back on that refusal.
+        """
+        from kiro_crew.session_environment import remote_workspace_for
+
+        client = self._client
+        return (
+            isinstance(client, AcpSessionProvider)
+            and client.backend in ACP_BACKENDS_SESSION_EVICTION
+            and remote_workspace_for(self._owning_session_key()) is None
+        )
 
     def set_delete_delay(self, seconds: float) -> None:
         """Keep the session's record for ``seconds`` after it ends, then delete it.
@@ -1251,6 +1357,32 @@ class AcpProvider(LLMProvider):
         """
         self._client.touch_activity()
 
+    def note_tool_heartbeat(
+        self, tool_call_id: str = "", *, activity_at: float | None = None
+    ) -> int:
+        """Hand a Kiro Crew tool's heartbeat to the live inner client.
+
+        This provider is what ``/api/session-keepalive`` finds in the registry, and
+        the per-call silence timer lives on the inner client's session handle
+        (``AcpSessionProvider.note_tool_heartbeat``). Returns how many calls it
+        stamped: none on a client with no such timer (the placeholder ``AcpClient``).
+        """
+        note = getattr(self._client, "note_tool_heartbeat", None)
+        return int(note(tool_call_id, activity_at=activity_at)) if callable(note) else 0
+
+    def mark_keepalive_routed(self) -> None:
+        """The registry ``/api/session-keepalive`` reads holds this provider.
+
+        Set by that registry (``kiro_crew.keepalive_route``). Stored here and
+        forwarded to the live inner client for the reason ``child_fidelity_aware``
+        is: the kiro backend's placeholder client is replaced at runtime startup,
+        and the stored mark is re-applied then.
+        """
+        self._keepalive_routed = True
+        mark = getattr(self._client, "mark_keepalive_routed", None)
+        if callable(mark):
+            mark()
+
     @property
     def session_id(self) -> str:
         """Return the kiro-cli session UUID."""
@@ -1258,6 +1390,7 @@ class AcpProvider(LLMProvider):
 
     # The workspace ``cli.json`` overlay a spawn reads: ``kiro_crew.providers.acp_cli_overlay``.
     _apply_effort_overlay = _acp_cli_overlay._apply_effort_overlay
+    _recover_effort_overlay = _acp_cli_overlay._recover_effort_overlay
     _apply_tool_search_overlay = _acp_cli_overlay._apply_tool_search_overlay
     # The model and reasoning effort the session runs at: ``kiro_crew.providers.acp_model_effort``.
     maybe_refresh_available_models = _acp_model_effort.maybe_refresh_available_models
@@ -1272,6 +1405,8 @@ class AcpProvider(LLMProvider):
     set_model = _acp_model_effort.set_model
     clear_effort = _acp_model_effort.clear_effort
     _apply_initial_effort = _acp_model_effort._apply_initial_effort
+    ultracode_enabled = _acp_model_effort.ultracode_enabled
+    set_ultracode = _acp_model_effort.set_ultracode
     # A cold start on a shared ``AcpRuntime``: ``kiro_crew.providers.acp_runtime_start``.
     _start_kiro_runtime = _acp_runtime_start._start_kiro_runtime
     _emit_kiro_startup_metric = _acp_runtime_start._emit_kiro_startup_metric
@@ -1301,6 +1436,7 @@ class AcpProvider(LLMProvider):
     steer = _acp_turns.steer
     _inline_turn_finished_cleanly = _acp_turns._inline_turn_finished_cleanly
     wait_for_compaction = _acp_turns.wait_for_compaction
+    hold_chat_turn_gate = _acp_turns.hold_chat_turn_gate
 
 
 class SpecAdapterAcpProvider(AcpProvider):
@@ -1445,6 +1581,7 @@ _SERVED: frozenset[str] = frozenset(
         "_clamp_min_tokens",
         "_clear_cli_overlay_effort",
         "_is_transient_resume_lock_error",
+        "_read_cli_overlay",
         "_unlink_dead_session_lock",
         "_write_cli_overlay",
         "_write_tool_search_overlay",
@@ -1467,6 +1604,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _clamp_min_pct,
         _clamp_min_tokens,
         _clear_cli_overlay_effort,
+        _read_cli_overlay,
         _write_cli_overlay,
         _write_tool_search_overlay,
     )

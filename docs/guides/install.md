@@ -170,7 +170,13 @@ Once the wheel is in, the installer runs the new `kirocrew kas install` to
 download the [built-in KAS engine](#first-run) this release pins (about 55-70 MB
 for your platform). If that download fails, for example on a host with no
 access to the CDN, the install still succeeds and the installer prints the
-command to retry. Pass `--no-kas` (or set `KIROCREW_INSTALL_KAS=0`) to skip it:
+command to retry. On a host that cannot run the engine at all (no build for its
+platform, or a glibc older than the engine needs), Kiro Crew stays installed and
+the installer says why a chat on the default agent cannot start there in place
+of its next steps. A first install then exits 3; a re-run over an existing
+install, which is what `kirocrew update` does, exits 0. Pass `--no-kas` (or set
+`KIROCREW_INSTALL_KAS=0`) to skip the engine, for example on a host whose agent
+does not use it:
 
 ```bash
 curl -fsSL https://download.crew.kiro.dev/cli.sh | sh -s -- --no-kas
@@ -201,9 +207,8 @@ installed by the installer. Every release from `0.1.2` onward can be pinned.
 **These two releases will not be backfilled.** Signing an already-published
 digest today would create a fresh attestation for bytes that no signing
 pipeline produced, which asserts a provenance the project cannot re-establish
-after the fact. [SECURITY.md](../../SECURITY.md) already limits active support
-to the latest release, so the trust surface would widen for two releases that
-are several minor versions behind current `stable` and are supported by nobody.
+after the fact. Backfilling would also widen the trust surface for two releases
+that are several minor versions behind current `stable`.
 Their artifacts stay published and their `SHA256SUMS` stays fetchable for
 archival inspection, but the installer has no checksum-only path, so it will
 not install them.
@@ -222,6 +227,14 @@ home (`~/.kiro/crew-venv`, override with `KIROCREW_VENV`) and symlinks
 data home, so no whole-home operation can ever delete the live interpreter. The
 selected channel is recorded to `~/.kiro/crew/channel`.
 
+Before it downloads anything, the installer checks free space. It stops, naming
+the directory, when the disk beside the data home (where the managed venv and
+Python go) has less than about 500 MB free or the temp directory has less than
+about 100 MB (set `TMPDIR` to use another). A step that still runs out of space
+says so in plain words, and a failed first install removes the managed venv it
+started. The Python it downloaded to `~/.kiro/crew-python` stays, so a re-run
+does not fetch it again.
+
 Updates to a managed venv (`kirocrew update`, an approved in-app update, and the
 gateway's automatic update) build each new version as its own tree beside it,
 `crew-venv-<version>` (about 350 MiB with its dependencies), and switch the
@@ -236,9 +249,13 @@ finds one running (an active `kirocrew` systemd unit, the
 the data home's `gateway.lock`), it ends with a warning that names the restart
 command for that setup, such as `systemctl --user restart kirocrew`. Run it
 straight away. On a host that restricts unprivileged user
-namespaces and uses the `kirocrew-userns` AppArmor profile, run
-`kirocrew service install` again after every update so the profile follows the
-new launcher; the gateway's automatic update waits for you instead of applying
+namespaces and uses the `kirocrew-userns` AppArmor profile, the profile is
+attached to the launcher of every `crew-venv-<version>` tree, so it keeps
+applying after an update. A profile attached to one tree's exact path (one an
+earlier Kiro Crew wrote, or one written where the directory holding the install
+is not owned by the service's account alone) does not: run
+`kirocrew service install` again after the update so the profile follows the
+new launcher. The gateway's automatic update waits for you instead of applying
 there, and `kirocrew doctor` reports the attachment under Sandbox.
 
 The installer provisions its own Python by default instead of depending on the
@@ -247,7 +264,8 @@ binary (an installed `uv` on `PATH` is deliberately never executed -- `PATH`
 commonly leads with agent-writable directories), then installs a
 [python-build-standalone](https://github.com/astral-sh/python-build-standalone)
 CPython 3.12 into a user-owned directory beside the data home
-(`~/.kiro/crew-python`, override with `KIROCREW_PYTHON_DIR`). No package
+(`~/.kiro/crew-python`, override with `KIROCREW_PYTHON_DIR`), with no
+`python3.12` link added to `~/.local/bin` (`uv python install --no-bin`). No package
 manager, no sudo, and the prebuilt interpreter runs on old-glibc distros
 (CentOS 7) whose base repos never reach 3.10. Pass `--system-python` (or set
 `KIROCREW_MANAGED_PYTHON=0`) to run on a system Python 3.12+ instead — the
@@ -266,7 +284,11 @@ interpreter cannot be downloaded and a usable system Python 3.12+ exists, the
 run falls back to it with a warning (and retries the managed default next
 time); air-gapped hosts can point `KIROCREW_UV_URL` at a mirror of the uv
 release tree and `UV_PYTHON_INSTALL_MIRROR` at a mirror of the interpreter
-archives — the pinned SHA-256 digests are enforced either way. The signed
+archives — the pinned SHA-256 digests are enforced either way. Behind a
+TLS-intercepting proxy, uv's own bundled certificate roots refuse the
+interpreter download (`UnknownIssuer`) even when the system trusts the proxy's
+CA, so the installer retries that download once on the system certificate store
+(`UV_NATIVE_TLS=1`); a `UV_NATIVE_TLS` you set yourself is left as it is. The signed
 installer never pipes an unsigned third-party script into a shell: uv is
 fetched as a tarball and verified against pinned digests, exactly like the
 wheel itself. On a terminal the wheel download draws curl's progress bar and
@@ -321,9 +343,11 @@ checkout, such as a release tag, is on no branch: `kirocrew update` moves it to
 the first of `main`, `mainline` and `master` that `origin` has, and refuses <!-- wokeignore:rule=master -->
 when `origin` has none of them. After the reset the update rebuilds the
 dashboard (`npm ci` + `npm run build` in `website/`) and writes that output to
-`logs/frontend-build.log` in the data home. If the build fails, the update still
-installs the new revision's dependencies, then stops before restarting, names
-that file, and the gateway keeps running its current version: a restart would
+`logs/frontend-build.log` in the data home; on Windows no log is written, so
+that output is not kept. If the build fails, the update still installs the new
+revision's dependencies, then stops before restarting, names that file (or, with
+no log, says so: run `npm ci` and `npm run build` in `website/` to see the
+output), and the gateway keeps running its current version: a restart would
 pair the new backend with the previous dashboard bundle. The checkout already
 holds the new revision, so a second update reports it up to date: fix the cause
 the log names, then run the frontend and stage steps below before restarting. A clone with no `website/` or no `npm` skips the build and keeps its
@@ -436,19 +460,28 @@ are published, and they serve different needs:
 
 ```bash
 # 1. Track a channel. A PEP 503 simple index per channel, so pip resolves the
-#    newest version itself. --pre is required: every published version carries a
-#    prerelease suffix on nightly and insider.
+#    newest version itself. Stable versions carry no prerelease suffix, so the
+#    stable line needs no --pre. Every insider and nightly version does carry
+#    one, so those channels need it — and --pre then applies to every package
+#    pip resolves, third-party dependencies included:
+#      pip install --pre kirocrew --extra-index-url https://updates.crew.kiro.dev/feed/insider/simple/
 #    NOTE: --extra-index-url ADDS the channel index beside default PyPI, so pip
 #    pools `kirocrew` candidates across both and a higher-versioned public-PyPI
 #    package of the name would win. Prefer form 2 (or verify the installed
 #    artifact) where that exposure matters.
-pip install --pre kirocrew --extra-index-url https://updates.crew.kiro.dev/feed/stable/simple/
+pip install kirocrew --extra-index-url https://updates.crew.kiro.dev/feed/stable/simple/
 
 # 2. Pin one exact wheel by hash. Every version directory publishes a SHA256SUMS
 #    file beside the wheel; take your wheel's hash from there. pip verifies it and
 #    consults no index for Kiro Crew itself — so there is no name to squat.
 pip install "https://download.crew.kiro.dev/cli/stable/<version>/kirocrew-<version>-py3-none-any.whl#sha256=<sha256>"
 ```
+
+Create the venv and run either form under `umask 022`. Under umask `002`,
+`python -m venv` and pip leave the venv group-writable, and `kirocrew service
+install` then refuses to attach the
+[AppArmor profile](#linux-the-agent-sandbox-and-unprivileged-user-namespaces);
+`chmod -R g-w <venv>` repairs an existing install.
 
 Swap `stable` for `insider` or `nightly` in either URL. The two names split by
 class as a convention — `updates.crew.kiro.dev` for mutable pointers and indexes,
@@ -480,8 +513,8 @@ command installed on `PATH`.
 
 Optional extras. Kiro Crew is not on PyPI, so `pip install "kirocrew[voice]"`
 cannot resolve — install an extra's own distributions into the environment that
-runs the gateway instead (e.g. `pip install 'boto3>=1.34,<2'
-'amazon-transcribe>=0.6.3,<1' 'pywhispercpp>=1.5,<2'` for `voice`). The dashboard
+runs the gateway instead (e.g. `pip install "boto3>=1.34,<2"
+"amazon-transcribe>=0.6.3,<1" "pywhispercpp>=1.5,<2"` for `voice`). The dashboard
 prints the exact command, already pointed at the right interpreter.
 
 | Extra | Adds | For |
@@ -629,7 +662,7 @@ Override the Python interpreter with `make PY=python3.12 build`, or
 the `<data-home>/python-bin` marker `ensure-python.sh` records; a `PY` exported
 in the environment does not, so the marker still wins over it.
 
-`make wheel`, `make backend-bin` and `make desktop` take `EDITION=oss` or `EDITION=enterprise`, stamped into the built package's `kiro_crew/edition.py`. Only `EDITION=` on the `make` command line counts; an exported shell `EDITION` is ignored, even under `make -e`. Without it, the value comes from the `KIROCREW_BUILD_EDITION` environment variable, and then defaults to `oss`. Both set to different values, or any other value (wildcards such as `%` included), fails the build before it starts. On Windows, set `KIROCREW_BUILD_EDITION` before `.\make.ps1`. See [platform-context](../system-specs/modules/platform-context.md#build-time-edition-constant).
+`make wheel`, `make backend-bin` and `make desktop` take `EDITION=oss` or `EDITION=lts`, stamped into the built package's `kiro_crew/edition.py`. Only `EDITION=` on the `make` command line counts; an exported shell `EDITION` is ignored, even under `make -e`. Without it, the value comes from the `KIROCREW_BUILD_EDITION` environment variable, and then defaults to `oss`. Both set to different values, or any other value (wildcards such as `%` included), fails the build before it starts. On Windows, set `KIROCREW_BUILD_EDITION` before `.\make.ps1`. See [platform-context](../system-specs/modules/platform-context.md#build-time-edition-constant).
 
 Both desktop targets run `packaging/build-desktop.sh` on every platform,
 including Windows, where `make.ps1` invokes it through the Git for Windows bash:
@@ -836,9 +869,17 @@ and needs no sudo. That plist is a per-user LaunchAgent, so on a Mac the gateway
 starts when you log in, not at boot; see
 [The gateway does not start after a reboot until someone logs in](macos-troubleshooting.md#the-gateway-does-not-start-after-a-reboot-until-someone-logs-in).
 
+On a Linux host that systemd did not boot (no `/run/systemd/system`, as in a
+container whose PID 1 is something else, or WSL without systemd),
+`service install` refuses before anything is written, because no system unit
+could start there. Run `kirocrew gateway` under that host's own supervisor or
+boot script instead.
+
 The gateway runs untrusted agent tools, so it must run as a **non-root** user:
 the installer sets `User=` to the account behind `sudo` (`$SUDO_USER`, else
-`$USER`), and **refuses to install a `User=root` service**. From a bare `root`
+`$USER`, else `$LOGNAME`, else the account that owns the process's uid, so a
+non-interactive `ssh` session with neither variable set still resolves it),
+and **refuses to install a `User=root` service**. From a bare `root`
 login (or `sudo` with no `$SUDO_USER`), first create or pick a normal account and
 install as it, e.g. `sudo -u <user> KIROCREW_KIRO_BIN=... kirocrew service
 install` (the official Docker image already runs as the `kirocrew` user).
@@ -859,7 +900,11 @@ When another gateway already serves the same data home, the unit exits 78 and
 goes `failed` once instead of restarting, because the unit's
 `RestartPreventExitStatus=` names that code. A unit file without that directive
 keeps relaunching against the refusal; re-run `kirocrew service install` to
-rewrite it. See [Service Management](../system-specs/modules/cli.md#service-management)
+rewrite it. A unit installed before v0.10.0 on systemd 219 (Amazon Linux 2,
+RHEL 7) has the same fix: its restart cap sits where 219 does not read it, so a
+gateway that fails at boot restarts without end. `kirocrew service status` and
+`kirocrew doctor` name either one. See
+[Service Management](../system-specs/modules/cli.md#service-management)
 in the CLI spec for the details.
 
 ### SELinux-enforcing hosts with kirocrew under `$HOME`
@@ -1038,10 +1083,15 @@ kirocrew service install
 
 Where, and only where, this mechanism is the one in play, the installer also
 writes `/etc/apparmor.d/kirocrew-userns` and loads it. The profile grants
-exactly one permission (`userns`) and is **attached** to the resolved kirocrew
-launcher script (the same absolute path `service install` uses as `ExecStart`,
-typically something like `~/.kiro/crew-venv/bin/kirocrew`) — the same approach
-stock Ubuntu already uses for `chrome` and `brave`. The unit carries no
+exactly one permission (`userns`) and is **attached** to the kirocrew launcher
+script the unit's `ExecStart` resolves to, the same approach stock Ubuntu
+already uses for `chrome` and `brave`. For the managed install the attachment
+is `~/.kiro/crew-venv-*/bin/kirocrew`: an update installs each version as its
+own `crew-venv-<version>` tree, and the `*`, which never matches a `/`, covers
+each tree's launcher, so the profile keeps applying after an update. That form
+is used only when the directory holding those trees is owned by the service's
+account and writable by no other; anywhere else the profile is attached to the
+one resolved launcher path. The unit carries no
 `AppArmorProfile=` directive: that directive labels only the unit's own
 top-level process, and the gateway's sandbox probe runs in a child reached
 through a fork the directive's labelling never reaches.
@@ -1051,6 +1101,10 @@ it costs no additional privilege, and it **cannot fail your install**: if the
 profile cannot be written, loaded, or verified, you get a warning and the
 install continues. `kirocrew service uninstall` unloads and removes it, so a
 host is left as it was found rather than carrying an orphaned userns permission.
+
+The one-line installer (`cli.sh`) reads the same sysctl. When it is `1` and
+`/etc/apparmor.d/kirocrew-userns` is not there, the installer says, before its
+next steps, that agents cannot run until this command installs the profile.
 
 The installer skips the profile silently, with a reason it can print, when
 AppArmor is not an active LSM, when the sysctl is not `1`, when
@@ -1104,7 +1158,10 @@ that need it (`install`, `apparmor_parser`, `aa-exec`) and prompts you for a
 password when it does; running the whole thing as root would execute application
 code with privilege for no reason.
 
-Then restart the app. To check whether the launch you are looking at is covered:
+Then restart the app. The same restriction is why the AppImage starts the app
+with Chromium's sandbox off (`--no-sandbox`); the app shows a notice with this
+command when it does, and the profile turns both sandboxes back on. To check
+whether the launch you are looking at is covered:
 
 ```bash
 kirocrew sandbox status
@@ -1420,6 +1477,27 @@ docker rmi ghcr.io/kirodotdev/kirocrew:stable # remove the image (match the tag 
 flush; `docker rm -f` sends SIGKILL immediately, which can drop up to one
 5-second flush interval of recent session state.
 
+### Folders beside the data home
+
+Besides `~/.kiro/crew`, a host install can leave these folders under `~/.kiro`.
+The commands above remove none of them:
+
+| Folder | What it is | After uninstalling |
+| --- | --- | --- |
+| `~/.kiro/crew-python` | The Python runtime `cli.sh` downloads when the host has no suitable Python (moved by `KIROCREW_PYTHON_DIR`; it sits beside a custom `KIROCREW_HOME` as `<home>-python`). | Kiro Crew's. Safe to delete once the venv or pipx install that used it is gone. |
+| `~/.kiro/crew-auth-staging` | The staged copy of your Kiro sign-in that agent sessions read. The gateway rebuilds it at start. | Kiro Crew's. Safe to delete; it holds sign-in material, so deleting it is the tidy choice. |
+| `~/.kiro/mates` | Your crewmates' agent files (under `$KIRO_HOME` when you set it). | Kiro Crew's user data. Keep it if you plan to reinstall; remove it with the data home (see [Removing user data](#removing-user-data)). |
+| `~/.kiro/agents`, `~/.kiro/settings` | Agent and MCP settings shared with Kiro CLI and other Kiro tools. | Not Kiro Crew's alone. Leave them unless you are removing every Kiro tool. |
+
+To remove the two folders that are safe to delete after any uninstall:
+
+```bash
+rm -rf ~/.kiro/crew-python ~/.kiro/crew-auth-staging
+```
+
+If you set `KIROCREW_PYTHON_DIR` or `KIROCREW_HOME`, remove the matching
+`-python` folder at that location instead.
+
 ## Removing user data
 
 Uninstalling via any method above leaves your data home intact. To also remove
@@ -1444,6 +1522,15 @@ once the reinstall is confirmed good.
 This deletes configuration, credentials (`.env`), session history, memory
 databases, installed apps, and the embedding model cache.
 
+Your crewmates' agent files live outside the data home, in `~/.kiro/mates`
+(under `$KIRO_HOME` when you set it). To remove them too, back the folder up
+first (see [Folders beside the data home](#folders-beside-the-data-home)):
+
+```bash
+cp -a "${KIRO_HOME:-$HOME/.kiro}/mates" ~/kirocrew-backup-mates \
+  && rm -rf "${KIRO_HOME:-$HOME/.kiro}/mates"
+```
+
 > **Docker:** the commands above target a host data home. A Docker install keeps
 > everything in the `kirocrew-home` named volume instead, so remove that rather
 > than `~/.kiro/crew`: `docker volume rm kirocrew-home` (or `docker compose down -v`).
@@ -1463,12 +1550,21 @@ or when you want a completely fresh start.
 kirocrew stop                        # stop a foreground gateway (service uninstall won't)
 kirocrew service uninstall 2>/dev/null
 
-# 2. Uninstall the binary (use the matching command from above)
-pipx uninstall kirocrew          # or: pip uninstall kirocrew, rm the AppImage, etc.
+# 2. Uninstall the binary: run the block for your install method from
+#    "Uninstalling" above. A one-line install on a host without pipx (the usual
+#    fresh machine) is the "managed venv" block; with pipx it is
+#    `pipx uninstall kirocrew`; otherwise `pip uninstall kirocrew`, delete the
+#    AppImage, and so on.
 
 # 3. Back up and remove the data home (chained so a failed copy blocks the delete)
 cp -a "${KIROCREW_HOME:-$HOME/.kiro/crew}" ~/kirocrew-backup \
   && rm -rf "${KIROCREW_HOME:-$HOME/.kiro/crew}"
+
+# 3b. Remove the folders Kiro Crew keeps beside the data home (see "Folders
+#     beside the data home"); crewmate files are backed up first, chained the same way
+rm -rf ~/.kiro/crew-python ~/.kiro/crew-auth-staging
+cp -a "${KIRO_HOME:-$HOME/.kiro}/mates" ~/kirocrew-backup-mates \
+  && rm -rf "${KIRO_HOME:-$HOME/.kiro}/mates"
 
 # 4. Reinstall
 curl -fsSL https://download.crew.kiro.dev/cli.sh | sh
@@ -1490,6 +1586,9 @@ For reference, the data home structure and what each uninstall path touches:
   scope it touched — (plus the AppArmor profile it installed) or the launchd plist.
 - Python and npm package removal has no `preuninstall` or `postuninstall`
   cleanup hook.
+- No uninstall path removes `~/.kiro/crew-python` (the runtime `cli.sh` may
+  download), `~/.kiro/crew-auth-staging` or `~/.kiro/mates`; see
+  [Folders beside the data home](#folders-beside-the-data-home).
 - The macOS DMG/zip and the Linux AppImage have no cleanup hook, so removing the
   application bundle or image leaves the data home intact.
 - A Linux `.deb` / `.rpm` removal DOES run the package's own post-remove step,
@@ -1509,9 +1608,18 @@ the Kiro Crew home, which lives outside the install directory. Each signed Windo
 installer must pass an install, create-sentinel-under-`~/.kiro/crew`,
 uninstall, verify-sentinel smoke test before release. A separate Kiro-family
 uninstaller could remove the parent `~/.kiro/` directory; it must exclude
-`~/.kiro/crew` or prompt explicitly. That release-blocking cross-product
-sign-off is tracked in
-[issue #355](https://github.com/kirodotdev/KiroCrew/issues/355).
+`~/.kiro/crew` or prompt explicitly. Kiro Crew cannot enforce that on another
+product, so it is a documented accepted risk, not a release gate
+(UNINSTALLER-EXCLUDE-CREW in
+[config](../system-specs/modules/config.md#data-home-location)). To keep your
+data home out of reach of such a removal, set `KIROCREW_HOME` to a folder
+outside `~/.kiro/` (Kiro Crew starts a new data home there; it does not move an
+existing one). That does not move your crewmates' agent files in
+`~/.kiro/mates` (see [Folders beside the data home](#folders-beside-the-data-home)),
+so back that folder up separately. To keep your snapshots out of its reach
+too, set `snapshot_dir` in `config.json` to a folder outside `~/.kiro/`: by
+default `kirocrew snapshot` writes into the data home's `snapshots/` folder. A
+snapshot is not a full backup; see [Removing user data](#removing-user-data).
 
 ## Next steps
 

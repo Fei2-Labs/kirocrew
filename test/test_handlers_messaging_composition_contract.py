@@ -249,7 +249,12 @@ _BASE_OWNERS: dict[str, tuple[str, ...]] = {
 #: SHA-256 of the sorted ``"<name> <kind> <signature>"`` lines of every name in
 #: ``_BASE_OWNERS``, captured from the facade before the split that moved it: each
 #: moved name keeps the kind and signature it had there.
-_BASE_SHAPE_DIGEST = "5f9f90e8f0b3a71e8d11ad7ad64866a681de7fbdf2e1f64daf875f7248cfbff0"
+#: Two deliberate divergences since: ``_deliver_to_channel`` answers
+#: ``(sent, code, detail)``, so a refusal is distinguishable from a delivery fault;
+#: and ``_deliver_channel_dm`` takes an optional ``posted`` list of the delivered
+#: ``(conversation id, message id)`` pairs, so the notification bridge can link a
+#: reply transport's note to the approval a reply answers.
+_BASE_SHAPE_DIGEST = "d6971fb2121ad014702fafcee5a3541e999939c5427f127a37a7c3ca869fd87d"
 
 
 #: Helpers the split of ``api_send_message`` added to the send owner: the body it
@@ -410,7 +415,7 @@ def test_the_routes_and_the_package_reach_the_facade_objects() -> None:
     assert len({id(h) for h in served}) >= 28
     assert [h.__name__ for h in served if getattr(msg, h.__name__) is not h] == []
     reexports = _package_reexports()
-    assert len(reexports) == 50
+    assert len(reexports) == 53
     assert [n for n in reexports if getattr(handlers_pkg, n) is not getattr(msg, n)] == []
     server_names = _server_handler_names()
     assert {"api_spawn", "api_send_message"} <= server_names

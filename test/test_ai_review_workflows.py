@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 import shutil
 import subprocess
@@ -630,6 +629,7 @@ class TestPrReadiness:
             "fast-gate.yml|Fast Gate",
             "build.yml|Build",
             "code-review.yml|Code Review",
+            "pr-hygiene.yml|PR Hygiene",
             # Every PR must declare a triaged issue; a lane readiness does not
             # aggregate is a gate that can go red without turning the PR red.
             "issue-gate.yml|Issue Gate",
@@ -642,6 +642,24 @@ class TestPrReadiness:
         assert 'skipped) passed+=("$label")' in workflow
         assert '(.app.slug // "") == "github-advanced-security"' in workflow
         assert 'neutral|"") pending+=("$label (results pending)")' in workflow
+
+    def test_code_review_skips_edits_and_pr_hygiene_hears_them(self) -> None:
+        # Code Review reads no description, so an edit starts no scan; readiness
+        # holds a retarget pending through the base its run-name records
+        # (test_pr_readiness_evaluate.py). PR Hygiene reads the description and
+        # must hear the edit and every event Code Review does.
+        def types(name: str) -> set[str]:
+            doc = yaml.safe_load(_workflow(name))
+            trigger = (doc.get("on") or doc[True])["pull_request"] or {}
+            return set(trigger.get("types") or ("opened", "synchronize", "reopened"))
+
+        code_review = _workflow("code-review.yml")
+        assert "edited" not in types("code-review.yml")
+        assert "pull_request.title" not in code_review
+        assert "pull_request.body" not in code_review
+        # fix_loop_metrics reads code-review.yml runs as proof PR Hygiene ran.
+        assert types("code-review.yml") <= types("pr-hygiene.yml")
+        assert "edited" in types("pr-hygiene.yml")
 
     def test_readiness_listens_for_the_fast_gate_run_and_carves_it_out_when_stacked(
         self,
@@ -698,24 +716,6 @@ class TestPrReadiness:
         # The check-run specs above are what read a fork lane's verdict, and
         # they are keyed on Fast Gate, which does carry the PR head.
         assert '|fast-gate.yml"' in workflow
-
-    def test_the_legacy_lane_name_table_holds_only_the_lanes_16238_renamed(self) -> None:
-        # The publish re-check reads an old-name fork row as its lane when the
-        # head has no current-name row (behaviour: test_pr_readiness_publish.py).
-        # An entry for a lane that was NOT renamed, or one pointing at a name
-        # no lane uses, would let some other row answer for a lane; an old name
-        # that a workflow still posts would never stop answering.
-        workflow = _workflow("pr-readiness.yml")
-        spec = yaml.safe_load(workflow)
-        table = json.loads(spec["jobs"]["readiness"]["env"]["LEGACY_LANE_NAMES"])
-        assert table == {"Opus 5 Review": "Opus 5.5 Review", "GPT 5.6 Review": "GPT 6.1 Review"}
-        current = set(re.findall(r'"checkrun:([^|"]+)\|', workflow))
-        assert set(table.values()) <= current
-        assert not set(table) & current
-        for path in WORKFLOWS.glob("*.yml"):
-            if path.name != "pr-readiness.yml":
-                text = path.read_text(encoding="utf-8")
-                assert not [old for old in table if old in text], path.name
 
     def test_external_check_polling_counts_each_pass_once(self) -> None:
         workflow = _workflow("pr-readiness.yml")

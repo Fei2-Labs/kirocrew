@@ -1117,8 +1117,9 @@ print(datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime(sys
         date.chmod(0o755)
 
 
+@pytest.mark.parametrize("channel", ["stable", "insider"])
 def test_publish_workflow_signing_step_runs_verbatim_against_the_helper(
-    tmp_path: Path, test_key: SigningKey
+    tmp_path: Path, test_key: SigningKey, channel: str
 ) -> None:
     """Run the workflow's OWN signing script, unedited, against the real helper.
 
@@ -1203,7 +1204,7 @@ def test_publish_workflow_signing_step_runs_verbatim_against_the_helper(
         **hermetic,
         "PATH": f"{tools}{os.pathsep}{os.environ.get('PATH', '')}",
         "FAKE_AWS_SCRATCH": str(runner_temp),
-        "CHANNEL": CHANNEL,
+        "CHANNEL": channel,
         "CDN_BASE": CDN_BASE,
         "KEY_ARN": "arn:aws:kms:us-west-2:000000000000:key/test",
         "WHEEL_PATH": "cli-dist/" + WHEEL_NAME,
@@ -1225,8 +1226,10 @@ def test_publish_workflow_signing_step_runs_verbatim_against_the_helper(
     manifest_path = checkout / written["path"]
     assert manifest_path == dist / "cli-manifest.json"
     assert written["key_id"] == test_key.key_id
+    # The simple-index step stamps this value on the wheel's link.
+    assert written.get("python_requires") == ">=3.12"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["channel"] == CHANNEL
+    assert manifest["channel"] == channel
     assert manifest["version"] == VERSION
     assert manifest["python_requires"] == ">=3.12"
     assert "min_version" not in manifest
@@ -1240,11 +1243,21 @@ def test_publish_workflow_signing_step_runs_verbatim_against_the_helper(
         "--public-key",
         str(test_key.public),
         "--expected-channel",
-        CHANNEL,
+        channel,
         "--artifact-base",
         CDN_BASE,
         cwd=tmp_path,
     )
+    # Only a stable release also signs the wheel for insider, so the insider
+    # feed can catch up to stable: that manifest must pass the insider
+    # installer's own channel and wheel-URL binding.
+    if channel == "stable":
+        insider = _verify_manifest(
+            Path(written["insider_path"]), test_key, expected_channel="insider"
+        )
+        assert insider.returncode == 0, insider.stderr
+    else:
+        assert "insider_path" not in written
     # And the step left nothing behind in the checkout but what it declared.
     stray = sorted(
         p.relative_to(checkout).as_posix()
@@ -1258,6 +1271,70 @@ def test_publish_workflow_signing_step_runs_verbatim_against_the_helper(
         "packaging/signing/cli-manifest-public.pem",
         "packaging/signing/cli-manifest.py",
     ]
+
+
+def test_simple_index_links_carry_requires_python_and_the_merge_keeps_it(tmp_path: Path) -> None:
+    """Run "Publish PEP 503 simple index" verbatim, with ``curl`` and ``aws`` stubbed.
+
+    pip below the floor must be refused, not given a pre-0.6 release: the new link
+    carries the wheel's escaped ``Requires-Python``, a merged link keeps its attribute,
+    and a link published before the attribute existed is stamped ``>=3.12``.
+    """
+    if os.name == "nt":
+        pytest.skip("the publish step runs on the ubuntu runner")
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required to run the workflow step")
+
+    def link(version: str, attrs: str = "", sha: str = "00") -> str:
+        name = f"kirocrew-{version}-py3-none-any.whl"
+        href = f"{CDN_BASE}/cli/{CHANNEL}/{version}/{name}#sha256={sha}"
+        return f'<a href="{href}"{attrs}>{name}</a><br/>'
+
+    floor = ' data-requires-python="&gt;=3.12"'
+    live = tmp_path / "live.html"
+    live.write_text(
+        f"<html><body>{link('0.5.0')}\n{link('0.6.0', floor)}\n{link(VERSION)}</body></html>",
+        encoding="utf-8",
+    )
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "curl").write_text(
+        '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n'
+        '  case "$1" in -o) cp "$FAKE_LIVE_PAGE" "$2"; shift 2 ;; *) shift ;; esac\n'
+        "done\nprintf 200\n",
+        encoding="utf-8",
+    )
+    (tools / "aws").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    for shim in tools.iterdir():
+        shim.chmod(0o755)
+    work = tmp_path / "work"
+    work.mkdir()
+
+    step = _workflow_step("Publish PEP 503 simple index")
+    env = {
+        **os.environ,
+        "PATH": f"{tools}{os.pathsep}{os.environ.get('PATH', '')}",
+        "FAKE_LIVE_PAGE": str(live),
+        "CHANNEL": CHANNEL,
+        "BUCKET": "fixture-bucket",
+        "CDN_BASE": CDN_BASE,
+        "WHEEL_NAME": WHEEL_NAME,
+        "WHEEL_VERSION": VERSION,
+        "SHA256": "11",
+        "PYREQ": ">=3.13,<4",
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary.md"),
+    }
+    result = run_bounded(["bash", "-e", "-c", step["run"]], env, cwd=str(work))
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+    published = (work / "project.html").read_text(encoding="utf-8").splitlines()
+    assert published[1:-1] == [
+        link("0.5.0", floor),
+        link("0.6.0", floor),
+        link(VERSION, ' data-requires-python="&gt;=3.13,&lt;4"', sha="11"),
+    ]
+    # PYREQ is the signing step's Requires-Python output, pinned in the test above.
+    assert step["env"].get("PYREQ") == "${{ steps.manifest.outputs.python_requires }}"
 
 
 def _verify_manifest(

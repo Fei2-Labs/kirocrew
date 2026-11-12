@@ -3,7 +3,7 @@
 ``kiro_crew.agent`` is the import path everyone uses; the code lives under
 ``kiro_crew.agent_materialization``. Pinned: the module surface, the
 ``toolsSettings.subagent.availableAgents`` allowlist (read by
-``subagent_parts/agent_policy.py``) byte-for-byte on every path, the guest spec, and the
+``subagent_parts/spawn_allowlists.py``) byte-for-byte on every path, the guest spec, and the
 conductor prompts and grants. ``test_agent_refactor_spec_bytes.py`` freezes whole output.
 """
 
@@ -57,7 +57,7 @@ BASE_SURFACE: dict[str, str] = {
     "_CONDUCTOR_AGENT_FILENAME": "value str 923f5ca0627d569f",
     "_CONDUCTOR_CORE_GRANTS": "value tuple 7152a6eb169c7c40",
     "_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 41cf09029e05ee1b",
-    "_CONDUCTOR_SYSTEM_PROMPT": "value str 150260369de81bfe",
+    "_CONDUCTOR_SYSTEM_PROMPT": "value str df77e4c7d4df4b41",
     "_CREW_ONLY_HOOK_EVENTS": "value frozenset 9d900cfb866f983a",
     "_DEFAULT_KIRO_HOOKS_DIR": "value host",
     "_DEFAULT_SPEC_OBSERVATION_ATTEMPTS": "value int 4e07408562bedb8b",
@@ -85,7 +85,7 @@ BASE_SURFACE: dict[str, str] = {
     "_KNOWLEDGE_SYSTEM_PROMPT": "value str 23af593eebd8222f",
     "_LAUNCHER_EXEC_ENV_KEYS": "value frozenset 8c69b5e74a77bb5d",
     "_LEDGER_CONDUCTOR_AGENT_FILENAME": "value str a87e496fff7c15e0",
-    "_LEDGER_CONDUCTOR_WORK_GRANTS": "value tuple 21f3684b0bc1f923",
+    "_LEDGER_CONDUCTOR_WORK_GRANTS": "value tuple f34c6f243c0fc463",
     "_LEGACY_KIROCREW_HOOK_KEYS": "value frozenset 41cb57ce40df86b2",
     "_LITE_AGENT_FILENAME": "value str 55e6029e6c753857",
     "_MAIN_AGENT_NAME": "value str 153b868d134ec50e",
@@ -122,14 +122,14 @@ BASE_SURFACE: dict[str, str] = {
     "_SECURITY_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 41cf09029e05ee1b",
     "_SECURITY_CONDUCTOR_SYSTEM_PROMPT": "value str 40ca7692611062ec",
     "_TEAM_LEAD_AGENT_FILENAME": "value str ef870cb7d4ed6640",
-    "_TEAM_LEAD_SYSTEM_PROMPT": "value str eb82f8b7d681c4e5",
+    "_TEAM_LEAD_SYSTEM_PROMPT": "value str a20ee51c39338e8f",
     "_SOURCE_OWNED_MCP_KEYS": "value tuple b13c0a56645cc511",
     "_VALID_HOOK_EVENTS": "value frozenset 2b7aa96bff704c33",
     "_WORKER_AGENT_FILENAME": "value str e6d5cee102d8cbdf",
     "_WORKER_EXCLUDED_GRANTS": "value frozenset 1a2756dd420ed333",
     "_WORKER_MIRRORED_KEYS": "value tuple 27234a2a963813c9",
     "_WORKER_MIRRORED_SHAPES": "value dict 245618c04df2519f",
-    "_WORKER_SYSTEM_PROMPT": "value str a77eb5dc601ae983",
+    "_WORKER_SYSTEM_PROMPT": "value str 976f0b8249a8b0ef",
     "_WORKER_WORK_GRANTS": "value tuple 2617544a8ba41753",
     "_agent_identity_enabled": "callable _agent_identity_enabled() -> 'bool'",
     "_agentcore_capability_permitted": "callable _agentcore_capability_permitted() -> 'bool'",
@@ -223,7 +223,7 @@ BASE_SURFACE: dict[str, str] = {
     "_mcp_server_emission_eligible": "callable _mcp_server_emission_eligible(name: 'str', spec: 'object', *, gated_off: \"'frozenset[str] | None'\" = None) -> 'bool'",
     "_mcp_spec_gate_open": "callable _mcp_spec_gate_open(name: 'str', spec: 'dict') -> 'bool'",
     "_merge_kiro_hooks": "callable _merge_kiro_hooks(hooks: 'dict', user_hooks: 'dict') -> 'dict'",
-    "_merge_source_owned": "callable _merge_source_owned(mcps: 'dict', name: 'str', spec: 'dict', *, stale: 'set[str]') -> 'None'",
+    "_merge_source_owned": "callable _merge_source_owned(mcps: 'dict', name: 'str', spec: 'dict', *, stale: 'set[str]', replaced: 'dict[str, dict]', edition_owned: 'bool' = False) -> 'None'",
     "_migrations_dir": "callable _migrations_dir() -> 'Path'",
     "_norm_mcp_spec": "callable _norm_mcp_spec(spec: 'Any') -> 'Any'",
     "_normalize_mcp_server_keys": "callable _normalize_mcp_server_keys(config: 'dict', *, reserved_keys: 'Collection[str]' = (), removed_grants: 'list[str] | None' = None) -> 'dict[str, str]'",
@@ -343,7 +343,7 @@ BASE_SURFACE: dict[str, str] = {
     "reset_agent_model": "callable reset_agent_model(name: 'str') -> 'tuple[Path, str]'",
     "run_first_run_setup": "callable run_first_run_setup() -> 'None'",
     "safe_context_call": "callable safe_context_call(fn: \"'Callable[[], _T]'\", *, fallback: '_T' = <object object at 0x>, fallback_factory: \"'Optional[Callable[[], _T]]'\" = None, log_message: \"'str | None'\" = None) -> '_T'",
-    "safe_read_file_bytes_nolink": "callable safe_read_file_bytes_nolink(raw: 'str', within_root: 'str | None' = None, *, max_bytes: 'int | None' = None, allow_truncate: 'bool' = False, within_root_is_canonical: 'bool' = False, admit_hardlinked: 'Callable[[str, bytes], bool] | None' = None) -> 'bytes | None'",
+    "safe_read_file_bytes_nolink": "callable safe_read_file_bytes_nolink(raw: 'str', within_root: 'str | None' = None, *, max_bytes: 'int | None' = None, allow_truncate: 'bool' = False, within_root_is_canonical: 'bool' = False, admit_hardlinked: 'Callable[[str, bytes], bool] | None' = None, canonical_gate: 'bool' = False) -> 'bytes | None'",
     "sanitize_spec_env": "callable sanitize_spec_env(pairs: 'Iterable[tuple[str, str]]') -> 'dict[str, str]'",
     "sel": "callable sel() -> 'SecurityEventLog'",
     "shared_kiro_agents_writable": "callable shared_kiro_agents_writable() -> 'bool'",

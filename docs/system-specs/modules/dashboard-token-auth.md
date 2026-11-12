@@ -159,11 +159,11 @@ on: stripped of relay headers, or rewritten as relayed. It RETURNS its own
 refusals and records each one itself (`relay_ingress` rows, source `kiro_relay`),
 so the boundary never needs to.
 
-An enterprise build adds one layer to both chains, right after `token_auth`: the
-enterprise gate middleware (`dashboard/enterprise_gate_middleware.py`), which
+An LTS build adds one layer to both chains, right after `token_auth`: the
+LTS gate middleware (`dashboard/lts_gate_middleware.py`), which
 while the gate is closed denies everything but the login routes. It RAISES its
 403, so `deny_audit` records it. An `oss` build installs nothing. Contract:
-[platform-context § Enterprise gate](platform-context.md#enterprise-gate-login-half).
+[platform-context § LTS gate](platform-context.md#lts-gate-login-half).
 
 ## Components
 
@@ -201,6 +201,18 @@ session=True)`. Every other dashboard-user token omits it and is a one-time link
 It is reserved, so `extra` can neither set nor strip it
 (`test_the_session_claim_cannot_be_set_or_stripped_through_extra`;
 `test_skipping_nonce_registration_does_not_make_a_session`).
+
+`owner_mint` (`token_auth_tokens.OWNER_MINT_CLAIM`, value `"1"`) marks a token
+minted FOR the owner: the desktop `/api/token/local` bootstrap, the startup and
+`KIROCREW_READY` links, the owner's Slack session deep link
+(`messaging_api/proactive_send.py`), and the `/kirocrew dashboard` / `!dashboard`
+link when the caller is the owner loaded into the Slack handler. A
+messaging-allowlist user's link never carries it. The link→session exchange
+copies it onto the session token, the refresh token carries it through every
+rotation, and `_caller_bounds` copies it onto a link a session lends a phone. It
+grants nothing: the owner gate reads it only to label an already-refused former
+owner's session `401 stale_session_reauth` ([security](security.md)). A session
+minted without the claim keeps the generic denial until one fresh sign-in.
 
 Two expiry times:
 - `exp`: link click expiry; query-param validation uses this claim (`token_auth.validate_token`).
@@ -245,6 +257,9 @@ differently:
   that has `require_peer` but no signed `peer_key` fails closed and requires one
   new QR scan. Any child mobile/QR link minted by a peer-bound session carries
   the same `require_peer` + `peer_key` pair, so delegation cannot widen it.
+  When that key is not login-scoped (`ts:login:`), the phone-access QR refuses
+  the mint instead (`403 caller_device_bound`): its child could sign in only the
+  device already showing it. A login-scoped key still mints.
 
 `require_peer` is no longer exclusive to the QR shape. An **ordinary** session
 whose `?token=` exchange resolved a daemon-verified allowed peer also opens its
@@ -363,7 +378,7 @@ The `local_only` parameter is accepted for backward compatibility but does not c
 
 Request flow:
 1. Internal-path handling is separate: a loopback caller with a valid `X-Internal-Secret` is admitted, a mixed internal path can validate a cookie, and a strict internal path denies non-loopback callers; ordinary loopback requests continue to the token gate (`token_auth_middleware`; `test_loopback_requires_token`). A mixed internal path's cookie branch, on loopback and off it, sets `auth_from_query_token` from the credential `_extract_and_validate_token` validated, as the main path does: true for a `?token=` link, false for the session cookie, including a cookie adopted after a failed link.
-2. Bypass named non-secret routes: prefix routes `/assets/`, `/static/`, `/fonts/`, `/vendor/`, `/artifact-app/`, and `/sandbox-doc/`; exact routes `/logo.png`, `/favicon.ico`, `/manifest.json`, `/sw.js`, `/pcm-worklet.js`, `/api/token/local`, `/api/shutdown`, `/api/logout`, `/api/theme/boot`, `/api/health`, `/api/live`, and `/api/ready`; anchored icon files; and method-scoped routes `GET`/`HEAD /apps/<name>/ui/*`, `POST /api/hooks/agent`, `GET /api/hooks/agent/status` (`AGENT_HOOK_STATUS_PATH`: the same webhook token, re-checked in `api_hooks_agent_status`), `POST /api/messaging/teams`, `POST /api/apps/<name>/token`, `POST /api/auth/refresh`, `POST /api/auth/logout`, and `POST /api/update/revalidate` (`UPDATE_REVALIDATE_PATH`: the CLI's post-update badge revalidate, which self-authenticates over loopback with `X-Local-Secret`, re-checked in `api_update_revalidate`) (`_BYPASS_PREFIXES`, `_BYPASS_EXACT`, `_BYPASS_EXACT_METHODS`, and `token_auth_middleware()`). Every bypass on this list serves gateway-owned assets or a self-authenticating control route; none proxies foreign content. The `/browser-view` relay that once did (the retired CLI browser view, with its own path-token auth) was deleted with that view, and `test_browser_view_relay_paths_no_longer_bypass_auth` pins that its paths are gated like any other now ([browser module spec](browser.md)).
+2. Bypass named non-secret routes: prefix routes `/assets/`, `/static/`, `/fonts/`, `/vendor/`, `/artifact-app/`, and `/sandbox-doc/`; exact routes `/logo.png`, `/favicon.ico`, `/manifest.json`, `/sw.js`, `/pcm-worklet.js`, `/api/token/local`, `/api/shutdown`, `/api/logout`, `/api/theme/boot`, `/api/health`, `/api/live`, and `/api/ready`; anchored icon files; and method-scoped routes `GET`/`HEAD /apps/<name>/ui/*`, `POST /api/hooks/agent`, `GET /api/hooks/agent/status` (`AGENT_HOOK_STATUS_PATH`: the same webhook token, re-checked in `api_hooks_agent_status`), `POST /api/messaging/teams`, `POST /api/apps/<name>/token`, `POST /api/auth/refresh`, `POST /api/auth/logout`, and `POST /api/update/revalidate` (`UPDATE_REVALIDATE_PATH`: the CLI's post-update badge revalidate, which self-authenticates over loopback with `X-Local-Secret`, re-checked in `api_update_revalidate`), `GET /api/connections/oauth/callback` (`CREW_OAUTH_CALLBACK_PATH`: a vendor's redirect back to a DCR Connection sign-in, admitted in `crew_oauth_dcr.gateway_callback` only by a pending sign-in's `state`, single use, 600 s), and `POST /api/relay-viewer/token` (`RELAY_VIEWER_TOKEN_PATH`: the desktop app's relay access token mint, admitted in `api_relay_viewer_token` by loopback or the same-user unix socket, `X-Local-Secret` and a verified host process, like `/api/token/local`) (`_BYPASS_PREFIXES`, `_BYPASS_EXACT`, `_BYPASS_EXACT_METHODS`, and `token_auth_middleware()`). Every bypass on this list serves gateway-owned assets or a self-authenticating control route; none proxies foreign content. The `/browser-view` relay that once did (the retired CLI browser view, with its own path-token auth) was deleted with that view, and `test_browser_view_relay_paths_no_longer_bypass_auth` pins that its paths are gated like any other now ([browser module spec](browser.md)).
 
    `/api/token/local` carries its own gate: loopback (or a same-principal unix
    peer), then `X-Local-Secret`, then the local-owner process check. Each
@@ -384,13 +399,24 @@ Request flow:
    refused by `is_owner_dashboard_request`, so a claim would withdraw the
    capability the admission grants. Consulting the registry first changes what is
    recorded, never what is admitted; a registry that raises names no app and
-   leaves the host-process leg to decide as before.
+   leaves the host-process leg to decide as before. On loopback TCP the caller's
+   pid comes from `platform_compat.get_tcp_peer_pid`, a scan of every process's
+   descriptors, so it is resolved once per accepted connection: the answer is kept
+   against that connection's transport with the process start id read beside it,
+   and a later request on the same kept-alive connection reuses it while the pid
+   still reports that start id. A new connection, or a changed start id, resolves
+   again. The owner-process judgement itself still runs on every request. The
+   process that was the connection's unique holder at its first request stays its
+   caller for the connection's life: a later share of that socket (a fork without
+   exec, a descriptor passed over a Unix socket) is the holder delegating, which it
+   could equally do by handing over a minted token, and detecting it would take the
+   full scan this lookup avoids.
 3. Extract token from `?token=` query param or `mc_token_{port}` cookie
 4. Validate signature + expiry (link window for query param, session_exp for cookie). The cookie (session) path also requires `kind=session` or a non-empty `app` claim, so a link presented as `mc_token_{port}` is refused (`validate_token_with_app`; `test_unclicked_login_link_is_refused_as_a_session_cookie`). An unexchanged `?token=` on an internal path gets the link rules — its click window and a live nonce — never its session lifetime (`test_link_on_an_internal_path_query_gets_link_rules_not_session_rules`). A client that mints at `/api/token/local` and presents the result as the cookie must first trade it for a session: one `GET /api/status?token=<link>` with redirects off, keeping the `mc_token_{port}` `Set-Cookie` value (`ssh_tunnel_manager` does this)
 5. Check IP binding
 6. On query-param use: mint a SEPARATE session token, bind it to the peer key, add the link token's own nonce to the persisted denylist so the link string can never be presented as a cookie, and set `mc_token_{port}` with `max_age` derived from `session_exp`
 7. Log to SEL
-8. Publish the Shared Crew actor (`shared_crew.identity.publish_actor`) under `request[ACTOR_REQUEST_KEY]`, after every decision above and before the handler, on each path that admits a request: the internal-secret grant, both mixed-internal cookie branches and the main path. It is attribution only. It runs only for an admitted request, never raises (a failure publishes the Unknown principal), and its daemon lookup for a directly connected tailnet peer (`tailnet.resolve_direct_peer`) is not consulted by the pin or the allowlist, so it can neither admit nor refuse anything. Bypassed routes publish no actor and read as Unknown. Derivation rules are in [shared-crew.md](shared-crew.md) section 2.
+8. Publish the Shared Crew actor (`shared_crew.identity.publish_actor`) under `request[ACTOR_REQUEST_KEY]`, after every decision above and before the handler, on each path that admits a request: the relay branch (right after `admit_relay_caller`), the internal-secret grant, both mixed-internal cookie branches and the main path. It is attribution only. It runs only for an admitted request, never raises (a failure publishes the Unknown principal), and its daemon lookup for a directly connected tailnet peer (`tailnet.resolve_direct_peer`) is not consulted by the pin or the allowlist, so it can neither admit nor refuse anything. Bypassed routes publish no actor and read as Unknown. Derivation rules are in [shared-crew.md](shared-crew.md) section 2.
 9. Return 403 with JSON for `/api/*`, HTML for pages — **except** non-API `GET`/`HEAD` navigations, which are served the public SPA shell (see below)
 
 #### SSM listener: a Crew invite instead of a token
@@ -583,7 +609,51 @@ class TokenStateManager:
 
 `TokenStateManager` bounds concurrent link nonces and evicts the oldest through `OrderedDict.popitem(last=False)`; a successful nonce check refreshes that nonce's eviction position. This allows multiple browser tabs and `kirocrew token` invocations without unbounded link-state growth (`token_auth.TokenStateManager`).
 
-The in-memory `TokenStateManager` (link nonces, IP bindings, consumed set) is cleared on restart, but this does **not** log users out: an established session cookie is validated on the cookie path (`use_session_exp=True`), which needs only a valid HMAC signature (persistent key) + unexpired `session_exp` + a current revocation generation + a nonce not on the persisted denylist + `kind=session` or a non-empty `app` claim — it never consults the in-memory link-nonce set. Identity-persistent `require_peer` cookies additionally prove the original device with their signed `peer_key` before the hot pin is reconstructed; the deliberately fail-closed exception is a legacy claimless `require_peer` cookie, which must re-scan once because its original device cannot be recovered safely. Revoked-session state is durable: `RevokedNonceStore` persists to `token_revoked_nonces.json` (mode `0600`) and the revocation generation persists to `token_revocation.gen`, so a logged-out cookie stays dead across restarts while a restart alone (generation reloaded unchanged) logs nobody out. Users can revoke a single session via `POST /api/auth/logout` (`revoke_access_cookie()`) or all sessions — access cookies and refresh chains — via `kirocrew logout` (`revoke_all_sessions()`, which bumps the generation both token kinds embed and check).
+The in-memory `TokenStateManager` (link nonces, IP bindings, consumed set) is cleared on restart, but this does **not** log users out: an established session cookie is validated on the cookie path (`use_session_exp=True`), which needs only a valid HMAC signature (persistent key) + unexpired `session_exp` + a current revocation generation + a nonce not on the persisted denylist + `kind=session` or a non-empty `app` claim — it never consults the in-memory link-nonce set. Identity-persistent `require_peer` cookies additionally prove the original device with their signed `peer_key` before the hot pin is reconstructed; the deliberately fail-closed exception is a legacy claimless `require_peer` cookie, which must re-scan once because its original device cannot be recovered safely. Revoked-session state is durable: `RevokedNonceStore` persists to `token_revoked_nonces.json` (mode `0600`) and the revocation generation persists to `token_revocation.gen`, so a logged-out cookie stays dead across restarts while a restart alone (generation reloaded unchanged) logs nobody out. When `token_revoked_nonces.json` or `refresh_chains.json` exists but cannot be read (for example a Windows handle held without read sharing), the store does not read it as empty: access cookies or refresh rotations are refused, the file is not rewritten, a logout in that window answers 503 because its record is held in memory only, and the next check re-reads it, so the store recovers once the file reads again (`test_auth_store_unreadable.py`). A missing file still starts empty. Users can revoke a single session via `POST /api/auth/logout` (`revoke_access_cookie()`) or all sessions — access cookies and refresh chains — via `kirocrew logout` (`revoke_all_sessions()`, which bumps the generation both token kinds embed and check).
+
+The denylist check never waits for the disk. `is_revoked` runs on the event loop
+for every cookie request, while `revoke` writes `token_revoked_nonces.json` on a
+worker thread (the link exchange and `POST /api/auth/logout` both offload it). The
+store's dict lock is held for dict operations only; the file write runs under a
+second lock that only writers take, and each writer snapshots the dict once it
+holds that lock, so the last write to land carries every nonce revoked before it.
+A write that takes seconds, as a new file does under on-access antivirus scanning,
+therefore delays only the request that revoked, never the loop
+(`test_is_revoked_answers_while_a_denylist_write_is_stuck`).
+
+The refresh store follows the same rule. `RefreshStateManager` is read on the
+event loop for every `GET /api/auth/me` and `POST /api/auth/refresh`:
+`validate_refresh_token` calls `degraded_reason` and `is_chain_revoked`, and the
+refresh handler then calls `chain_peer`, `is_consumed` and `grace_replacement`.
+`mark_consumed`, `revoke_chain` and `bind_chain_peer` write `refresh_chains.json`
+on a worker thread. The store's dict lock is held only to snapshot the records
+and to set the degraded mark; the staging, synced write and rename run outside
+it. Writes stay ordered because every writer holds `_write_sequence_lock` from
+its mutation through its write, so the last rename carries the newest state
+(`test_refresh_checks_answer_while_a_rotation_write_is_stuck`). A refresh check
+that arrives during a slow write answers from memory at once. The answer window
+is deliberate: the rotated `jti` is reported consumed and the chain's peer bound
+before the write lands, which fails closed whether or not it lands, but
+`mark_consumed` installs the grace replacement only after its write succeeds, so
+a same-IP replay during the window finds no replacement and is never handed a
+pair whose rotation the caller then declines to publish
+(`test_grace_replay_is_withheld_while_the_rotation_write_is_in_flight`). A check
+sees the write's failure, if any, once the write has ended.
+
+A duplicate that lands in that window is not reuse. `mark_consumed` records a pending
+rotation `(jti, ip, done)` per chain in the same critical section that marks the `jti`
+consumed, and removes it, then sets `done`, in the step that installs the grace entry or
+rolls the mark back. When `is_consumed` is true and `grace_replacement` is empty, the
+refresh handler calls `await_pending_rotation(chain_id, jti, ip)` through
+`asyncio.to_thread` (bounded by `REFRESH_PENDING_WAIT_SECS`, never on the loop) and reads
+the grace entry again: a rotation that landed serves the pair as a grace replay, and one
+that failed, rolled back or outlasted the wait answers `503 refresh_state_unavailable`
+(audit `rotation_in_flight`) without revoking the chain. Only the same `jti` from the same
+address matches a pending record; a duplicate from another address or an older `jti` is
+still judged as reuse and revokes
+(`test_a_same_ip_refresh_during_a_rotation_write_never_revokes_the_chain`,
+`test_a_different_ip_duplicate_during_a_rotation_write_still_revokes`,
+`test_a_failed_rotation_write_clears_the_pending_record`).
 
 If `token_revocation.gen` exists but cannot be read as an integer, both token
 validators fail closed until the state is repaired. The gateway warning names
@@ -592,6 +662,8 @@ the warning also states the security consequence: resetting the counter can
 re-enable unexpired sessions previously revoked by `kirocrew logout`.
 
 #### App-token scope confinement (CWE-269)
+
+**Who can mint one.** `validate_app_secret` first requires the owner-enable marker `<crew-home>/host-exec-grants/<name>` (`apps/host_exec_grants.py`), which only an owner-authenticated action writes (`enable_app`, a first owner `POST /api/apps/register`) and every disabling write and uninstall revoke. The directory is a top-level crew-home leaf, sealed read-only in the sandbox, pre-created and no-follow, so no record written under the agent-writable `apps/<name>/` can mint a token for an app the owner did not enable. Only then is the secret compared with the gateway's own record, `member-records/app-secrets/<name>` (`read_app_secret`), which every sandbox masks; the agent-readable `apps/<name>/` holds no secret. An `apps/<name>/.app_secret` an older version left is never read, and a read never replaces it. Only the places where the app gets what the secret grants do: the backend spawn (`replace_legacy_app_secret`, delivered as `KIROCREW_PROXY_SECRET`), the load of an app's in-process hooks (`hooks_integration._prepare_hook_load`), and an owner registration (returned in its response). Code that runs in the gateway process holds no secret: its `AppContext.app_token()` mints the same app token behind the same owner-enable marker (`issue_in_process_app_token`), audited as `app_token_exchange` with source `app_context`. The app-scope check re-reads the marker on every request (off the event loop), so a disable ends an existing token's API grants at once. An app enabled before the marker existed cannot mint until the owner enables it again.
 
 An **app token** (payload carries a non-empty `app` claim, minted by the `X-App-Secret` exchange at `POST /api/apps/<name>/token`) must not have the same reach as a dashboard-user token. `_enforce_app_scope(request, app_name, path)` applies least privilege, **deny-by-default**:
 
@@ -942,7 +1014,7 @@ request into an HTTP request to this gateway's loopback TCP listener and stamps 
 person as `x-kiro-relay-user`. `dashboard/kiro_relay/` is the Crew's half of that
 contract, and `relay_client/` is the relay client that calls it. All of it is behind
 `tunnel.relay_enabled`, **off by default**: off, the gateway builds its
-`RelayIngress` off and starts no relay client. An enterprise build ignores that
+`RelayIngress` off and starts no relay client. An LTS build ignores that
 local switch with the rest of the `tunnel` control
 ([platform-context § Local switches with no governance key](platform-context.md#local-switches-with-no-governance-key-edition_lockspy)).
 
@@ -964,6 +1036,7 @@ carries any relay header:
 | a personal Crew, and the named user is not its owner | `403 relay_not_owner` |
 | a remote limit applies (below) | `403` with that limit's code |
 | a verified handover whose headers can't be rebuilt without the relay header (a value that can't be re-encoded) | `400 relay_header_invalid`, never served with the header |
+| a `GET` or `HEAD` of the bare `/`, with no query and no `Upgrade` | `302` to `/chat`: the relay root is the Crew address the control plane hands out, and the dashboard's home is `/chat`. Every other path, a query on `/`, and a direct (non-relay) `/` are served as before |
 | otherwise | served as relayed |
 
 **The strip inside the rule.** Both layers name relay headers by one definition,
@@ -1033,7 +1106,7 @@ check:
 |---|---|---|
 | Local-only | `relay_local_only` | the strict internal API paths, and any request presenting `X-Internal-Secret`, `X-Local-Secret` or `X-App-Secret` |
 | Instances | `instances_disabled` | `/api/instances` and everything under it, for everyone remote. The code the instances gate already answers when the feature is off, which the dashboard reads as "no instances here" |
-| Local token and secret routes | `relay_local_credential` | `/api/token/local`, `/api/auth/mobile-link`, `/api/tailnet/mobile/qr`, `/api/auth/refresh`, `/api/apps/<name>/token`, `/api/apps/register`, each path a shipped built-in app declares as a `relay_credential_paths` host grant (`apps.builtin_host_grants`; today Dev Fleet's `/api/apps/dev-fleet/pod-token` and `/apps/dev-fleet/api/pod/token`, a pod's dashboard token), `/api/webhooks/tokens` and under it (a webhook bearer and signing secret that invoke an agent on their own), `/api/logout`, `/api/update/revalidate`, `/api/secrets` and under it |
+| Local token and secret routes | `relay_local_credential` | `/api/token/local`, `/api/auth/mobile-link`, `/api/tailnet/mobile/qr`, `/api/auth/refresh`, `/api/apps/<name>/token`, `/api/apps/register`, each path a shipped built-in app declares as a `relay_credential_paths` host grant (`apps.builtin_host_grants`; today Dev Fleet's `/api/apps/dev-fleet/pod-token` and `/apps/dev-fleet/api/pod/token`, a pod's dashboard token), `/api/webhooks/tokens` and under it (a webhook bearer and signing secret that invoke an agent on their own), `/api/logout`, `/api/update/revalidate`, `/api/secrets` and under it, `/api/relay-viewer` and under it (the relay viewer calls the control plane with this machine's Kiro sign-in and mints relay access tokens) |
 | Shutdown | `relay_shutdown_refused` | `/api/shutdown` |
 | Apps for teammates | `relay_apps_teammate` | for a teammate only: `/apps/*` (each app's UI and backend proxy), `/api/apps` with everything under it (app management and every route an app registers in-process), `/api/publish-providers` and `/api/app-store/refresh` |
 | Non-canonical path | `relay_path_noncanonical` | a path with a `%` left after decoding, an empty segment or a dot segment, checked before any route: a later hop could read it as another path (the app proxy re-encodes what it captured, so `%2574` reaches an app's backend as `t`) |

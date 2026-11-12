@@ -6,6 +6,9 @@ open before touching that subsystem: see
 [Read before you touch](#read-before-you-touch). The frontend has its own router,
 [`website/AGENTS.md`](website/AGENTS.md).
 
+This codebase is yours: what it's for and how it's built are your call, and
+you'll keep building on it.
+
 ## What this is
 
 Kiro Crew is an open-source personal AI agent: chat from the web dashboard, the
@@ -178,7 +181,7 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
   #14436 had to revert a tightening whose sweep missed such a client.
 - **Computer use is governed by one on/off row only**: the operator opt-in on the
   keystone `computer_use.json`, ANDed with `capabilities.computer_use`
-  ([rfc-crew-enterprise-edition](docs/request-for-change/rfc-crew-enterprise-edition.md),
+  ([rfc-crew-lts-edition](docs/request-for-change/rfc-crew-lts-edition.md),
   appendix "Desktop control"). Never add finer `computer_use.*` scopes, more
   capability rows, approval ordinals or pointer permits. Its refusals run **in band** on
   `tools._dispatch`, never at the fail-OPEN `hooks` gate, because a pre-authorized
@@ -265,7 +268,7 @@ seams: [app-kit-platform](docs/system-specs/modules/app-kit-platform.md).
 <body — what and why, not how; wrapped at 72>
 ```
 
-Types the PR-title gate in `code-review.yml` accepts: `feat`, `fix`, `docs`,
+Types the PR-title gate in `pr-hygiene.yml` accepts: `feat`, `fix`, `docs`,
 `style`, `refactor`, `perf`, `test`, `chore`, `ci`, `build`, `revert`. **One
 logical change per commit**, and at most two commits per PR.
 

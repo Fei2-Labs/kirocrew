@@ -55,6 +55,11 @@ export const DURABLE_PREF_KEYS: readonly string[] = [
   // default from overwriting another origin's backup.
   'mc-ui',
   'mc-app-nav-order',
+  // The rail rows the user unpinned (lib/appNavHidden.ts) or pinned
+  // (lib/navPinned.ts). Written only by their clicks, through
+  // savePrefExplicitly (issue #34741).
+  'mc-app-nav-hidden',
+  'mc-nav-pinned',
   'mc-apps-expanded',
   'mc-bottom-terminal',
   'mc-files-rail-open',
@@ -103,7 +108,7 @@ export const DURABLE_PREF_KEYS: readonly string[] = [
   // can write, however convenient re-acknowledging is.
   'mc-agent-scene',
   'mc-kb-graph-physics',
-  // Notification sound settings (enabled/volume/per-category presets) --
+  // Notification sound settings (enabled/volume/per-category presets, a timed mute) --
   // hooks/useNotificationSound.ts. JSON blob, written only on an explicit save.
   'mc-notification-sound',
   'mc:notif:activeKinds:v2',
@@ -114,6 +119,10 @@ export const DURABLE_PREF_KEYS: readonly string[] = [
   // The composer's list-indent keyboard hint, dismissed (components/ChatInput.tsx).
   // Written only by the Dismiss click, through savePrefExplicitly.
   'kirocrew:list-indent-hint-dismissed',
+  // The "hooks have no effect in this session" notice, dismissed
+  // (pages/chat/SpecHooksNotice.tsx). Written only by its Dismiss click,
+  // through savePrefExplicitly. It hides a notice and gates nothing.
+  'kirocrew:spec-hooks-run-nowhere-notice-dismissed',
   // Settings > Shortcuts, and the push-to-talk key on Settings > Voice. Each
   // key is written only by an explicit user action, on its settings page or in
   // the shortcuts reference modal. No hook writes a default on mount. The

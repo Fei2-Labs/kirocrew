@@ -45,7 +45,8 @@ def _make_gateway():
     gateway.subagent_mgr.running = []
     gateway.subagent_mgr.queued_count_for = MagicMock(return_value=0)
     gateway.subagent_mgr.queued_count_for_async = AsyncMock(return_value=0)
-    gateway.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
+    # The cron run's live session: a completion continues it (``is_new`` False).
+    gateway.sessions.get_or_create = AsyncMock(return_value=(MagicMock(), False, False))
     gateway.sessions.release = MagicMock()
     gateway.sessions.reset = AsyncMock()
     gateway.sessions.cancel_current = AsyncMock()
@@ -695,9 +696,14 @@ class TestCronCallbackDashboardChat:
         job = _make_job(persistent_session=False)
         _run_callback(gateway, job, stream_result="cron output")
         assert _results_in_tab(slots, "cron output") == []
-        # The bell still carries the result, with no slot to continue in.
+        # The bell still carries the result, with no slot to continue in, and
+        # names the result it carries.
+        assert job.last_result_ts > 0
         gateway.dashboard_state.notify.assert_any_call(
-            "cron", "Cron: test-job", "cron output", meta={"job_id": "j1"}
+            "cron",
+            "Cron: test-job",
+            "cron output",
+            meta={"job_id": "j1", "result_ts": job.last_result_ts},
         )
 
     @pytest.mark.usefixtures("_reset_surface_registry")

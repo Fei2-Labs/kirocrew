@@ -39,6 +39,7 @@ from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_discovery import clear_list_agents_cache, parsed_agent_specs
 from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.bounded_read import bounded_read
 from kiro_crew.chat_attachments import ATTACHMENTS_DIR_SUFFIX
 from kiro_crew.config.loader import (
     ConfigReadError,
@@ -138,7 +139,7 @@ class _SettingsRefused(Exception):
 def _read_archive_text(path: Path) -> str:
     """The archive's *path* as text, read no further than the settings-document cap."""
     with open(path, "rb") as fh:
-        raw = fh.read(_MAX_SETTINGS_DOCUMENT_BYTES + 1)
+        raw = bounded_read(fh, _MAX_SETTINGS_DOCUMENT_BYTES + 1)
     if len(raw) > _MAX_SETTINGS_DOCUMENT_BYTES:
         raise _SettingsRefused(
             f"the archive's {path.name} is larger than {_MAX_SETTINGS_DOCUMENT_BYTES} bytes"
@@ -597,7 +598,7 @@ def _read_session_mtimes(zf: zipfile.ZipFile) -> dict[str, float]:
         return {}
     try:
         with zf.open(manifests[0]) as src:
-            raw = src.read(_MAX_SETTINGS_DOCUMENT_BYTES + 1)
+            raw = bounded_read(src, _MAX_SETTINGS_DOCUMENT_BYTES + 1)
         if len(raw) > _MAX_SETTINGS_DOCUMENT_BYTES:
             return {}
         manifest = json.loads(raw)
@@ -729,8 +730,7 @@ def apply_import_zip(
     # The extraction (up to the uncompressed cap) stages under the data home's
     # ``staging`` leaf, on the install's own disk rather than a RAM-backed tmpfs ``/tmp``.
     # This function runs off the event loop, so ``staging_dir()`` is no on-loop call.
-    # The uploaded ``.zip`` spool stays in the system temp dir, where ``part_stream``
-    # creates it under the handlers' shared cancellation-safety invariant.
+    # The uploaded ``.zip`` spool sits in its own directory of the same leaf.
     with tempfile.TemporaryDirectory(dir=str(staging_dir())) as work_str:
         work = Path(work_str)
         platform_compat.restrict_dir_to_owner(work)
@@ -904,9 +904,13 @@ def apply_import_zip(
                     else:
                         summary["items"].append("memory (skipped: not a regular file)")
                         summary.setdefault("refused_merges", []).append("memory")
-                else:
-                    _merge_memory(snap / "memory.db", mc / "memory.db")
+                elif _merge_memory(snap / "memory.db", mc / "memory.db"):
                     summary["items"].append("memory (merged)")
+                else:
+                    # A refused merge imported no row, so it is named and flagged
+                    # in refused_merges, as a refused crons merge is below.
+                    summary["items"].append("memory (skipped: unreadable or corrupt memory.db)")
+                    summary.setdefault("refused_merges", []).append("memory")
 
             if (snap / "crons.json").is_file():
                 if (mc / "crons.json").is_file():
@@ -1130,5 +1134,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _UNREADABLE_STORE,
         _publish_staged_cron_store,
         _read_staged_cron_store,
+        _read_staged_store_bytes,
         _sanitize_cron_text,
     )

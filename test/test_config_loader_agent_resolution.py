@@ -876,11 +876,11 @@ class TestAppAgentDispatch(unittest.TestCase):
         real = hooks_mod.safe_read_file
         refused: list[str] = []
 
-        def _guarded(path: str) -> str:
+        def _guarded(path: str, **kwargs) -> str:
             if path.endswith("evil.json"):
                 refused.append(path)
                 raise PermissionError("sensitive path refused")
-            return real(path)
+            return real(path, **kwargs)
 
         with tempfile.TemporaryDirectory() as td:
             d = self._agents_dir(
@@ -908,10 +908,10 @@ class TestAppAgentDispatch(unittest.TestCase):
 
         real = hooks_mod.safe_read_file
 
-        def _flaky(path: str) -> str:
+        def _flaky(path: str, **kwargs) -> str:
             if path.endswith("lead.json"):
                 raise OSError("transient read failure")
-            return real(path)
+            return real(path, **kwargs)
 
         with tempfile.TemporaryDirectory() as td:
             d = self._agents_dir(
@@ -921,6 +921,10 @@ class TestAppAgentDispatch(unittest.TestCase):
             with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
                 loader.refresh_materialized_agents()
                 assert loader.materialized_snapshot_complete() is True
+                # An edit elsewhere is what makes the next refresh scan at all.
+                (d / "other.json").write_text(
+                    json.dumps({"name": "other", "description": "edited"}), encoding="utf-8"
+                )
                 with unittest.mock.patch.object(hooks_mod, "safe_read_file", _flaky):
                     loader.refresh_materialized_agents()
                 assert loader.materialized_snapshot_complete() is False
@@ -944,18 +948,21 @@ class TestAppAgentDispatch(unittest.TestCase):
 
         real = hooks_mod.safe_read_file
 
-        def _flaky(path: str) -> str:
+        def _flaky(path: str, **kwargs) -> str:
             if path.endswith("KiroPkg-captain.json"):
                 raise OSError("transient read failure")
-            return real(path)
+            return real(path, **kwargs)
 
         with tempfile.TemporaryDirectory() as td:
             d = self._agents_dir(Path(td), {"KiroPkg-captain.json": {"name": "captain"}})
             with unittest.mock.patch.object(loader, "kiro_agents_dir", lambda: d):
                 loader.refresh_materialized_agents()
                 assert loader.dispatch_kiro_agent("KiroPkg-captain") == "captain"
+                # An edit elsewhere is what makes the next refresh scan at all.
+                (d / "other.json").write_text(json.dumps({"name": "other"}), encoding="utf-8")
                 with unittest.mock.patch.object(hooks_mod, "safe_read_file", _flaky):
                     loader.refresh_materialized_agents()
+                assert not loader.materialized_snapshot_complete()
                 assert loader.dispatch_kiro_agent("KiroPkg-captain") == "captain"
 
     def test_an_incomplete_scan_still_drops_an_agent_whose_file_was_removed(self):

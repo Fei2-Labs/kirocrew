@@ -65,12 +65,9 @@ def _run(argv, cwd, env=None, **kwargs):
 def _collect_argv(basetemp, *args):
     """A nested ``--collect-only`` of only the TARGETS.
 
-    Given file arguments, pytest still walks every sibling of each argument's
-    directory and offers each to ``pytest_collect_file`` -- about 4,600 entries
-    of ``test/`` for three files, roughly 40% of one child's time.
-    ``--ignore-glob=*`` refuses every path that is not a named argument (pytest
-    never ignores an initial path), so the child reads only the TARGETS and
-    collects the same nodes.
+    Pytest otherwise offers every sibling in ``test/`` to ``pytest_collect_file``.
+    ``--ignore-glob=*`` refuses every path that is not a named argument (pytest never
+    ignores an initial path), so the child reads only the TARGETS.
     """
     return [
         sys.executable,
@@ -304,7 +301,7 @@ def test_workflow_routes_every_scope_without_changing_local_defaults(jobs):
     assert (
         "backend-test-ipv6" in gate["needs"]
         and gate["if"]
-        == "${{ !cancelled() && (github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true') }}"
+        == "${{ !cancelled() && (github.event_name != 'push' || vars.MERGE_QUEUE_ENABLED != 'true' || github.actor != 'github-merge-queue[bot]') }}"
     )
     guard = _step(jobs, "coverage-gate", "Require upstream")
     assert guard["env"]["IPV6"] == "${{ needs.backend-test-ipv6.result }}"

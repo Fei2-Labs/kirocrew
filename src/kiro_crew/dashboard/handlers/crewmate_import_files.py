@@ -39,6 +39,7 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import crewmate_stage
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.owner_only_files import mkdirs_owner_only
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,14 @@ def _member(slug: str, member: str) -> tuple[str, Any, Any]:
     return key, agent, cfg
 
 
+def _is_within(path: str, root: str) -> bool:
+    """Whether *path* is *root* or inside it; paths on different drives are not."""
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:  # Windows: the two paths are on different drives
+        return False
+
+
 def _skills_root(cfg: Any, agent: Any) -> Path:
     """``<the crewmate's own workspace>/.kiro/skills``, refused if any part is a link."""
     from kiro_crew.config.loader import workspace_dir_from_entry
@@ -117,7 +126,7 @@ def _skills_root(cfg: Any, agent: Any) -> Path:
             raise _Refused(409, "workspace_link", "the Bot's workspace holds a link")
     root = workspace / ".kiro" / "skills"
     real_ws = os.path.realpath(workspace)
-    if os.path.commonpath([real_ws, os.path.realpath(root)]) != real_ws:
+    if not _is_within(os.path.realpath(root), real_ws):
         raise _Refused(409, "workspace_link", "the skills folder is outside the workspace")
     return root
 
@@ -161,7 +170,7 @@ def _scripts_dir(slug: str) -> Path:
             raise _Refused(409, "scripts_dir_link", "the Bot's script folder holds a link")
     mkdirs_owner_only(target)
     real_crons = os.path.realpath(crons_dir)
-    if os.path.commonpath([real_crons, os.path.realpath(target)]) != real_crons:
+    if not _is_within(os.path.realpath(target), real_crons):
         raise _Refused(409, "scripts_dir_link", "the script folder is outside crons/")
     return target
 
@@ -293,7 +302,7 @@ async def _set_avatar(key: str, ext: str, blob: bytes) -> str:
         tmp = staged.with_suffix(f".{ext}.tmp-{uuid.uuid4().hex[:8]}")
         try:
             tmp.write_bytes(blob)
-            os.replace(tmp, staged)
+            replace_with_retry(tmp, staged)
         finally:
             tmp.unlink(missing_ok=True)
 

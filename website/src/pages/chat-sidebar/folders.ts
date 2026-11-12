@@ -234,7 +234,7 @@ export function useFolderVisibility({ folders, localSlots, filterHiddenFolders }
 }
 
 /** The rows that announce folders the filter menu is hiding, and their peeks. */
-export function useFolderFilterReveal({ folderFilterActive, effectiveHiddenFolders: filterHiddenFolders, folders, isFolderHidden, folderCompare, boardLaneActive }: {
+export function useFolderFilterReveal({ folderFilterActive, effectiveHiddenFolders: filterHiddenFolders, folders, isFolderHidden, folderCompare, boardFoldersDrawn }: {
   folderFilterActive: boolean
   /** The unchecks a pin leaves in force (`useFolderVisibility`). Everything below
    *  reads this set, never the raw one, so the block, the reveal rows and the
@@ -243,7 +243,8 @@ export function useFolderFilterReveal({ folderFilterActive, effectiveHiddenFolde
   folders: ChatFolder[]
   isFolderHidden: (f: ChatFolder) => boolean
   folderCompare: (a: ChatFolder, b: ChatFolder) => number
-  boardLaneActive: boolean
+  /** The board is on screen with its folder blocks: not board-flat, which draws none. */
+  boardFoldersDrawn: boolean
 }) {
   // List view (the folder tree) drops an unchecked folder's whole block --
   // header and sessions together -- and the board column does the same. Only
@@ -312,13 +313,14 @@ export function useFolderFilterReveal({ folderFilterActive, effectiveHiddenFolde
    *  absent at all.
    *
    *  `allHiddenFolders` is the wrong number too, and in the opposite direction, for a
-   *  BOARD: it drops a folder its own hide-when-empty attribute would remove, and a
-   *  board column draws a folder block whatever that attribute says
+   *  BOARD WITH FOLDER BLOCKS: it drops a folder its own hide-when-empty attribute
+   *  would remove, and a board column draws a folder block whatever that attribute says
    *  (`relevantFolders` filters on `isFolderFilteredOut` alone). So on a board the
    *  uncheck does take that block away, and dropping it announces nothing while the
    *  header disappears — the exact traceless hide this row exists to end. The other
-   *  lanes narrow by `isFolderHidden` themselves, so there the uncheck takes nothing
-   *  a reader would otherwise have seen, and counting it would over-report.
+   *  lanes narrow by `isFolderHidden` themselves, and board-flat draws no folder block
+   *  at all, so there the uncheck takes nothing a reader would otherwise have seen,
+   *  and counting it would over-report.
    *
    *  Hence one predicate and two scopes, not two unrelated counts. A count and not a
    *  list, because nothing renders this population: the reveal rows draw from
@@ -329,12 +331,12 @@ export function useFolderFilterReveal({ folderFilterActive, effectiveHiddenFolde
     let n = 0
     for (const f of folders) {
       if (!filterHiddenFolders.has(f.id)) continue
-      if (!boardLaneActive && isFolderHidden(f)) continue
+      if (!boardFoldersDrawn && isFolderHidden(f)) continue
       if (coveredByHiddenAncestor(f, folders, filterHiddenFolders)) continue
       n += 1
     }
     return n
-  }, [folders, folderFilterActive, filterHiddenFolders, isFolderHidden, boardLaneActive])
+  }, [folders, folderFilterActive, filterHiddenFolders, isFolderHidden, boardFoldersDrawn])
   return {
     isFolderFilteredOut, revealedContainers, toggleReveal, hiddenByContainer, allHiddenFolders,
     hiddenFolderCount,
@@ -503,7 +505,31 @@ export function useFolderMutations({ queryClient, setFolderActionError, setFolde
     }
     updateFolderMutation.mutate({ id, body: { collapsed: !f.collapsed } })
   }, [folders, updateFolderMutation, connected, queryClient])
-  return { createFolderMutation, deleteFolderMutation, updateFolderMutation, toggleCollapse }
+  // "Collapse all folders": the server closes the whole tree in one write. A
+  // failure changes nothing there, so the settle-time refetch redraws it.
+  const closeAllInCache = useCallback(() => {
+    queryClient.setQueryData<ChatFolder[]>(['chat-folders'], old =>
+      (old ?? []).map(f => f.collapsed ? f : { ...f, collapsed: true }))
+  }, [queryClient])
+  const collapseAllMutation = useMutation({
+    mutationKey: CHAT_FOLDERS_WRITE_KEY,
+    mutationFn: () => api.collapseAllChatFolders(),
+    onMutate: async () => {
+      await queryClient.cancelQueries({ queryKey: ['chat-folders'] })
+      closeAllInCache()
+    },
+    onError: (err) => {
+      setFolderActionError((errMessage(err) || i18nT('components.errorBoundary.something_went_wrong')))
+      setFolderOfflineNotice('')
+    },
+    onSettled: () => invalidateFoldersWhenIdle(queryClient),
+  })
+  const collapseAllFolders = useCallback(() => {
+    // Offline it closes the cached tree and sends nothing, as `toggleCollapse` does.
+    if (!connected) closeAllInCache()
+    else collapseAllMutation.mutate()
+  }, [connected, closeAllInCache, collapseAllMutation])
+  return { createFolderMutation, deleteFolderMutation, updateFolderMutation, toggleCollapse, collapseAllFolders }
 }
 
 /** The folder writes, typed once for the owners that call them. */

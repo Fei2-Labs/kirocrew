@@ -17,6 +17,12 @@ reload or a gateway restart still reads it. One record per paused root (``paused
 * ``owed``: the members whose turn the dispatch gate ended because of the pause
   (:func:`owe_turn`). They stay in ``stopped`` whatever their Stop answered.
 
+Beside ``paused`` the file keeps ``resuming``: per root, the stopped members of a
+record Resume all dropped whose hand-backs have not finished
+(:func:`forget_resuming`). A restart in between ends that Resume, so the load
+holds them again (as :func:`keep_pending` does) and the next Resume all
+continues them.
+
 The routes in ``dashboard/handlers/crew_pause.py`` write it; the queue drain,
 the sends, the autonudge fire and ``session_create`` read it. Reads are in
 memory and take no lock: each write publishes a new map, never
@@ -45,10 +51,14 @@ MAX_FILE_BYTES = 256 * 1024
 
 _lock = threading.Lock()
 _records: dict[str, dict[str, Any]] = {}
-#: Stopped members of records a Resume all dropped, until its hand-backs finish:
-#: a turn its dispatch gate ends meanwhile is still continued by that Resume.
-_RESUMING: set[str] = set()
+#: Per root, the stopped members of a record a Resume all dropped, until their
+#: hand-backs finish: a turn its dispatch gate ends meanwhile is still continued
+#: by that Resume. Stored with the records, so a restart does not lose them.
+_resuming: dict[str, list[str]] = {}
 _loaded_from: Path | None = None
+#: The live records hold an owed turn the pause file refused (:func:`owe_turn`).
+#: Every write stores the whole map, so the next one that succeeds stores it.
+_unsaved = False
 
 
 def _path() -> Path:
@@ -79,6 +89,26 @@ def _clean_paused(raw: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _clean_resuming(raw: Any) -> dict[str, list[str]]:
+    if not isinstance(raw, dict):
+        return {}
+    out = {root: _keys(keys) for root, keys in raw.items() if isinstance(root, str) and root}
+    return {root: keys for root, keys in out.items() if keys}
+
+
+def _fold_resuming(
+    records: dict[str, dict[str, Any]], resuming: dict[str, list[str]]
+) -> dict[str, dict[str, Any]]:
+    """Hold again what an unfinished Resume all still had to continue.
+
+    The restart ended that Resume, so no hand-back is coming: the members stay
+    paused until the next Resume all continues them.
+    """
+    for root, keys in resuming.items():
+        _hold_pending(records, root, [k for k in keys if k != root], root_pending=root in keys)
+    return records
+
+
 def _ensure_loaded() -> None:
     """Load the file once per data home. Caller holds ``_lock``."""
     global _loaded_from
@@ -90,11 +120,15 @@ def _ensure_loaded() -> None:
         if path.is_file() and path.stat().st_size <= MAX_FILE_BYTES:
             raw = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
-                records = _clean_paused(raw.get("paused"))
+                records = _fold_resuming(
+                    _clean_paused(raw.get("paused")), _clean_resuming(raw.get("resuming"))
+                )
     except Exception:  # a damaged file pauses nothing, and is not re-read every turn
         records = {}
         logger.warning("crew pause: could not read %s; no crew is paused", path, exc_info=True)
-    _publish(records)
+    # The file's ``resuming`` stays until the next write, which stores the
+    # records it was folded into instead.
+    _publish(records, {})
     _loaded_from = path
 
 
@@ -157,30 +191,44 @@ def _live() -> dict[str, dict[str, Any]]:
     return _records
 
 
-def _commit(records: dict[str, dict[str, Any]]) -> None:
-    """Write *records*, then make them the live map. Caller holds ``_lock``.
+def _commit(
+    records: dict[str, dict[str, Any]], resuming: dict[str, list[str]] | None = None
+) -> None:
+    """Write *records* and *resuming* (the live one when omitted), then publish them.
 
-    Written first and published after: a write that fails raises with the live
-    state unchanged, so memory and the file never disagree.
+    Caller holds ``_lock``. Written first and published after: a write that
+    fails raises with the live state unchanged, so memory and the file never
+    disagree.
     """
+    if resuming is None:
+        resuming = _resuming
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    body = json.dumps({"paused": records}, sort_keys=True, indent=1) + "\n"
+    doc: dict[str, Any] = {"paused": records}
+    if resuming:
+        doc["resuming"] = resuming
+    body = json.dumps(doc, sort_keys=True, indent=1) + "\n"
     if len(body.encode("utf-8")) > MAX_FILE_BYTES:
         # The loader ignores a bigger file as damaged, so writing one would drop
         # every stored pause at the next restart: refuse it, live state unchanged.
         raise OSError(f"crew pause: the pause file would exceed {MAX_FILE_BYTES} bytes")
     atomic_write(path, body, mode=0o600, restrict_to_owner=True, newline="\n")
-    _publish(records)
+    global _unsaved
+    _unsaved = False
+    _publish(records, resuming)
 
 
-def _publish(records: dict[str, dict[str, Any]]) -> None:
-    """Make *records* the live map. Caller holds ``_lock``.
+def _publish(
+    records: dict[str, dict[str, Any]], resuming: dict[str, list[str]] | None = None
+) -> None:
+    """Make *records* (and *resuming*, when given) the live state. Caller holds ``_lock``.
 
     A new object replaces the old one, which readers may still be reading.
     """
-    global _records
+    global _records, _resuming
     _records = records
+    if resuming is not None:
+        _resuming = resuming
 
 
 def _copy_records() -> dict[str, dict[str, Any]]:
@@ -248,6 +296,7 @@ def owe_turn(slot_key: str) -> bool:
     finished handing its stopped members back. ``False`` means the hold was lifted
     with nothing owed, so the gate lets the turn run.
     """
+    global _unsaved
     with _lock:
         _ensure_loaded()
         records = _copy_records()
@@ -260,30 +309,90 @@ def owe_turn(slot_key: str) -> bool:
                 if slot_key not in rec.setdefault(field, []):
                     rec[field] = sorted([*rec[field], slot_key])
                     changed = True
-        if changed:
-            _commit(records)
+        if changed or _unsaved:
+            try:
+                _commit(records)
+            except OSError:
+                # The gate ends the turn either way, so a write the disk or the
+                # size cap refuses keeps the obligation in memory, marked unsaved:
+                # Resume all still continues it, and the next write (any pause
+                # write, or this gate's next refusal) retries storing it.
+                # shortcut: a restart before a write succeeds forgets it, as main
+                # always did; store it elsewhere if that ever shows up.
+                logger.warning("crew pause: owed turn of %s kept in memory only", slot_key)
+                _unsaved = True
+                _publish(records)
         if any(slot_key in rec.get("owed", []) for rec in records.values()):
             return True
         # The record is gone, but the Resume all that dropped it continues this
         # member once its turn has ended: end it rather than run it twice.
-        return slot_key in _RESUMING
+        return any(slot_key in keys for keys in _resuming.values())
 
 
-def forget_resuming(keys: list[str]) -> None:
-    """Resume all handed *keys* back: a later gate runs their turns instead of ending them."""
-    _RESUMING.difference_update(keys)
+def forget_resuming(
+    keys: list[str],
+    *,
+    root: str = "",
+    pending: list[str] | None = None,
+    root_pending: bool = False,
+) -> bool:
+    """Resume all is done with *keys*: a later gate runs their turns instead of ending them.
+
+    *pending* (and *root* itself when *root_pending*) were not handed back: they
+    are held again under *root*, as :func:`keep_pending` does, in the SAME write,
+    so at no moment, on disk or in memory, are they owed by nobody. BLOCKING
+    (one small file write). Answers whether the file holds the result. A write
+    the disk refuses still applies in memory (the gate must stop ending these
+    turns), marked unsaved so the next write stores it, and answers False so the
+    caller reports it; until then the file still names them as resuming, so a
+    restart holds them again rather than losing them.
+    """
+    global _unsaved
+    with _lock:
+        _ensure_loaded()
+        records = _copy_records()
+        if pending or root_pending:
+            _hold_pending(records, root, pending or [], root_pending=root_pending)
+        drop = set(keys)
+        resuming = {r: kept for r, old in _resuming.items() if (kept := sorted(set(old) - drop))}
+        if resuming == _resuming and records == _records and not _unsaved:
+            return True
+        try:
+            _commit(records, resuming)
+        except OSError:
+            logger.warning("crew pause: resume hand-back of %s kept in memory only", keys)
+            _unsaved = True
+            _publish(records, resuming)
+            return False
+        return True
 
 
 def resume(root: str) -> dict[str, Any] | None:
-    """Drop *root*'s record and return it, ``None`` when it was not paused. BLOCKING."""
+    """Drop *root*'s record and return it, ``None`` when it was not paused. BLOCKING.
+
+    Its stopped members are stored as resuming in the same write, until
+    :func:`forget_resuming` says they were handed back.
+    """
     with _lock:
         _ensure_loaded()
         records = _copy_records()
         rec = records.pop(root, None)
         if rec is not None:
-            _commit(records)
-            _RESUMING.update(rec.get("stopped") or [])
+            resuming = dict(_resuming)
+            stopped = set(rec.get("stopped") or [])
+            if stopped:
+                resuming[root] = sorted(set(resuming.get(root) or []) | stopped)
+            _commit(records, resuming)
         return rec
+
+
+def roots_naming(slot_key: str) -> list[str]:
+    """The roots whose record :func:`release` would edit for *slot_key*, sorted."""
+    return sorted(
+        root
+        for root, rec in _live().items()
+        if any(slot_key in rec.get(field, []) for field in ("held", "stopped", "owed"))
+    )
 
 
 def release(slot_key: str) -> dict[str, dict[str, Any]]:
@@ -403,21 +512,28 @@ def keep_pending(root: str, keys: list[str], *, root_pending: bool) -> None:
     with _lock:
         _ensure_loaded()
         records = _copy_records()
-        old = records.get(root)
-        if old is not None:
-            # A newer Pause all landed meanwhile: keep it, and add these to it.
-            old["held"] = sorted(set(old["held"]) | set(keys))
-            old["tree"] = sorted(set(old["tree"]) | set(keys))
-            old["stopped"] = sorted(
-                set(old["stopped"]) | set(keys) | ({root} if root_pending else set())
-            )
-        else:
-            records[root] = {
-                "tree": sorted(keys),
-                "held": sorted(keys),
-                "stopped": sorted([*keys, *([root] if root_pending else [])]),
-                "owed": [],
-                "paused_at": datetime.now(timezone.utc).isoformat(),
-                "root_released": not root_pending,
-            }
+        _hold_pending(records, root, keys, root_pending=root_pending)
         _commit(records)
+
+
+def _hold_pending(
+    records: dict[str, dict[str, Any]], root: str, keys: list[str], *, root_pending: bool
+) -> None:
+    """Hold *keys* (and *root* when *root_pending*) under *root* in *records*, in place."""
+    old = records.get(root)
+    if old is not None:
+        # A newer Pause all landed meanwhile: keep it, and add these to it.
+        old["held"] = sorted(set(old["held"]) | set(keys))
+        old["tree"] = sorted(set(old["tree"]) | set(keys))
+        old["stopped"] = sorted(
+            set(old["stopped"]) | set(keys) | ({root} if root_pending else set())
+        )
+    else:
+        records[root] = {
+            "tree": sorted(keys),
+            "held": sorted(keys),
+            "stopped": sorted([*keys, *([root] if root_pending else [])]),
+            "owed": [],
+            "paused_at": datetime.now(timezone.utc).isoformat(),
+            "root_released": not root_pending,
+        }

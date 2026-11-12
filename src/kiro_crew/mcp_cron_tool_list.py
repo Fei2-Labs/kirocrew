@@ -1,7 +1,12 @@
-"""The tool catalogue the cron MCP server returns for ``tools/list``.
+"""The tool catalogue the cron MCP server returns for ``tools/list``, and the server's declaration.
 
 One definition per cron tool: its name, description and input schema, with the
-display titles :mod:`kiro_crew.mcp_tool_titles` adds.
+display titles :mod:`kiro_crew.mcp_tool_titles` adds; and :data:`SERVER`, what
+``initialize`` says about the server.
+
+Nothing here imports a tool handler: an agent engine holds a session's first prompt
+until every MCP server has listed its tools, so this is all the server loads before it
+answers (``kiro_crew.mcp_shared_listing``).
 
 Served through :mod:`kiro_crew.mcp_cron`, which callers and tests import and
 patch; this module never imports it.
@@ -16,6 +21,8 @@ from kiro_crew.cron_service.model import (
     _AUTO_PAUSE_MAX,
     _AUTO_PAUSE_THRESHOLD,
 )
+from kiro_crew.mcp_instructions import CRON as _INSTRUCTIONS
+from kiro_crew.mcp_shared_listing import StdioServer
 from kiro_crew.mcp_tool_titles import with_titles
 
 # ``auto_pause_after_failures`` description for the ``cron_add`` and ``cron_update``
@@ -79,7 +86,8 @@ def _list_tools() -> list[dict[str, Any]]:
                         "type": "boolean",
                         "description": "If true, return a JSON document instead "
                         "of text: one record per owned job with its mode, "
-                        "schedule, context settings, prompt, and folded "
+                        "schedule, context settings, prompt, Schedule-page "
+                        "folder ({id, name}, or null when ungrouped), and folded "
                         "run-history counts (runs, failures, distinct results, "
                         "runs that found nothing to do). Takes precedence over "
                         "verbose and over ids' implied verbose, because it "
@@ -213,6 +221,15 @@ def _list_tools() -> list[dict[str, Any]]:
                         "Set False for polling/scanner jobs with no conversational state — "
                         "avoids unbounded context growth. Set True (or omit) for "
                         "conversational reminders that should remember prior runs.",
+                    },
+                    "new_chat_per_run": {
+                        "type": "boolean",
+                        "description": "When true, every run opens its own dashboard chat "
+                        "tab on its own fresh session, so the user can review that run and "
+                        "reply to it alone (default false). Implies persistent_session false "
+                        "when that is omitted. Agent crons only; hide_in_chat still wins. "
+                        "Use it only for infrequent jobs: every run keeps a tab, so the "
+                        "schedule must leave at least 24 hours between runs or it is refused.",
                     },
                     "minimal_context": {
                         "type": "boolean",
@@ -364,6 +381,14 @@ def _list_tools() -> list[dict[str, Any]]:
                         "type": "boolean",
                         "description": "Whether this cron reuses one agent session across runs.",
                     },
+                    "new_chat_per_run": {
+                        "type": "boolean",
+                        "description": "When true, every run opens its own chat tab on its "
+                        "own fresh session. Turning it on implies persistent_session false "
+                        "when that is omitted; persistent_session true turns it off. "
+                        "Use it only for infrequent jobs: every run keeps a tab, so the "
+                        "schedule must leave at least 24 hours between runs or it is refused.",
+                    },
                     "minimal_context": {
                         "type": "boolean",
                         "description": "When true, skip memory/lessons/skills/history "
@@ -472,3 +497,16 @@ def _list_tools() -> list[dict[str, Any]]:
         },
     ]
     return with_titles("kirocrew-cron", tools)
+
+
+#: The server as ``initialize`` describes it. ``kiro_crew.mcp_cron.run_mcp_server``
+#: passes the loop these same values, so the answers written before the handlers load
+#: and the ones the loop writes after cannot differ.
+SERVER = StdioServer(
+    name="kirocrew-cron",
+    version="1.0.0",
+    list_tools=_list_tools,
+    advertise_caller_identity=True,
+    error_prefix_is_error=True,
+    instructions=_INSTRUCTIONS,
+)

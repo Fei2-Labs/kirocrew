@@ -6,7 +6,10 @@ disclose where pods cannot run, the CLI entry point the pods use, and pod-down.
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import sys
+import uuid
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +27,7 @@ from kiro_crew.apps.builtins.dev_fleet import live as live_mod
 from kiro_crew.apps.builtins.dev_fleet import repository as repository_mod
 from kiro_crew.apps.builtins.dev_fleet import runtime as runtime_mod
 from kiro_crew.apps.builtins.dev_fleet import worktree_ops as worktree_ops_mod
+from kiro_crew.pod import windows as pod_windows
 
 # Per-worktree context: issue/ticket links + purpose one-liner
 
@@ -422,6 +426,28 @@ async def test_fleet_payload_reports_no_reason_when_pods_work():
     assert fleet["pods_unavailable_reason"] is None
 
 
+@pytest.mark.parametrize("schtasks", [r"C:\Windows\System32\schtasks.exe", None])
+def test_pod_gate_admits_windows_when_task_scheduler_resolves(monkeypatch, schtasks):
+    """Windows pods are Task Scheduler tasks. With the gate false, ``_load_cfg`` is
+    None and the pod identity and removal checks are skipped. The gate runs at
+    import, so the test loads a private copy of the module."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(pod_windows, "schtasks_bin", lambda: schtasks)
+    name = f"_dev_fleet_runtime_gate_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, runtime_mod.__file__)
+    assert spec is not None and spec.loader is not None
+    probe = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, probe)
+    spec.loader.exec_module(probe)
+
+    if schtasks:
+        assert (probe._POD_AVAILABLE, probe._POD_ERROR) == (True, "")
+    else:
+        assert probe._POD_AVAILABLE is False
+        assert "schtasks.exe" in probe._POD_ERROR
+        assert "systemd" not in probe._POD_ERROR
+
+
 @pytest.mark.asyncio
 async def test_fleet_payload_says_live_state_is_known_when_the_pointer_reads():
     fleet = await _fleet_with(
@@ -598,6 +624,45 @@ async def test_main_checkout_build_state_is_probed(tmp_path):
     # Pod state still never applies to main.
     assert row["running"] is False
     assert row["port"] is None
+
+
+@pytest.mark.asyncio
+async def test_unstamped_main_venv_reads_built_but_a_worktree_needs_the_stamp(
+    tmp_path, monkeypatch
+):
+    """Regression: Pull + Build rebuilds the MAIN checkout's venv without writing
+    the provision stamp, so a stamp-gated probe reported a freshly synced main
+    as unbuilt. Main gets the presence-only venv probe; a worktree with the same
+    unstamped venv still reads as not built, because provision owns its venv."""
+    from kiro_crew.pod import provision as prov
+
+    def _venv(root):
+        binp = root / ".venv" / ("Scripts" if platform_compat.IS_WINDOWS else "bin")
+        binp.mkdir(parents=True)
+        exe = binp / ("kirocrew.exe" if platform_compat.IS_WINDOWS else "kirocrew")
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+
+    main_co = tmp_path / "repo"
+    wt = tmp_path / "repo-wt-unstamped"
+    _venv(main_co)
+    _venv(wt)
+    # A resolvable build input with no matching stamp: the state of every venv
+    # Pull + Build has just rebuilt.
+    monkeypatch.setattr(prov, "_is_current", lambda checkout, artifact: False)
+
+    fleet = await _fleet_with(
+        [
+            {"path": str(main_co), "branch": "main", "is_main": True},
+            {"path": str(wt), "branch": "feat/x", "is_main": False},
+        ],
+        _POD_AVAILABLE=False,
+        _POD_ERROR="pods require Linux systemd",
+        _load_cfg=lambda: None,
+    )
+    rows = {w["is_main"]: w for w in fleet["worktrees"]}
+    assert rows[True]["has_venv"] is True
+    assert rows[False]["has_venv"] is False
 
 
 # _find_cli must target a RUNNABLE entry point

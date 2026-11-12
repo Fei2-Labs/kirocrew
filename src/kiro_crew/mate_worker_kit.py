@@ -150,6 +150,9 @@ def _skipped(
         have = _present_items(spec, base, key)
         for item in sorted(set(tkit[key]) & have):
             rows.append({"section": key, "id": item, "change": "skipped"})
+    # A grant-only tool setting the worker already grants (``_without_held_grants``).
+    for path in sorted(tkit.get("held_grants") or []):
+        rows.append({"section": "toolsSettings", "id": path, "change": "skipped"})
     return rows
 
 
@@ -182,8 +185,52 @@ def _added(
     return rows
 
 
-def _approval_refs(spec: dict[str, Any]) -> set[str]:
-    """Approval selectors from both file-level and per-server grants."""
+def _allow_rules(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    """The ``allow`` rules in *spec*'s ``permissions`` block."""
+    perms = spec.get("permissions")
+    rules = perms.get("rules") if isinstance(perms, dict) else None
+    return [
+        rule
+        for rule in (rules if isinstance(rules, list) else [])
+        if isinstance(rule, dict) and rule.get("effect") == "allow"
+    ]
+
+
+def _permission_refs(spec: dict[str, Any], base: dict[str, Any] | None) -> set[str]:
+    """The ``allowedTools`` refs *spec*'s ``mcp`` and built-in allow rules land as on the worker.
+
+    The worker merge writes an allow its list can express as that list's own
+    entries: an ``mcp`` one as its refs (``mate_spec_policy.mcp_allow_refs``), an
+    unscoped built-in one as its tool name (``kas_tool_view.builtin_allow_tool``),
+    unless the list already grants it (``mate_spec_policy._carry_mcp_allow``,
+    ``_carry_builtin_allow``). A rule the worker *base* already grants, and a ref
+    the base already lists, are left out the same way.
+    """
+    from kiro_crew.agent_sdk.kas_tool_view import (
+        allow_granted_by_spec,
+        builtin_allow_tool,
+        permission_allow_derivable,
+    )
+    from kiro_crew.mate_spec_policy import mcp_allow_refs
+
+    held = base or {}
+    listed = held.get("allowedTools")
+    have = {t for t in listed if isinstance(t, str)} if isinstance(listed, list) else set()
+    refs: set[str] = set()
+    for rule in _allow_rules(spec):
+        carried = mcp_allow_refs(rule)
+        if carried is None:
+            name = builtin_allow_tool(rule)
+            carried = [name] if name else None
+        if carried is None or not permission_allow_derivable(rule):
+            continue
+        if not allow_granted_by_spec(rule, held):
+            refs.update(ref for ref in carried if ref not in have)
+    return refs
+
+
+def _listed_refs(spec: dict[str, Any]) -> set[str]:
+    """Approval selectors *spec* lists: ``allowedTools`` and per-server ``autoApprove``."""
     value = spec.get("allowedTools")
     refs = {t for t in value if isinstance(t, str)} if isinstance(value, list) else set()
     servers = spec.get("mcpServers")
@@ -197,32 +244,73 @@ def _approval_refs(spec: dict[str, Any]) -> set[str]:
     return refs
 
 
-def _approval_changes(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, str]]:
+def _approval_refs(spec: dict[str, Any], base: dict[str, Any] | None = None) -> set[str]:
+    """Approval selectors from file-level, per-server and ``permissions`` grants.
+
+    The listed ones are :func:`_listed_refs`; the ``permissions`` ones are
+    :func:`_permission_refs`, less what the worker *base* already grants.
+    """
+    return _listed_refs(spec) | _permission_refs(spec, base)
+
+
+def _approval_changes(
+    before: dict[str, Any], after: dict[str, Any], base: dict[str, Any] | None = None
+) -> list[dict[str, str]]:
     """One row per auto-approval grant the add writes, so the owner sees it before applying.
 
     Diffed from the file before and after (the same written result ``apply``
-    saves), so the preview cannot list fewer grants than the file will hold. Both
-    channels count: an ``allowedTools`` entry, and a tool in a server entry's own
-    ``autoApprove``; either lets the worker run that tool with no prompt, so both
-    are listed as ``allowedTools`` rows (``@server/tool``).
+    saves), so the preview cannot list fewer grants than the file will hold. Three
+    channels count: an ``allowedTools`` entry, a tool in a server entry's own
+    ``autoApprove``, and an ``mcp`` or unscoped built-in allow in ``permissions``,
+    which the worker merge writes into the worker's ``allowedTools`` unless the
+    worker *base* already grants it. Each lets the worker run that tool with no
+    prompt, so all three are listed as ``allowedTools`` rows (``@server`` /
+    ``@server/tool``, or a built-in tool name such as ``use_subagent``).
     """
 
     return [
         {"section": "allowedTools", "id": ref, "change": "added"}
-        for ref in sorted(_approval_refs(after) - _approval_refs(before))
+        for ref in sorted(_approval_refs(after, base) - _approval_refs(before, base))
     ]
+
+
+def _unlisted_allow_added(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Whether *after* holds a ``permissions`` allow that *before* did not, of a
+    shape no ``allowedTools`` ref expresses.
+
+    Such an allow grants on its own: KAS keeps a scoped or excluded one in the
+    block, and Crew's gate answers an unscoped shell or file one itself
+    (``kas_permissions.crew_answered_builtins``). An allow the list can express
+    is counted through its refs instead (:func:`_permission_refs`).
+    """
+    from kiro_crew.agent_sdk.kas_tool_view import permission_allow_derivable
+
+    held = {_digest(rule) for rule in _allow_rules(before)}
+    return any(
+        _digest(rule) not in held and not permission_allow_derivable(rule)
+        for rule in _allow_rules(after)
+    )
 
 
 def _runs_unasked(
     before: dict[str, Any], after: dict[str, Any], base: dict[str, Any] | None = None
 ) -> bool:
-    """Whether a newly selected tool intersects an approval the worker will hold.
+    """Whether the add lets a tool the worker can use run without a prompt.
 
-    A selector on a server the worker *base* declares counts too, against the
-    file's approvals and the base's own, since the worker inherits both.
+    A newly selected tool that intersects an approval the worker will hold
+    counts. A selector on a server the worker *base* declares counts too, against
+    the file's approvals and the base's own, since the worker inherits both. So
+    does a new ``permissions`` allow that grants with no ``allowedTools`` ref
+    (:func:`_unlisted_allow_added`), and a new unscoped built-in allow, whose tool
+    name lands in the worker's list; ``deny`` and ``ask`` rules never count.
     """
+    if _unlisted_allow_added(before, after):
+        return True
+    new_grants = _permission_refs(after, base) - _permission_refs(before, base)
+    if any(not ref.startswith("@") for ref in new_grants):
+        return True
     existing = set(_kit_of(before)["tools"])
-    grants = _approval_refs(after)
+    grants = _approval_refs(after, base)
     new = [
         ref
         for ref in _kit_of(after)["tools"]
@@ -341,7 +429,9 @@ def _plan(member: str, body: Any) -> tuple[Path, dict[str, Any], dict[str, Any],
     Its ``hooks``, ``permissions`` and ``toolsSettings`` are layered on exactly
     (``mate_spec_policy``); they run on the crewmate's worker only, so the add is
     refused, naming the field, when one cannot be kept exactly or when the
-    crewmate's backend cannot apply them.
+    crewmate's backend cannot apply them. A grant-only tool setting the Bot's
+    worker already grants is left out first (:func:`_without_held_grants`) and
+    recorded in the kit's ``held_grants``.
     """
     from kiro_crew.mate_config import MateConfigError, _carried_restrictions, _resolved_source_spec
     from kiro_crew.mate_config_migration import uncarried_restrictions
@@ -354,6 +444,7 @@ def _plan(member: str, body: Any) -> tuple[Path, dict[str, Any], dict[str, Any],
         source = _resolved_source_spec(template)
     except MateConfigError as exc:
         raise WorkerKitError("template_unreadable") from exc
+    source, tkit["held_grants"] = _without_held_grants(source, spec, path.stem)
     lost = uncarried_restrictions(source)
     if lost:
         # A restriction the worker would not keep exactly.
@@ -439,6 +530,57 @@ def _plan(member: str, body: Any) -> tuple[Path, dict[str, Any], dict[str, Any],
     return path, spec, new_spec, template, tkit
 
 
+def _without_held_grants(
+    source: dict[str, Any], spec: dict[str, Any], file_id: str
+) -> tuple[dict[str, Any], list[str]]:
+    """*source* less each grant-only tool setting the Bot's worker already grants,
+    and the ``<tool>.<key>`` path of each one left out.
+
+    The keys are ``mate_spec_policy.HELD_GRANT_SETTINGS``, each proved against the
+    worker the Bot runs once the add lands: the base and *source* merged without
+    them, less the tools the Bot's file *spec* excludes and the approvals its
+    owner revoked (``mate_approval_revocations``, read for *file_id*), so the
+    worker behaves as the agent declares and no prompt appears or disappears.
+    Nothing is left out when the base or the revoked approvals cannot be read,
+    that merge refuses something else, or one of those tools is written under
+    two kiro-cli spellings; the gates after this then name the key with the rest.
+    """
+    from kiro_crew import mate_approval_revocations as revocations
+    from kiro_crew.mate_spec_policy import (
+        SpecPolicyUncarried,
+        grant_settings_in,
+        held_grant_settings,
+        without_settings,
+    )
+    from kiro_crew.mate_worker import merge_worker_spec, worker_additions
+
+    candidates = grant_settings_in(source)
+    base = _worker_base_or_none() if candidates else None
+    if base is None:
+        return source, []
+    trial = without_settings(source, candidates)
+    # The Bot's own exclusions narrow the worker as the agent's do (``_plan`` joins both).
+    excluded = [
+        t
+        for value in (trial.get("excludedTools"), spec.get("excludedTools"))
+        for t in (value if isinstance(value, list) else [])
+        if isinstance(t, str)
+    ]
+    if excluded:
+        trial["excludedTools"] = list(dict.fromkeys(excluded))
+    try:
+        # Stripped after the merge, as ``mate_worker.resolve_worker_spec`` does.
+        merged = revocations.strip(
+            merge_worker_spec(base, worker_additions(base, trial)), revocations.revoked(file_id)
+        )
+    except (SpecPolicyUncarried, revocations.RevocationsUnreadable):
+        return source, []
+    held = held_grant_settings(source, merged)
+    if not held:
+        return source, []
+    return without_settings(source, held), [f"{tool}.{key}" for tool, key in held]
+
+
 def _carry_policy(member: str, new_spec: dict[str, Any], source: dict[str, Any]) -> None:
     """Layer *source*'s hooks, permissions and tool settings into the file *new_spec*.
 
@@ -482,12 +624,16 @@ def _carry_policy(member: str, new_spec: dict[str, Any], source: dict[str, Any])
 
 
 def _crewmate_backend(member: str, held: dict[str, Any]) -> str:
-    """The backend crewmate *member*'s worker runs on."""
+    """The backend Crew bot *member*'s worker runs on once its file holds *held*.
+
+    Judged on the spec being written: a Bot that follows the Settings harness
+    and gains policy runs on KAS (``crewmate_harness.worker_backend_for_spec``).
+    """
     from kiro_crew.config.loader import KiroCrewConfig
-    from kiro_crew.mate_worker import crewmate_worker_backend
+    from kiro_crew.crewmate_harness import worker_backend_for_spec
 
     try:
-        return crewmate_worker_backend(KiroCrewConfig.load(), member)
+        return worker_backend_for_spec(KiroCrewConfig.load(), member, bool(held))
     except Exception as exc:  # noqa: BLE001 - an unstartable pin applies nothing
         logger.warning("backend of %s unresolved; refusing its policy", member, exc_info=True)
         raise WorkerKitError(
@@ -673,7 +819,7 @@ def preview(member: str, body: Any) -> dict[str, Any]:
         "changes": [
             *_directions_change(current, tkit.get("prompt") or ""),
             *_added(tkit, spec, base, new_spec),
-            *_approval_changes(spec, new_spec),
+            *_approval_changes(spec, new_spec, base),
             *_skipped(tkit, spec, base),
             *_exclusion_changes(spec, new_spec),
             *_muted_server_changes(spec, new_spec),
@@ -716,7 +862,14 @@ def apply_reporting(member: str, body: Any) -> tuple[dict[str, Any], bool]:
             raise WorkerKitError("stale_revision")
         if _digest(new_spec) != _digest(spec):
             atomic_write(path, json.dumps(new_spec, indent=2) + "\n", restrict_to_owner=True)
-            regrants = [row["id"] for row in _approval_changes(spec, new_spec)]
+            base = _worker_base_or_none()
+            if base is None:
+                # The preview leaves out a ``permissions`` allow the base already
+                # grants, which an unread base cannot show: only the listed
+                # channels re-grant, so a failed read restores no revoked approval.
+                regrants = sorted(_listed_refs(new_spec) - _listed_refs(spec))
+            else:
+                regrants = [row["id"] for row in _approval_changes(spec, new_spec, base)]
             revocations.record(path.stem, [], regrants)
             policy_changed = _digest(policy_of(new_spec)) != _digest(policy_of(spec))
     try:

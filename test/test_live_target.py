@@ -217,6 +217,47 @@ class TestReadTargetReason:
         maybe_reexec(["gateway"])  # must not raise
         assert execs == []
 
+    @pytest.mark.parametrize("site", ["checkout", "entry point", "src/kiro_crew"])
+    def test_checkout_stat_permission_error_is_ignored(self, tmp_path, monkeypatch, site):
+        """A checkout the gateway cannot stat is an ignored pointer, not a crash.
+
+        On Python 3.12 ``Path.is_dir``/``is_file`` re-raise an access error, so
+        each of ``validate``'s stats is fed one.
+        """
+        checkout = _make_valid_checkout(tmp_path)
+        denied = {
+            "checkout": checkout,
+            "entry point": target_bin(checkout),
+            "src/kiro_crew": checkout / "src" / "kiro_crew",
+        }[site].resolve()
+        for name in ("is_dir", "is_file"):
+            real = getattr(Path, name)
+
+            def check(self, _real=real):
+                if self == denied:
+                    raise PermissionError(13, "Access is denied", str(self))
+                return _real(self)
+
+            monkeypatch.setattr(Path, name, check)
+        pointer_path().write_text(json.dumps({"checkout": str(checkout)}))
+        monkeypatch.delenv(EXEC_MARKER, raising=False)
+        mock_execve = MagicMock()
+        monkeypatch.setattr(os, "execve", mock_execve)
+        log = MagicMock()
+
+        try:
+            target, reason = read_target_reason()
+            maybe_reexec(["gateway"], log=log)
+        except OSError as exc:
+            pytest.fail(f"a checkout stat error escaped the live-target read: {exc!r}")
+
+        assert target is None
+        assert reason is not None
+        assert "cannot be read" in reason and str(checkout.resolve()) in reason
+        mock_execve.assert_not_called()
+        args = log.warning.call_args[0]
+        assert "ignoring" in args[0] % args[1:]
+
     def test_invalid_json_returns_none_with_reason(self, tmp_path):
         path = pointer_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -671,6 +712,22 @@ class TestMaybeReexec:
         monkeypatch.setattr(os, "execve", mock_execve)
         maybe_reexec(["gateway"])
         mock_execve.assert_not_called()
+
+    def test_marker_is_not_inherited_by_a_restart_replacement(self, tmp_path, monkeypatch):
+        """The exec'd gateway drops the marker, so a restart's replacement follows the pointer."""
+        checkout = _make_valid_checkout(tmp_path)
+        write_target(checkout)
+        monkeypatch.setattr(sys, "argv", ["/other/bin/kirocrew", "gateway"])
+        monkeypatch.setenv(EXEC_MARKER, "1")
+        mock_execve = MagicMock()
+        monkeypatch.setattr(os, "execve", mock_execve)
+        monkeypatch.setattr(os, "chdir", MagicMock())
+        maybe_reexec(["gateway"])
+        mock_execve.assert_not_called()
+        assert EXEC_MARKER not in os.environ
+        # The replacement inherits this environment and boots through the same bootstrap.
+        maybe_reexec(["gateway"])
+        mock_execve.assert_called_once()
 
     def test_returns_without_exec_when_no_pointer(self, monkeypatch):
         """No pointer file -> stay here."""

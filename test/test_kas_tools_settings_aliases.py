@@ -25,7 +25,9 @@ from kiro_crew.acp.kas_permissions import (
     trusted_agents_withheld,
     withhold_answered_under_authored_rules,
 )
+from kiro_crew.agent_sdk import kas_tool_view
 from kiro_crew.agent_sdk.kas_tool_view import tools_settings_family, tools_settings_unenforced
+from kiro_crew.platform import allowed_commands
 
 _ALL = frozenset({"fs_read", "fs_write", "shell"})
 
@@ -157,12 +159,75 @@ class TestNotice:
 
     def test_trusted_agents_dropped_by_the_ceiling_are_named(self, monkeypatch):
         spec = _spec(toolsSettings={"subagent": {"trustedAgents": ["reviewer"]}})
-        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: False)
+        withhold, permit = (lambda ref: False), (lambda ref: True)
+        monkeypatch.setattr(kas_agents, "may_skip_gate_for_session", lambda *_a: withhold)
         assert spec_keys_without_carrier(spec, translates_tools_settings=True) == [
             "toolsSettings.subagent.trustedAgents"
         ]
-        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: True)
+        monkeypatch.setattr(kas_agents, "may_skip_gate_for_session", lambda *_a: permit)
         assert spec_keys_without_carrier(spec, translates_tools_settings=True) == []
+
+    @pytest.mark.parametrize(
+        ("settings", "named"),
+        [
+            (
+                {"subagent": {"trustedAgents": ["r"], "x": 1}},
+                ["subagent.trustedAgents", "subagent.x"],
+            ),
+            (
+                {"use_subagent": {"trustedAgents": ["r"], "x": 1}},
+                ["use_subagent.trustedAgents", "use_subagent.x"],
+            ),
+            ({"agentCrew": {"trustedAgents": ["r"]}}, ["agentCrew.trustedAgents"]),
+            # kiro-cli keeps `subagent` whole, so only its keys are read.
+            (
+                {"subagent": {"trustedAgents": ["r"]}, "use_subagent": {"trustedAgents": ["r"]}},
+                ["subagent.trustedAgents", "use_subagent"],
+            ),
+            (
+                {"subagent": {"trustedAgents": ["r"]}, "use_subagent": {"x": 1}},
+                ["subagent.trustedAgents", "use_subagent"],
+            ),
+        ],
+    )
+    def test_a_kept_alias_is_named_as_the_spec_wrote_it(self, monkeypatch, settings, named):
+        # The session's own predicate, which the trustedAgents check asks.
+        monkeypatch.setattr(kas_agents, "may_skip_gate_for_session", lambda *_a: lambda ref: False)
+        spec = _spec(toolsSettings=settings)
+        got = spec_keys_without_carrier(spec, translates_tools_settings=True)
+        assert got == [f"toolsSettings.{path}" for path in named]
+        # The worker policy's tool view names the same spellings.
+        unenforced = [p for p in named if not p.endswith(".trustedAgents")]
+        assert tools_settings_unenforced(settings) == unenforced
+
+    def test_an_unreadable_entry_is_named_as_the_spec_wrote_it(self, monkeypatch):
+        # `\p{N}` is outside the regex syntax Crew reads, so the entry is unusable: the
+        # session notice names the entry and why, the worker policy's view the key.
+        monkeypatch.setattr(kas_agents, "may_skip_gate_now", lambda ref: False)
+        entry = r"ls \p{N}"
+        settings = {"executeBash": {"allowedCommands": [entry]}}
+        reason = allowed_commands.refusal_reason(entry)
+        spec = _spec(toolsSettings=settings)
+        got = spec_keys_without_carrier(spec, translates_tools_settings=True)
+        assert reason and got == [f"toolsSettings.executeBash.allowedCommands: {entry} ({reason})"]
+        assert tools_settings_unenforced(settings) == ["executeBash.allowedCommands"]
+        # kirocrew doctor's row names the same spelling. Looked up when called, so a
+        # module without it fails this test, not the file.
+        unread = kas_tool_view.unreadable_allowed_commands(settings)
+        assert unread == [("executeBash", entry, reason)]
+
+    def test_an_ascii_class_entry_is_named_for_the_crewmate_as_the_spec_wrote_it(self):
+        # `\d` is carried for the session, but read over ASCII, so a crewmate's
+        # policy names it under the alias the spec used.
+        settings = {"executeBash": {"allowedCommands": [r"ls \d"]}}
+        assert tools_settings_unenforced(settings) == ["executeBash.allowedCommands"]
+
+    def test_withheld_write_paths_are_named_as_the_spec_wrote_them(self, monkeypatch):
+        # The ceiling withholds the write grant, so `allowedPaths` go unanswered.
+        monkeypatch.setattr(kas_agents, "may_grant_builtin_at_gate_now", lambda tool: False)
+        spec = _spec(toolsSettings={"fsWrite": {"allowedPaths": ["/tmp/x"]}})
+        got = spec_keys_without_carrier(spec, translates_tools_settings=True)
+        assert got == ["toolsSettings.fsWrite.allowedPaths"]
 
     def test_an_untranslatable_trusted_agents_entry_is_not_named_twice(self):
         # `?` has no shared reading, so the translation already names it.
@@ -209,7 +274,7 @@ class TestPwshProcessControl:
 
 class TestOtherReadersAgree:
     def test_the_spawn_gate_reads_the_alias_kiro_cli_keeps(self):
-        from kiro_crew.subagent_parts.agent_policy import spawn_allowlist
+        from kiro_crew.subagent_parts.spawn_allowlists import spawn_allowlist
 
         assert spawn_allowlist({"toolsSettings": {"crew": {"availableAgents": []}}}) == ()
         both = {"crew": {"availableAgents": []}, "subagent": {"availableAgents": ["*"]}}
@@ -263,7 +328,7 @@ class TestOtherReadersAgree:
 
     def test_the_notice_never_calls_an_enforced_use_subagent_list_unapplied(self):
         from kiro_crew.agent_sdk.tools_settings_reach import tools_settings_unapplied
-        from kiro_crew.subagent_parts.agent_policy import spawn_allowlist
+        from kiro_crew.subagent_parts.spawn_allowlists import spawn_allowlist
 
         only = {"use_subagent": {"availableAgents": ["reviewer"]}}
         assert spawn_allowlist({"toolsSettings": only}) == ("reviewer",)

@@ -402,7 +402,7 @@ describe('SignalsPanel', () => {
     fireEvent.click(button)
 
     const polling = await screen.findByRole('button', { name: /Polling…/ })
-    expect(polling).toBeDisabled()
+    expect(polling).toHaveAttribute('aria-disabled', 'true')
 
     await act(async () => {
       reject(new Error('the /signals route refused the poll'))
@@ -414,7 +414,69 @@ describe('SignalsPanel', () => {
         timeout: 5_000,
       }),
     ).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Poll now/ })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /Poll now/ })).not.toHaveAttribute('aria-disabled')
+  })
+
+  it('keeps keyboard focus on Poll now while polling, and ignores a second press', async () => {
+    // A native `disabled` takes the focused button out of the tab order, so a
+    // keyboard press dropped focus to the page for the whole poll.
+    await renderPanel()
+    let resolve: (v: SignalsResult) => void = () => {}
+    vi.mocked(opsApi.signals).mockReturnValue(
+      new Promise<SignalsResult>(res => {
+        resolve = res
+      }),
+    )
+    const calls = vi.mocked(opsApi.signals).mock.calls.length
+
+    const button = screen.getByRole('button', { name: /Poll now/ })
+    button.focus()
+    fireEvent.click(button)
+    await screen.findByRole('button', { name: /Polling…/ })
+    expect(button).not.toBeDisabled()
+    expect(button).toHaveFocus()
+
+    fireEvent.click(button)
+    expect(vi.mocked(opsApi.signals).mock.calls.length).toBe(calls + 1)
+
+    await act(async () => {
+      resolve(mkSignalsResult())
+      await Promise.resolve()
+    })
+    await screen.findByRole('button', { name: /Poll now/ })
+    expect(button).toHaveFocus()
+  })
+
+  it('keeps keyboard focus on a signal row Claim while the claim runs, and ignores a second press', async () => {
+    // A native `disabled` takes the focused button out of the tab order, so a
+    // keyboard press dropped focus to the page while the claim ran. The row
+    // itself unmounts only once the claim resolves and the signal leaves the
+    // unclaimed list; focus must hold on the button for the whole pending leg.
+    const { queryClient } = await renderPanel()
+    seedSignals(queryClient, { unclaimed: [mkSignal()] })
+    const button = await screen.findByRole('button', { name: 'Claim' })
+
+    let resolve: (v: ClaimEnvelope) => void = () => {}
+    vi.mocked(opsApi.claim).mockReturnValue(
+      new Promise<ClaimEnvelope>(res => {
+        resolve = res
+      }),
+    )
+
+    button.focus()
+    fireEvent.click(button)
+    await waitFor(() => expect(button).toHaveAttribute('aria-disabled', 'true'))
+    expect(button).not.toBeDisabled()
+    expect(button).toHaveFocus()
+
+    // A second press while pending must not fire a second claim.
+    fireEvent.click(button)
+    expect(vi.mocked(opsApi.claim).mock.calls.length).toBe(1)
+
+    await act(async () => {
+      resolve(mkClaim())
+      await Promise.resolve()
+    })
   })
 
   it('reports an exact ledger match and a cleared fast path on the claim receipt', async () => {

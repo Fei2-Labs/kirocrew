@@ -205,7 +205,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_cron_stream_with_posttoken_resume",
             "async function",
-            "(client: 'Any', message: 'str', *, job_name: 'str', on_resume: 'Callable[[], None] | None' = None, **stream_kwargs: 'Any') -> 'tuple[str, float | None]'",
+            "(client: 'Any', message: 'str', *, job_name: 'str', directive_refusals: 'list[str]', on_resume: 'Callable[[], None] | None' = None, **stream_kwargs: 'Any') -> 'tuple[str, float | None]'",
         ),
     ),
     "cron_verdict": (
@@ -248,6 +248,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(self, origin_key: 'str', text: 'str', *, actor_key: 'str') -> 'bool'",
         ),
         ("_cron_job_is_silent", "method", "(self, parent_key: 'str') -> 'bool'"),
+        ("_cron_dm_user", "method", "(self, job: 'CronJob') -> 'str'"),
     ),
     "mcp_broker": (
         ("_init_mcp_discovery", "method", "(self) -> 'None'"),
@@ -260,6 +261,19 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "_init_mcp_gateway",
             "async method",
             "(self, stub_servers: 'frozenset[str] | None' = None) -> 'None'",
+        ),
+        (
+            "_mark_mcp_broker_ready",
+            "method",
+            "(self, manager: 'GatewayManager', approvals: 'LaunchApprovals', "
+            "socket_path: 'Path', stubs: 'frozenset[str]', sharing: 'bool') -> 'None'",
+        ),
+        ("_mcp_gateway_start_retry_delay", "method", "(self, attempt: 'int') -> 'float'"),
+        (
+            "_retry_mcp_gateway_start",
+            "async method",
+            "(self, manager: 'GatewayManager', approvals: 'LaunchApprovals', "
+            "socket_path: 'Path', stubs: 'frozenset[str]', sharing: 'bool') -> 'None'",
         ),
         ("_mcp_resolve_refresh_secs", "method", "(self) -> 'float'"),
         (
@@ -284,10 +298,14 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("_wire_mcp_gateway_dashboard", "method", "(self) -> 'None'"),
     ),
     "memory_lifecycle": (
-        ("_initialize_memory_worker", "method", "(self) -> 'bool'"),
+        ("_initialize_memory_worker", "method", "(self, dashboard_state: 'Any' = None) -> 'bool'"),
         ("_stop_memory_startup", "method", "(self) -> 'None'"),
         ("_start_memory_after_ready", "method", "(self) -> 'None'"),
-        ("_schedule_memory_preparation", "method", "(self) -> \"'asyncio.Task[None] | None'\""),
+        (
+            "_schedule_memory_preparation",
+            "method",
+            "(self, dashboard_state: 'Any' = None) -> \"'asyncio.Task[None] | None'\"",
+        ),
         ("_wait_for_memory_preparation", "async method", "(self) -> 'bool'"),
         ("_repair_member_memory_once", "method", "(self) -> 'None'"),
         ("_repair_member_memory", "async method", "(self) -> 'None'"),
@@ -331,25 +349,16 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_drain_update_callback_work",
             "async method",
-            "(self, *, timeout: 'float | None') -> 'bool'",
-        ),
-        (
-            "_prepare_auto_update_apply",
-            "async method",
-            "(self, *, mandatory: 'bool', mandatory_key: 'str' = '') -> 'bool'",
+            "(self, *, timeout: 'float | None', include_turns: 'bool' = True) -> 'bool'",
         ),
         ("_finish_auto_update_apply", "async method", "(self) -> 'None'"),
-        ("_restart_gate_when_idle", "async method", "(self) -> 'tuple[bool, int, int]'"),
-        ("_release_restart_gate_hold", "async method", "(self) -> 'None'"),
         ("_wheel_apply_module", "staticmethod", "() -> 'Any'"),
-        ("_dashboard_policy_applies", "staticmethod", "() -> \"list['asyncio.Task[Any]']\""),
         (
             "_settle_update_work",
             "async method",
             "(self, update_task: \"'asyncio.Task[None] | None'\") -> 'None'",
         ),
         ("_run_update_checks", "async method", "(self) -> 'None'"),
-        ("_retry_pending_update_restart", "async method", "(self) -> 'bool'"),
         ("_check_for_updates", "async method", "(self) -> 'None'"),
         (
             "_auto_update_effect",
@@ -358,24 +367,13 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
         ("_publish_provider_update_state", "method", "(self, result: 'object') -> 'None'"),
         ("_check_for_updates_via_provider", "async method", "(self, provider: 'object') -> 'None'"),
-        (
-            "_restart_after_update_claimed",
-            "async method",
-            "(self, launcher: 'str | None', exe: 'str | None') -> 'None'",
-        ),
         ("_check_for_updates_legacy", "async method", "(self) -> 'None'"),
-        (
-            "_restart_after_update_body",
-            "async method",
-            "(self, respawn: 'Callable[[], str]') -> 'None'",
-        ),
     ),
     "update_apply": (
-        ("_auto_apply_update", "async method", "(self, *, mandatory: 'bool' = False) -> 'None'"),
         (
             "_auto_apply_wheel_update",
             "async method",
-            "(self, channel: 'str', version: 'str', *, mandatory: 'bool' = False, mandatory_key: 'str' = '') -> 'None'",
+            "(self, channel: 'str', version: 'str', *, mandatory: 'bool' = False) -> 'None'",
         ),
         (
             "_notice_wheel_update_once",
@@ -393,6 +391,11 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "_fire_dashboard_nudge",
             "async method",
             "(self, loop: 'NudgeLoop', wake_message: 'str | None' = None) -> 'bool | MonitorDispatchResult'",
+        ),
+        (
+            "_start_dashboard_wake_turn",
+            "async method",
+            "(self, loop: 'NudgeLoop', slot: 'Any', wake_message: 'str | None', tagged: 'str', visible: 'str', trigger_text: 'str | None', fired_generation: 'int') -> 'MonitorDispatchResult'",
         ),
         (
             "_work_ledger_wake_loop",
@@ -467,7 +470,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_interactive_approval",
             "method",
-            "(self, source: 'str', slot_resolver: 'Callable[[str], str] | None' = None, nudge_key: 'str' = '', *, raise_when_unreachable: 'bool' = False, requester: 'str' = '') -> 'ToolApprovalCallback'",
+            "(self, source: 'str', slot_resolver: 'Callable[[str], str] | None' = None, nudge_key: 'str' = '', *, raise_when_unreachable: 'bool' = False, requester: 'str' = '', on_host_decision: 'Callable[[str, str], None] | None' = None) -> 'ToolApprovalCallback'",
         ),
         (
             "_heartbeat_approval",
@@ -476,7 +479,11 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         ),
     ),
     "service_boot": (
-        ("_auto_open_dashboard", "async method", "(self, dashboard_url: 'str') -> 'None'"),
+        (
+            "_auto_open_dashboard",
+            "async method",
+            "(self, dashboard_url: 'str', *, print_link: 'bool') -> 'None'",
+        ),
         ("_init_services", "async method", "(self) -> 'None'"),
         (
             "_notify_consolidation_abandoned",
@@ -581,7 +588,7 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_acquire_with_model_fallback",
             "async method",
-            "(self, job: 'CronJob', cron_execution: 'ExecutionContext', key: 'str', agent_id: 'str | None', cwd: 'str | None' = None, crew_agent: 'str | None' = None, *, execution: 'ExecutionContext | None' = None, replace_execution: 'bool' = False) -> \"'tuple[LLMProvider, bool, bool, bool]'\"",
+            "(self, job: 'CronJob', cron_execution: 'ExecutionContext', key: 'str', agent_id: 'str | None', cwd: 'str | None' = None, crew_agent: 'str | None' = None, *, execution: 'ExecutionContext | None' = None, replace_execution: 'bool' = False) -> \"'tuple[LLMProvider, bool, bool, bool, Any]'\"",
         ),
         (
             "_retained_session_agent_mismatch",
@@ -625,7 +632,8 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
         (
             "_failure_alert_due",
             "function",
-            "(job: 'CronJob', streak: 'int', *, denied: 'bool' = False) -> 'bool'",
+            "(job: 'CronJob', streak: 'int', *, denied: 'bool' = False,"
+            " auth_expiry: 'bool' = False) -> 'bool'",
         ),
         ("_log_held_alert", "function", "(job: 'CronJob') -> 'None'"),
         (
@@ -650,9 +658,14 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "(self, job: 'CronJob', detail: 'str', *, denied: 'bool' = False) -> 'None'",
         ),
         (
+            "_alert_cron_interrupted",
+            "async method",
+            "(self, job: 'CronJob', detail: 'str') -> 'None'",
+        ),
+        (
             "_cron_single_failure",
             "async method",
-            "(self, job: 'CronJob', exc: 'Exception', session_key: 'str', _gate_counted: 'bool', _job_owns_failure: 'bool', _hand_over_streak: 'bool') -> 'None'",
+            "(self, job: 'CronJob', exc: 'Exception', session_key: 'str', _gate_counted: 'bool', _job_owns_failure: 'bool', _hand_over_streak: 'bool', *, _auth_expiry: 'bool' = False) -> 'None'",
         ),
     ),
     "orchestrator_init": (
@@ -762,15 +775,30 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "async method",
             "(self, info: 'SubagentInfo', parent_key: 'str') -> 'None'",
         ),
+        (
+            "_route_cron_parent_to_tab",
+            "async method",
+            "(self, info: 'SubagentInfo', *, parent_key: 'str', injection_counted: 'bool' = False, **route_kwargs: 'Any') -> 'None'",
+        ),
+        ("_drop_cron_injection", "method", "(self, parent_key: 'str') -> 'None'"),
     ),
     "runtime_charge": (
         ("_apply_gate_verdict", "function", "(job: 'CronJob', tally: '_GateTally') -> 'bool'"),
+        (
+            "_cron_auth_expiry",
+            "function",
+            "(job: 'CronJob', exc: 'BaseException') -> 'bool'",
+        ),
         (
             "_cron_failure_attribution",
             "function",
             "(job: 'CronJob', _run_provider: 'object | None') -> 'tuple[bool, bool]'",
         ),
-        ("_charge_failure", "function", "(job: 'CronJob', _hand_over_streak: 'bool') -> 'None'"),
+        (
+            "_charge_failure",
+            "function",
+            "(job: 'CronJob', _hand_over_streak: 'bool', *, auth_expiry: 'bool' = False) -> 'None'",
+        ),
         (
             "_streak_after_charge",
             "function",
@@ -1272,10 +1300,8 @@ _GUARDED_TOKEN_HOMES: dict[str, frozenset[str]] = {
     "session_store_for_turn": frozenset(
         {"gateway", "heartbeat_turns", "nudge_channel_fire", "subagent_injection"}
     ),
-    "create_subprocess_": frozenset({"gateway", "install_repair", "update_apply"}),
-    "isolated_python_argv": frozenset({"install_repair", "update_apply"}),
-    "respawn_executable": frozenset({"update_apply", "update_schedule"}),
-    "reexec_python_module": frozenset({"update_schedule"}),
+    "create_subprocess_": frozenset({"gateway", "install_repair"}),
+    "isolated_python_argv": frozenset({"install_repair"}),
     "_running_script_ids.add": frozenset({"cron_exec"}),
     "caused_by_this_session": frozenset({"runtime_charge"}),
     "note_shared_death": frozenset({"runtime_charge"}),
@@ -1290,7 +1316,6 @@ _GUARDED_TOKEN_HOMES: dict[str, frozenset[str]] = {
     "autonudge_state": frozenset({"nudge_wiring"}),
     "_run_chat": frozenset(
         {
-            "cron_fire",
             "gateway",
             "nudge_dashboard_fire",
             "result_egress",

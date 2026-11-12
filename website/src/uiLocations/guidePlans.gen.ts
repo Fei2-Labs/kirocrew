@@ -3,7 +3,7 @@
 import type { UiGuidePlan } from './types'
 
 /** The `build_digest` of the packaged index this bundle was built with (see `guideBuildDigest`). */
-export const GUIDE_BUILD_DIGEST = "sha256:5a660daf3a790cce2a2675a2a176e5bf0dcfaa841571622dead75aee7af21b8c"
+export const GUIDE_BUILD_DIGEST = "sha256:667e9c20184933fec08c55a712ebe25b68d1d0021bdf34e4eb91ecb072117c9e"
 
 /** Curated location ids: the only ids a live observation may name. */
 export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
@@ -69,6 +69,8 @@ export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
   "composer.stop",
   "composer.voice",
   "connections.mcp-servers-tab",
+  "knowledge.add-source",
+  "knowledge.sources-tab",
   "mcp.add-custom",
   "mcp.add-server",
   "mcp.probe",
@@ -102,6 +104,7 @@ export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
   "notifications.page-mark-all-read",
   "overview.memory-details",
   "schedule.add-job",
+  "schedule.batch-actions",
   "schedule.cancel-run",
   "schedule.create-first",
   "schedule.delete",
@@ -232,6 +235,10 @@ export const GUIDE_REVEAL_SCOPES = {
     "kind": "menu",
     "revealer": "members.switcher"
   },
+  "menu:schedule.batch-actions": {
+    "kind": "menu",
+    "revealer": "schedule.batch-actions"
+  },
   "menu:sessions.create-menu": {
     "kind": "menu",
     "revealer": "sessions.create-menu"
@@ -271,6 +278,10 @@ export const GUIDE_REVEAL_SCOPES = {
   "open:connections.mcp-servers-tab": {
     "kind": "open",
     "revealer": "connections.mcp-servers-tab"
+  },
+  "open:knowledge.sources-tab": {
+    "kind": "open",
+    "revealer": "knowledge.sources-tab"
   },
   "shell.nav-rail": {
     "kind": "state",
@@ -1706,6 +1717,46 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
       }
     ]
   },
+  "knowledge.add-source": {
+    "version": 2,
+    "label_key": "pages.knowledge.sourcesList.add_source",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/capabilities?tab=knowledge",
+        "steps": [
+          {
+            "id": "any:knowledge.sources-tab",
+            "location": "knowledge.sources-tab",
+            "label_key": "pages.knowledge.index.sources_tab",
+            "scope": "open:knowledge.sources-tab"
+          },
+          {
+            "id": "any:knowledge.add-source",
+            "location": "knowledge.add-source",
+            "label_key": "pages.knowledge.sourcesList.add_source"
+          }
+        ]
+      }
+    ]
+  },
+  "knowledge.sources-tab": {
+    "version": 2,
+    "label_key": "pages.knowledge.index.sources_tab",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/capabilities?tab=knowledge",
+        "steps": [
+          {
+            "id": "any:knowledge.sources-tab",
+            "location": "knowledge.sources-tab",
+            "label_key": "pages.knowledge.index.sources_tab"
+          }
+        ]
+      }
+    ]
+  },
   "mcp.add-server": {
     "version": 2,
     "label_key": "pages.overview.mcpTab.add_server",
@@ -2384,6 +2435,34 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
       }
     ]
   },
+  "schedule.batch-actions": {
+    "version": 2,
+    "label_key": "pages.schedulePage.batchActions.actions_for_selected",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/schedule",
+        "steps": [
+          {
+            "id": "any:select:one_job_checked",
+            "kind": "select",
+            "location": "schedule.job-list",
+            "label_key": "pages.schedulePage.jobs_table",
+            "selection": "one_job_checked",
+            "entity": "tickjob",
+            "requires": [
+              "schedule_list_view"
+            ]
+          },
+          {
+            "id": "any:schedule.batch-actions",
+            "location": "schedule.batch-actions",
+            "label_key": "pages.schedulePage.batchActions.actions_for_selected"
+          }
+        ]
+      }
+    ]
+  },
   "schedule.delete": {
     "version": 2,
     "label_key": "pages.schedulePage.delete",
@@ -2428,6 +2507,15 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
             "label_key": "pages.schedulePage.jobs_table",
             "selection": "one_job_checked",
             "entity": "tickjob",
+            "requires": [
+              "schedule_list_view"
+            ]
+          },
+          {
+            "id": "any:schedule.batch-actions",
+            "location": "schedule.batch-actions",
+            "label_key": "pages.schedulePage.batchActions.actions_for_selected",
+            "scope": "menu:schedule.batch-actions",
             "requires": [
               "schedule_list_view"
             ]

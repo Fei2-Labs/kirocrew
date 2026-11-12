@@ -24,6 +24,10 @@ from kiro_crew.session import BACKGROUND_KEY, CONSOLIDATE_KEY, HEARTBEAT_KEY, Se
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.testing.wait import await_until
 
+#: These tests start background helper turns, which are skipped while the host's
+#: memory posture is critical (see ``ample_host_free_memory``).
+pytestmark = pytest.mark.usefixtures("ample_host_free_memory")
+
 #: Ceiling for a wait that only fails on a hang: these steps finish in
 #: milliseconds, so a test fails by name instead of losing the xdist worker.
 _HANG_CEILING_S = 30
@@ -148,6 +152,31 @@ class TestSessionManager:
 
         mgr.mark_provider_switch_replay("thread1")
         assert mgr.first_turn_history_owed_pending("thread1") is False
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_noted_replay_delivery_lasts_as_long_as_its_lease(self, cfg):
+        """A delivery is noted only on an armed lease and binds to the native
+        conversation it reached: it survives a re-arm, a respawned process does
+        not inherit it, and a lease armed after the old one settled starts without it."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+        live, respawned = ("client", "sid", "pid-1"), ("client", "sid", "pid-2")
+
+        assert mgr.note_provider_switch_replay_delivered("thread1", live) is False
+        mgr.mark_provider_switch_replay("thread1")
+        assert mgr.provider_switch_replay_delivered("thread1", live) is False
+        assert mgr.note_provider_switch_replay_delivered("thread1", live) is True
+        mgr.mark_provider_switch_replay("thread1")
+        assert mgr.provider_switch_replay_delivered("thread1", live) is True
+        assert mgr.provider_switch_replay_delivered("thread1", respawned) is False
+        assert mgr.provider_switch_replay_pending("thread1") is True
+
+        mgr.consume_provider_switch_replay("thread1")
+        assert mgr.provider_switch_replay_delivered("thread1", live) is False
+        mgr.mark_provider_switch_replay("thread1")
+        assert mgr.provider_switch_replay_delivered("thread1", live) is False
         await mgr.close_all()
 
     @pytest.mark.asyncio

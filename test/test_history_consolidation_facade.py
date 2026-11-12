@@ -51,6 +51,8 @@ _BASE_MODULE_NAMES = frozenset("""
     _InheritGlobal _LessonDeleteDecision _LESSON_PASSTHROUGH_FIELDS
     _MAX_CONSOLIDATION_SEMANTIC_VALUE_CHARS _MAX_EPISODIC_PER_CONSOLIDATION
     _OversizedItem _audit_oversized_semantic _refuse_oversized_semantic _v1_consolidation_confidence
+    _MAX_REFUSED_SEMANTIC_NOTES _REFUSED_SEMANTIC_NOTE_DAYS _REFUSED_SEMANTIC_NOTE_PREFIX
+    _refused_semantic_note _refused_semantic_notice _update_refused_semantic_note
     _MAX_LESSONS_PER_CONSOLIDATION _MAX_SEMANTIC_PER_CONSOLIDATION _PLACEHOLDER_BODIES
     _PersistenceDisabledMidRun _RunCommitState _SEEDED_PER_SWEEP _SEED_MAX_AGE_SECS
     _SEMANTIC_OMISSION_NOTICE _SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION
@@ -247,7 +249,7 @@ _BASE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "function",
         False,
         False,
-        "(self, raw: 'object', vector_store: \"'VectorMemoryStore | None | _InheritGlobal'\" = <_InheritGlobal>, lesson_store: \"'LessonStore | None | _InheritGlobal'\" = <_InheritGlobal>, *, facets: \"'MemoryFacets | None'\" = None, key: 'str' = '', commit_state: '_RunCommitState | None' = None) -> 'None'",
+        "(self, raw: 'object', vector_store: \"'VectorMemoryStore | None | _InheritGlobal'\" = <_InheritGlobal>, lesson_store: \"'LessonStore | None | _InheritGlobal'\" = <_InheritGlobal>, *, facets: \"'MemoryFacets | None'\" = None, key: 'str' = '', commit_state: '_RunCommitState | None' = None, changes_out: 'dict[str, int] | None' = None) -> 'None'",
     ),
     "_scan_unconsolidated_transcripts": ("function", False, False, "(self) -> 'dict[str, float]'"),
     "_seed_last_activity": ("function", True, False, "(self) -> 'None'"),
@@ -297,7 +299,7 @@ _BASE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "function",
         False,
         False,
-        "(self, result: 'dict', key: 'str', vector_store: \"'VectorMemoryStore | None | _InheritGlobal'\" = <_InheritGlobal>, *, facets: \"'MemoryFacets | None'\" = None, snapshot: 'dict | None' = None, visible_keys: 'frozenset[str] | None' = None, messages: 'list[dict] | None' = None, commit_state: '_RunCommitState | None' = None) -> 'None'",
+        "(self, result: 'dict', key: 'str', vector_store: \"'VectorMemoryStore | None | _InheritGlobal'\" = <_InheritGlobal>, *, facets: \"'MemoryFacets | None'\" = None, snapshot: 'dict | None' = None, visible_keys: 'frozenset[str] | None' = None, messages: 'list[dict] | None' = None, commit_state: '_RunCommitState | None' = None, changes_out: 'dict[str, int] | None' = None) -> 'None'",
     ),
     "check_idle_sessions": ("function", False, False, "(self) -> 'None'"),
     "consolidate_now": ("function", True, False, "(self, key: 'str') -> 'bool'"),

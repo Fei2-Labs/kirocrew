@@ -3,10 +3,10 @@ import { isLookPreviewFrame } from '../utils/lookPreview'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAppDispatch } from '../store'
 import { sseTodoUpdate, sseMcpReportUpdate, sseSlotTitle, triggerRefresh, triggerCronRefresh, fetchSlots, remoteSlotRead } from '../store/dashboardSlice'
-import { addNotification, ackNotificationByTs, unackNotificationByTs, clearAllNotifications } from '../store/notificationsSlice'
+import { addNotification, ackNotificationByTs, unackNotificationByTs, applyNotificationDismiss, clearAllNotifications } from '../store/notificationsSlice'
 import { dispatchMcNotification, dispatchLiveNotification } from './notificationEvent'
 import {
-  fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, refreshSlot, retireSwappedRows, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, resolveByApprovalId, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, subagentReplayDone, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, sseMcpAppRender, sseSideQueue, sideClose, sideClosedElsewhere, queueEntryAttachments, isTerminalWorkflowStatus,
+  fetchHistory, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, refreshSlot, retireSwappedRows, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, resolveElicitationRow, sseSubagentPending, setSubagentApprovalTarget, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, subagentReplayDone, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, sseMcpAppRender, sseSideQueue, sideClose, sideClosedElsewhere, queueEntryAttachments, isTerminalWorkflowStatus,
   forgetSideSteerSubmittedText, noteSideQueueDroppedByClose, readSideSteerSubmittedText,
   takeSideQueueEditForClose,
 } from '../store/chatSlice'
@@ -19,6 +19,7 @@ import { handleGuideObserveFrame } from '../guide/liveObservation'
 import { applyCardUpdate } from '../api/cards'
 import type { Notification, TodoList, McpSessionReport } from '../types'
 import { i18nT } from '../i18n/t'
+import { CONFIG_PENDING_QUERY_KEY } from '../pages/settings/configPendingQuery'
 import { teamRoots } from '../pages/chat/command-center/model'
 import {
   applySessionProjection,
@@ -41,6 +42,7 @@ import { createFoldWatch, FOLD_HELLO_FRAME, type FoldWatch } from './websocket/f
 import { applySlotFoldFrame, readSlotFoldFrame, resetWorkDeltaBases, SLOT_DELTA_FRAME, type SlotFoldFrame, type SlotFoldOutcome } from './websocket/workDelta'
 import { appWatchedSlots, noteAppSlotChanged, noteAppSlotFrame, onAppWatchedSlotsChange } from '../utils/appSlotPush'
 import { catchupSlots, createChunkWatch, type ChunkWatch } from './websocket/chunkWatch'
+import { SilenceWatchdog, type SilenceWatchdogHost } from '../utils/socketSilenceWatchdog'
 import { decodeFrame } from './websocket/frames'
 import { useStreamBuffers } from './websocket/streamBuffers'
 import { useVoicePlayback } from './websocket/voicePlayback'
@@ -61,6 +63,7 @@ import {
   handleSlotFoldMoved,
   handleSourceStatus,
   handleThreadReply,
+  invalidateChatPins,
   invalidateRefreshQueries,
 } from './websocket/serverState'
 import { DASHBOARD_FIELDS_FRAME, handleDashboardFields } from './websocket/dashboardFields'
@@ -68,10 +71,11 @@ import { useChatStream } from './websocket/chatStream'
 import { useTurnCompletion } from './websocket/turnCompletion'
 import { attachFocusRelay, focusedSlotForCurrentSurface } from './websocket/attention'
 import { emitAppReload, emitChannelEvent, emitComputerUseFrame, emitCronHistory, emitResumeAllDone } from './websocket/browserEvents'
-import { runFirstConnect, runReconnectCatchUp } from './websocket/reconnectCatchUp'
+import { createReconnectSnapshotWait, runFirstConnect, runReconnectCatchUp, type ReconnectSnapshotWait } from './websocket/reconnectCatchUp'
 import { browserLiveStore } from './useBrowserLive'
 import { applySharedCrewFrame, onSharedCrewSocketOpen, setSharedCrewSender } from './sharedCrew/sharedCrewSocket'
 import { batchedUnlessOpen } from '../lib/streamBatch'
+import { noteCrewSteerReceipt } from '../lib/crewSteerNotice'
 
 /* The dashboard's single multiplexed WebSocket. `useWebSocket` composes the
    owners under ./websocket — connection, stream buffers, voice, approvals,
@@ -119,16 +123,13 @@ export {
 } from './websocket/slotProjection'
 
 export { ROW_STALL_MS, ROW_STALL_TICK_MS } from './websocket/rowDeliveryWatchdog'
+export { RECONNECT_HEALTHY_MS } from '../utils/reconnectBackoff'
+export { RECONNECT_SNAPSHOT_WAIT_MS } from './websocket/reconnectCatchUp'
 
-/** A socket that has delivered nothing for this long while the page is visible
- *  is treated as dead, even when its `readyState` still reads OPEN. The gateway
- *  pushes a `dashboard` status frame on every socket every 5s
- *  (`_WS_STATUS_INTERVAL` in `dashboard/ws.py`), so this is four missed ticks. */
-export const WS_SILENCE_MS = 20_000
-/** How often the silence check runs: the status frame's own cadence. */
-export const WS_SILENCE_CHECK_MS = 5_000
-/** Ceiling for the silence window after repeated silent reconnects. */
-export const WS_SILENCE_MAX_MS = 300_000
+// The silence-watchdog timing constants are owned by the shared helper so the
+// dashboard socket and the two app sockets cannot drift. Re-exported here
+// because existing dashboard consumers (and tests) import them from this module.
+export { WS_SILENCE_MS, WS_SILENCE_CHECK_MS, WS_SILENCE_MAX_MS } from '../utils/socketSilenceWatchdog'
 
 /** Single multiplexed WebSocket replacing all SSE + polling connections. */
 const getDashboardState = () => store.getState().dashboard
@@ -138,16 +139,26 @@ export function useWebSocket() {
   const queryClient = useQueryClient()
   const socket = useSocketConnection()
   const { reconnectingRef } = socket
-  // Silence watchdog state (see WS_SILENCE_MS), kept in visible time: when the
-  // current socket last delivered a frame, when its silence clock started (at
-  // open), when the page was hidden (0 while visible), until when a socket
-  // thawed by a return is spared, and how many silent sockets in a row the
-  // watchdog has replaced.
-  const lastFrameAtRef = useRef(0)
-  const silenceClockStartedAtRef = useRef(0)
-  const hiddenAtRef = useRef(0)
-  const graceUntilRef = useRef(0)
-  const silentReconnectsRef = useRef(0)
+  // The silence watchdog: one instance for the hook's whole lifetime, re-seeded
+  // by `markOpen` on each socket open and fed `markFrame` on every delivered
+  // frame. Its timing state (visible-time stamps, hidden skip, thaw grace,
+  // window doubling) lives in the shared helper, not here. It reads its host
+  // through `silenceHostRef`, which the arming effect below points at the
+  // current socket and `forceReconnect`.
+  const silenceHostRef = useRef<SilenceWatchdogHost>({ isOpen: () => false, onDead: () => {} })
+  const silenceRef = useRef<SilenceWatchdog | null>(null)
+  if (silenceRef.current === null) {
+    silenceRef.current = new SilenceWatchdog({
+      isOpen: () => silenceHostRef.current.isOpen(),
+      onDead: () => silenceHostRef.current.onDead(),
+    })
+  }
+  // The reconnect catch-up window, closed by the new socket's connect snapshot.
+  const reconnectSnapshotRef = useRef<ReconnectSnapshotWait | null>(null)
+  if (reconnectSnapshotRef.current === null) {
+    reconnectSnapshotRef.current = createReconnectSnapshotWait(dispatch, reconnectingRef)
+  }
+  const reconnectSnapshot = reconnectSnapshotRef.current
   const voice = useVoicePlayback(dispatch)
   const automations = useAutomationSeed(dispatch, queryClient)
   // Prefer the gateway's runtime monitor kind list over the bundled snapshot so
@@ -182,13 +193,13 @@ export function useWebSocket() {
    *  non-English locale shows. */
   const syncPendingApprovals = useCallback(async () => {
     try {
-      await approvals.reconcilePending((a, slot) => {
+      await approvals.reconcilePending((a, slot, target) => {
         if (slot) {
           dispatch(sseChatMessage({
             slot, role: 'permission',
             content: `[${a.source || 'agent'}] ${a.tool || 'Unknown'}`,
             ts: String(a.ts || Date.now() / 1000),
-            meta: { tool_input: a.tool_input || '', approval_id: a.id, source: a.source, registry: 'coordinator', ...(a.tool_call_id ? { tool_call_id: a.tool_call_id } : {}) },
+            meta: { tool_input: a.tool_input || '', approval_id: a.id, source: a.source, registry: 'coordinator', approval_target: target, ...(a.tool_call_id ? { tool_call_id: a.tool_call_id } : {}) },
           }))
         }
       })
@@ -200,9 +211,10 @@ export function useWebSocket() {
     if (!ws) return
 
     ws.onopen = () => {
-      socket.resetBackoff()
-      silenceClockStartedAtRef.current = Date.now()
-      lastFrameAtRef.current = silenceClockStartedAtRef.current
+      // Not a backoff reset: a socket that drops before it proves healthy keeps
+      // the backoff growing (see `RECONNECT_HEALTHY_MS`).
+      socket.noteOpen()
+      silenceRef.current?.markOpen()
       slotList.resetForConnection()
       // A new socket starts unwatched; the gateway's hello re-sends the set.
       foldWatchRef.current?.reset()
@@ -218,6 +230,9 @@ export function useWebSocket() {
       // which a restarted gateway's frames would all fall below. One re-read per
       // connection re-bases it on the process now serving.
       void queryClient.invalidateQueries({ queryKey: ['crew-log-projections'] }, { cancelRefetch: false })
+      // `config_pending_changed` is one-shot: a change while the socket was down
+      // is only seen by re-reading.
+      void queryClient.invalidateQueries({ queryKey: CONFIG_PENDING_QUERY_KEY }, { cancelRefetch: false })
       // The Context tab's usage revisions belong to the previous process too.
       resetContextTraceRefresh()
       // Cache auto-speak preference
@@ -236,6 +251,7 @@ export function useWebSocket() {
         syncPendingQuestions: cards.syncPendingQuestions,
         syncWorkflowRuns,
         focusedSlot: focusedSlotForCurrentSurface,
+        reconnectSnapshot,
       }
       if (socket.wasConnectedRef.current) {
         // No frame could arrive while the socket was down (a gateway restart is
@@ -257,7 +273,7 @@ export function useWebSocket() {
     ws.binaryType = 'arraybuffer'
 
     ws.onmessage = (e) => {
-      if (socket.wsRef.current === ws) lastFrameAtRef.current = Date.now()
+      if (socket.wsRef.current === ws) silenceRef.current?.markFrame()
       // The look-preview frame (utils/lookPreview.ts) is a still picture of the
       // product drawn from fixtures: no live frame may repaint it with the
       // user's real sessions, runs or notices. The socket stays open only so
@@ -286,6 +302,7 @@ export function useWebSocket() {
             break
           case 'slots':
             slotList.onSlots(msg, data, e.data as string)
+            if (socket.wsRef.current === ws) reconnectSnapshot.onSlots(data)
             break
           case 'shared_crew.presence':
           case 'shared_crew.work':
@@ -304,6 +321,12 @@ export function useWebSocket() {
             break
           case 'credential_redaction_changed':
             handleCredentialRedactionChanged(queryClient, msg.data as { enabled?: unknown; changed_at?: unknown } | undefined)
+            break
+          case 'config_pending_changed':
+            // Owner-only frame: a settings file edited outside the dashboard went
+            // pending or was resolved. The Settings nav dot and the Security cards
+            // read this one query (pages/settings/configPendingQuery.ts).
+            void queryClient.invalidateQueries({ queryKey: CONFIG_PENDING_QUERY_KEY })
             break
           case 'skills.pending_changed': {
             // A skill candidate (new or an update proposal) was just staged for
@@ -383,8 +406,16 @@ export function useWebSocket() {
             // slot_key only — no pin content — so nothing sensitive crosses the
             // WebSocket to any listener.
             const slotKey = (data as { slot_key?: string }).slot_key
-            if (slotKey) {
-              queryClient.invalidateQueries({ queryKey: ['chat-pins', slotKey] })
+            if (slotKey) invalidateChatPins(queryClient, slotKey)
+            break
+          }
+          case 'crew_steer_unrecorded': {
+            // Owner-only frame: a steer into a Crew Mode worker was delivered but
+            // its background ledger record failed. Same note a receipt's
+            // `ledger_error` sets under the worker's composer.
+            const { slot, reason } = data as { slot?: unknown; reason?: unknown }
+            if (typeof slot === 'string' && typeof reason === 'string') {
+              noteCrewSteerReceipt(slot, { ledger_error: reason })
             }
             break
           }
@@ -403,8 +434,9 @@ export function useWebSocket() {
             // configured sound — the Redux action alone only drives the
             // toast/badge, not the sound.
             // RFC Phase 3: muted-channel (silenced) and passive notes are
-            // feed-only — no sound.
-            if (!n.silenced && n.priority !== 'passive') {
+            // feed-only — no sound. So is a quiet replacement: a keyed note
+            // moving along its lifecycle at no higher priority.
+            if (!n.silenced && n.priority !== 'passive' && !n.quiet) {
               dispatchMcNotification(n.kind)
             }
             // The in-app banner hears LIVE arrivals only. A reconnect catch-up
@@ -415,7 +447,7 @@ export function useWebSocket() {
             // The boot snapshot never reaches here at all (it arrives through
             // `fetchNotifications`, not this frame), so mount replay is
             // excluded by construction.
-            if (!reconnectingRef.current) dispatchLiveNotification(n)
+            if (!reconnectingRef.current && !n.quiet) dispatchLiveNotification(n)
             break
           }
           case 'panel_published':
@@ -451,6 +483,10 @@ export function useWebSocket() {
           case 'notification_unack':
             dispatch(unackNotificationByTs(data.ts))
             break
+          case 'notification_dismiss':
+            // The note's publisher withdrew it; every view drops it.
+            dispatch(applyNotificationDismiss(data.ts))
+            break
           case 'notifications_clear':
             // Another view cleared the inbox; drop this view's copy so the
             // bell badge (derived from items) converges to 0. Idempotent.
@@ -461,7 +497,7 @@ export function useWebSocket() {
             // which the command center reads too.
             // The registry, the chime, the feed note and the live banner; the
             // owning slot comes back ('' for an unowned approval).
-            const targetSlot = approvals.onApprovalFrame(data, reconnectingRef.current)
+            const { slot: targetSlot, target } = approvals.onApprovalFrame(data, reconnectingRef.current)
             // Inject inline in the OWNING chat only. An approval with no
             // explicit slot has no owning conversation (an unowned cron /
             // taskrunner command): falling back to activeSlot planted the card
@@ -470,13 +506,15 @@ export function useWebSocket() {
             // 404'd as soon as the short background window elapsed. Unowned
             // approvals live on the global surface (notification feed) only —
             // the feed note above already delivered it there.
-            if (targetSlot) {
+            // A frame that names no request (no instance) raises nothing to
+            // decide: every control below is bound to the target.
+            if (targetSlot && target) {
               dispatch(sseChatMessage({
                 slot: targetSlot,
                 role: 'permission',
                 content: `[${data.source || 'agent'}] ${data.tool || 'Unknown'}`,
                 ts: String(data.ts || Date.now() / 1000),
-                meta: { tool_input: data.tool_input || '', approval_id: data.id, source: data.source, registry: 'coordinator', ...(data.tool_call_id ? { tool_call_id: data.tool_call_id } : {}) },
+                meta: { tool_input: data.tool_input || '', approval_id: data.id, source: data.source, registry: 'coordinator', approval_target: target, ...(data.tool_call_id ? { tool_call_id: data.tool_call_id } : {}) },
               }))
               // For spawn approvals, create a pending subagent entry instead of a toolLog approval.
               // Require an explicit slot from the event: falling back to activeSlot would
@@ -487,9 +525,10 @@ export function useWebSocket() {
                 if (data.slot) {
                   const agentId = rid.replace('spawn:', '')
                   dispatch(sseSubagentPending({ slot: data.slot, id: agentId, task: (data.tool as string || '').replace('spawn_run(', '').replace(/\)$/, ''), approval_id: rid }))
+                  if (target) dispatch(setSubagentApprovalTarget({ slot: data.slot, id: agentId, approval_target: target }))
                 }
               } else if (data.source !== 'subagent') {
-                dispatch(sseActivityEvent({ slot: targetSlot, kind: 'approval', text: data.tool || i18nT('hooks.useWebSocket.unknown'), approval_id: data.id, approval_type: 'chat' }))
+                dispatch(sseActivityEvent({ slot: targetSlot, kind: 'approval', text: data.tool || i18nT('hooks.useWebSocket.unknown'), approval_id: data.id, approval_type: 'chat', approval_target: target }))
               }
             }
             break
@@ -502,9 +541,10 @@ export function useWebSocket() {
           case 'elicitation_resolved':
             // An MCP server's question was answered (by the person, or cancelled
             // when its window ran out): stamp the card's row so it stops offering
-            // buttons. Same row-by-approval_id write the permission rows take.
+            // buttons. Only an elicitation row: the one the frame's mid names
+            // when it names one.
             if (typeof data.id === 'string' && typeof data.slot === 'string') {
-              dispatch(resolveByApprovalId({
+              dispatch(resolveElicitationRow({
                 id: data.id,
                 slot: data.slot,
                 decision: String(data.action || 'cancel'),
@@ -665,6 +705,11 @@ export function useWebSocket() {
             dispatch(sseActivityEvent(ev))
             break
           }
+          case 'models_changed':
+            // A cold model list was filled by a background session the server
+            // started for it (no chat spawned, so no `spawned` frame came).
+            queryClient.invalidateQueries({ queryKey: ['available-models'] })
+            break
           case 'subagent_spawn':
             dispatch(sseSubagentSpawn(data as { slot: string; id: string; task: string; agent: string; label?: string; model?: string; requested_model?: string; batch_id?: string }))
             break
@@ -1126,10 +1171,13 @@ export function useWebSocket() {
       } catch { /* ignore malformed */ }
     }
 
-    ws.onclose = () => socket.handleClose(ws, dispatch, voice.releaseVoiceOnSocketLoss, connect)
+    ws.onclose = (ev) => {
+      if (socket.wsRef.current === ws) reconnectSnapshot.disarm()
+      socket.handleClose(ws, dispatch, voice.releaseVoiceOnSocketLoss, connect, ev?.code)
+    }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, queryClient, socket, reconnectingRef, voice, automations, approvals, cards, syncWorkflowRuns, buffers, slotList, bundle, chatStream, turnCompletion, syncPendingApprovals])
+  }, [dispatch, queryClient, socket, reconnectingRef, reconnectSnapshot, voice, automations, approvals, cards, syncWorkflowRuns, buffers, slotList, bundle, chatStream, turnCompletion, syncPendingApprovals])
 
   /** Replace the socket now (see `SocketConnection.forceReconnect`): the
    *  health probe's recovery path and the silence watchdog's remedy. */
@@ -1140,72 +1188,25 @@ export function useWebSocket() {
 
   /** Replace a socket that is OPEN but has stopped delivering.
    *
-   *  A browser can keep a WebSocket whose transport is gone -- a phone that
-   *  changed networks, or a tab resumed after the OS froze it -- without ever
-   *  firing `onclose`. Nothing else notices: the reconnect catch-up only runs on
-   *  close, and the health probe only polls while `connected` is false. Every
-   *  one-shot frame is then lost until a manual reload; an agent-armed
-   *  `autonudge_state` is the visible case, since no local mutation writes that
-   *  record. The gateway's 5s `dashboard` frame is the liveness signal: while the
-   *  page is visible, a socket silent for WS_SILENCE_MS is torn down through
-   *  `forceReconnect`, whose catch-up re-reads every frame family.
-   *
-   *  Silence is measured in visible time only. Hidden pages are skipped (timers
-   *  are throttled there, and a suspended tab processed nothing); on the return
-   *  every stamp moves past the hidden interval, so silence adds up across tab
-   *  switches while a frame that arrived in the background counts as arriving
-   *  at the return. A thawed socket then gets two checks to deliver its next
-   *  status frame before it can be replaced -- unless its visible silence had
-   *  already passed the window when the page came back, in which case the
-   *  first check replaces it, so a dead socket cannot outlive a run of glances
-   *  each shorter than that grace. Each consecutive silent replacement doubles
-   *  the window up to WS_SILENCE_MAX_MS, so a gateway that stopped sending
-   *  status on a live socket costs one reconnect per window rather than one
-   *  every 20s; a socket observed live for a whole window of visible time since
-   *  it opened resets the count. */
+   *  The rule and its visible-time bookkeeping live in the shared
+   *  `SilenceWatchdog` (see `utils/socketSilenceWatchdog`), so this socket, the
+   *  mochi panel socket and the crew-companion socket cannot drift. Here we only
+   *  wire it to this hook's connection: `isOpen` reads the live socket's
+   *  `readyState`, and `onDead` is `forceReconnect`, whose catch-up re-reads
+   *  every frame family. The agent-armed `autonudge_state` is the visible case a
+   *  dead-but-open socket drops, since no local mutation writes that record. */
   useEffect(() => {
-    const silenceWindowMs = () => Math.min(
-      WS_SILENCE_MS * 2 ** silentReconnectsRef.current,
-      WS_SILENCE_MAX_MS,
-    )
-    const check = () => {
-      if (document.hidden) return
-      const ws = socket.wsRef.current
-      if (!ws || ws.readyState !== WebSocket.OPEN) return
-      const now = Date.now()
-      const silenceMs = silenceWindowMs()
-      if (now - lastFrameAtRef.current <= silenceMs) {
-        if (now - silenceClockStartedAtRef.current > silenceMs) silentReconnectsRef.current = 0
-        return
-      }
-      if (now < graceUntilRef.current) return
-      silentReconnectsRef.current += 1
-      forceReconnect()
+    // The instance outlives this effect: a re-run only re-points the host and
+    // re-arms the timer, so the silent-replacement streak and the visible-time
+    // stamps survive it.
+    silenceHostRef.current = {
+      isOpen: () => socket.wsRef.current?.readyState === WebSocket.OPEN,
+      onDead: forceReconnect,
     }
-    const onVisibility = () => {
-      const now = Date.now()
-      if (document.hidden) {
-        hiddenAtRef.current = now
-        return
-      }
-      // Move each stamp past only the hidden time after it, and never past
-      // now: a stamp from before the hide keeps its visible age, and a frame
-      // that arrived while hidden counts as arriving at the return.
-      const skipHidden = (stamp: number) => stamp + now - Math.max(hiddenAtRef.current, stamp)
-      lastFrameAtRef.current = skipHidden(lastFrameAtRef.current)
-      silenceClockStartedAtRef.current = skipHidden(silenceClockStartedAtRef.current)
-      hiddenAtRef.current = 0
-      // Two checks of grace for a thawed socket, none for one whose visible
-      // silence had already passed the window before it was hidden.
-      graceUntilRef.current = now - lastFrameAtRef.current > silenceWindowMs()
-        ? 0
-        : now + WS_SILENCE_CHECK_MS * 2
-    }
-    const timer = setInterval(check, WS_SILENCE_CHECK_MS)
-    document.addEventListener('visibilitychange', onVisibility)
+    const watchdog = silenceRef.current
+    watchdog?.start()
     return () => {
-      clearInterval(timer)
-      document.removeEventListener('visibilitychange', onVisibility)
+      watchdog?.stop()
     }
   }, [socket, forceReconnect])
 
@@ -1239,6 +1240,7 @@ export function useWebSocket() {
     })
     return () => {
       socket.beginClosing()
+      reconnectSnapshot.disarm()
       buffers.flushForUnmount()
       socket.closeForUnmount()
       voice.dispose()
@@ -1253,7 +1255,7 @@ export function useWebSocket() {
       chunkWatch.dispose()
       if (chunkWatchRef.current === chunkWatch) chunkWatchRef.current = null
     }
-  }, [socket, connect, voice, buffers, cards, queryClient])
+  }, [socket, connect, voice, buffers, cards, queryClient, reconnectSnapshot])
 
   return { subscribeLogs: socket.subscribeLogs, subscribeSubagents: socket.subscribeSubagents, forceReconnect }
 }

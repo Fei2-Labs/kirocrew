@@ -75,7 +75,11 @@ def test_summary_counts_open_items_and_splits_out_the_person():
     # Each person-waiting item names its worker, so the row can count it once.
     assert summary["person_workers"] == ["chat-w", "chat-w"]
     a, e = summary["items"]
-    assert a == {"worker": "chat-w", "stale_at_ms": NOW_MS - 5 * 60_000 + WINDOW_MS}
+    assert a == {
+        "worker": "chat-w",
+        "stale_at_ms": NOW_MS - 5 * 60_000 + WINDOW_MS,
+        "looping": False,
+    }
     # A question for the conductor: the ledger never flags it while the move is not
     # the worker's.
     assert e["stale_at_ms"] == 0
@@ -98,7 +102,29 @@ def test_an_answered_person_wait_is_the_worker_s_again():
 def test_a_quiet_item_is_stale_now_and_a_looping_worker_never():
     quiet = _item("q", last_report_at=_stamp(40))
     assert _summary([quiet])["items"][0]["stale_at_ms"] == NOW_MS
-    assert _summary([quiet], looping={"dashboard:chat-w"})["items"][0]["stale_at_ms"] == 0
+    looped = _summary([quiet], looping={"dashboard:chat-w"})["items"][0]
+    assert looped["stale_at_ms"] == 0
+    # The row reads the loop itself, so a worker waiting on CI shows as running.
+    assert looped["looping"] is True
+
+
+def test_a_worker_waiting_until_a_time_is_not_stalled_before_it():
+    """A ``progress`` report naming ``wake_at`` is a wait the worker declared,
+    so the row's stall clock starts when that wait ends, not at the report."""
+    wake = NOW + timedelta(hours=2)
+    waiting = _item("w", last_report_at=_stamp(40), wake_at=wake.isoformat())
+    (only,) = _summary([waiting])["items"]
+    assert only["stale_at_ms"] == int(wake.timestamp() * 1000) + WINDOW_MS
+    # A wait that already ended leaves the report's own window in force.
+    ended = _item("e", last_report_at=_stamp(40), wake_at=_stamp(30))
+    assert _summary([ended])["items"][0]["stale_at_ms"] == NOW_MS
+
+
+def test_a_looping_worker_whose_question_the_conductor_owes_is_not_shown_running():
+    """The move is the conductor's: the row keeps it a wait, loop or not."""
+    asked = _item("q", status="question", last_report_at=_stamp(2))
+    (only,) = _summary([asked], looping={"dashboard:chat-w"})["items"]
+    assert only["looping"] is False
 
 
 def test_a_closed_worker_that_reported_is_stale_at_once():
@@ -108,7 +134,7 @@ def test_a_closed_worker_that_reported_is_stale_at_once():
 def test_a_remote_worker_is_never_flagged_stalled_here():
     quiet = _item("r", worker_instance_id="peer-1", last_report_at=_stamp(40))
     (only,) = _summary([quiet], closed={"dashboard:chat-w"})["items"]
-    assert only == {"worker": "", "stale_at_ms": 0}
+    assert only == {"worker": "", "stale_at_ms": 0, "looping": False}
 
 
 def test_remember_keeps_open_items_by_slot_and_reports_only_a_move():

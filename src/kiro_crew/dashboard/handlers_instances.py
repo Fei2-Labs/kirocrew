@@ -48,6 +48,7 @@ from kiro_crew.dashboard.handlers_instances_gate import (
     _ADDRESSING_FIELDS,
     _CHAIN_MUTATION_LOCK,
     _PEER_FIELD_MAX_CHARS,
+    _TRANSPORT_FIELDS,
     _apply_update,
     _audit,
     _chain_refusal,
@@ -55,6 +56,7 @@ from kiro_crew.dashboard.handlers_instances_gate import (
     _instance_view,
     _is_correlated_cloud_instance,
     _manager_unavailable_response,
+    _moves_the_tunnel,
     _registry,
     _status_for,
 )
@@ -88,6 +90,7 @@ from kiro_crew.instances.registry import (  # noqa: F401
     InstancesError,
     InstancesRegistry,
     InvalidInstanceError,
+    RegistryUnreadableError,
     ancestor_ids,
     descendant_ids,
     is_headless_provisioner,
@@ -106,6 +109,20 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
 logger = logging.getLogger("kiro_crew.dashboard.handlers_instances")
+
+
+def _registry_unreadable_response(exc: RegistryUnreadableError) -> web.Response:
+    """503 for a mutation the registry refused because ``instances.json`` is unreadable.
+
+    The file is unchanged, so the message tells the user what to repair rather
+    than reporting a gateway fault; the path and cause go to the log.
+    """
+    logger.warning("instances registry refused a write: %s", exc)
+    message = (
+        "Your instances file (instances.json) could not be read, so nothing was "
+        "saved. Fix or restore that file, then try again."
+    )
+    return web.json_response({"error": message, "code": "instances_file_unreadable"}, status=503)
 
 
 # ── read endpoints ───────────────────────────────────────────────────────
@@ -247,6 +264,9 @@ async def api_instances_add(request: web.Request) -> web.Response:
                 via_remote_id=via_remote_id,
                 instance_id=body.get("id"),
             )
+        except RegistryUnreadableError as e:
+            _audit("add", "denied", error=str(e))
+            return _registry_unreadable_response(e)
         except DuplicateInstanceError as e:
             # Split from InvalidInstanceError because the two are different user
             # actions: a name collision is resolved by renaming, a rejected field by
@@ -335,24 +355,6 @@ async def api_instances_update(request: web.Request) -> web.Response:
     if bad is not None:
         _audit("update", "denied", request_id=instance_id, error=bad)
         return web.json_response({"error": bad, "code": "instance_invalid"}, status=400)
-    # A tunnel is opened from these fields, so editing one of them makes a live
-    # tunnel wrong rather than merely out of date: it keeps forwarding the old
-    # port to the old host under the new label. Tear it down as part of the save
-    # so the next connect builds from what the user just entered.
-    transport_keys = {
-        "ssh_host",
-        "remote_port",
-        "connection_method",
-        "ssm_target",
-        "ssm_run_as",
-        "aws_profile",
-        "aws_region",
-        "remote_bin",
-        # The far end of a chained forward. A live tunnel holding the parent's
-        # OLD port forwards to a port nothing listens on any more, which is the
-        # same wrongness as an edited host.
-        "via_remote_port",
-    }
     current = await asyncio.to_thread(reg.get, instance_id)
     if current is None:
         _audit("update", "denied", request_id=instance_id, error="not found")
@@ -424,11 +426,11 @@ async def api_instances_update(request: web.Request) -> web.Response:
     # Disabling is a teardown too, and it takes the same locked path: the
     # tunnel closes and the flag lands in one critical section, so a connect
     # racing it is either torn down here or reads the flag and is refused.
-    # Every disable takes it, even one `current` reads as off: that read precedes
-    # the lock, so an enable and a connect can land after it.
-    transport_changed = changes.get("disabled") is True or any(
-        k in transport_keys and v != getattr(current, k) for k, v in changes.items()
-    )
+    # Every disable takes it, and every edit naming a transport field: `current`
+    # precedes the lock, so an edit and a connect can land after it. Whether a
+    # transport edit tears down is decided under the lock (`_moves_the_tunnel`).
+    disabling = changes.get("disabled") is True
+    locked_edit = disabling or not _TRANSPORT_FIELDS.isdisjoint(changes)
     # Validate the PROPOSED record before touching the tunnel. The registry
     # validates too, but that happens after the teardown — so a rejected edit
     # would answer 400 having already disconnected a healthy crew, punishing the
@@ -449,7 +451,7 @@ async def api_instances_update(request: web.Request) -> web.Response:
     mgr = getattr(state, "instances_manager", None)
 
     try:
-        if transport_changed and mgr is not None:
+        if locked_edit and mgr is not None:
             # The teardown and the coordinate rewrite must not be observable
             # apart. With the lock released between them a `connect` can read the
             # OLD record, and whether its tunnel is already CONNECTED or still
@@ -459,10 +461,16 @@ async def api_instances_update(request: web.Request) -> web.Response:
             # connect either finishes before (and is torn down inside) or starts
             # after (and reads the new coordinates).
             inst = await mgr.reconfigure(
-                instance_id, functools.partial(_apply_update, reg, instance_id, changes)
+                instance_id,
+                functools.partial(_apply_update, reg, instance_id, changes),
+                needs_teardown=(
+                    None
+                    if disabling
+                    else functools.partial(_moves_the_tunnel, reg, instance_id, changes)
+                ),
             )
         else:
-            if transport_changed:
+            if locked_edit:
                 # No manager: nothing to tear down, but say so — a silent skip
                 # would look identical to a teardown that ran.
                 logger.warning(
@@ -476,6 +484,9 @@ async def api_instances_update(request: web.Request) -> web.Response:
     except InstanceNotFoundError as e:
         _audit("update", "denied", request_id=instance_id, error=str(e))
         return web.json_response({"error": str(e), "code": "instance_not_found"}, status=404)
+    except RegistryUnreadableError as e:
+        _audit("update", "denied", request_id=instance_id, error=str(e))
+        return _registry_unreadable_response(e)
     except (InvalidInstanceError, InstancesError) as e:
         _audit("update", "denied", request_id=instance_id, error=str(e))
         return web.json_response({"error": str(e)}, status=400)
@@ -608,7 +619,12 @@ async def api_instances_remove(request: web.Request) -> web.Response:
         # above has already brought every captured crew down, deepest first; this only
         # deletes rows. The helper answers deepest-first too, so each id is audited in the
         # order it was torn down.
-        for removed_id in await asyncio.to_thread(reg.remove_cascade, instance_id):
+        try:
+            removed_ids = await asyncio.to_thread(reg.remove_cascade, instance_id)
+        except RegistryUnreadableError as e:
+            _audit("remove", "denied", request_id=instance_id, error=str(e))
+            return _registry_unreadable_response(e)
+        for removed_id in removed_ids:
             if removed_id != instance_id:
                 _audit("remove", "success", request_id=removed_id)
     if mgr is not None:
@@ -790,7 +806,12 @@ async def api_instances_connect(request: web.Request) -> web.Response:
                     request_id=instance_id,
                     error="token unconfirmed and re-mint failed",
                 )
-                body["error"] = "token expired and re-mint failed"
+                # The token may still have hours left; what failed is the far
+                # end answering for it, usually a stopped remote gateway.
+                body["error"] = (
+                    "the crew's token could not be confirmed or re-minted; "
+                    "check that its remote gateway is running"
+                )
                 body["code"] = _connect_failure_code(body, "instance_token_unconfirmed")
                 return web.json_response(body, status=502)
         # The token and the port it is paired with are one answer. `body` froze the
@@ -881,7 +902,10 @@ async def api_instances_embed_token(request: web.Request) -> web.Response:
 
     Refuses a crew we ourselves reach through a further hop. That is the depth cap
     seen from this end and it is the only place it can be seen: the caller counts
-    hops in its own registry and cannot know that ours adds another one.
+    hops in its own registry and cannot know that ours adds another one. The one
+    exception is ``own_page``: the caller is a page of OURS served through a port
+    forward on another number (the desktop app's managed tunnel), whose pane rides
+    no hop past ours, so such a crew is minted by our parent for that port.
     """
     denied = _guard(request, "embed_token")
     if denied is not None:
@@ -912,7 +936,13 @@ async def api_instances_embed_token(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    ok, payload = await mgr.mint_embed_token(instance_id, port)
+    own_page = body.get("own_page", False)
+    if not isinstance(own_page, bool):
+        _audit("embed_token", "denied", request_id=instance_id, error="bad own_page")
+        return web.json_response(
+            {"error": "own_page must be true or false", "code": "invalid_field"}, status=400
+        )
+    ok, payload = await mgr.mint_embed_token(instance_id, port, own_page=own_page)
     if not ok:
         status = int(payload.pop("status", 502))
         _audit("embed_token", "failure", request_id=instance_id, error=str(payload.get("code")))
@@ -1591,6 +1621,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _cap_str,
         _clean_peer_parent,
         _clean_peer_slot,
+        _peer_version,
         _proxy_canonical_path,
         _redact_peer_payload,
         _redact_peer_value,

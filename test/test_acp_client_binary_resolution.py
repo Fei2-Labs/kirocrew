@@ -574,6 +574,7 @@ class TestResolveKiroBinEnvOverride:
 
     @pytest.mark.asyncio
     async def test_spawn_launches_self_updated_override(self, tmp_path):
+        from kiro_crew import kiro_cli as kiro_cli_module
         from kiro_crew import sandbox as sandbox_module
         from kiro_crew.acp import client as client_module
         from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
@@ -599,6 +600,9 @@ class TestResolveKiroBinEnvOverride:
                 "resolve_kiro_cli",
                 return_value=str(fake),
             ),
+            # The engine probe runs through the sandboxed runner, which would
+            # meet the mocked create_subprocess_exec below; it lists no v2 here.
+            patch.object(kiro_cli_module, "kas_relay_help", return_value=None),
             patch(
                 "asyncio.create_subprocess_exec",
                 mock_exec,
@@ -674,10 +678,12 @@ class TestResolveKiroBinEnvOverride:
         # path is runtime-owned, so only its presence and shape are pinned here.
         extra_private = wrap_kwargs.pop("extra_private_dirs")
         assert isinstance(extra_private, (list, tuple))
-        # The default tier leaves ~/.ssh readable, so the ssh-agent socket is kept.
+        # The default tier leaves ~/.ssh readable, so the ssh-agent socket is kept;
+        # the list is where the wrap reports the forward it applied.
         assert wrap_kwargs == {
             "strip_python_env": True,
             "is_kiro_cli": True,
+            "forward_ssh_auth_sock_out": [sys.platform != "win32"],
             **({} if sys.platform == "win32" else {"forward_ssh_auth_sock": True}),
         }
         voice_guard.assert_called_once_with(client._work_dir)

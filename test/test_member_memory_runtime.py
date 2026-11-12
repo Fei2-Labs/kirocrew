@@ -21,7 +21,9 @@ from kiro_crew.subagent_persistence import (
 )
 from kiro_crew.testing.wait import await_until
 
-pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+#: The consolidation tests start background helper turns, which are skipped while the
+#: host's memory posture is critical (see ``ample_host_free_memory``).
+pytestmark = pytest.mark.usefixtures("healthy_host_memory", "ample_host_free_memory")
 
 
 @pytest.mark.asyncio
@@ -122,7 +124,7 @@ async def test_private_task_failure_lesson_never_uses_global_provider_or_store(m
         patch.object(runner, "_notify", AsyncMock()),
     ):
         await runner._extract_lesson(task, run)
-    assert llm.await_args.kwargs == {"runtime_key": runtime}
+    assert llm.await_args.kwargs == {"runtime_key": runtime, "agent": ""}
     private_vectors.write_lesson.assert_called_once_with(
         "check inputs", "tool", None, "task_runner"
     )

@@ -1,14 +1,8 @@
 """What a failed registry clone tells the installer.
 
-The credential-posture hint fires for an index-originated clone only when git's
-output is auth-shaped (softened to a likely cause when git cannot find the
-repository), every clone env that feeds the failure classifier pins a
-locale that is valid on the running platform, the classifier's markers anchor on
-git's own phrasing, and the sibling failure shapes carry the sentence in ``error``
-and the slug in ``code``.
-
-``test_external_registry.py`` holds the index cache, fetch and lookup tests and names
-every sibling; shared fixtures live in ``external_registry_helpers.py``.
+The credential-posture hint fires only for auth-shaped git output, the clone locale is
+valid on the running platform, and failure shapes carry the sentence in ``error`` and
+the slug in ``code``. Shared fixtures live in ``external_registry_helpers.py``.
 """
 
 from __future__ import annotations
@@ -21,15 +15,10 @@ from external_registry_helpers import _explicit_registry_execution_admission  # 
 
 
 class TestCloneFailureDiagnostics:
-    """A failed clone must tell an index-originated installer WHY: the clone
-    ran credential-free because the repo URL differs from the registry URL, so
-    a private sibling repo cannot be read. Owner-designated installs keep the
-    ambient identity, so their failure must NOT carry the misleading hint.
+    """An index-originated clone failure says it ran credential-free; an owner one does not.
 
-    The human sentence lives in ``error`` and the machine slug in ``code``: the
-    App Store install banner renders ``result.error`` and never
-    ``result.message`` (AppDetailPage.tsx), so a slug in ``error`` would be
-    shown to the user verbatim.
+    The install banner renders ``result.error`` verbatim (AppDetailPage.tsx), so the
+    sentence goes in ``error`` and the slug in ``code``.
     """
 
     @staticmethod
@@ -140,16 +129,9 @@ class TestCloneFailureDiagnostics:
         assert "credential" not in err["error"].lower()
 
 
-# ---------------------------------------------------------------------------
-# Clone-failure diagnostics honesty.
-#   Finding 1: the index-originated credential-posture hint must only fire when
-#   git's output is auth-shaped (or ambiguously so); a DNS blip or typo'd
-#   branch must NOT be told to restructure repositories, and no raw
-#   credential-bearing stderr may reach the banner.
-#   Finding 2: three sibling failure shapes must carry the human sentence in
-#   `error` and the machine slug in `code` (the install banner renders
-#   `result.error` verbatim and ignores `code`).
-# ---------------------------------------------------------------------------
+# Clone-failure diagnostics: the credential-posture hint fires only for auth-shaped
+# git output (not a DNS blip or a typo'd branch), and no raw credential-bearing stderr
+# reaches the banner.
 
 
 class _FailingCloneProc:
@@ -165,7 +147,13 @@ class _FailingCloneProc:
         return (self._output, None)
 
 
-async def _run_index_clone_failure(tmp_path, output: bytes, *, index_originated: bool = True):
+async def _run_index_clone_failure(
+    tmp_path,
+    output: bytes,
+    *,
+    index_originated: bool = True,
+    git_url: str = "https://github.com/acme/private-sibling.git",
+):
     """Drive ``_git_clone_or_pull`` down the fresh-clone path to a nonzero exit
     whose merged output is *output*; return the result dict. ``index_originated``
     selects the confused-deputy (credential-free) posture path (True, default)
@@ -187,7 +175,7 @@ async def _run_index_clone_failure(tmp_path, output: bytes, *, index_originated:
         patch("kiro_crew.apps.registry.create_subprocess_limited", new=_fake_create),
     ):
         result = await reg._git_clone_or_pull(
-            "https://github.com/acme/private-sibling.git",
+            git_url,
             "main",
             dest,
             [],
@@ -197,8 +185,7 @@ async def _run_index_clone_failure(tmp_path, output: bytes, *, index_originated:
 
 
 class TestIndexOriginatedCloneFailureHintIsGated:
-    """Finding 1: the credential-posture remedy is honest only when withheld
-    credentials are a plausible cause."""
+    """The credential-posture remedy fires only when withheld credentials are a plausible cause."""
 
     @pytest.mark.asyncio
     async def test_auth_shaped_failure_keeps_the_posture_hint(self, tmp_path):
@@ -265,12 +252,8 @@ class TestIndexOriginatedCloneFailureHintIsGated:
         assert result.get("code") not in ("git_clone_failed_no_credentials",)
         assert result["error"] == "git clone failed"
         assert "credentials are withheld" not in result["error"]
-        # non-2xx-body-carries-code: the bare fallback is the only failure shape
-        # on this path that once returned no `code`; a machine keys on `code`
-        # while the frontend renders `error` verbatim, so the slug must be
-        # present even when no failure class is recognized (the non-2xx invariant
-        # in docs/system-specs/common/code-style.md). Regression pin: this
-        # assertion fails at the pre-fix tree.
+        # non-2xx-body-carries-code: the bare fallback still carries the slug when no
+        # failure class is recognized (docs/system-specs/common/code-style.md).
         assert result["code"] == "git_clone_failed"
 
     @pytest.mark.asyncio
@@ -278,9 +261,8 @@ class TestIndexOriginatedCloneFailureHintIsGated:
         # auth-marker-precision: a LOCAL filesystem failure — an unwritable
         # clone destination — emits git's own `Permission denied` errno text
         # with NO method parenthetical. It has nothing to do with withheld
-        # remote credentials, so the credential-posture remedy MUST NOT fire.
-        # Fails at the pre-fix tree (the bare `permission denied` marker matched
-        # this local errno and mislabeled it credential-blocked); passes after.
+        # remote credentials, so the credential-posture remedy MUST NOT fire; a bare
+        # `permission denied` marker would match this local errno.
         result = await _run_index_clone_failure(
             tmp_path,
             b"fatal: could not create work tree dir "
@@ -408,8 +390,7 @@ class TestIndexOriginatedCloneFailureHintIsGated:
         # The owner-designated (index_originated=False) path never runs the
         # credential-posture classifier — its sole failure shape is the outer
         # bare body. It, too, must carry the machine-readable `code` (the second
-        # bare return site). Regression pin: fails at the pre-fix tree, where the
-        # body was `{"ok": False, "name": ...}` with no `code`.
+        # bare return site).
         result = await _run_index_clone_failure(
             tmp_path,
             b"fatal: something weird happened\n",
@@ -446,6 +427,173 @@ class TestIndexOriginatedCloneFailureHintIsGated:
         assert banner == (
             "Git clone failed: host could not be resolved; "
             "check your network and proxy settings (HTTPS_PROXY, NO_PROXY)."
+        )
+
+
+_SSH_APP_URL = "ssh://git.example.com/acme/proxy-only-app.git"
+
+# What git prints when ssh, run with no ssh config, cannot resolve a host name
+# that only a ~/.ssh/config route (ProxyCommand, ProxyJump, Host alias) reaches.
+_SSH_NAME_UNRESOLVED = (
+    b"ssh: Could not resolve hostname git.example.com: Name or service not known\n"
+    b"fatal: Could not read from remote repository.\n"
+    b"\n"
+    b"Please make sure you have the correct access rights\n"
+    b"and the repository exists.\n"
+)
+
+
+class _ScriptedGitProc:
+    """A git subprocess that exits with *returncode* and prints *output*."""
+
+    def __init__(self, returncode: int, output: bytes = b"") -> None:
+        self.returncode = returncode
+        self._output = output
+
+    async def communicate(self):
+        return (self._output, None)
+
+
+def _assert_strict_ssh_route_refusal(result) -> None:
+    assert result is not None and result["ok"] is False
+    assert result["code"] == "git_clone_failed_strict_ssh_route"
+    banner = result["error"]
+    # It says why: the fetch ran in the strict sandbox, which hides ~/.ssh, so
+    # neither the ssh config nor the agent applied.
+    assert "strict sandbox, which hides ~/.ssh" in banner
+    assert "~/.ssh/config" in banner
+    assert "ssh-agent" in banner
+    # And what the user can do instead.
+    assert "kirocrew app install <dir>" in banner
+    # ssh never reads the HTTP(S) proxy variables, so that hint would mislead.
+    assert "HTTPS_PROXY" not in banner
+    # A constant sentence: nothing from git's output or the URL reaches it.
+    assert "git.example.com" not in banner
+    assert "Name or service not known" not in banner
+
+
+class TestStrictSshRouteRefusal:
+    """A credential-free ssh fetch whose host did not resolve says it ran strict."""
+
+    @pytest.mark.asyncio
+    async def test_index_clone_of_an_unresolved_ssh_host_explains_the_strict_tier(self, tmp_path):
+        result = await _run_index_clone_failure(
+            tmp_path, _SSH_NAME_UNRESOLVED, git_url=_SSH_APP_URL
+        )
+        _assert_strict_ssh_route_refusal(result)
+
+    @pytest.mark.asyncio
+    async def test_pinned_index_fetch_of_an_unresolved_ssh_host_explains_the_strict_tier(
+        self, tmp_path
+    ):
+        from kiro_crew.apps import registry as reg
+
+        def _fake_wrap_argv(argv, mode="standard", **_kwargs):
+            return argv, None
+
+        async def _fake_create(*args, **kwargs):
+            if "fetch" in args:
+                return _ScriptedGitProc(128, _SSH_NAME_UNRESOLVED)
+            return _ScriptedGitProc(0)
+
+        with (
+            patch("kiro_crew.apps.registry.is_clone_host_trusted", return_value=True),
+            patch("kiro_crew.apps.registry.wrap_argv", side_effect=_fake_wrap_argv),
+            patch("kiro_crew.apps.registry.cgroup_scope_argv", side_effect=lambda c: c),
+            patch("kiro_crew.apps.registry.create_subprocess_limited", new=_fake_create),
+        ):
+            result = await reg._git_clone_or_pull(
+                _SSH_APP_URL,
+                "main",
+                tmp_path / "pinned-dest",
+                [],
+                index_originated=True,
+                commit="a" * 40,
+            )
+        _assert_strict_ssh_route_refusal(result)
+
+    @pytest.mark.asyncio
+    async def test_index_pull_of_an_unresolved_ssh_host_explains_the_strict_tier(self, tmp_path):
+        from kiro_crew.apps import registry as reg
+
+        dest = tmp_path / "existing"
+        (dest / ".git").mkdir(parents=True)
+
+        def _fake_wrap_argv(argv, mode="standard", **_kwargs):
+            return argv, None
+
+        async def _fake_create(*args, **kwargs):
+            assert "pull" in args
+            return _ScriptedGitProc(1, _SSH_NAME_UNRESOLVED)
+
+        with (
+            patch("kiro_crew.apps.registry.is_clone_host_trusted", return_value=True),
+            patch("kiro_crew.apps.registry.wrap_argv", side_effect=_fake_wrap_argv),
+            patch("kiro_crew.apps.registry.cgroup_scope_argv", side_effect=lambda c: c),
+            patch("kiro_crew.apps.registry.create_subprocess_limited", new=_fake_create),
+            patch.object(reg, "_clone_origin_url", new=AsyncMock(return_value=_SSH_APP_URL)),
+            patch.object(reg, "_read_clone_branch", return_value="main"),
+        ):
+            result = await reg._git_clone_or_pull(
+                _SSH_APP_URL, "main", dest, [], index_originated=True
+            )
+        _assert_strict_ssh_route_refusal(result)
+
+    @pytest.mark.asyncio
+    async def test_owner_designated_ssh_clone_keeps_the_plain_failure(self, tmp_path):
+        # An owner-designated clone keeps the operator's ssh config and agent,
+        # so the strict-tier explanation would be wrong there.
+        result = await _run_index_clone_failure(
+            tmp_path, _SSH_NAME_UNRESOLVED, git_url=_SSH_APP_URL, index_originated=False
+        )
+        assert result is not None and result["ok"] is False
+        assert result["code"] == "git_clone_failed"
+        assert "strict" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_index_ssh_auth_refusal_keeps_the_posture_hint(self, tmp_path):
+        result = await _run_index_clone_failure(
+            tmp_path,
+            b"git@git.example.com: Permission denied (publickey).\n"
+            b"fatal: Could not read from remote repository.\n",
+            git_url=_SSH_APP_URL,
+        )
+        assert result is not None and result["ok"] is False
+        assert result["code"] == "git_clone_failed_no_credentials"
+
+    def test_only_ssh_own_unresolved_name_line_is_matched(self):
+        from kiro_crew.apps.registry_pipeline.git_targets import (
+            _git_output_is_ssh_name_unresolved,
+        )
+
+        assert _git_output_is_ssh_name_unresolved(_SSH_NAME_UNRESOLVED.decode()) is True
+        # The macOS resolver's wording after the same ssh prefix.
+        assert (
+            _git_output_is_ssh_name_unresolved(
+                "ssh: Could not resolve hostname git.example.com: "
+                "nodename nor servname provided, or not known"
+            )
+            is True
+        )
+        # libcurl's HTTPS name failure is a network problem, not an ssh route.
+        assert (
+            _git_output_is_ssh_name_unresolved(
+                "fatal: unable to access 'https://github.com/acme/x.git/': "
+                "Could not resolve host: github.com"
+            )
+            is False
+        )
+        # The phrase echoed inside another line (a URL, a server message) is not
+        # ssh's own report.
+        assert (
+            _git_output_is_ssh_name_unresolved(
+                "fatal: repository 'ssh://h/ssh: could not resolve hostname' not found"
+            )
+            is False
+        )
+        assert (
+            _git_output_is_ssh_name_unresolved("remote: ssh: Could not resolve hostname x: y")
+            is False
         )
 
 
@@ -554,16 +702,11 @@ class TestCloneLocaleIsPinnedForDeterministicClassifier:
 
 
 class TestCloneLocaleIsPlatformValid:
-    """locale-value-valid-on-every-platform: the pinned clone locale
-    (``_GIT_CLONE_LOCALE``, fed to ``anonymous_git_env``'s ``LC_ALL``) MUST be a
-    locale that is valid on the current platform's libc. ``C.UTF-8`` is the
-    always-present UTF-8 locale on glibc/musl (Linux) but is NOT a valid BSD-libc
-    locale on macOS, where an explicitly-set invalid ``LC_ALL`` makes
-    ``setlocale`` fall to C/ASCII and suppresses PEP 538 coercion, so a child
-    reading non-ASCII git output raises ``UnicodeDecodeError`` — turning the
-    diagnostic clone into a crash. The deterministic property is that the pinned
-    value is platform-appropriate: ``en_US.UTF-8`` on Darwin, ``C.UTF-8``
-    elsewhere (mirroring :mod:`kiro_crew.service.common`)."""
+    """``_GIT_CLONE_LOCALE`` is ``en_US.UTF-8`` on Darwin and ``C.UTF-8`` elsewhere.
+
+    macOS libc lacks ``C.UTF-8``; an invalid ``LC_ALL`` falls to ASCII and non-ASCII
+    git output raises ``UnicodeDecodeError``. Mirrors :mod:`kiro_crew.service.common`.
+    """
 
     def test_pinned_locale_is_valid_for_the_running_platform(self):
         # The module-level constant, as resolved for THIS host, must be the
@@ -723,8 +866,10 @@ class TestRefErrorMarkerPrecision:
 
 
 class TestSiblingFailureShapesUseCodeNotError:
-    """Finding 2: the three sibling shapes carry the human sentence in `error`
-    and the machine slug in `code`."""
+    """The three sibling shapes carry the human sentence in `error` and the slug in `code`.
+
+    The install banner renders `result.error` verbatim and ignores `code`.
+    """
 
     @pytest.mark.asyncio
     async def test_destination_not_a_checkout_slug_in_code(self, tmp_path):

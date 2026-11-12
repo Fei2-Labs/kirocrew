@@ -20,7 +20,6 @@ from pathlib import Path  # noqa: F401
 from typing import TYPE_CHECKING, Any, NamedTuple  # noqa: F401
 
 from aiohttp import web
-from aiohttp.client_exceptions import ClientConnectionResetError  # noqa: F401
 
 from kiro_crew import members as members_mod  # noqa: F401
 from kiro_crew import model_registry  # noqa: F401
@@ -35,6 +34,10 @@ from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS  # n
 from kiro_crew.agent_sdk.capabilities import MODEL_NAMESPACE_ACP, capabilities_of  # noqa: F401
 from kiro_crew.agent_sdk.provider_identity import is_claude_code  # noqa: F401
 from kiro_crew.agent_switch_command import switch_announcement  # noqa: F401
+from kiro_crew.approval_mode_policy import (  # noqa: F401
+    KNOWN_APPROVAL_MODES,
+    session_mode_permitted,
+)
 from kiro_crew.apps import seams as _app_seams
 from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry  # noqa: F401
 from kiro_crew.config.fields import _coerce_bool  # noqa: F401 -- read by chat_api.slot_repair
@@ -61,12 +64,14 @@ from kiro_crew.config.sections import (  # noqa: F401 -- read by chat_api.slot_s
 from kiro_crew.dashboard import display_verdicts  # noqa: F401 -- read by chat_api.slot_detail
 from kiro_crew.dashboard.approval_posture import trust_reaches_subagents  # noqa: F401
 from kiro_crew.dashboard.body_numbers import body_int  # noqa: F401
+from kiro_crew.dashboard.card_send import CARD_ORIGIN_META_KEY
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed  # noqa: F401
 from kiro_crew.dashboard.chat_api import agent_switch as _owner_agent_switch
 from kiro_crew.dashboard.chat_api import app_admission as _owner_app_admission
 from kiro_crew.dashboard.chat_api import chat_send as _owner_chat_send
 from kiro_crew.dashboard.chat_api import conductor_close as _owner_conductor_close
 from kiro_crew.dashboard.chat_api import continue_turn as _owner_continue_turn
+from kiro_crew.dashboard.chat_api import crew_steer as _owner_crew_steer
 from kiro_crew.dashboard.chat_api import followup_card as _owner_followup_card
 from kiro_crew.dashboard.chat_api import handoff as _owner_handoff
 from kiro_crew.dashboard.chat_api import handover_drain as _owner_handover_drain
@@ -74,11 +79,13 @@ from kiro_crew.dashboard.chat_api import pending_context as _owner_pending_conte
 from kiro_crew.dashboard.chat_api import project_lists as _owner_project_lists
 from kiro_crew.dashboard.chat_api import prompt_queue as _owner_prompt_queue
 from kiro_crew.dashboard.chat_api import resume as _owner_resume
+from kiro_crew.dashboard.chat_api import resume_identity as _owner_resume_identity
 from kiro_crew.dashboard.chat_api import resume_window as _owner_resume_window
 from kiro_crew.dashboard.chat_api import session_relaunch as _owner_session_relaunch
 from kiro_crew.dashboard.chat_api import slot_approval as _owner_slot_approval
 from kiro_crew.dashboard.chat_api import slot_create as _owner_slot_create
 from kiro_crew.dashboard.chat_api import slot_detail as _owner_slot_detail
+from kiro_crew.dashboard.chat_api import slot_discard as _owner_slot_discard
 from kiro_crew.dashboard.chat_api import slot_effort as _owner_slot_effort
 from kiro_crew.dashboard.chat_api import slot_guards as _owner_slot_guards
 from kiro_crew.dashboard.chat_api import slot_lifecycle as _owner_slot_lifecycle
@@ -88,6 +95,7 @@ from kiro_crew.dashboard.chat_api import slot_repair as _owner_slot_repair
 from kiro_crew.dashboard.chat_api import slot_settings as _owner_slot_settings
 from kiro_crew.dashboard.chat_api import slot_summary as _owner_slot_summary
 from kiro_crew.dashboard.chat_api import source_links as _owner_source_links
+from kiro_crew.dashboard.chat_api import sse_write as _owner_sse_write
 from kiro_crew.dashboard.chat_api import turn_stop as _owner_turn_stop
 from kiro_crew.dashboard.chat_api.agent_switch import (  # noqa: F401
     CREW_MODE_LOCKED,
@@ -117,29 +125,18 @@ from kiro_crew.dashboard.chat_api.app_admission import (  # noqa: F401
     _slot_not_found,
 )
 from kiro_crew.dashboard.chat_api.chat_send import (  # noqa: F401
-    _CREW_PERSON_STEER,
-    _HELD_CREW_STEERS,
-    CREW_STEER_QUEUE_KEY,
     _api_chat_send,
     _committed_if_accepted,
     _composer_locked_answer,
-    _person_crew_worker_root,
     _send_binds_agent,
     _send_harness_command,
     _send_id_of,
     _send_writes_persona,
     _settle_send_race,
     _sweep_stale_permissions,
-    _take_held,
     api_chat,
-    crew_steer_consumed,
-    crew_steer_discarded,
-    crew_steer_requeued,
     decided_message_handling,
-    hold_crew_steer,
-    mark_crew_steer,
     steer_is_auto,
-    write_sse_or_abort,
 )
 from kiro_crew.dashboard.chat_api.conductor_close import (  # noqa: F401
     _close_managed,
@@ -154,7 +151,25 @@ from kiro_crew.dashboard.chat_api.continue_turn import (  # noqa: F401
     continue_slot_turn,
     session_start_failure_streak,
 )
+from kiro_crew.dashboard.chat_api.crew_steer import (  # noqa: F401
+    _CREW_PERSON_STEER,
+    _HELD_CREW_STEERS,
+    _STEER_RECORD_LOCKS,
+    CREW_STEER_QUEUE_KEY,
+    CREW_STEER_UNRECORDED_FRAME,
+    _person_crew_worker_root,
+    _record_crew_steer,
+    _release_steer_record,
+    _take_held,
+    crew_steer_consumed,
+    crew_steer_discarded,
+    crew_steer_requeued,
+    hold_crew_steer,
+    mark_crew_steer,
+    record_crew_steer_later,
+)
 from kiro_crew.dashboard.chat_api.followup_card import (  # noqa: F401
+    _project_offers_no_worktree,
     _redact_followup_item,
     api_chat_slot_followup,
 )
@@ -217,16 +232,21 @@ from kiro_crew.dashboard.chat_api.resume import (  # noqa: F401
     api_chat_slot_resume,
     resume_slot_from_history,
 )
+from kiro_crew.dashboard.chat_api.resume_identity import (  # noqa: F401
+    _pinned_live_outcome,
+)
 from kiro_crew.dashboard.chat_api.resume_window import (  # noqa: F401
     _reconcile_slot_window,
 )
 from kiro_crew.dashboard.chat_api.session_relaunch import (  # noqa: F401
+    _report_reload_respawn,
     api_chat_slot_project,
     api_chat_slot_reload,
     api_chat_slot_workspace,
     reload_slot_session,
 )
 from kiro_crew.dashboard.chat_api.slot_approval import (  # noqa: F401
+    _STRICT_NATIVE_ACTIONS,
     _apply_inherited_postures,
     _approval_target_required,
     _deny_approval_mode,
@@ -241,6 +261,7 @@ from kiro_crew.dashboard.chat_api.slot_approval import (  # noqa: F401
     _is_deny_override_card,
     _pending_elicitation_ids,
     _still_owning,
+    _strict_native_owner,
     _sweep_pending_approvals,
     api_chat_mode,
     api_chat_slot_approve,
@@ -278,11 +299,13 @@ from kiro_crew.dashboard.chat_api.slot_detail import (  # noqa: F401
     api_chat_slots,
     api_chat_slots_unrestored,
 )
+from kiro_crew.dashboard.chat_api.slot_discard import api_chat_slot_discard  # noqa: F401
 from kiro_crew.dashboard.chat_api.slot_effort import (  # noqa: F401
     _configured_backend_for_slot,
     _own_models_field,
     api_chat_slot_reasoning_effort,
     api_chat_slot_selection_capabilities,
+    api_chat_slot_ultracode,
 )
 from kiro_crew.dashboard.chat_api.slot_guards import (  # noqa: F401
     _CommitToken,
@@ -298,6 +321,7 @@ from kiro_crew.dashboard.chat_api.slot_lifecycle import (  # noqa: F401
     _close_slot,
     _drain_file_changes_flush,
     _emit_archived_rows,
+    _hand_off_cards_when_the_turn_ends,
     _NudgeRetireFailed,
     _pending_guarded_history_writes,
     _release_closed_execution,
@@ -305,6 +329,7 @@ from kiro_crew.dashboard.chat_api.slot_lifecycle import (  # noqa: F401
     _restore_slot_nudge_loop,
     _retire_slot_nudge_loop,
     _slot_still_ours,
+    _timed_close_stage,
     api_chat_slot_delete,
     api_chat_slots_cleanup,
     close_slot,
@@ -321,11 +346,18 @@ from kiro_crew.dashboard.chat_api.slot_model import (  # noqa: F401
     switch_slot_model,
 )
 from kiro_crew.dashboard.chat_api.slot_note import (  # noqa: F401
+    _UNSET,
+    NoteDelivery,
+    SourceCheckFailed,
     _discard_held_note,
+    _flush_held_notes_if_idle,
     _note_already_durable,
     _note_delivered_live,
     _persist_deferred_note_hold,
+    _same_chat_replacement,
     api_chat_slot_note,
+    deliver_note,
+    write_slot_note,
 )
 from kiro_crew.dashboard.chat_api.slot_repair import (  # noqa: F401
     api_chat_slot_repair_images,
@@ -354,10 +386,13 @@ from kiro_crew.dashboard.chat_api.source_links import (  # noqa: F401
     api_chat_slot_source_link_unlink,
     api_chat_slot_source_links,
 )
+from kiro_crew.dashboard.chat_api.sse_write import write_sse_or_abort  # noqa: F401
 from kiro_crew.dashboard.chat_api.turn_stop import (  # noqa: F401
+    _cancel_cron_run,
     _cancel_target,
     _compaction_in_flight,
     _make_stop_resolver,
+    _may_cancel_cron_run,
     _open_stop_event_card,
     _rearm_stop_event,
     _reject_pending_approvals,
@@ -376,10 +411,12 @@ from kiro_crew.dashboard.chat_delivery import (  # noqa: F401
     STEER_STEERED,
     TURN_ACTOR_META_KEY,
     attachment_meta,
+    knowledge_meta,
     normalize_send_id,
     queue_entry_is_user_origin,
     queue_entry_view,
     queue_for_next_turn,
+    queue_view,
     queued_text_for_display,
     quote_meta,
     start_queue_persist,
@@ -406,6 +443,7 @@ from kiro_crew.dashboard.chat_persistence import (  # noqa: F401
     _rehydrate_slot_title,
     _remember_reasoning_effort_for_restore,
     _restore_dismissed_source_links,
+    _restore_fork_lineage,
     _restore_model_fields,
     _restored_agent_name,
     _restored_mode,
@@ -445,9 +483,14 @@ from kiro_crew.dashboard.chat_tags import (  # noqa: F401
     validate_folder_tag_ids,
 )
 from kiro_crew.dashboard.chat_title import _maybe_auto_title  # noqa: F401
+from kiro_crew.dashboard.chat_title_fork import (  # noqa: F401
+    fork_title_pending,
+    schedule_fork_title,
+)
 from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     _MANUAL_CONTINUE_MSG,
     _MANUAL_RESUME_MSG,
+    REQUEUED_STEER_ROW_MID_META,
     SESSION_START_FAILED_KIND,
     SLOT_DETAIL_MAX_LIMIT,
     SYNTHETIC_RECOVERY_KIND,
@@ -487,6 +530,9 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: F401
 from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     tighten_replacement_to_restricted_original as _tighten_replacement_to_restricted_original,
 )
+from kiro_crew.dashboard.chat_utils import (  # noqa: F401
+    transcripts_share_file,
+)
 from kiro_crew.dashboard.default_session_folder import (  # noqa: F401
     resolve_default_session_folder,
 )
@@ -508,6 +554,7 @@ from kiro_crew.dashboard.handlers.agents_harness_effort import (  # noqa: F401
     own_models_backend,
 )
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request  # noqa: F401
+from kiro_crew.dashboard.interaction_coordinator import native_resolution_target  # noqa: F401
 from kiro_crew.dashboard.relay_archive import relay_archive_refusal  # noqa: F401
 from kiro_crew.dashboard.request_priority import owner_start_priority  # noqa: F401
 from kiro_crew.dashboard.session_folders import (  # noqa: F401
@@ -515,12 +562,17 @@ from kiro_crew.dashboard.session_folders import (  # noqa: F401
     create_session_folder,
 )
 from kiro_crew.dashboard.slot_buffers import (  # noqa: F401
+    AWAITING_DURABLE_WRITE,
     MAX_DEFERRED_NOTE_CHARS,
     MAX_DEFERRED_NOTES,
     MAX_SOURCE_LABEL_LEN,
+    MERGED_FROM_MAX_CREATED_AT_CHARS,
+    MERGED_FROM_META_KEY,
     SOURCE_LABEL_CTRL_RE,
     DeferredHoldFull,
+    DeferredHoldOutcome,
     DeferredHoldRebound,
+    NoteEvidence,
     note_hold_durable,
     persist_deferred_notes_sync,
 )
@@ -536,13 +588,15 @@ from kiro_crew.dashboard.slot_ownership import (  # noqa: F401
     deny_app_session_control,
     deny_app_slot_access,
     deny_app_slot_session_access,
+    member_thread_grant,
     own_session_key,
-    read_session_grant,
+    read_session_control_grant,
     session_grant,
     slot_not_found,
     transcript_acquisition_reason,
 )
 from kiro_crew.dashboard.slot_persistence.metadata_line import (  # noqa: F401
+    autocompact_commits,
     tighten_line_for_appends,
 )
 from kiro_crew.dashboard.slot_persistence.takeover_ordering import (  # noqa: F401
@@ -561,6 +615,7 @@ from kiro_crew.dashboard.slot_projection import (  # noqa: F401
 from kiro_crew.dashboard.slot_queue_repository import (  # noqa: F401
     RESTORED_QUEUE_KEY,
     RESTORED_SEND_CHOSEN_KEY,
+    refused_durable_ids,
     warn_if_not_durable,
 )
 from kiro_crew.dashboard.slot_registry import (  # noqa: F401
@@ -572,7 +627,9 @@ from kiro_crew.dashboard.slot_retention import (  # noqa: F401
     loop_slot_keys,
     select_idle_slot_keys,
 )
+from kiro_crew.dashboard.snapshot_commit import close_in_flight  # noqa: F401
 from kiro_crew.dashboard.state import (  # noqa: F401
+    _MAX_CONTEXT_PER_SOURCE,
     _MAX_DISMISSED_SOURCE_LINKS,
     TURN_OPENING_INJECT_KINDS,
     DashboardState,
@@ -591,9 +648,12 @@ from kiro_crew.dashboard.state import (  # noqa: F401
     row_mid,
 )
 from kiro_crew.dashboard.system_notices import (  # noqa: F401
+    SESSION_RELOAD_DEFERRED_TEXT,
     SESSION_RELOAD_KIND,
+    SESSION_RELOAD_READY_TEXT,
     SESSION_SWITCH_KIND,
     is_system_notice,
+    session_reload_failed_notice,
     session_switch_notice,
 )
 from kiro_crew.dashboard.token_auth import folder_principal  # noqa: F401
@@ -604,11 +664,14 @@ from kiro_crew.dashboard.turn_dispatch import (  # noqa: F401
 from kiro_crew.history import (  # noqa: F401
     HUMAN_TURN_META_KEY,
     ConversationLog,
+    TranscriptBusy,
+    TranscriptWithheld,
     carry_provenance,
     is_incognito_transcript,
     transcript_stems,
 )
 from kiro_crew.history_projection import TranscriptRevisionChanged  # noqa: F401
+from kiro_crew.hooks import dispatch_session_lane_changed_bulk  # noqa: F401
 from kiro_crew.jsonl_util import OversizedRecord, SplitlinesBoundaryRecord  # noqa: F401
 from kiro_crew.llm_helpers import (  # noqa: F401
     pick_epoch_host,
@@ -621,6 +684,7 @@ from kiro_crew.memory_startup import (  # noqa: F401
 )
 from kiro_crew.memory_stores import UnknownMemoryStore  # noqa: F401
 from kiro_crew.messaging.link import canonical_key, is_channel_session_key  # noqa: F401
+from kiro_crew.mrkdwn_title import SLACK_TEXT_META_KEY
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
 from kiro_crew.safety_override import (  # noqa: F401
@@ -630,6 +694,7 @@ from kiro_crew.safety_override import (  # noqa: F401
 )
 from kiro_crew.sandbox import voice_runtime_workspace_conflict  # noqa: F401
 from kiro_crew.security import (  # noqa: F401
+    is_sensitive_canonical_path,
     is_sensitive_path,
     redact_credentials,
     redact_exfiltration_urls,
@@ -688,7 +753,8 @@ _SESSION_RELOAD_NOTICE = (
 
 
 #: Row-meta keys a REQUEST may never supply, because the gateway mints them and a
-#: surface reads them as the gateway's own claim. ``decisions_strip`` is a Jev
+#: surface reads them as the gateway's own claim. Merge-card identity and note
+#: retirement fields are server-minted for the same reason. ``decisions_strip`` is a Jev
 #: decision receipt with a verdict control attached (``decisions/points/
 #: message_steer.py``, ``website/src/pages/chat/SteerDecisionLine.tsx``), so a
 #: caller-supplied one would render a decision nobody made. ``HUMAN_TURN_META_KEY``
@@ -709,6 +775,16 @@ _SESSION_RELOAD_NOTICE = (
 #: ``relay`` is the cross-session sender the delivery path stamps on a
 #: ``session_send`` row; the transcript draws it as a card naming that session, so a
 #: caller-supplied one would show a message as another session's.
+#: ``CARD_ORIGIN_META_KEY`` marks a row a dashboard card sent (``card_send``), so a
+#: caller-supplied one would label typed text as a page's, or the reverse.
+#: ``SLACK_TEXT_META_KEY`` is the gateway's record that a row was copied in from a
+#: Slack thread, which the fallback title reads as Slack mrkdwn.
+#: ``steer``, ``steerState`` and ``requeued_steer_row_mid`` are the gateway's
+#: record of a steer's lifecycle (``chat_delivery``, ``chat_turn/steer_queue``).
+#: A row stamped ``steerState: superseded`` is hidden from the transcript
+#: (``groupDisplayItems.isSupersededSteerRow``), so a caller-supplied pair would
+#: hide the only row of a prompt that ran. Clients send a steer as the top-level
+#: ``steer`` flag, never in ``meta``.
 RESERVED_ROW_META_KEYS = frozenset(
     {
         "decisions_strip",
@@ -718,6 +794,16 @@ RESERVED_ROW_META_KEYS = frozenset(
         "slack_request",
         CHAT_BANNER_META_KEY,
         "relay",
+        MERGED_FROM_META_KEY,
+        "noteId",
+        "noteRowFor",
+        CARD_ORIGIN_META_KEY,
+        SLACK_TEXT_META_KEY,
+        "steer",
+        "steerState",
+        # Redirects a pin or link on a superseded row (`_retire_superseded_steer_row`).
+        "supersededBy",
+        REQUEUED_STEER_ROW_MID_META,
     }
 )
 
@@ -988,7 +1074,7 @@ _SESSION_START_REPEAT_REFUSAL_AT = 2
 #: one above them -- the mirror of ``INJECT_KIND_OPENS_TURN`` in
 #: ``website/src/pages/chat/RecoveryCard.tsx`` (``recovery`` and
 #: ``user_replay`` continue the same turn and are deliberately absent).
-_TURN_OPENING_INJECT_KINDS = frozenset({"cron", "synthesis"})
+_TURN_OPENING_INJECT_KINDS = frozenset({"cron", "synthesis", "workflow", "heartbeat"})
 
 
 def _has_conversation(slot: _ChatSlot) -> bool:
@@ -1005,11 +1091,24 @@ def _has_conversation(slot: _ChatSlot) -> bool:
 
     Rows are walked with the same skip rules as ``_is_interrupted`` so the two
     cannot disagree about what counts as the conversation's floor.
+
+    A heartbeat prompt's ``inject`` row is a floor too: delivered to an unused
+    chat it is the only request there, and a first turn that fails to start
+    must still be resumable from it. Mirrored by ``selectContinuable`` in
+    ``website/src/store/chat/selectors.ts``.
     """
     for m in slot.messages:
-        if is_system_notice(m.get("role"), m.get("meta")):
+        meta = m.get("meta")
+        if is_system_notice(m.get("role"), meta):
             continue
         if m.get("role") in ("user", "assistant") and m.get("content"):
+            return True
+        if (
+            m.get("role") == "inject"
+            and m.get("content")
+            and isinstance(meta, dict)
+            and meta.get("injectKind") == "heartbeat"
+        ):
             return True
     return False
 
@@ -1021,8 +1120,9 @@ class SlotCloseError(Exception):
     Extracted alongside :func:`close_slot` so the DELETE endpoint and
     session-control's ``close_target`` map the SAME four failures the same way.
     ``code`` is the machine-readable contract; ``message`` is advisory prose;
-    ``status`` is 500 for every close failure (each leaves the tab open and
-    every partial step rolled back — a state the user can see and retry).
+    ``status`` is 500 for the close's own failures (each leaves the tab open and
+    every partial step rolled back — a state the user can see and retry); a
+    refusal carries its own status.
     """
 
     def __init__(self, message: str, code: str, status: int = 500) -> None:
@@ -1046,6 +1146,10 @@ _GUARDED_WRITE_WAIT_SECS = 5.0
 #: read this long never produced chips there either. Here only this close waits,
 #: and past the bound it goes on to archive what the window holds.
 _FILE_CHANGES_DRAIN_SECS = 25.0
+
+#: Seconds one stage of a close may take before it logs a warning naming it. The
+#: gateway logs warnings and up, so a slow close otherwise names no step.
+_SLOW_CLOSE_STAGE_SECS = 5.0
 
 
 # Serializes slot SWITCH transactions that share one session, keyed by
@@ -1299,7 +1403,6 @@ class ResumeOutcome(NamedTuple):
 MAX_COLOR_INDEX = 20
 
 
-_MAX_CONTEXT_PER_SOURCE = 10
 _MAX_CONTEXT_CONTENT = 40000
 # Default expiry for a note's context half: if the user never sends a follow-up
 # within 24h, the stale entry is dropped at drain rather than attaching itself to
@@ -1311,9 +1414,6 @@ _NOTE_CONTEXT_MAX_AGE = 86400
 # read back from disk), so the value lives in slot_buffers.
 _MAX_DEFERRED_NOTES = MAX_DEFERRED_NOTES
 
-# Distinguishes "key absent" from an explicit JSON null, which `body.get("maxAge")`
-# alone cannot: both yield None, so the two cannot mean different things without it.
-_UNSET = object()
 
 # Source label bounds. The label is interpolated into the
 # ``[Background context from "{source}"]`` prompt frame at drain, so disallow
@@ -1336,6 +1436,7 @@ _facade_compose(
         _owner_chat_send,
         _owner_conductor_close,
         _owner_continue_turn,
+        _owner_crew_steer,
         _owner_followup_card,
         _owner_handoff,
         _owner_handover_drain,
@@ -1343,11 +1444,13 @@ _facade_compose(
         _owner_project_lists,
         _owner_prompt_queue,
         _owner_resume,
+        _owner_resume_identity,
         _owner_resume_window,
         _owner_session_relaunch,
         _owner_slot_approval,
         _owner_slot_create,
         _owner_slot_detail,
+        _owner_slot_discard,
         _owner_slot_effort,
         _owner_slot_guards,
         _owner_slot_lifecycle,
@@ -1357,6 +1460,7 @@ _facade_compose(
         _owner_slot_settings,
         _owner_slot_summary,
         _owner_source_links,
+        _owner_sse_write,
         _owner_turn_stop,
     ),
 )

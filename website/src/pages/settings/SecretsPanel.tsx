@@ -22,7 +22,6 @@ import { i18nT } from '../../i18n/t'
 import { Link } from 'react-router-dom'
 import { settingsPath } from '../../components/settingsPath'
 import { connectionsOAuthClientEntryId } from '../../components/commandPalette/settingsManual'
-import { useGatewayPlatform } from '../../hooks/useGatewayPlatform'
 
 /**
  * The three secrets requests go through `api/client.ts`, not a local `fetch`.
@@ -280,11 +279,6 @@ function ManagedSecretRow({
 
 export function SecretsPanel() {
   const queryClient = useQueryClient()
-  // On Windows the mediated call route refuses every call (it needs a
-  // Unix-domain socket with peer-credential attestation), so the authorize
-  // command only signs a grant the host can never use. Show a notice in place
-  // of the command there, mirroring the CLI's own refusal.
-  const gatewayPlatform = useGatewayPlatform()
   const [showAdd, setShowAdd] = useState(false)
   const [newName, setNewName] = useState('')
   const [newValue, setNewValue] = useState('')
@@ -469,6 +463,27 @@ export function SecretsPanel() {
                         {i18nT('settings.secrets.connections_client_secret_manage')}
                       </Link>
                     </div>
+                  ) : secret.kind === 'wakatime_oauth' && secret.name === 'WAKATIME_OAUTH_TOKENS' ? (
+                    // Written by the WakaTime sign-in flow and refused by the generic
+                    // vault routes (409), so it is listed read-only and managed from
+                    // the WakaTime panel, where Disconnect clears it.
+                    <div
+                      key={secret.name}
+                      className="flex items-center justify-between gap-3 rounded-md border border-border bg-bg px-3 py-2 text-sm"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate font-medium text-text">{secret.name}</div>
+                        <div className="text-xs text-muted">
+                          {i18nT('settings.secrets.wakatime_oauth_tokens_description')}
+                        </div>
+                      </div>
+                      <Link
+                        to={settingsPath({ tab: 'overview', params: { view: 'wakatime' } })}
+                        className="shrink-0 text-xs text-accent hover:underline"
+                      >
+                        {i18nT('settings.secrets.wakatime_oauth_tokens_manage')}
+                      </Link>
+                    </div>
                   ) : (
                   <ManagedSecretRow
                     key={secret.name}
@@ -495,18 +510,12 @@ export function SecretsPanel() {
               <p className="text-sm text-muted">
                 {i18nT('settings.secrets.custom_description')}
               </p>
-              {gatewayPlatform === 'windows' ? (
-                <p className="text-sm text-muted">
-                  {i18nT('settings.secrets.custom_authorize_windows')}
-                </p>
-              ) : (
-                <p className="text-sm text-muted">
-                  {i18nT('settings.secrets.custom_authorize', { server: SECRETS_SERVER_GRANT })}
-                  <code className="block mt-1.5 rounded-md border border-border bg-bg-elevated px-2.5 py-1.5 font-mono text-[12px] text-accent overflow-x-auto">
-                    {SECRETS_AUTHORIZE_COMMAND}
-                  </code>
-                </p>
-              )}
+              <p className="text-sm text-muted">
+                {i18nT('settings.secrets.custom_authorize', { server: SECRETS_SERVER_GRANT })}
+                <code className="block mt-1.5 rounded-md border border-border bg-bg-elevated px-2.5 py-1.5 font-mono text-[12px] text-accent overflow-x-auto">
+                  {SECRETS_AUTHORIZE_COMMAND}
+                </code>
+              </p>
 
               {otherNames.length > 0 ? (
                 <div className="space-y-2">

@@ -35,6 +35,28 @@ def _legacy_venv_entries(home: Path) -> list[str]:
         return []
 
 
+def _doctor_data_home_owner(issues: list[str]) -> None:
+    """Report data-home entries another account owns, and where the docs explain them.
+
+    Joins ``issues``: a home this account cannot read fails every config read and
+    every Bot create, which is exactly what the doctor exists to catch.
+    """
+    from kiro_crew.data_home_owner import HELP_URL, check_data_home
+
+    access = check_data_home(Path(cli_doctor.config_dir()))
+    if access.ok:
+        print("  owner:       ✅ this account owns its files")
+        return
+    whose = f"belong to {access.owner}" if access.owner else "can't be used by this account"
+    print(f"  owner:       ❌ some files {whose}, so Kiro Crew can't read them:")
+    for path in access.foreign:
+        print(f"               {path}")
+    print("               Kiro Crew was probably started as root once (for example with sudo).")
+    print("               Stop running it as root, then give the files back to your account:")
+    print(f"               {HELP_URL}")
+    issues.append(f"data home files {whose}; see {HELP_URL}")
+
+
 def _doctor_data_home() -> None:
     """Report the data home and any leftover top-level ``~/.kirocrew`` directory.
 
@@ -602,12 +624,23 @@ def _doctor_project(issues: list[str]) -> str:
     if not proj:
         saved_proj = cli_doctor.config_dir() / "project_dir"
         if saved_proj.is_file():
-            saved = saved_proj.read_text(encoding="utf-8").strip()
+            try:
+                saved = saved_proj.read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeDecodeError) as exc:
+                # A file left root-owned by one ``sudo kirocrew setup``, or not
+                # UTF-8: report it as this row, so the sections after it still
+                # print (Data Home's owner row is the one that explains it).
+                print(f"  source dir:  ❌ {saved_proj} is unreadable ({type(exc).__name__})")
+                print(
+                    f"               Fix: rm {shlex.quote(str(saved_proj))}, then run kirocrew setup"
+                )
+                issues.append("unreadable project_dir")
+                return ""
             if saved and Path(saved).is_dir():
                 proj = saved
             else:
                 print(f"  source dir:  ❌ stale — points to deleted {saved}")
-                print(f"               Fix: rm {cli_doctor.config_dir() / 'project_dir'}")
+                print(f"               Fix: rm {shlex.quote(str(saved_proj))}")
                 issues.append("stale project_dir")
                 stale_project = True
     if proj and Path(proj).is_dir():
@@ -647,7 +680,7 @@ def _doctor_sqlite_fts5(issues: list[str]) -> None:
     build without FTS5 breaks memory init.
     """
     try:
-        from kiro_crew._sqlite_compat import fts5_available
+        from kiro_crew._sqlite_compat import PYSQLITE3_REQUIREMENT, fts5_available
 
         if fts5_available():
             print("  sqlite fts5: ✅ available")
@@ -658,7 +691,7 @@ def _doctor_sqlite_fts5(issues: list[str]) -> None:
             # exactly the case the gate hides the command.
             if cli_doctor.pip_install_channel_available():
                 print(
-                    f"{render._INDENT}Fix: {cli_doctor.pip_install_command_for('pysqlite3-binary')}"
+                    f"{render._INDENT}Fix: {cli_doctor.pip_install_command_for(PYSQLITE3_REQUIREMENT)}"
                 )
             print("               Or use a Python whose SQLite was built with FTS5.")
             issues.append("sqlite fts5")
@@ -726,7 +759,8 @@ def _doctor_tz_data(issues: list[str]) -> None:
         issues.append("timezone data missing")
         return
     if offset == _TZ_PROBE_OFFSET:
-        print("  tz data:     ✅ current (America/Vancouver stays UTC-7 in winter)")
+        print("  tz data:     ✅ current (IANA tzdb 2026b or later)")
+        print("               Sample check on America/Vancouver, not your configured zone.")
         return
     print("  tz data:     ⚠️  out of date (older than IANA tzdb 2026b)")
     print("               It still moves America/Vancouver back to UTC-8 on")

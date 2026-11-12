@@ -33,17 +33,17 @@ from test_update_provider import _UNALLOCATABLE_PID
 import kiro_crew.apps.routes as routes_mod
 from conftest import requires_symlinks
 from kiro_crew import platform_compat
+from kiro_crew.apps import protected_app_state
 from kiro_crew.apps.manager import enable_app
 from kiro_crew.apps.routes import (
     _get_app_secret,
     _resolve_app_backend_url,
     invalidate_app_secret_cache,
 )
+from kiro_crew.dashboard.token_auth import write_app_secret
 from kiro_crew.testing.ids import UNALLOCATABLE_PID
 
-# ---------------------------------------------------------------------------
 # POST /api/apps/{name}/open
-# ---------------------------------------------------------------------------
 
 
 class TestOpenApp:
@@ -249,9 +249,7 @@ class TestOpenApp:
         assert spawned == []
 
 
-# ---------------------------------------------------------------------------
 # GET /apps/{name}/ui/{path} — path and type validation
-# ---------------------------------------------------------------------------
 
 
 class TestAppUiFile:
@@ -304,9 +302,7 @@ class TestAppUiFile:
             assert (await resp.json())["error"] == "invalid path"
 
 
-# ---------------------------------------------------------------------------
 # POST /api/apps/{name}/dev
-# ---------------------------------------------------------------------------
 
 
 class TestAppDevMode:
@@ -353,9 +349,7 @@ class TestAppDevMode:
             assert "error" not in (await resp.json())
 
 
-# ---------------------------------------------------------------------------
 # GET/PUT /api/apps/{name}/config
-# ---------------------------------------------------------------------------
 
 
 class TestAppConfig:
@@ -449,31 +443,25 @@ class TestAppConfig:
             assert await resp.json() == {"theme": "dark"}
 
 
-# ---------------------------------------------------------------------------
 # App-secret cache + backend URL resolution
-# ---------------------------------------------------------------------------
 
 
 class TestAppSecretCache:
     def test_missing_secret_is_not_cached(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        home = _setup_env(tmp_path, monkeypatch)
+        _setup_env(tmp_path, monkeypatch)
         assert _get_app_secret(APP) == ""
         # A secret provisioned after the first miss must still be picked up.
-        app_dir = home / "apps" / APP
-        app_dir.mkdir(parents=True, exist_ok=True)
-        (app_dir / ".app_secret").write_text("s3cret\n", encoding="utf-8")
+        write_app_secret(APP, "s3cret")
         assert _get_app_secret(APP) == "s3cret"
 
     def test_cached_secret_survives_file_removal_until_invalidated(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        home = _setup_env(tmp_path, monkeypatch)
-        app_dir = home / "apps" / APP
-        app_dir.mkdir(parents=True, exist_ok=True)
-        secret_file = app_dir / ".app_secret"
-        secret_file.write_text("cached-value", encoding="utf-8")
+        _setup_env(tmp_path, monkeypatch)
+        write_app_secret(APP, "cached-value")
+        secret_file = protected_app_state.secret_path(APP)
         assert _get_app_secret(APP) == "cached-value"
         secret_file.unlink()
         assert _get_app_secret(APP) == "cached-value"
@@ -534,9 +522,7 @@ class TestResolveAppBackendUrl:
         assert _resolve_app_backend_url(APP) is None
 
 
-# ---------------------------------------------------------------------------
 # Reverse proxy /apps/{name}/api/{path} — authorization gates
-# ---------------------------------------------------------------------------
 
 
 class _FakeCM:
@@ -568,12 +554,9 @@ class _FakeSession:
 def _fail_proxy_backend_with(app: web.Application, exc: BaseException) -> None:
     """Make the proxy's outbound session raise ``exc``, installed BEFORE start.
 
-    ``register_app_routes`` creates the real ``ClientSession`` in an
-    ``on_startup`` hook; hooks run in registration order, so this one runs
-    right after it, closes the real session (its connector would otherwise
-    outlive the test) and installs the fake while the app is still mutable.
-    An ``app[...]`` write after the test server has started is deprecated by
-    aiohttp.
+    Startup hooks run in registration order, so this one runs right after the hook that
+    creates the real ``ClientSession``, closes it (its connector would outlive the test)
+    and installs the fake while the app is still mutable, as aiohttp requires.
     """
 
     async def _swap(app_: web.Application) -> None:
@@ -640,12 +623,10 @@ class TestApiProxyAuthorization:
     async def test_missing_app_secret_is_502(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        home = _setup_env(tmp_path, monkeypatch)
+        _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
         enable_app(APP)
-        secret_file = home / "apps" / APP / ".app_secret"
-        if secret_file.exists():
-            secret_file.unlink()
+        protected_app_state.secret_path(APP).unlink(missing_ok=True)
         invalidate_app_secret_cache(APP)
         monkeypatch.setattr(routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1")
         async with TestClient(TestServer(_make_app())) as client:
@@ -659,10 +640,10 @@ class TestApiProxyAuthorization:
     ) -> None:
         import aiohttp
 
-        home = _setup_env(tmp_path, monkeypatch)
+        _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
         enable_app(APP)
-        (home / "apps" / APP / ".app_secret").write_text("k", encoding="utf-8")
+        write_app_secret(APP, "k")
         invalidate_app_secret_cache(APP)
         monkeypatch.setattr(routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1")
         app = _make_app()
@@ -676,10 +657,10 @@ class TestApiProxyAuthorization:
     async def test_backend_timeout_is_504(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        home = _setup_env(tmp_path, monkeypatch)
+        _setup_env(tmp_path, monkeypatch)
         _install(tmp_path)
         enable_app(APP)
-        (home / "apps" / APP / ".app_secret").write_text("k", encoding="utf-8")
+        write_app_secret(APP, "k")
         invalidate_app_secret_cache(APP)
         monkeypatch.setattr(routes_mod, "_resolve_app_backend_url", lambda n: "http://127.0.0.1:1")
         app = _make_app()
@@ -703,10 +684,10 @@ async def test_api_proxy_signs_and_forwards_to_backend(
     """
     from kiro_crew.apps.proxy_auth import verify_proxy_request
 
-    home = _setup_env(tmp_path, monkeypatch)
+    _setup_env(tmp_path, monkeypatch)
     _install(tmp_path)
     enable_app(APP)
-    (home / "apps" / APP / ".app_secret").write_text("proxy-key", encoding="utf-8")
+    write_app_secret(APP, "proxy-key")
     invalidate_app_secret_cache(APP)
 
     seen: dict[str, Any] = {}

@@ -90,9 +90,66 @@ export const opensDisplayTurn = (msg: ChatMessage): boolean =>
   TURN_OPENER_ROLES.has(msg.role) || injectOpensTurn(msg)
 
 /**
+ * A steer the turn never took, whose own queued turn has since written a fresh
+ * row with the same text (`steerState: 'superseded'`, see `chat_delivery.py`).
+ * The row stays in the transcript for history; drawing it would show the
+ * message twice. A `user` row is a person's or a peer's steer, and a `nudge`
+ * row is an automation steer (a work-ledger wake).
+ */
+export function isSupersededSteerRow(m: ChatMessage): boolean {
+  const meta = m.meta as { steer?: unknown; steerState?: unknown } | undefined
+  return (m.role === 'user' || m.role === 'nudge') && meta?.steer === true && meta.steerState === 'superseded'
+}
+
+/**
+ * The index of the row drawn in place of the superseded steer at `idx`, or -1
+ * when that row is not in `messages`.
+ *
+ * The server names the successor by `meta.supersededBy` (its `mid`,
+ * `superseded_steer._retire_superseded_steer_row`). An ID match also requires a
+ * non-steer row with the superseded row's own role and the same text. A caller
+ * can supply `mid`, and a fork can copy `supersededBy`. These checks prevent an
+ * unrelated row from replacing the copied steer: a `user` row never takes a
+ * `nudge` steer's place, and a `nudge` row never takes a `user` steer's place.
+ * Rows that fail the checks do not stop the scan.
+ *
+ * In a live tab the successor of a `user` steer is the row `queue_pop`
+ * rebuilt. It has no `mid` until a refresh, so the fallback is the first later
+ * non-steer row with the same role, no `mid` and the same text. The server
+ * supersedes a row only when the drained text equals it.
+ */
+export function supersededSuccessorIdx(messages: ChatMessage[], idx: number): number {
+  const row = messages[idx]
+  if (!row || !isSupersededSteerRow(row)) return -1
+  const next = (row.meta as Record<string, unknown> | undefined)?.supersededBy
+  if (typeof next !== 'string' || !next) return -1
+  for (let i = idx + 1; i < messages.length; i++) {
+    const m = messages[i]
+    const meta = m.meta as Record<string, unknown> | undefined
+    if (m.role === row.role && !meta?.steer && meta?.mid === next && m.content === row.content) return i
+  }
+  for (let i = idx + 1; i < messages.length; i++) {
+    const m = messages[i]
+    const meta = m.meta as Record<string, unknown> | undefined
+    if (m.role === row.role && !meta?.steer && !meta?.mid && m.content === row.content) return i
+  }
+  return -1
+}
+
+/**
+ * Whether the row at `idx` is left undrawn: a superseded steer whose successor
+ * is in the same list. The successor always comes later, so any view that cuts
+ * it off (a fork made above it, a bounded page) still draws the old row, the
+ * only copy of the text in that view.
+ */
+export function isHiddenSupersededSteer(messages: ChatMessage[], idx: number): boolean {
+  return supersededSuccessorIdx(messages, idx) >= 0
+}
+
+/**
  * The synthesis injection that closes a sub-agent fan-out.
  *
- * `_run_pending_synthesis` (chat_runner.py) appends this row before dispatching
+ * `_run_pending_synthesis` (chat_turn/queue_cycle.py) appends this row before dispatching
  * the one turn that folds every sub-agent's result into a single answer, and
  * stamps `meta.injectKind = 'synthesis'` on it. Its presence is therefore proof
  * that everything the agent emitted since the user's prompt was INTERIM: the
@@ -109,7 +166,7 @@ export const isSynthesisInjection = (msg: ChatMessage): boolean =>
  * The row a turn that ENDED carries its per-turn stats on: its last
  * assistant-role row for a completed turn (`_attach_turn_stats`), the newest
  * reply the runner recorded for any other end (`_persist_partial_reply`,
- * chat_runner.py).
+ * chat_turn/turn_reply_seams.py).
  *
  * This is how the region walk finds where a synthesis turn ENDED. A synthesis
  * row opens a turn whose answer is real, user-facing content no later synthesis
@@ -201,12 +258,14 @@ function answerEndIndex(items: readonly TurnItem[]): number {
  * the fan-out toggle would hide content on the promise that something below
  * repeats it, which nothing does. An `mcp_app` row (an embedded MCP App's
  * ui/message delivery) is here for the same reason: the user's own click
- * landed it, and nothing in the fold repeats it.
+ * landed it, and nothing in the fold repeats it. A `workflow` follow-up is the
+ * same again: its answer is about a workflow run, not the fan-out; and so is a
+ * `heartbeat` prompt, whose answer is about the heartbeat task.
  *
  * `recovery` is deliberately NOT here: a tool-stall recovery inside a fan-out is
  * a continuation of the very work being folded.
  */
-const FOREIGN_INJECT_KINDS = new Set(['cron', 'user_replay', 'mcp_app'])
+const FOREIGN_INJECT_KINDS = new Set(['cron', 'user_replay', 'mcp_app', 'workflow', 'heartbeat'])
 const isForeignInjection = (msg: ChatMessage): boolean => {
   if (msg.role !== 'inject') return false
   if (isNoteRow(msg)) return true
@@ -284,6 +343,7 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
     // it, the user does not. One it CAN parse renders as a compact outcome row,
     // which is the only scrollback record that a wave's results arrived.
     if (messages[i].role === 'subagent' && !isSubagentCompletionMessage(messages[i])) continue
+    if (isHiddenSupersededSteer(messages, i)) continue
     if (GROUPABLE.has(messages[i].role)) {
       if (!group.length) groupStart = i
       group.push(messages[i])

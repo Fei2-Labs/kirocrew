@@ -62,6 +62,12 @@ class FakeClient:
             on_sent(message_id)
         return message_id
 
+    async def edit_text(self, jid: str, message_id: str, text: str, on_sent=None) -> bool:
+        # An edit is a send with its own id, handed over like any other.
+        if on_sent is not None:
+            on_sent(next(self._next_ids))
+        return True
+
     async def phone_for_lid(self, lid_jid: str) -> str:
         self.lid_lookups.append(lid_jid)
         return self.lid_map.get(lid_jid, "")
@@ -171,6 +177,15 @@ class TestGauntlet:
         ids = await harness.transport._send_tracked(OWN_JID, "agent reply")
         await harness.transport.receive(
             event(chat=OWN_JID, sender=OWN_JID, from_me=True, message_id=ids[0])
+        )
+        assert harness.dispatched == []
+
+    async def test_own_edit_echo_is_dropped(self, harness):
+        # A streamed reply is edited in place; each edit echoes back from_me
+        # under its own id, and in the self-chat it must not read as a command.
+        assert await harness.transport.edit_text(OWN_JID, "ORIG1", "agent reply, longer")
+        await harness.transport.receive(
+            event(chat=OWN_JID, sender=OWN_JID, from_me=True, message_id="SENT1")
         )
         assert harness.dispatched == []
 
@@ -821,7 +836,7 @@ class TestPreIngestionOriginalIsCapturedForTheSpool:
     ``receive`` rewrites ``msg.text`` with attachment context and temp paths
     before dispatch, so a route built from ``inbound.text`` at the dispatch site
     would spool -- and the restart notice would quote -- on-disk paths to files
-    that do not survive the restart. The original caption and media count are captured
+    that do not survive the restart. The original caption and media names are captured
     BEFORE ingestion in a side table keyed like the others.
     """
 
@@ -842,7 +857,7 @@ class TestPreIngestionOriginalIsCapturedForTheSpool:
             return IngestResult(image_paths=[str(image)])
 
         monkeypatch.setattr(mod, "ingest_media", fake_ingest)
-        seen: list[tuple[str, tuple[str, int] | None]] = []
+        seen: list[tuple[str, tuple[str, tuple[str, ...]] | None]] = []
 
         async def dispatch(msg):
             seen.append((msg.text, harness.transport.pending_original.get(id(msg))))
@@ -855,7 +870,7 @@ class TestPreIngestionOriginalIsCapturedForTheSpool:
         assert len(seen) == 1
         ingested_text, original = seen[0]
         assert str(image) in ingested_text, "ingestion did not rewrite the text"
-        assert original == ("look at this", 1), "the pre-ingestion original was not captured"
+        assert original == ("look at this", ("image.jpg",)), "the original was not captured"
         assert harness.transport.pending_original == {}, "the side table leaked past dispatch"
         assert not image.exists(), "receive did not hand the temp path to cleanup"
 
@@ -887,8 +902,37 @@ class TestPreIngestionOriginalIsCapturedForTheSpool:
         assert seen == [True, False]
         assert harness.transport.pending_voice_note == set(), "the flag leaked past dispatch"
 
+    async def test_a_document_records_the_name_its_sender_gave_it(self, harness, monkeypatch):
+        import kiro_crew.whatsapp.transport as mod
+        from kiro_crew.messaging.attachments import IngestResult
+
+        async def fake_ingest(*a, **kw):
+            return IngestResult()
+
+        monkeypatch.setattr(mod, "ingest_media", fake_ingest)
+        seen: list[tuple[str, tuple[str, ...]] | None] = []
+
+        async def dispatch(msg):
+            seen.append(harness.transport.pending_original.get(id(msg)))
+
+        harness.transport._dispatch = dispatch
+        doc = event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="")
+        doc.Message = Msg(
+            conversation="",
+            extendedTextMessage=None,
+            documentMessage=Msg(
+                caption="the draft",
+                mimetype="application/pdf",
+                fileName="report.pdf",
+                fileLength=1024,
+            ),
+        )
+        await harness.transport.receive(doc)
+
+        assert seen == [("the draft", ("report.pdf",))]
+
     async def test_a_text_only_message_records_zero_media(self, harness):
-        seen: list[tuple[str, int] | None] = []
+        seen: list[tuple[str, tuple[str, ...]] | None] = []
 
         async def dispatch(msg):
             seen.append(harness.transport.pending_original.get(id(msg)))
@@ -898,7 +942,7 @@ class TestPreIngestionOriginalIsCapturedForTheSpool:
             event(chat=OWN_JID, sender=OWN_JID, from_me=True, text="just words")
         )
 
-        assert seen == [("just words", 0)]
+        assert seen == [("just words", ())]
 
 
 @pytest.mark.asyncio

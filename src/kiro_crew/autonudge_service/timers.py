@@ -27,7 +27,7 @@ from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Concatenate, Iterator, ParamSpec, TypeVar
 
-from kiro_crew import shutdown_event
+from kiro_crew import probes, shutdown_event
 from kiro_crew.autonudge_service.maintenance import _DurabilityDrain
 from kiro_crew.autonudge_service.model import (
     _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
@@ -35,15 +35,19 @@ from kiro_crew.autonudge_service.model import (
     _START_FAILURE_STANDDOWN_AFTER,
     APPROVAL_HOLD,
     PERSON_WAIT_HOLD,
+    SUBJECT_READ_SECS,
     NudgeAdmissionRefused,
     NudgeLoop,
     _MutationAdmission,
+    _positive_number,
     _TransactionSubmissions,
     credit_held_runtime,
     hold_span,
     is_structured_monitor_loop,
     note_hold_start,
+    runtime_elapsed,
 )
+from kiro_crew.autonudge_service.subject import loop_subject
 from kiro_crew.monitoring.models import MONITOR_STATE_VERSION, MonitorDispatchResult
 
 if TYPE_CHECKING:
@@ -70,6 +74,20 @@ _MONITOR_RETRY_MAX_BACKOFF_SECS = 300
 # race their follow-up message; a short beat leaves room for notify_user_input
 # to cancel the pending fire again if they are still actively conversing.
 _OVERDUE_REARM_SECS = 10
+
+# How long after its runtime budget runs out a loop's timer wakes. asyncio may run
+# a timer up to its clock's resolution early (about 16 ms on Windows), and a wake
+# just short of the budget would fire a turn instead of stopping the loop.
+_BUDGET_WAKE_SLACK_SECS = 1.0
+
+
+# Gap between the loops that are overdue when the service starts. After a
+# restart every overdue loop would otherwise wake in the same few seconds, each
+# cold-starting its session and that session's MCP servers together, which is
+# how a host short of memory crash-loops. The n-th such loop is held n gaps
+# (``_boot_holds``) before its normal countdown, so their sessions start one at
+# a time. A work-ledger loop's boot replay is not held (``start()``).
+_BOOT_WAKE_STAGGER_SECS = 30
 
 
 # How often the reconciler walks the store looking for an active loop with no
@@ -334,6 +352,21 @@ def _drained_bookkeeping(
     return wrapper
 
 
+def _held_tick_rearms(loop: NudgeLoop) -> bool:
+    """Whether *loop*'s held tick re-arms one read interval out to read its subject again.
+
+    Only an approval-held GATED loop that names one pull request does, which
+    ``subject_reads.hold_tick`` reads so a merge or a close settles the loop. An
+    ungated loop never does: ``gate=False`` promises a terminal reading can never
+    end it, so held it reads nothing, exactly as a held loop naming no pull
+    request, and waits for a person.
+    """
+    if not loop.approval_stalled or not loop.gate or loop.monitor is None:
+        return False
+    target = loop_subject(loop)
+    return target is not None and target.kind == probes.GH_PR
+
+
 def notify_approval_stalled(self: AutoNudgeService, slot_key: str) -> None:
     """Record that a tool approval in *slot_key* went unanswered: hold the loop.
 
@@ -473,12 +506,13 @@ async def release_approval_hold(
     arm: bool = True,
     admission: _MutationAdmission | None = None,
 ) -> bool:
-    """End *slot_key*'s approval hold, because a person is back. True if one ended.
+    """End *slot_key*'s approval hold, because the slot moved past it. True if one ended.
 
-    Reached only where a person is proven present: an approval answered in the slot
+    Reached where a person is proven present -- an approval answered in the slot
     (via ``autonudge.release_approval_hold_for``), a typed dashboard message
-    (``notify_user_input(human=True)``), or the popover's manual fire. An agent's or
-    app's turn does not count: it proves the session runs, not that anyone can answer.
+    (``notify_user_input(human=True)``), the popover's manual fire -- and where a
+    new dashboard turn starts in the slot for any sender (``_turn_open``): that
+    turn proves no prompt is still open, and one that stalls again re-holds.
 
     The held time is added to ``created_ts`` so the hold spends no runtime budget.
     ``arm`` re-arms toward the (usually passed) deadline, so the next cycle runs within
@@ -999,6 +1033,8 @@ def _cancel_timer(self: AutoNudgeService, loop_id: str, *, drop_claims: bool = T
     callers where ``asyncio.current_task()`` would raise, hence
     :func:`_current_task_or_none`.
     """
+    # A boot hold belongs to the timer it was set for; a re-arm starts without it.
+    self._boot_holds.pop(loop_id, None)
     t = self._timers.pop(loop_id, None)
     if t is None or t.done():
         return
@@ -1056,6 +1092,10 @@ def _arm_from_deadline(self: AutoNudgeService, loop: NudgeLoop) -> None:
     ``_OVERDUE_REARM_SECS``, so a user mid-conversation keeps deferring it. The delay
     is capped at ``idle_secs`` so a clock jump cannot park the timer past one interval.
 
+    ``_timer`` stops a prompt loop on a spent runtime budget only when it wakes, so a
+    budget that runs out before the deadline wakes it then; which arms keep the
+    deadline, and why, is in the monitor-architecture spec ("Runtime bounds").
+
     A monitor arms on the same deadline (one user-set clock); the probe gate in
     :meth:`_timer` decides whether its tick spends a turn. A monitor whose
     ``version`` this gateway does not implement (a newer gateway's record) gets no
@@ -1085,11 +1125,27 @@ def _arm_from_deadline(self: AutoNudgeService, loop: NudgeLoop) -> None:
         if loop.monitor is not None:
             loop.monitor.next_probe_at = loop.next_due_ts
         self._persist_soon()
+    if _held_tick_rearms(loop) and not is_structured_monitor_loop(loop):
+        # A held gated loop naming one pull request: its timer is its subject read
+        # (``subject_reads.hold_tick``), one read interval out whatever its deadline,
+        # from every arm: a turn ending, a deferred re-arm, a reconciler rescue. Any
+        # other held loop is armed toward its deadline as any loop is, so its tick
+        # still reaches the cycle cap and the stop sentinel. The release arms toward
+        # the deadline.
+        self._arm_timer(loop, delay=SUBJECT_READ_SECS)
+        return
     remaining = loop.next_due_ts - now
     if remaining <= 0:
         delay = float(seams._OVERDUE_REARM_SECS)
     else:
         delay = min(remaining, float(loop.idle_secs))
+    budget = _positive_number(loop.max_runtime_secs)
+    anchor = _positive_number(loop.created_ts)
+    prompt_loop = not is_structured_monitor_loop(loop)
+    if budget and anchor and prompt_loop and not loop.waiting_on_person:
+        left = budget - runtime_elapsed(loop, anchor)
+        if left > 0:
+            delay = min(delay, left + _BUDGET_WAKE_SLACK_SECS)
     self._arm_timer(loop, delay=delay)
 
 
@@ -1172,10 +1228,15 @@ def _reconcile_once(self: AutoNudgeService) -> None:
             continue
         if loop.id in self._firing or loop.id in self._maintenance_quiescing:
             continue
-        if loop.approval_stalled and not is_structured_monitor_loop(loop):
-            # Paused for approval: no live timer is the intended state, and
-            # ``release_approval_hold`` re-arms it. Rescuing it here would only
-            # wake a tick that holds again, every pass, for as long as it waits.
+        if (
+            loop.approval_stalled
+            and not is_structured_monitor_loop(loop)
+            and not _held_tick_rearms(loop)
+        ):
+            # Paused for approval with no pull request to read (or ungated): no live
+            # timer is the intended state, and ``release_approval_hold`` re-arms it. A
+            # gated one that names a pull request re-arms itself to keep reading it
+            # (``subject_reads.hold_tick``), so it is rescued like any other.
             continue
         monitor = loop.monitor
         if monitor is not None and monitor.version != MONITOR_STATE_VERSION:

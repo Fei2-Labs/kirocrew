@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.config import live
 from kiro_crew.dashboard.chat_utils import (
-    STEER_INTENT_META,
+    COMPOSER_SEND_META,
     STEER_POSSIBLY_DELIVERED_META,
     _redact_for_display,
     _redact_meta,
@@ -33,6 +33,7 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.slot_queue_repository import (
     ATTACHMENT_META_KEYS,
     RESTORED_QUEUE_KEY,
+    refused_durable_ids,
     warn_if_not_durable,
 )
 from kiro_crew.history import HUMAN_TURN_META_KEY
@@ -67,6 +68,7 @@ STEER_UNAVAILABLE = "unavailable"
 #              in-flight generation was actually redirected.
 #   requeued -- the turn ended with no consumption echo, so the teardown moved the
 #              message to the queue and it runs as its own turn.
+#   superseded -- that own turn has written its row, so this one is not drawn.
 #
 # A steer can only be injected at a model-inference boundary, so a turn that is
 # streaming text without dispatching a tool may never reach one before it ends
@@ -85,6 +87,9 @@ STEER_STATE_RETRACTED = "retracted"
 # harness can drop a steer its turn has not read -- so the dashboard draws the
 # controls from the row alone.
 STEER_RETRACTABLE_META = "steerRetract"
+# A requeued row whose own turn has since written a fresh row with the same text:
+# the transcript keeps it, the client does not draw it again.
+STEER_STATE_SUPERSEDED = "superseded"
 
 # Upper bound on a client-minted ``meta.sendId`` accepted into the steer path.
 # Client mints are ~17 chars; the bound exists because the value is raw client
@@ -125,6 +130,12 @@ QUOTE_META_KEY = "quote"
 QUOTE_TEXT_MAX_LEN = 2048
 QUOTE_FIELD_MAX_LEN = 256
 QUOTE_ROLES = frozenset({"user", "assistant"})
+
+# Bounds on a knowledge envelope mark (``knowledge_meta``): no envelope is longer
+# than the gateway's 60 MiB request body, and the base36 djb2 hash is 7 characters.
+KNOWLEDGE_ENVELOPE_META_KEY = "knowledgeEnvelope"
+KNOWLEDGE_ENVELOPE_MAX_LEN = 60 * 1024 * 1024
+KNOWLEDGE_HASH_MAX_LEN = 16
 
 # The short display label a scripted ``POST /api/chat`` may carry (``banner`` in
 # the body). It rides on the user row's meta; the row's ``content`` and the turn's
@@ -545,6 +556,7 @@ async def steer_into_running_turn(
     responsive = responsive and user_origin and not channel_origin
     send_id = normalize_send_id(send_id)
     quote = quote_meta(attachments)
+    knowledge = knowledge_meta(attachments)
     attachments = attachment_meta(attachments)
     # Display attribution for an app-authored steer, kept separate from the
     # attachment-list reduction above (which allowlists only the file/paste
@@ -579,6 +591,10 @@ async def steer_into_running_turn(
         # prompt and nothing consumes it; the queue path delivers it as
         # the next turn instead.
         logger.info("no prompt in flight for slot %s; queueing instead of steering", slot.key)
+        return STEER_UNAVAILABLE
+    if getattr(slot, "_compact_command_turn", False) is True:
+        # The turn IS a manual /compact: no prompt runs that a steer could join.
+        logger.info("slot %s is compacting; queueing instead of steering", slot.key)
         return STEER_UNAVAILABLE
 
     # Register as pending BEFORE the await: ``steer()`` suspends on
@@ -705,11 +721,12 @@ async def steer_into_running_turn(
         slot._turn_owner_sent = False
     if admission is not None:
         slot._steer_admissions[message] = admission
-    if attachments or quote or app_label or app_actor or banner or relay_meta:
+    if attachments or quote or knowledge or app_label or app_actor or banner or relay_meta:
         # Retained for the REQUEUE with the attachment lists: a steer the turn
         # ended before consuming is drained as a queued row, and that row is
         # rebuilt from this map -- without the quote here it would render its
-        # blockquote as text instead of the card, without a peer's
+        # blockquote as text instead of the card, without the knowledge mark
+        # its queue card would show the knowledge envelope, without a peer's
         # cross-session sender (``relay``) it would draw as a raw
         # ``[sent by session …]`` bubble instead of the session-message card,
         # without appLabel the drained
@@ -722,6 +739,7 @@ async def steer_into_running_turn(
         slot._steer_attachment_meta[message] = {
             **attachments,
             **quote,
+            **knowledge,
             **({"relay": dict(relay_meta)} if relay_meta else {}),
             **({"appLabel": app_label} if app_label else {}),
             **({TURN_ACTOR_META_KEY: "app"} if app_actor else {}),
@@ -739,7 +757,7 @@ async def steer_into_running_turn(
         # with the attachment lists rather than in the lockstep origin maps,
         # which the persisting tail drops while the steer is still unconsumed: a
         # steer the turn ends before taking keeps its intent past the sub-agent
-        # hold (``STEER_INTENT_META``) instead of parking behind a wave its
+        # hold (``COMPOSER_SEND_META``) instead of parking behind a wave its
         # sender chose not to wait for.
         slot._steer_act_now.add(message)
     if decision_strip:
@@ -1252,20 +1270,24 @@ def queue_for_next_turn(
     channel_recipient: dict[str, Any] | None = None,
     quote: dict[str, Any] | None = None,
     commands_off: bool = False,
-    steer_intent: bool = False,
+    composer_send: bool = False,
     author: dict[str, Any] | None = None,
     admission: dict[str, Any] | None = None,
     banner: str = "",
+    queued_work: Any = None,
+    knowledge: dict[str, Any] | None = None,
 ) -> str:
     """Append *message* to the slot's queue and announce it; return the queue id.
+
+    *queued_work* is the fair-admission result for a parked send; its work id is
+    stamped on the entry before the durable verdict, because the write weighs it.
 
     The running turn's teardown drains the queue, so this is how a message
     reaches a busy slot when steering is unavailable or not asked for.
 
-    *steer_intent* stamps :data:`STEER_INTENT_META`: the session's own human asked
-    this send to act now and the running turn could not take it, so the sub-agent
-    hold releases it at the turn's end rather than parking it behind the wave.
-    Only the composer's steer fallback passes it.
+    *composer_send* stamps :data:`COMPOSER_SEND_META`: the session's own human
+    typed this into the composer, so the sub-agent hold releases it at the turn's
+    end rather than parking it behind the wave. Only the composer passes it.
 
     *admission* supplies containment captured before an asynchronous queue path
     began. When absent, containment is captured here at enqueue like every direct
@@ -1329,6 +1351,9 @@ def queue_for_next_turn(
     the row it appends, so this is the only way a QUEUED send's row carries the
     receipt for the decision that queued it. Absent on every send that was not
     decided, which keeps the entry's prior shape.
+
+    *knowledge* is the send's :func:`knowledge_meta`, stamped on the entry and its
+    ``queue_push`` frame so the queue card finds the knowledge envelope exactly.
     """
     # circular import: session_control imports this module at module level.
     from kiro_crew.dashboard.session_control import CHANNEL_RECIPIENT_META_KEY, containment_meta
@@ -1361,8 +1386,8 @@ def queue_for_next_turn(
         meta["decisions_strip"] = decision_strip
     if commands_off:
         meta[COMMANDS_OFF_META_KEY] = True
-    if steer_intent:
-        meta[STEER_INTENT_META] = True
+    if composer_send:
+        meta[COMPOSER_SEND_META] = True
     if author:
         # *author* is the server-derived Shared Crew author of a person's send
         # (``attribution.author_meta``). The drain unions it onto the row and
@@ -1371,6 +1396,8 @@ def queue_for_next_turn(
     if banner:
         # Already bounded and redacted by the caller (``normalize_banner``).
         meta[CHAT_BANNER_META_KEY] = banner
+    if knowledge:
+        meta.update(knowledge)
     qid = slot.queue_append(
         message,
         meta=meta,
@@ -1378,6 +1405,10 @@ def queue_for_next_turn(
         directive_channel_origin=directive_channel_origin,
         directive_owner_origin=directive_owner_origin,
     )
+    if queued_work is not None:
+        from kiro_crew.shared_crew import admission_entry as _sc_entry
+
+        _sc_entry.stamp_queued_work(slot, qid, queued_work)
     # Append-only session ledger. The session id comes off the client the running
     # turn published on the slot -- a message is only queued because a turn IS
     # running, so it is there. No turn ordinal: this message belongs to no turn
@@ -1417,12 +1448,14 @@ def queue_for_next_turn(
         push.setdefault("meta", {})["sendId"] = push_identity
     if banner:
         push.setdefault("meta", {})[CHAT_BANNER_META_KEY] = banner
-    state.broadcast_ws("queue_push", push)
+    if knowledge:
+        push.setdefault("meta", {}).update(knowledge)
     # Accepted, and possibly not persisted: the write ceilings refuse an entry
     # past the count cap or the byte budget and the send is still accepted, so
-    # that case is reported at WARNING rather than left silent. It is not a field
-    # on this frame: a caller-visible flag was carried here and read by nothing.
-    warn_if_not_durable(slot._queue, qid, slot.key)
+    # that case is logged at WARNING and drawn on the card this frame makes.
+    if not warn_if_not_durable(slot._queue, qid, slot.key):
+        push.setdefault("meta", {})["durable"] = False
+    state.broadcast_ws("queue_push", push)
     start_queue_persist(state, slot)
     return qid
 
@@ -1432,9 +1465,9 @@ def start_queue_persist(state: "DashboardState", slot: "_ChatSlot") -> None:
 
     Called from both places a prompt is accepted onto a slot queue: the busy-slot
     path in this module, and the sub-agent hold branch in ``chat_api/chat_send``. Both
-    answer the sender a receipt saying whether the entry is durable, so both must
-    start the write that makes it so; a receipt from one path and a write from
-    only the other is the asymmetry this seam exists to prevent.
+    accept a prompt onto the queue, so both must start the write that keeps it; an
+    accept from one path and a write from only the other is the asymmetry this
+    seam exists to prevent.
 
     The prompt's transcript row is written by the DRAIN, so between this accept
     and that drain the queue is the ONLY record of the user's words. Waiting for
@@ -1576,6 +1609,29 @@ def quote_meta(user_meta: dict | None, *, user_origin: bool = True) -> dict[str,
     return {QUOTE_META_KEY: redacted[QUOTE_META_KEY]}
 
 
+def knowledge_meta(meta: object) -> dict[str, dict[str, Any]]:
+    """``{"knowledgeEnvelope": {"len": ..., "hash": ...}}`` for the queue card, or ``{}``.
+
+    Read off a send's ``meta.knowledge.envelope``, or a queue entry's own key.
+    Only the mark, never the knowledge text: the card needs nothing else to find
+    the envelope at the head of the entry's text, and the client checks the mark
+    against that text, so a mark that does not match the edited text hides nothing.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    mark = meta.get(KNOWLEDGE_ENVELOPE_META_KEY)
+    if mark is None and isinstance(meta.get("knowledge"), dict):
+        mark = meta["knowledge"].get("envelope")
+    if not isinstance(mark, dict):
+        return {}
+    length, digest = mark.get("len"), mark.get("hash")
+    if type(length) is not int or not 0 < length <= KNOWLEDGE_ENVELOPE_MAX_LEN:
+        return {}
+    if not isinstance(digest, str) or not 0 < len(digest) <= KNOWLEDGE_HASH_MAX_LEN:
+        return {}
+    return {KNOWLEDGE_ENVELOPE_META_KEY: {"len": length, "hash": digest}}
+
+
 def attachment_meta(user_meta: dict | None) -> dict[str, list[str]]:
     """The attachment lists of a send's ``meta``, reduced to lists of strings.
 
@@ -1676,6 +1732,8 @@ def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:
         view.setdefault("meta", {}).update(quote)
     if banner := banner_meta(item.get("meta")):
         view.setdefault("meta", {}).update(banner)
+    if knowledge := knowledge_meta(item.get("meta")):
+        view.setdefault("meta", {}).update(knowledge)
     # The structural kind tag rides in ``meta`` so the queue card can classify
     # a system entry (an MCP-App message, for one) without parsing its text —
     # the same enqueue-time source the server's own drain reads, and the same
@@ -1697,3 +1755,23 @@ def queue_entry_view(item: dict[str, Any]) -> dict[str, Any]:
     if item.get(RESTORED_QUEUE_KEY):
         view.setdefault("meta", {})["restored"] = True
     return view
+
+
+def queue_view(
+    queue: list[dict[str, Any]], refused: set[str] | None = None
+) -> list[dict[str, Any]]:
+    """The slot-detail ``queue[]`` field: :func:`queue_entry_view` per entry, with
+    ``meta.durable: false`` on each prompt the durable write will not keep. Judged
+    on this read, so a refresh corrects the verdict a ``queue_push`` frame drew.
+
+    A caller rendering a trimmed copy of the queue passes ``refused``, read off the
+    LIVE entries: the writer weighs fields such a copy drops (source channels, the
+    system-entry stamps), so judging the copy would mark the wrong prompts."""
+    snapshot = list(queue)
+    if refused is None:
+        refused = refused_durable_ids(snapshot)
+    views = [queue_entry_view(item) for item in snapshot]
+    for view in views:
+        if view["id"] in refused:
+            view.setdefault("meta", {})["durable"] = False
+    return views

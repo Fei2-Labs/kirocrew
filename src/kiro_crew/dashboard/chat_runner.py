@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib  # noqa: F401
 import functools  # noqa: F401
 import hashlib
@@ -51,7 +52,6 @@ from kiro_crew.acp.client import (
     resolve_pin_spelling,
 )
 from kiro_crew.acp.types import (
-    ACP_BACKENDS_MEMBER_CAPABILITIES,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -80,6 +80,7 @@ from kiro_crew.acp.types import (
 from kiro_crew.acp_backends import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_PROMPT_HANDLER_COMMANDS,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_LOCAL_CLEAR,
     ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
@@ -119,6 +120,7 @@ from kiro_crew.dashboard import chat_turn as _chat_turn
 from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard import engine_fallback as _engine_fallback
 from kiro_crew.dashboard import git_repo_touches as _git_repo_touches
+from kiro_crew.dashboard import trace_binding
 from kiro_crew.dashboard.chat_delivery import COMMANDS_OFF_META_KEY  # noqa: F401
 from kiro_crew.dashboard.chat_delivery import START_BACKGROUND_META_KEY  # noqa: F401
 from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY as _TURN_ACTOR_META_KEY
@@ -128,6 +130,7 @@ from kiro_crew.dashboard.chat_title import title_then_refresh
 from kiro_crew.dashboard.chat_turn.account_identity import (
     _mark_kiro_signed_out,
     _retire_sessions_on_identity_change,
+    install_acquire_identity_check,
 )
 from kiro_crew.dashboard.chat_turn.acp_recovery import (  # noqa: F401
     _binding_rebuild_allowed,
@@ -202,10 +205,12 @@ from kiro_crew.dashboard.chat_turn.queue_drain import (  # noqa: F401
     _start_next_queued_turn,
     drain_idle_parent_queue_for_stall,
     idle_slot_admits_drain,
+    read_tab_notices,
     subagents_hold_user_messages,
 )
 from kiro_crew.dashboard.chat_turn.recipient import (  # noqa: F401
     _authorize_recipient,
+    _recipient_principal,
     _resolve_channel_target,
     _resolve_mirror_target,
 )
@@ -236,7 +241,9 @@ from kiro_crew.dashboard.chat_turn.session_reset import (
 from kiro_crew.dashboard.chat_turn.slash_commands import (  # noqa: F401
     _answer_slash_without_channel,
     _chat_turn_backend,
+    _begin_compact_command,
     _forwards_harness_command,
+    _slash_command_backend,
     _turn_compact_command,
     _turn_slash_gate,
 )
@@ -250,7 +257,11 @@ from kiro_crew.dashboard.chat_turn.stop_recovery import (
     _turn_persist_and_settle,
     _turn_stop_recovery,
 )
-from kiro_crew.dashboard.chat_turn.stream_chunks import _on_text_chunk, _on_thinking_chunk
+from kiro_crew.dashboard.chat_turn.stream_chunks import (
+    _on_text_chunk,
+    _on_thinking_chunk,
+    _release_held_text,
+)
 from kiro_crew.dashboard.chat_turn.tool_approval import (  # noqa: F401
     _auto_approve_reason,
     _on_permission_request,
@@ -271,6 +282,7 @@ from kiro_crew.dashboard.chat_turn.turn_admission import (
     _source_channel_mismatch,
     _turn_admit,
 )
+from kiro_crew.dashboard.chat_turn.turn_context import hand_merge_cards_to_open_twin  # noqa: F401
 from kiro_crew.dashboard.chat_turn.turn_dispatch_gates import (
     _turn_dispatch_gates,
     _turn_dispatch_prep,
@@ -300,6 +312,7 @@ from kiro_crew.dashboard.chat_turn.turn_reply_seams import _flush_thinking_strea
 from kiro_crew.dashboard.chat_turn.turn_spec_hooks import _turn_stop_hook
 from kiro_crew.dashboard.chat_turn.turn_stats import (  # noqa: F401
     _MAX_MODEL_ID_LEN,
+    _broadcast_live_context,
     _context_usage_payload,
     _emit_ttft_metric,
     _on_complete,
@@ -339,6 +352,7 @@ from kiro_crew.dashboard.handlers.usage import (
 )
 from kiro_crew.dashboard.mate_thread_wakes import note_turn_end as _note_mate_wakes
 from kiro_crew.dashboard.poisoned_escalation import POISONED_SESSION_CYCLES  # noqa: F401
+from kiro_crew.dashboard.prompt_handoff import prompt_handed_off
 from kiro_crew.dashboard.recovery_replays import SESSION_NOT_FOUND_CANCELLED_TEXT  # noqa: F401
 from kiro_crew.dashboard.recovery_replays import ReplayFamily
 
@@ -351,7 +365,12 @@ from kiro_crew.dashboard.session_directive_apply import (  # noqa: F401
     apply_session_directive,
     apply_session_directive_outcome,
 )
+from kiro_crew.dashboard.session_health import RAW_FRAME_LOG_LABEL
+from kiro_crew.dashboard.skill_read_ahead import read_beside_claim  # noqa: F401
 from kiro_crew.dashboard.state import (  # noqa: F401
+    _MAX_CONSUMED_MERGE_CARDS,
+    _MAX_CONTEXT_PER_SOURCE,
+    _MAX_PENDING_CONTEXT,
     _MAX_SLOT_MESSAGES,
     CRON_NOTIFY_PREFIX,
     NATIVE_SUBAGENT_DONE_RESULT_CAP,
@@ -362,6 +381,8 @@ from kiro_crew.dashboard.state import (  # noqa: F401
     NATIVE_SUBAGENT_TERMINAL_TTL_SECS,
     DashboardState,
     _ChatSlot,
+    _ConsumedMergeCard,
+    _log_task_exception,
     append_and_surface,
     build_infra_retry_prompt,
     build_stale_recovery_prompt,
@@ -403,6 +424,7 @@ from kiro_crew.llm_helpers import (  # noqa: F401
     first_advertised_fallback,
     probe_fallback_restore,
     provider_last_turn_usage,
+    record_interaction_event,
     run_bg_oneliner,
     slot_switch_session_lock,
     throttle_retry_delay,
@@ -443,6 +465,7 @@ from kiro_crew.providers.base import (
     SessionMcpReport,
 )
 from kiro_crew.repeat_loop import RepeatLoopTracker
+from kiro_crew.runtime_ownership import chat_turn_gate_hold
 from kiro_crew.safety_override import safety_override  # noqa: F401
 from kiro_crew.security import (
     REDACTED_CREDENTIAL_TAG,
@@ -465,13 +488,17 @@ from kiro_crew.session_agent_selection import (  # noqa: F401
     restore_agent_selection,
     session_agent_selection_kind,
 )
+from kiro_crew.slack.code_channels.approval_picker import keep_card as keep_code_channel_card
 from kiro_crew.slack.code_channels.binding import mirror_post_thread as code_channel_post_thread
 from kiro_crew.slack.code_channels.binding import notify_turn_end as notify_code_channel_turn_end
 from kiro_crew.slack.code_channels.binding import (
     notify_turn_start as notify_code_channel_turn_start,
 )
+from kiro_crew.slack.code_channels.worker_approvals import finish as finish_worker_approval
+from kiro_crew.slack.code_channels.worker_approvals import start as start_worker_approval_relay
 from kiro_crew.slack.handler import post_linked_approval
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.tracing import turns as trace_turns
 from kiro_crew.trust_patterns import (  # noqa: F401 -- compatibility re-export
     _mask_quoted_separators,
 )
@@ -612,17 +639,6 @@ _RECIPIENT_LOGGED_CAP = 512
 _name_grant_refusal_off_loop = refusal_for_command_off_loop
 
 
-def _member_capable_backend_names() -> str:
-    """The ``agent.member_acp_backend`` values that can load a member's saved spec.
-
-    Read from :data:`ACP_BACKENDS_MEMBER_CAPABILITIES` so the remedy a refused member
-    chat shows names the set the refusal was judged against. kiro-cli is left out:
-    a member backend set to ``kiro`` runs on KAS, which the list already names.
-    """
-    names = sorted(ACP_BACKENDS_MEMBER_CAPABILITIES - {ACP_BACKEND_KIRO})
-    return ", ".join(names[:-1]) + " or " + names[-1] if len(names) > 1 else names[0]
-
-
 # Global cap on concurrent speculative spawns. Bounds the process/RSS burst
 # when many slots fire signals at once (bulk restore, slot surfing); a spawn
 # that cannot get a permit simply skips — the first message cold-starts as
@@ -715,6 +731,18 @@ def _hands_off_queue_on_exit(
         turn_exit = _TurnExit()
         closing = False
         setup_failed = False
+        # A Dashboard card's turn is registered for its whole length, so the spawn gate
+        # can tell that the parent is one (see card_send.card_turn). Not read off the
+        # session's approval policy: other writers rewrite that.
+        from kiro_crew.dashboard import card_send
+
+        card_mark = (
+            card_send.card_turn(effective_session_key(slot))
+            if kwargs.get("_card_origin") is True
+            else None
+        )
+        if card_mark is not None:
+            card_mark.__enter__()
         try:
             # Shared Crew fair admission for a turn no admitted work started
             # (shared_crew.turn_gate); a pass-through when admission is off.
@@ -740,6 +768,10 @@ def _hands_off_queue_on_exit(
                 setup_failed = not turn_exit.local_command
             raise
         finally:
+            # Released FIRST, before anything that can await: the turn's own work is
+            # over, and a cancel the tail below defers and re-raises must not skip it.
+            if card_mark is not None:
+                card_mark.__exit__(None, None, None)
             if not closing and not turn_exit.handed_off:
                 try:
                     # A cancel landing inside the tail is deferred until the
@@ -877,6 +909,11 @@ async def _run_chat(
     # deactivate a loop whose config advanced since (the A->B->A race that a
     # message-value key could not tell apart). Captured by the fire path.
     _directive_loop_gen: int = 0,
+    # The drained synthetic-recovery entry was queued by a loop's own cycle (marked
+    # by ``_queue_recovery``): that loop's ``(id, config generation)``. It grants no
+    # wake authority; a fault that ends this turn is charged to that loop as its
+    # cycle's. Only the queue drain sets it.
+    _recovered_wake: tuple[str, int] | None = None,
     # The text skill triggers match on a loop's wake, when it is not the
     # message: a plain nudge passes the loop's own message, without the cycle
     # header the fire path prepends. ``None`` matches the turn's own text. Set
@@ -905,6 +942,17 @@ async def _run_chat(
     # before the mirror posted its echo. Set only by the drain, from the entry's
     # ``MIRROR_ECHO_OWED_META_KEY`` stamp, so the replay is echoed once.
     _recovery_echo_owed: bool = False,
+    # The turn runs a Dashboard card's reply (``card_send``): words a page chose, not
+    # words the person typed. It never inherits an auto-approval, so every tool call
+    # it makes reaches the approval card, whatever the thread's trust, trust-reads,
+    # trusted patterns, hook auto-approve list or YOLO say (``_on_permission_request``).
+    # Stamped by ``api_chat``, carried through a recovery requeue by the entry's
+    # ``cardOrigin`` meta, and read by nothing else.
+    _card_origin: bool = False,
+    # The prompt is already in the linked channel conversation (``channel_prompt``):
+    # the mirror does not quote it there again. Stamped by ``api_chat`` and carried
+    # through the queue by the entry's ``promptOnChannel`` meta.
+    _prompt_on_channel: bool = False,
     # Who caused this turn, from the dispatch that knows -- a consumed queue
     # entry's enqueue-time ``kind`` tag, or an injector calling this runner
     # directly. Recorded in the session's log, so it must not be derivable from
@@ -944,12 +992,15 @@ async def _run_chat(
         _directive_self_wake=_directive_self_wake,
         _directive_loop_id=_directive_loop_id,
         _directive_loop_gen=_directive_loop_gen,
+        _recovered_wake=_recovered_wake,
         _skill_trigger_text=_skill_trigger_text,
         _directive_channel_origin=_directive_channel_origin,
         _directive_source_channels=_directive_source_channels,
         _directive_owner_origin=_directive_owner_origin,
         _commands_off=_commands_off,
         _recovery_echo_owed=_recovery_echo_owed,
+        _card_origin=_card_origin,
+        _prompt_on_channel=_prompt_on_channel,
         _turn_actor=_turn_actor,
         regenerate_hint=regenerate_hint,
         _on_consumed=_on_consumed,
@@ -988,10 +1039,40 @@ async def _run_chat(
     # to clear it, and a cut with no text after it leaves nothing to judge.
     _compaction_text_offset = 0
     turn._compaction_text_offset = _compaction_text_offset
+    # The merge-card state below is bound here, after the phases that run
+    # before the outer try and before it, so the phases cut from _run_chat, the
+    # except arms and the finally all read a defined value on every exit. It
+    # lives on the turn, which is the one storage cell those phases and this
+    # frame share.
+    # True only when an empty-response verdict found no productive activity, so
+    # the prompt is still unanswered even if the recovery ladder gives up.
+    turn._empty_verdict_left_prompt_unanswered = False
+    # Merge-card context is consumed once the prompt carrying it has reached the
+    # model's native session and stays there (``_merge_cards_reached_the_model``);
+    # every other exit returns it to the draining slot from ``_turn_record_outcome``
+    # (chat_turn/queue_cycle.py), the first phase of the finally below.
+    turn._drained_merge_contexts = []
+    turn._merge_contexts_completed = False
+    # Whether this turn lands, decided after the stream by _turn_ending_chain;
+    # bound here so the finally reads a defined value on every exit, including
+    # one that never reached the decision.
+    turn._turn_lands = False
+    # What a verbatim replay of this turn re-queues: the message without the
+    # merge-card frames the drain below prepends (``TurnContext.prefix_without_cards``);
+    # ``_queue_recovery`` substitutes it for a requeue of ``message``.
+    _message_without_merge_cards = message
+    turn._message_without_merge_cards = _message_without_merge_cards
+    # This turn's id roots the ACP turns it streams, or joins the run it reports
+    # on (dashboard/trace_binding.py). Awaited before anything below needs undoing:
+    # it binds nothing until its reads are done.
+    _trace_root = await trace_binding.bind_turn(
+        state, slot, getattr(turn, "_recovery_turn_id", ""), top=_prompt_depth == 0
+    )
     # A turn that is not timed (a nested ``/prompts get`` turn shares its outer
     # turn's task and context) hides the open record from every gate and phase
     # it reaches, and gives it back on the way out.
     _timing_hidden = None if _timed else turn_timing.suspend()
+    _turn_gate = contextlib.AsyncExitStack()
     try:
         if _timed:
             turn_timing.mark("admit_start")
@@ -1008,6 +1089,14 @@ async def _run_chat(
         if _timed:
             turn_timing.mark("prompt_built")
 
+        # On a shared chat runtime, take the per-process chat turn gate BEFORE the
+        # dispatch gates, and hold it to the ``finally`` (a null hold otherwise).
+        # Waiting for a co-tenant's turn here means a Stop or a close that lands
+        # during the wait is seen by the checks below, instead of being answered
+        # "idle" while this turn runs once the gate frees. The stream's own gate is
+        # reentrant for this task, and a /compact keeps it through its deferred
+        # receipt, so no co-tenant turn can take this session's ownerless frames.
+        await _turn_gate.enter_async_context(chat_turn_gate_hold(client))
         # No await from here to the stream loop: begin_turn (in _turn_dispatch_gates) and the
         # stream's turn registration stay one yield-free span.
         _flow = await _turn_dispatch_gates(turn)
@@ -1041,14 +1130,23 @@ async def _run_chat(
         if _agent_started:
             event_stream = turn._agent_turn_stream = client.stream_unsolicited()
         elif is_slash:
+            if turn.first_word == "/compact":
+                _begin_compact_command(turn)
             event_stream = client.stream_command(message)
         else:
             event_stream = client.stream(_segment_user_span(turn, full_message))
         if _timed:
             turn_timing.mark("stream_open")
+        # Admission, the session claim, the prompt build and every gate are
+        # behind this turn, so the session's background helpers (title, tags)
+        # cannot delay it from here on: this is the mark they wait for.
+        prompt_handed_off(slot)
         async for event in event_stream:
             if _timed:
                 turn_timing.mark("first_event")
+            # A usage_update moves the counts without an event of its own, so
+            # each event is the chance to show it while the turn runs.
+            _broadcast_live_context(turn)
             if turn._agent_cancel_owed:
                 await _send_owed_agent_cancel(turn, client, event)
             if _ask_the_owed_cancel_answered(turn, event):
@@ -1143,6 +1241,7 @@ async def _run_chat(
             elif event.kind == EVENT_THINKING_CHUNK:
                 await _on_thinking_chunk(turn, event)
             elif event.kind == EVENT_TOOL_CALL:
+                await _release_held_text(turn, before_tool=True)
                 await _on_tool_call(turn, event)
             elif event.kind == EVENT_TOOL_CALL_UPDATE:
                 await _on_tool_call_update(turn, event)
@@ -1165,6 +1264,7 @@ async def _run_chat(
                 continue
             elif event.kind == EVENT_STEER_CONSUMED:
                 await _on_steer_consumed(turn, event)
+                await _release_held_text(turn)
             elif event.kind == EVENT_STEER_DROPPED:
                 await _on_steer_dropped(turn, event)
             elif event.kind == EVENT_COMPACTION_STATUS:
@@ -1232,6 +1332,14 @@ async def _run_chat(
         _escalation = turn._escalation
         message = turn.message
         logger.warning("ACP error in slot %s: [%s] %s", slot.key, type(exc).__name__, exc)
+        # A curated message hides the harness's own frame; log that frame
+        # (already redacted and bounded) on its own line so a diagnostics
+        # bundle carries the cause. Kept off the line above, which the
+        # session-health scanner parses; the scanner skips provider text
+        # inside this record by its label.
+        _raw_detail = getattr(exc, "raw_detail", "")
+        if _raw_detail:
+            logger.warning("%s %s: %s", RAW_FRAME_LOG_LABEL, slot.key, _raw_detail)
         _msg = str(exc)
         turn._msg = _msg
         # Retry-eligible transients:
@@ -1333,6 +1441,9 @@ async def _run_chat(
     except Exception as exc:
         await _on_error(turn, exc)
     finally:
+        with contextlib.suppress(Exception):
+            await _turn_gate.aclose()
+        trace_turns.release_turn_root(_trace_root)
         state.release_turn_heartbeat(turn)
         if _timed:
             # A turn with no visible output (error, stop, tool-only, cancel)

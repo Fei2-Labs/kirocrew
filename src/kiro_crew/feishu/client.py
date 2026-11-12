@@ -4,9 +4,10 @@ Inbound: lark-oapi ``ws.Client`` runs in a daemon thread and pushes
 normalized ``LarkInbound`` frames into the async event loop via
 ``asyncio.run_coroutine_threadsafe``.
 
-Outbound: ``send_reply`` (an answer to an inbound message) and ``send_new``
-(a new message to a person or group) wrap the sync lark-oapi REST API in
-``run_in_executor`` so they never block the event loop.
+Outbound: ``send_reply`` (an answer to an inbound message), ``send_image_reply``
+(an image answering one) and ``send_new`` (a new message to a person or group)
+wrap the sync lark-oapi REST API in ``run_in_executor`` so they never block the
+event loop.
 
 ``lark-oapi`` is an OPTIONAL dependency: it ships in the ``feishu`` extra, and
 is installed on its own with ``pip install 'lark-oapi>=1.4,<2'`` (this project
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import io
 import json
 import logging
 import mimetypes
@@ -217,6 +219,15 @@ def _post_body(content: dict[str, Any]) -> tuple[str, list[tuple[Attachment, str
     ``@_user_N`` placeholder, so mentions and commands read as in a plain
     message. ``img`` and ``media`` nodes become resource references; emoji and
     rules carry nothing to read.
+
+    A file attached alongside the text does NOT ride in ``content`` -- Feishu
+    puts it in a top-level ``files`` array that the published content reference
+    omits. Each entry that is a dict with a key becomes the same ``file``
+    resource a single-file message does, so it runs the identical gates, limits
+    and download path; a folder entry has no key the resource API can fetch, so
+    it is named as unreadable in the same ``[Attachment <name> — <reason>]``
+    line ``ingest_attachments`` uses for a rejection rather than dropped in
+    silence.
     """
     lines = [str(content.get("title") or "")]
     files: list[tuple[Attachment, str]] = []
@@ -239,6 +250,14 @@ def _post_body(content: dict[str, Any]) -> tuple[str, list[tuple[Attachment, str
             elif tag == "media":
                 files += _resource("media", node)
         lines.append("".join(parts))
+    for entry in content.get("files") or ():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("is_folder"):
+            name = str(entry.get("file_name") or "folder")
+            lines.append(f"[Attachment {name} — a folder cannot be fetched here]")
+        else:
+            files += _resource("file", entry)
     return "\n".join(lines).strip(), files
 
 
@@ -424,20 +443,26 @@ class LarkClient:
 
     def _sync_create(self, receive_id_type: str, receive_id: str, text: str) -> None:
         """Blocking REST create; call only from a worker thread."""
+        # ensure_ascii=False for the payload-size reason given in ``_sync_reply``.
+        content = json.dumps({"text": text}, ensure_ascii=False)
+        self._sync_post_create(receive_id_type, receive_id, "text", content)
+
+    def _sync_post_create(
+        self, receive_id_type: str, receive_id: str, msg_type: str, content: str
+    ) -> None:
+        """Blocking REST create of one *msg_type* message; call only from a worker thread."""
         from lark_oapi.api.im.v1 import (  # noqa: PLC0415
             CreateMessageRequest,
             CreateMessageRequestBody,
         )
 
-        # ensure_ascii=False for the payload-size reason given in ``_sync_reply``.
-        content = json.dumps({"text": text}, ensure_ascii=False)
         req = (
             CreateMessageRequest.builder()
             .receive_id_type(receive_id_type)
             .request_body(
                 CreateMessageRequestBody.builder()
                 .receive_id(receive_id)
-                .msg_type("text")
+                .msg_type(msg_type)
                 .content(content)
                 .build()
             )
@@ -449,11 +474,6 @@ class LarkClient:
 
     def _sync_reply(self, message_id: str, text: str) -> None:
         """Blocking REST reply; call only from a worker thread."""
-        from lark_oapi.api.im.v1 import (  # noqa: PLC0415
-            ReplyMessageRequest,
-            ReplyMessageRequestBody,
-        )
-
         # ensure_ascii=False: the default escapes non-ASCII to ``\uXXXX``, which
         # DOUBLES a CJK reply's payload (6 bytes per char) and quadruples an
         # emoji's (12, as a surrogate pair). The splitter bounds the reply in
@@ -461,11 +481,20 @@ class LarkClient:
         # escaped form pushes an ordinary 4000-char Chinese reply past the limit
         # and the API rejects it -- the user receives nothing.
         content = json.dumps({"text": text}, ensure_ascii=False)
+        self._sync_post_reply(message_id, "text", content)
+
+    def _sync_post_reply(self, message_id: str, msg_type: str, content: str) -> None:
+        """Blocking REST reply of one *msg_type* message; call only from a worker thread."""
+        from lark_oapi.api.im.v1 import (  # noqa: PLC0415
+            ReplyMessageRequest,
+            ReplyMessageRequestBody,
+        )
+
         req = (
             ReplyMessageRequest.builder()
             .message_id(message_id)
             .request_body(
-                ReplyMessageRequestBody.builder().content(content).msg_type("text").build()
+                ReplyMessageRequestBody.builder().content(content).msg_type(msg_type).build()
             )
             .build()
         )
@@ -507,6 +536,75 @@ class LarkClient:
             raise RuntimeError(f"Feishu resource download refused: code={resp.code} msg={resp.msg}")
         with open(dest, "wb") as fh:
             shutil.copyfileobj(resp.file, fh)
+
+    async def send_image_reply(self, message_id: str, data: bytes) -> bool:
+        """Reply to *message_id* with *data* as an image message.  True on success.
+
+        Uploads the bytes with ``im.v1.image.create`` (``image_type=message``),
+        then replies ``msg_type=image`` with the returned ``image_key``. A refusal
+        at either step (an app without the ``im:resource`` grant, an image Feishu
+        rejects) is logged and returned as False, never raised.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(self._executor, self._sync_image_reply, message_id, data)
+        except Exception as exc:
+            logger.error("Feishu image reply failed (message_id=%s): %s", message_id, exc)
+            return False
+        return True
+
+    async def send_new_image(self, receive_id_type: str, receive_id: str, data: bytes) -> bool:
+        """Send *data* as a NEW image message to *receive_id*.  True on success.
+
+        The unprompted counterpart of :meth:`send_image_reply`, as
+        :meth:`send_new` is of :meth:`send_reply`: the same upload, then
+        ``im.v1.message.create`` with ``msg_type=image``. A refusal at either step
+        is logged and returned as False, never raised.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                self._executor, self._sync_image_create, receive_id_type, receive_id, data
+            )
+        except Exception as exc:
+            logger.error("Feishu image send failed (%s): %s", receive_id_type, exc)
+            return False
+        return True
+
+    def _sync_image_create(self, receive_id_type: str, receive_id: str, data: bytes) -> None:
+        """Blocking upload + new image message; call only from a worker thread."""
+        image_key = self._sync_upload_image(data)
+        self._sync_post_create(
+            receive_id_type, receive_id, "image", json.dumps({"image_key": image_key})
+        )
+
+    def _sync_image_reply(self, message_id: str, data: bytes) -> None:
+        """Blocking upload + image reply; call only from a worker thread."""
+        image_key = self._sync_upload_image(data)
+        self._sync_post_reply(message_id, "image", json.dumps({"image_key": image_key}))
+
+    def _sync_upload_image(self, data: bytes) -> str:
+        """Blocking ``im.v1.image.create``; returns the image_key or raises."""
+        from lark_oapi.api.im.v1 import (  # noqa: PLC0415
+            CreateImageRequest,
+            CreateImageRequestBody,
+        )
+
+        req = (
+            CreateImageRequest.builder()
+            .request_body(
+                CreateImageRequestBody.builder()
+                .image_type("message")
+                .image(io.BytesIO(data))
+                .build()
+            )
+            .build()
+        )
+        resp = self._lark.im.v1.image.create(req)
+        image_key = getattr(resp.data, "image_key", "") if resp.success() else ""
+        if not image_key:
+            raise RuntimeError(f"Feishu image upload error: code={resp.code} msg={resp.msg}")
+        return str(image_key)
 
     # -- Bot identity --------------------------------------------------------
 
@@ -720,8 +818,20 @@ class LarkClient:
         """
         loop = self._loop
         handler = self._on_message
+        # A closed client delivers nothing: an SDK receiver that outlived its
+        # close() (a reconnect it finished on its own) must not reach the
+        # dispatcher of a channel that was disabled or replaced.
+        if self._closed:
+            return
         if loop is not None and not loop.is_closed() and handler is not None:
-            asyncio.run_coroutine_threadsafe(handler(inbound), loop)
+
+            async def _run_if_open() -> None:
+                # Checked again on the loop: a delivery queued just before
+                # close() started must not run once the client is closed.
+                if not self._closed:
+                    await handler(inbound)
+
+            asyncio.run_coroutine_threadsafe(_run_if_open(), loop)
 
     # -- Lifecycle ----------------------------------------------------------
 
@@ -851,41 +961,54 @@ class LarkClient:
         if identity_task is not None and not identity_task.done():
             identity_task.cancel()
         ws = self._ws_client
-        if ws is not None:
-            stop = getattr(ws, "stop", None)
-            if callable(stop):
-                # A future SDK may expose a synchronous stop. Keep it off the
-                # gateway loop because a wedged peer would otherwise freeze all
-                # tasks and make the caller's timeout ineffective.
+        try:
+            if ws is not None:
+                await self._stop_receiver(ws)
+        finally:
+            # Also when the caller's timeout cancels the wait above: the
+            # executors and the badge must still be released.
+            # Do not wait: an in-flight REST reply must not hold up shutdown.
+            self._executor.shutdown(wait=False)
+            self._download_executor.shutdown(wait=False)
+            # An intentional shutdown is still "not connected" — with no reason,
+            # because nothing failed.
+            self._notify_state(False, "")
+            logger.info("Feishu client closed")
+
+    async def _stop_receiver(self, ws: Any) -> None:
+        """Stop the SDK's receiver: its own ``stop`` when it has one, else its loop."""
+        stop = getattr(ws, "stop", None)
+        if callable(stop):
+            # A future SDK may expose a synchronous stop. Keep it off the
+            # gateway loop because a wedged peer would otherwise freeze all
+            # tasks and make the caller's timeout ineffective.
+            try:
+                await asyncio.get_running_loop().run_in_executor(self._executor, stop)
+            except Exception:
+                logger.debug("Feishu WS stop failed", exc_info=True)
+            return
+        ws_loop = self._ws_loop
+        if ws_loop is None or ws_loop.is_closed():
+            return
+        # lark-oapi 1.x exposes only the private async disconnect used by its own
+        # reconnect path. Disable reconnect before closing, then stop the loop that
+        # blocks in start().
+        if hasattr(ws, "_auto_reconnect"):
+            ws._auto_reconnect = False
+        disconnect = getattr(ws, "_disconnect", None)
+        try:
+            if callable(disconnect) and ws_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(disconnect(), ws_loop)
                 try:
-                    await asyncio.get_running_loop().run_in_executor(self._executor, stop)
+                    await asyncio.wrap_future(future)
                 except Exception:
-                    logger.debug("Feishu WS stop failed", exc_info=True)
-            else:
-                ws_loop = self._ws_loop
-                if ws_loop is not None and not ws_loop.is_closed():
-                    # lark-oapi 1.x exposes only the private async disconnect
-                    # used by its own reconnect path. Disable reconnect before
-                    # closing, then stop the loop that blocks in start().
-                    if hasattr(ws, "_auto_reconnect"):
-                        ws._auto_reconnect = False
-                    disconnect = getattr(ws, "_disconnect", None)
-                    if callable(disconnect) and ws_loop.is_running():
-                        future = asyncio.run_coroutine_threadsafe(disconnect(), ws_loop)
-                        try:
-                            await asyncio.wrap_future(future)
-                        except Exception:
-                            logger.debug("Feishu WS disconnect failed", exc_info=True)
-                    try:
-                        ws_loop.call_soon_threadsafe(ws_loop.stop)
-                    except RuntimeError:
-                        # The disconnect may make a future SDK return from
-                        # start() and close the loop before this signal lands.
-                        pass
-        # Do not wait: an in-flight REST reply must not hold up shutdown.
-        self._executor.shutdown(wait=False)
-        self._download_executor.shutdown(wait=False)
-        # An intentional shutdown is still "not connected" — with no reason,
-        # because nothing failed.
-        self._notify_state(False, "")
-        logger.info("Feishu client closed")
+                    logger.debug("Feishu WS disconnect failed", exc_info=True)
+        finally:
+            # Also when the wait is cancelled: a loop left running reconnects
+            # on its own once the network is back.
+            try:
+                ws_loop.call_soon_threadsafe(ws_loop.stop)
+            except RuntimeError:
+                # The disconnect may make a future SDK return from start() and
+                # close the loop before this signal lands.
+                pass

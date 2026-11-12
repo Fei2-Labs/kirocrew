@@ -25,6 +25,7 @@ from kiro_crew.acp.elicitation import is_elicitation_request
 from kiro_crew.acp.engine_fallback import is_v2_model_fallback
 from kiro_crew.acp.harness_tool_names import (  # noqa: F401
     CLAUDE_READ_ONLY_BUILTINS,
+    CODEX_TOOL_IDS_BY_KIRO_TOOL,
     GOOSE_READ_ONLY_BUILTINS,
     MAX_HARNESS_TOOL_NAME_LEN,
     qualified_harness_tool_id,
@@ -73,6 +74,7 @@ from kiro_crew.acp.types import (  # noqa: F401
 )
 from kiro_crew.acp_backends import (  # noqa: F401
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_PI,
@@ -165,10 +167,14 @@ def attach_kas_custom_agents(
 
     Keys in ``kas_permissions.CREW_ONLY_ENTRY_KEYS`` are dropped here: they are
     Crew's record of what it answers itself at the permission request, not a
-    field the engine defines.
+    field the engine defines. The one that carries the mcp.json reads is applied
+    first, against the ``mcpServers`` array already in *params*
+    (:func:`~kiro_crew.acp.kas_settings_mcp.finish_settings_mcp`).
     """
     if not agents:
         return
+    from kiro_crew.acp.kas_settings_mcp import finish_settings_mcp
+
     meta = params.get("_meta")
     if not isinstance(meta, dict):
         meta = {}
@@ -176,7 +182,9 @@ def attach_kas_custom_agents(
     wire = [
         (
             {
-                **{k: v for k, v in a.items() if k not in CREW_ONLY_ENTRY_KEYS},
+                **{
+                    k: v for k, v in finish_settings_mcp(a).items() if k not in CREW_ONLY_ENTRY_KEYS
+                },
                 "id": kas_wire_agent_id(a["id"]),
             }
             if isinstance(a, dict) and isinstance(a.get("id"), str)
@@ -604,7 +612,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _LAUNCH_SHAPED_WORDS,
         BACKGROUND_LAUNCH_LABELS_MAX,
         CODEX_COMPACTION_TITLE,
+        NATIVE_COMPACTION_CANCELLED,
+        NATIVE_COMPACTION_STATES_MAX,
         BackgroundLaunchRecord,
+        NativeCompactionStates,
         _is_launch_shaped,
         _printable_launch_label,
         _service_error_detail,
@@ -612,6 +623,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         parse_background_launch,
         parse_claude_compaction_notice,
         parse_codex_compaction_update,
+        parse_native_compaction_update,
         prompt_is_adapter_command,
         unattributed_terminal_error,
         unrecognised_background_launch,
@@ -632,8 +644,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         STRANDS_SIDE_READ_ONLY_REFUSAL,
         StrandsCallIdentity,
         _anchored_in_workspace,
+        _envelope_mcp_owner,
         _is_kas_remote_builtin,
+        _pi_connection_identity,
         _workspace_call_arguments,
+        bridged_title_identity,
         build_permission_event,
         claude_mcp_identity,
         gate_envelope,
@@ -677,6 +692,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.acp._dispatch_parts.tool_call_identity import (  # noqa: F401
         _ACP_SHELL_KIND,
         _CODEX_MCP_TOOL_CALL_MARKER,
+        _CODEX_WEB_SEARCH_INPUT_TYPE,
         _HARNESS_TOOL_ID_RE,
         _MAX_HARNESS_TOOL_ID_LEN,
         _MCP_IDENTITY_META_CHANNELS,
@@ -690,10 +706,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _permission_tool_id,
         _str_field,
         classify_tool_call,
+        codex_tool_name,
         harness_tool_name,
         is_shell_kind,
         meta_builtin_server_names,
         meta_builtin_shell,
+        stated_harness_tool_name,
     )
     from kiro_crew.acp._dispatch_parts.tool_call_provenance import (  # noqa: F401
         LIVENESS_DIGEST_PREFIX,
@@ -796,7 +814,13 @@ def parse_usage_update(update: dict[str, Any]) -> tuple[int | float | None, int 
                 used = nested.get("used")
             if size is None:
                 size = nested.get("size")
-    return _token_count(used), _token_count(size)
+    used, size = _token_count(used), _token_count(size)
+    # A negative count is no reading: it would make context_pct negative, which
+    # every metadata path clamps out, and a reader keyed on the 0-100 range
+    # (Telegram's context gauge) has no bucket for it.
+    if used is not None and used < 0:
+        used = None
+    return used, size
 
 
 def parse_usage_cost(update: dict[str, Any]) -> float | None:

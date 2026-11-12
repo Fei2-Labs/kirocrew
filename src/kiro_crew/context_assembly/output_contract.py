@@ -3,7 +3,8 @@
 The critical-rules block is the dashboard and channel assistant's own output contract:
 diff blocks for file changes (selected per runtime by :func:`_critical_rules_for`, from
 the same trusted resolution that names the ``[RUNTIME]`` line), the ``[OPTIONS: ...]``
-footer and the absolute-path and link rules. Both variants are fixed module constants,
+footer, the absolute-path and link rules, and the rule to ask a person only when
+human involvement is truly required (in every variant). Both variants are fixed module constants,
 never templated, so the marker-neutralization prefix check and the tests can treat
 "a critical-rules block" as one of two strings. The ``[UI LANGUAGE]`` block steers the
 language of tool-call purpose text to the configured dashboard language, admitted only
@@ -81,8 +82,13 @@ def normalize_ui_language_tag(value: object, *, source: str = "language") -> str
     return tag
 
 
-def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
+def _build_ui_language_section(cfg: "KiroCrewConfig", *, frame_delivered: bool = False) -> str:
     """Build the [UI LANGUAGE] block from ``dashboard.language``.
+
+    ``frame_delivered`` is whether this session receives the [RESPONSE
+    PREFERENCES] frame (``_response_preferences_apply``). Only then may the
+    reply sentence defer to it; a sub-agent never gets the frame, so it keeps
+    the follow-the-user sentence. Defaults to False, the old sentence.
 
     Tool-call purpose text is model prose that renders as UI chrome: the
     dashboard's tool-call pill label and the messaging renderers' task title.
@@ -123,10 +129,27 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
         "(as on a shell tool), so the tool-call timeline and the task titles "
         "derived from it read in one language instead of two.\n"
         "This applies ONLY to that tool-call purpose text. Your replies to the "
-        "user keep following the language the user writes in, and code, "
+        f"user {_reply_language_clause(cfg, frame_delivered)}, and code, "
         "identifiers, paths, and log output stay verbatim.\n"
         "[End of UI language]\n\n"
     )
+
+
+def _reply_language_clause(cfg: "KiroCrewConfig", frame_delivered: bool) -> str:
+    """Where the [UI LANGUAGE] block says replies take their language from.
+
+    A set ``dashboard.preferred_language`` puts the reply language in the
+    [RESPONSE PREFERENCES] frame, so where that frame is delivered this block
+    must not also tell the model to follow the message's language: two
+    disagreeing rules in one context is the switching the setting exists to
+    stop. Unset, or in a session without the frame, replies follow the user.
+    """
+    from kiro_crew.config.sections import PREFERRED_LANGUAGES
+
+    code = getattr(getattr(cfg, "dashboard", None), "preferred_language", "")
+    if frame_delivered and isinstance(code, str) and code in PREFERRED_LANGUAGES:
+        return "take their language from [RESPONSE PREFERENCES]"
+    return "keep following the language the user writes in"
 
 
 # Critical rules reinforced every session (supplements the system prompt).
@@ -193,6 +216,20 @@ _LIVE_STATE_RULE = (
 )
 
 
+# Every variant carries this rule, so every Crew agent (conductor, worker, Bot,
+# Ultra Mode, sub-agent) gets it from this one place.
+_ASK_ONLY_WHEN_NEEDED_RULE = (
+    "Ask a person only when human involvement is truly required. When you have a "
+    "clear recommendation, act on it and report what you did. Ask only when the "
+    "step (a) needs credentials, a sign-in or a permission only they can grant, "
+    "(b) spends money or meaningful quota, (c) cannot be undone or deletes or "
+    "overwrites someone else's work, (d) turns on a real preference you cannot "
+    "infer and a wrong guess is costly, or (e) the person explicitly asked to "
+    "decide it. Otherwise pick the default, state it as an assumption, and "
+    "continue. Never stop work just to confirm a plan that is already approved.\n"
+)
+
+
 _CRITICAL_RULES_TAIL = (
     "When referencing file paths in your response, ALWAYS use the absolute path "
     "inside inline `code` backticks (e.g. `/home/user/project/src/main.py`). "
@@ -240,10 +277,14 @@ _CRITICAL_RULES_TAIL = (
 
 # Every variant stays a fixed module constant, never templated: the
 # marker-neutralization prefix check matches _CRITICAL_RULES_VARIANTS exactly.
-_CRITICAL_RULES = _CRITICAL_RULES_HEAD + _DIFF_RULE_DASHBOARD + _CRITICAL_RULES_TAIL
+_CRITICAL_RULES = (
+    _CRITICAL_RULES_HEAD + _ASK_ONLY_WHEN_NEEDED_RULE + _DIFF_RULE_DASHBOARD + _CRITICAL_RULES_TAIL
+)
 
 
-_CRITICAL_RULES_CHANNEL = _CRITICAL_RULES_HEAD + _DIFF_RULE_CHANNEL + _CRITICAL_RULES_TAIL
+_CRITICAL_RULES_CHANNEL = (
+    _CRITICAL_RULES_HEAD + _ASK_ONLY_WHEN_NEEDED_RULE + _DIFF_RULE_CHANNEL + _CRITICAL_RULES_TAIL
+)
 
 
 # A sub-agent's reply is read by the parent agent that spawned it, not drawn in
@@ -253,6 +294,7 @@ _CRITICAL_RULES_CHANNEL = _CRITICAL_RULES_HEAD + _DIFF_RULE_CHANNEL + _CRITICAL_
 # absolute paths, and the gender rule.
 _CRITICAL_RULES_SUBAGENT = (
     _CRITICAL_RULES_HEAD
+    + _ASK_ONLY_WHEN_NEEDED_RULE
     + "Your reply goes to the agent that started you, not to a person in a chat "
     "UI. Do not add [OPTIONS: ...] lines, <!-- keep-visible --> markers or other "
     "UI markup.\n"

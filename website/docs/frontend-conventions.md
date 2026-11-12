@@ -97,6 +97,9 @@ Other shared modules:
   constrain the text column's height while reserving room for the hand-off.
   `messagePlacement` is `'beside'` by default; `'below'` puts the raw message on
   its own line under a plain-language `title`, and is ignored without a `title`.
+  `actionPlacement="below-on-phone"` puts the hand-off under the message only
+  below `sm` and beside it from `sm` up, in both variants, so a notice that
+  spans a settings card keeps its sentence the row's width on a phone.
 - `Clickable.tsx` (accessible clickable div; see below)
 - `SegmentedControl.tsx` (sliding pill, Framer Motion) — see the switcher rule below.
   It is a WAI-ARIA radiogroup: each segment is `role="radio"` with `aria-checked`
@@ -113,6 +116,10 @@ Other shared modules:
 - `InfoTip.tsx` (the one help-tip pattern: hover or focus reveals, click or tap
   pins, Escape dismisses, and the tip text is the glyph's accessible
   description — see [below](#help-text-description-or-infotip)),
+  `TruncatedText.tsx` (one line cut off with an ellipsis whose full text shows
+  in an `InstantTip` on hover and on keyboard focus; use it instead of
+  `truncate` plus a native `title`, which the macOS desktop app often does not
+  paint and no browser shows on focus),
   `MarkdownRenderer.tsx` (the markdown renderer, with highlight.js
   syntax highlighting; its owners are mapped [below](#the-markdown-renderer)),
   `TypewriterText.tsx`
@@ -223,6 +230,7 @@ and every other concern has one owner under `components/markdown/`.
 | `MarkdownRenderer.tsx` | the ordered remark and rehype chains, and the parser built from them that the source repairs read (`AUTOLINK_PARSER`); `MD_COMPONENTS`, the element-to-renderer map, with the fence `code` override and the link overrides `MdAnchor` / `MdParagraph`; the per-block source passes and their order (`MarkdownBlock`); fence dispatch (`BlockRenderer`); the root component and its providers |
 | `markdown/contexts.ts` | every context the pipeline's modules share, each created once; the facade re-exports the six public ones (`MediaApprovedCtx` stays private to `markdown/remoteMedia.tsx`, which both provides and reads it) |
 | `markdown/linkTargets.ts`, `markdown/pathReferences.ts` | what a link or code span points at: artifact routes, unfurl eligibility, open sessions, sidebar folder paths (folder-chip resolution); path candidates, `file:line` suffixes, probe resolution and activation |
+| `markdown/linkAddressTip.tsx` | a link's address bubble: which links show their address (`linkAddress`), the hover pause, and stepping aside for an app's link-preview card |
 | `markdown/sanitize.ts` | the tag and attribute allowlist (`rehypeSanitize`) and `remarkVerbatimUnknownTags` |
 | `markdown/treeTransforms.ts` | fenced-code marking, block unwrapping, soft breaks, source positions, position-stable root keys |
 | `markdown/streamingEffects.ts` | the streaming tail's glow, reveal and caret |
@@ -264,6 +272,7 @@ so the panel's effects keep one order.
 |---|---|
 | `MarkdownPanel.tsx` | `Props`, the panel and its two layouts (side panel, full screen), the edit, save, close and navigate guards, comment drafts and their anchor highlight, the line reveal |
 | `MarkdownPanelHeader.tsx` | the header's controls: the breadcrumb, the artifact and knowledge toggles, the ⋯ menu |
+| `markdownPanelPrint.ts` | the ⋯ menu's Print or save as PDF: the live preview marked for the print stylesheet in `sidebar-and-side-panel.css`; Pierre's code wraps on paper through `PIERRE_PRINT_WRAP_CSS` (`pierre/config.ts`) |
 | `useMarkdownPanelFileState.ts` | the file's knowledge-library and artifact-library state |
 | `MarkdownPanelBody.tsx` | the body's blocks: comment hint, missing-file banner, empty-diff notice, diff view, comment overlay, find bar |
 | `markdownPanelSourcePos.ts` | where a selection sits in the source (`resolveSourcePos`, `findCoords`) |
@@ -384,12 +393,14 @@ component moved whole, so each one registers its hooks in its BASE order.
 | `remoteCrewPanelModel.ts` | launch-job predicates, the remembered launch-form keys, the size tiers, the sign-in failure sentences |
 | `RemoteCrewPanelLaunch.tsx` | the setup tab's size, provisioner and prerequisite cards, the launch progress card, the sign-in block |
 | `RemoteCrewPanelCrewRow.tsx` | one crew row (badges, lifecycle actions, inline edit) and the fargate turn-API URL field |
+| `RemoteCrewPanelRestartBanner.tsx` | the "on, but not active yet" banner and its gateway restart button |
 
 The edges between owners are `SecurityPanelTailnet.tsx` to `SecurityPanelPosture.tsx`,
 `SecurityPanelGovernance.tsx` to `SecurityPanelDeniedCommands.tsx`,
 `SecurityPanelDeniedCommands.tsx` to `SecurityPanelTrust.tsx`, and the two Remote Crew
 component owners to `remoteCrewPanelModel.ts` (with `RemoteCrewPanelCrewRow.tsx` to
-`RemoteCrewPanelLaunch.tsx` for the sign-in block). Unlike the panels above, these
+`RemoteCrewPanelLaunch.tsx` for the sign-in block, and `RemoteCrewPanelRestartBanner.tsx`
+to `RemoteCrewPanelCrewRow.tsx` for the banner id Connect names). Unlike the panels above, these
 owners keep their own Settings* primitives and settings-search anchors: each `.tsx`
 owner is mapped to its facade's tab in `PANEL_TAB_MAP`
 (`website/scripts/settingsExtract.ts`), so the extractor and the manual-anchor check
@@ -607,6 +618,23 @@ href resolves to the current page — matching `md-notebook/Preview.tsx`'s
 `href ? <a …> : <span>` trade. A test that pins an anchor existing for a
 destination the transform rejects is pinning a defect.
 
+The inert label is not silent in the chat renderers (`MdAnchor` and Mochi's
+`ChatPanelMarkdown`): it wears a muted dotted underline built from existing
+tokens, and the generic reason `components.markdownRenderer.refused_link_destination`
+as its hover `title` and as visually-hidden text, so touch, keyboard and
+screen-reader users get it too. In `MdAnchor` that text is a `::after`
+pseudo-element fed from `data-refused-reason`, never a text node, so the
+label's DOM text stays what the source renders (inline commenting's
+`resolveSourcePos` aligns text nodes against the source span) and a copied
+message carries no reason; Mochi, which has no stylesheet for it, uses an
+unselectable visually-hidden span. The reason never names the destination. The
+cue covers every input that reaches the guard: the `''` sentinel, an href the
+sanitizer deleted (`javascript:`, `data:`), and a raw `<a>` with no href, which
+arrives in the same absent shape. A named in-page anchor (`name` or `id`) and
+an anchor with no content are targets, not links, and keep the plain span
+(`components/markdown/refusedLinkCue.ts`). `md-notebook/Preview.tsx` is not a chat
+renderer and keeps the plain span.
+
 One deliberate, key-scoped exception exists: a Windows absolute path
 (`WINDOWS_ABS_PATH_RE` — a drive-letter path) is passed through **for image
 `src` only**, because `defaultUrlTransform` parses `C:` as an unknown scheme and
@@ -681,7 +709,9 @@ parameters a fetch varies on, so a stale entry cannot serve a different subject.
 Real-time updates arrive on a single WebSocket at `/api/ws`, read through
 `useWebSocket`, which reconnects with capped exponential backoff (1s doubling to a
 10s ceiling) and re-fetches state through Redux on reconnect instead of reloading
-the page.
+the page. The slot list is the exception: the new socket's connect snapshot
+carries it, so the reconnect catch-up reads it over HTTP only when that snapshot
+is empty or does not come (`createReconnectSnapshotWait` in `reconnectCatchUp.ts`).
 
 `src/hooks/useWebSocket.ts` is the composition point and the only import path:
 it holds the frame routing table (one `case` per frame type), the silence
@@ -915,9 +945,9 @@ files own it:
     the focus rings and the swatch hover cue. Strays: table striping, the
     follow-up chip width cap, the skill-load heading sizes and the highlight.js
     colours.
-  - `sidebar-and-side-panel.css` owns session and folder rows, the list dock and
-    the side-panel tab strip. Strays: the inline lucide icon size and the
-    panel-icon pane morph.
+  - `sidebar-and-side-panel.css` owns session and folder rows, the list dock,
+    the side-panel tab strip and the file preview's print layout. Strays: the
+    inline lucide icon size and the panel-icon pane morph.
   - `highlights-and-page-zoom.css` owns search, find and comment highlights and
     the coarse-pointer rules that stop page zoom. Strays: the artifact toolbar
     button heights and the mobile sessions-drawer width.
@@ -1055,7 +1085,11 @@ path with unchanged ranges folded. The content limit is measured in JavaScript U
 code units rather than encoded bytes so the guard stays allocation-free while an
 editor changes. Editable live diffs use the same
 predicate and degrade to the ordinary editable file surface rather than becoming
-read-only. Do not duplicate or weaken the limits at call sites.
+read-only; the editor reports that drop through `onLiveDiffDegraded`, and a
+Files panel tab in diff mode then shows a clean buffer's read-only diff view in
+its place. There, and only on the visible tab, the pair starts its worker diff
+without the click (`autoLineByLine`); chat file cards and the Turn Diff tab stay
+click-to-start. Do not duplicate or weaken the limits at call sites.
 
 ## Typography scale
 
@@ -1095,6 +1129,13 @@ against `location.pathname` only, so a multi-segment, query, or hash route would
 register and then never resolve. The same constraint and the reasoning behind it
 are in [extension-seams](extension-seams.md), which covers registering routes and
 icons from a downstream edition instead of editing the seed maps.
+
+A builtin page still renders while its app is off, and the app's proxied API
+(`/apps/<name>/api/*`) then refuses every call with `code: "app_not_enabled"`.
+Throw `toApiError` from the page's fetch helpers so the code survives, test it
+with `isAppNotEnabledError` (`src/api/apiError.ts`), and show the disabled-app
+copy (`components.appHost.this_app_is_disabled`) with a way to Apps instead of
+the call's error. File Explorer and Workflows do this.
 
 ## Crew capability drafts
 

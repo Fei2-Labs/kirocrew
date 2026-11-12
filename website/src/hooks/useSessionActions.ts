@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '../api/client'
-import { apiErrorCode, isSlotCapError } from '../api/apiError'
+import { apiErrorCode, isSlotCapError, slotAttachedDetail } from '../api/apiError'
 import { store, useAppDispatch } from '../store'
 import type { MuteFlag } from '../store/dashboardSlice'
 import { captureForkOrigin, deleteSlot, forkMayOpen, forkOpenSettled, forkOpenStarted, listForkedSlot, requestSlotFolderOpen, switchSlot } from '../store/chatSlice'
@@ -113,8 +113,9 @@ export interface SessionActions {
   toggleMutesOpened: (slotKey: string) => void
   /** Toggle the per-row mute of this session. */
   toggleMuted: (slotKey: string) => void
-  /** Copy the session's share link. */
-  copyLink: (slotKey: string) => void
+  /** Copy the session's share link. Resolves whether the link reached the
+   *  clipboard, so the menu can confirm it or say that it did not. */
+  copyLink: (slotKey: string) => Promise<boolean>
   /** Move to a folder (or root for null) — shared optimistic move + rollback. */
   move: (slotKey: string, folderId: string | null) => void
   /** Relaunch the slot's agent process in place (fresh MCP servers/env, conversation preserved). */
@@ -429,14 +430,15 @@ export function useSessionActions(mode?: string, opts?: {
   // feature exists to fix. alert() is the always-available surface (the
   // dashboard has no global toast); the copy branches on the backend's
   // machine-readable code, because "try again when the session is idle" is a
-  // dead end for a slot that LOOKS idle but has sub-agents still working.
+  // dead end for a slot that LOOKS idle but has sub-agents still working, and the
+  // sub-agent copy names the runs and queued spawns keeping it attached.
   const reloadMutation = useMutation({
     mutationFn: (slot: string) => api.chatSlotReload(slot),
     onError: (err) => {
       const body = err instanceof ApiError ? err.body : ''
-      alert(i18nT(body.includes('slot_subagents_running')
-        ? 'hooks.useSessionActions.reload_failed_subagents'
-        : 'hooks.useSessionActions.reload_failed'))
+      alert(body.includes('slot_subagents_running')
+        ? [i18nT('hooks.useSessionActions.reload_failed_subagents'), slotAttachedDetail(body)].filter(Boolean).join('\n')
+        : i18nT('hooks.useSessionActions.reload_failed'))
     },
   })
 
@@ -487,7 +489,7 @@ export function useSessionActions(mode?: string, opts?: {
 
   const copyLink = useCallback((slotKey: string) => {
     const slot = store.getState().dashboard.slots.find(s => s.key === slotKey)
-    copySessionLink(slotKey, slot?.title, undefined, mode)
+    return copySessionLink(slotKey, slot?.title, undefined, mode)
   }, [mode])
 
   const move = useCallback((slotKey: string, folderId: string | null) => {

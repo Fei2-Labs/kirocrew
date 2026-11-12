@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         SUBAGENT_COMPLETION_PREFIX,
         Any,
         GatewayOrchestrator,
+        HostSpawnDecision,
         LLMEvent,
         SubagentDelivery,
         SubagentEventCoalescer,
@@ -329,7 +330,10 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
     assert self.ctx_builder is not None
 
     def _is_yolo() -> bool:
-        return safety_override().is_active()
+        # ``gateway --approval yolo``'s grant is the dashboard's only: a dashboard
+        # parent passes it on through its stored session policy instead.
+        so = safety_override()
+        return so.is_active() and so.is_cli_launch is not True
 
     def _spawn_slot_resolver(request_id: str) -> str:
         """Resolve slot from spawn request_id (spawn:{agent_id})."""
@@ -354,19 +358,25 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
     # unreachable behaviour. It is a separate closure because the one above is
     # also wired as ``on_tool_approval``: a mid-run tool prompt has no
     # terminal path that could report the refusal, so raising there would turn
-    # a recoverable park into a lost turn.
+    # a recoverable park into a lost turn. It also reports the answers it gave
+    # with nobody asked, keyed by the request's unique ``spawn:<id>``.
+    _host_decided: dict[str, str] = {}
     _approve_spawn_gate = self._interactive_approval(
-        "subagent", slot_resolver=_spawn_slot_resolver, raise_when_unreachable=True
+        "subagent",
+        slot_resolver=_spawn_slot_resolver,
+        raise_when_unreachable=True,
+        on_host_decision=_host_decided.__setitem__,
     )
 
     async def _spawn_approve(
         request_id: str, description: str, parent_session_key: str = ""
-    ) -> bool:
+    ) -> bool | HostSpawnDecision:
         # Channel-side delivery FIRST. A spawn parented on
         # a live channel conversation (Telegram, …) is best answered where the
         # human already is, with that channel's own Approve/Deny/Trust
         # keyboard. The seam returns True/False when the channel surfaced the
-        # prompt and got a press; None means no channel hook owns this session,
+        # prompt and got a press, a HostSpawnDecision when the prompt's wait
+        # elapsed unpressed; None means no channel hook owns this session,
         # or the hook could not surface it here — either way, fall through to
         # the unchanged Slack-DM/dashboard gate below (which still raises
         # SpawnApprovalUnreachable when no surface is attached).
@@ -374,7 +384,9 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
         if channel_decision is not None:
             return channel_decision
         event = LLMEvent(kind="permission_request", request_id=request_id, title=description)
-        return await _approve_spawn_gate(event, parent_session_key)
+        approved = await _approve_spawn_gate(event, parent_session_key)
+        cause = _host_decided.pop(request_id, None)
+        return approved if cause is None else HostSpawnDecision(approved, cause)
 
     # Debounced slots push: keep slots[].subagents_running and
     # slots[].subagents_queued live for every
@@ -426,6 +438,17 @@ def _init_subagents(self: GatewayOrchestrator) -> None:
             return
         slot_name = _event_slot(info.parent_session_key)
         base = {"id": info.id, "slot": slot_name}
+        # A nested run's cards draw in the tab its spawn tree started from. Its
+        # parent's queued depth and wave start stay on the parent's own slot, the
+        # one the slot list sums and ``batch_finished`` names. (Type guard: test
+        # doubles pass MagicMock infos.)
+        _root = getattr(info, "root_session_key", "")
+        if (
+            isinstance(_root, str)
+            and _root
+            and etype not in ("subagent_queued", "spawn_batch_started")
+        ):
+            base["slot"] = _event_slot(_root)
         # Batch identity rides every frame when present so the UI can
         # group/aggregate a wave without a lookup table. (Type guard:
         # test doubles pass MagicMock infos.)

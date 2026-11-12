@@ -38,6 +38,7 @@ ASSEMBLERS: tuple[str, ...] = (
     "dashboard/goal_setup.py",
     "dashboard/mate_thread_wakes.py",
     "dashboard/mate_welcome.py",
+    "dashboard/stale_wake.py",
     "mate_upgrade_notice.py",
     "mate_capability_catalog.py",
     "dashboard_agentic.py",
@@ -144,7 +145,7 @@ def test_no_sentence_of_a_piece_is_left_as_a_literal(rel: str) -> None:
 
 #: The server modules whose tools only a crewmate is given.
 _CREWMATE_SERVERS: tuple[str, ...] = (
-    "mcp_mate.py",
+    "mcp_mate_tool_list.py",
     "mcp_panel.py",
     "mcp_crew_log.py",
     "mcp_work.py",
@@ -165,6 +166,7 @@ _EXEMPT: dict[str, str] = {
     "work_brief": "a worker's tool (mcp_work.WORKER_TOOLS), never the conductor's",
     "work_report": "a worker's tool (mcp_work.WORKER_TOOLS), never the conductor's",
     "work_ledger_rebuild": "repairs a damaged or missing ledger, not part of the ordinary loop",
+    "accept_eval": "named by the act-by-status rule, rendered only with the ledger (see below)",
     "offer_dashboard_page": (
         "named by its per-turn note (dashboard/page_offer.py), which is the only time "
         "the crewmate may call it"
@@ -320,7 +322,12 @@ def test_the_worker_hands_a_blocked_command_back_for_the_user() -> None:
 # -- ledger tracking and the gated patrol, only where the ledger is mounted ---- #
 
 #: What the patrol text must name, and what a render without the ledger must not.
-_PATROL_MARKS = ('watch="work-ledger"', "300..900", "patrol_budget.py renew")
+_PATROL_MARKS = (
+    'watch="work-ledger"',
+    "every 300 seconds",
+    "7-day runaway backstop",
+    "ONE final report",
+)
 #: The ledger verbs the tracking sentence names only where they are mounted.
 _LEDGER_TOOLS = ("work_ledger_record", "work_ledger_read", "work_ledger_rebuild")
 
@@ -340,8 +347,42 @@ def test_the_patrol_piece_names_the_gated_ledger_watch_band_and_renewal() -> Non
         text.index("4. `session_send`"),
     ]
     assert order == sorted(order)
-    # A quick single task keeps the report flow.
-    assert "[Worker report] stays your patrol" in text
+    # Every dispatched task is an item, a single one too, with a goal only for
+    # work with more than one item; the refused-arm fallback stays.
+    assert "a single task too" in text
+    assert "a single task needs no goal" in text
+    assert "needs no item" not in text
+    assert "the [Worker report] turns stay your patrol" in text
+
+
+def test_both_conductors_send_one_final_report_before_they_stop_the_patrol() -> None:
+    """Bot and Ultra Mode end a patrol the same way: the final report first, the stop
+    in a later step, and no bound for the model to pick (rfc-permanent-patrol.md)."""
+    from kiro_crew import agent
+    from kiro_crew.context_assembly import member
+
+    bot = " ".join(member.ledger_rules_block("conductor.patrol").split())
+    root = " ".join(agent._CONDUCTOR_SYSTEM_PROMPT.split())
+    for text in (bot, root):
+        report = text.index("First send the user ONE final report")
+        stop = text.index("Then, in a later step, stop the loop with `autonudge_stop`")
+        assert report < stop
+        assert "The final report is your last message to the user." in text
+        assert "Pass no `interval_secs`, no `max_cycles` and no `max_runtime_secs`" in text
+        assert "mode=renew" not in text
+    assert "stop the loop with monitor_stop" not in bot
+
+
+def test_the_ledger_tracking_sentence_tracks_every_dispatched_task() -> None:
+    mounted = crewmate_prompts.text("conductor.tracking_ledger")
+    assert "Every task you hand to a worker" in mounted
+    assert "more than one item" not in mounted
+
+
+def test_the_worker_reads_its_brief_and_reports_on_its_item() -> None:
+    text = crewmate_prompts.text("worker.principles")
+    assert "Call work_brief first" in text
+    assert "report on it with work_report" in text
 
 
 def test_the_tracking_sentence_without_the_ledger_names_no_ledger_tool() -> None:
@@ -489,6 +530,7 @@ def test_a_binding_whose_chat_spec_cannot_be_read_has_no_ledger(
     monkeypatch.setattr(member_mate_tools, "_chat_spec", boom)
     assert member_mate_tools.binding_has_ledger_tools(object()) is False
     assert member_mate_tools.binding_has_ledger_tools(None) is False
+    assert member_mate_tools.member_has_ledger_tools("no-such-bot") is False
 
 
 def test_the_ledger_preview_fixture_renders_the_patrol_cleanly() -> None:

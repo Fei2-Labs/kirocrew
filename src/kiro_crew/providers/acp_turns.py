@@ -93,10 +93,20 @@ def _to_llm_event(e: Any) -> LLMEvent:
         tool_identity_trusted=e.tool_identity_trusted,
         mcp_identity_trusted=e.mcp_identity_trusted,
         mcp_identity_unreadable=e.mcp_identity_unreadable,
+        # The check that set the flag above; dropping it leaves a flagged event
+        # with no reason.
+        mcp_identity_unreadable_reason=e.mcp_identity_unreadable_reason,
+        # Dropping this lets an ambiguous MCP identity fall through to the
+        # per-tool deny/title checks it must refuse outright on this surface.
+        mcp_identity_ambiguous=e.mcp_identity_ambiguous,
         kas_builtin_ids=e.kas_builtin_ids,
+        # Dropping it hides the reason box on a KAS card, and the reason with it.
+        takes_rejection_reason=e.takes_rejection_reason,
         # Dropping this would leave every spec-granted KAS built-in prompting on
         # this surface: the gate's spec-builtin-grant row reads it.
         spec_granted_builtins=e.spec_granted_builtins,
+        # Same row: dropping this would leave every hook-held MCP grant prompting.
+        spec_hook_held=e.spec_hook_held,
         # Same row: dropping this would leave every allowedCommands match prompting.
         spec_granted_commands=e.spec_granted_commands,
         # Dropping this would let a `denyByDefault` spec's unlisted command run on
@@ -106,6 +116,15 @@ def _to_llm_event(e: Any) -> LLMEvent:
         # spec-write-allowlist row reads this.
         spec_write_allowlist=e.spec_write_allowlist,
         spec_write_cwd=e.spec_write_cwd,
+        # Same row as spec_granted_builtins, with the denies it is checked against.
+        spec_denied_grant=e.spec_denied_grant,
+        # Dropping this would refuse a read-only command an `autoAllowReadonly`
+        # spec runs under `denyByDefault`: the spec-shell-allowlist row reads it.
+        spec_shell_readonly=e.spec_shell_readonly,
+        # Dropping this would leave every allowedPaths write prompting: the
+        # gate's spec-builtin-grant row reads it.
+        spec_granted_paths=e.spec_granted_paths,
+        spec_granted_read_paths=e.spec_granted_read_paths,
         # Dropping this would let a native KAS sub-agent's call inherit the
         # parent's in-session deny overrides on this surface.
         native_child_call=e.native_child_call,
@@ -247,19 +266,28 @@ async def _readmit_cloud_session(provider: AcpProvider, scope: tuple[str, str, s
 
 
 async def stream(
-    self: AcpProvider, message: str, timeout: float | None = None, *, allow_image: bool = True
+    self: AcpProvider,
+    message: str,
+    timeout: float | None = None,
+    *,
+    allow_image: bool = True,
+    prompt_gate: Callable[[], None] | None = None,
 ) -> AsyncIterator[LLMEvent]:
+    """Send *message*; ``prompt_gate`` is called under the write lock, right
+    before the prompt is written."""
     ask, self._sign_in_ask = getattr(self, "_sign_in_ask", ""), ""
     # The direct client can respawn in ensure_ready; resolve that BEFORE
     # comparing receipts so a recycled conversation receives the full text.
     await self._ready_confirmed_session()
     stale_compaction.sync_provider_compaction_delivery(self, self.essential_delivery)
     send = self._client.stream_events
-    if ask:
+    if ask or prompt_gate is not None:
         from kiro_crew.acp.session_provider import AcpSessionProvider
 
         if isinstance(self._client, AcpSessionProvider):
-            send = functools.partial(self._client.stream, sign_in_ask=ask)
+            send = functools.partial(self._client.stream, sign_in_ask=ask, prompt_gate=prompt_gate)
+        elif prompt_gate is not None:
+            send = functools.partial(send, prompt_gate=prompt_gate)
     if not allow_image:
         send = functools.partial(send, allow_image=False)
     if timeout is not None:
@@ -483,6 +511,41 @@ def _inline_turn_finished_cleanly(self: AcpProvider) -> bool:
     """
     probe = getattr(self._client, "turn_finished_cleanly", None)
     return bool(probe()) if callable(probe) else False
+
+
+class _HeldChatTurnGate:
+    """The scope :func:`hold_chat_turn_gate` opens: the backing session's hold, or nothing."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+        self._held: Any = None
+
+    async def __aenter__(self) -> None:
+        hold = getattr(self._client, "hold_chat_turn_gate", None)
+        if hold is None:
+            return
+        held = hold()
+        if hasattr(held, "__aenter__") and hasattr(held, "__aexit__"):
+            await held.__aenter__()
+            self._held = held
+
+    async def __aexit__(self, *exc: Any) -> Any:
+        held, self._held = self._held, None
+        if held is not None:
+            return await held.__aexit__(*exc)
+        return None
+
+
+def hold_chat_turn_gate(self: AcpProvider) -> _HeldChatTurnGate:
+    """Hold a shared process's chat turn gate across a whole compaction.
+
+    The compaction paths wrap ``stream_command('/compact')`` and the deferred
+    ``wait_for_compaction`` receipt in this, so a co-tenant chat cannot start a
+    turn between them into which this session's ownerless compaction terminal is
+    fanned. Delegates to the backing ``AcpSessionProvider``; a placeholder client
+    before startup or a non-runtime client has no gate, and this holds nothing.
+    """
+    return _HeldChatTurnGate(self._client)
 
 
 async def wait_for_compaction(

@@ -47,9 +47,16 @@ export default function UpdatePill({ variant = 'pill', showLabel = false }: { va
   const guardedLeave = useGuardedLeave()
   const target = settingsPath({ tab: 'about' })
   const openAbout = () => guardedLeave(() => navigate(target), target)
+  // `update_restart_ready`: an update is installed, or the served bundle is gone,
+  // and only a restart a person chooses is left (the gateway never restarts
+  // itself). It lights the pill even when no newer build is on offer.
+  const restartReady = useAppSelector(s => s.dashboard.status?.update_restart_ready === true)
+  // The person armed an update: it applies at the next start, never while the
+  // gateway runs (`update_armed_version`).
+  const armed = useAppSelector(s => !!s.dashboard.status?.update_armed_version)
   const updateAvailable = useAppSelector(
     s => s.dashboard.status?.update_available === true || s.dashboard.desktopUpdateAvailable
-  )
+  ) || restartReady || armed
   // Fork-maintainer signal: the canonical upstream moved ahead of the fork's
   // own main. Only a checkout carrying an `upstream` remote ever reports it —
   // fleet installs cloned from the fork alone never see this state, so the
@@ -75,8 +82,11 @@ export default function UpdatePill({ variant = 'pill', showLabel = false }: { va
     label = pct === null
       ? i18nT('components.updatePill.downloading')
       : i18nT('components.updatePill.downloading_percent', { percent: pct })
-  } else if (updateAvailable && desktop?.state === 'downloaded') {
+  } else if (desktop?.state === 'downloaded' || restartReady) {
     label = i18nT('components.updatePill.update_ready')
+    Icon = RefreshCw
+  } else if (armed) {
+    label = i18nT('components.updatePill.update_when_i_restart')
     Icon = RefreshCw
   } else if (!updateAvailable) {
     // The fork-sync-only state: no installable update, but upstream moved and

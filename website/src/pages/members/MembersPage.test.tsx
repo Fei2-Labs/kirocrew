@@ -250,6 +250,14 @@ vi.mock('../../components/ChatPane', async () => {
         <a href="https://elsewhere.example/members?create=1&name=evil" data-testid="chat-link-foreign">foreign</a>
         {/* What the transcript's renderer hands the host for a plain click on either
             staged-dashboard link form (see dashboardPreview.link.test.tsx). */}
+        {/* A folder chip in a reply, and a thread footer's Open: what the
+            transcript hands the host for each click. */}
+        {typeof rest.onFolderOpen === 'function' && (
+          <button data-testid="chat-open-folder" onClick={() => (rest.onFolderOpen as (path: string) => void)('/home/u/work/evidence/')}>folder</button>
+        )}
+        {(rest.threads as { onOpen?: (mid: string) => void } | undefined)?.onOpen && (
+          <button data-testid="chat-open-thread" onClick={() => (rest.threads as { onOpen: (mid: string) => void }).onOpen('m-1')}>thread</button>
+        )}
         {typeof rest.onArtifactOpen === 'function' && (
           <>
             <button data-testid="chat-open-preview-member" onClick={() => (rest.onArtifactOpen as (ref: string) => void)('dashboard-preview:member:oncall')}>preview by name</button>
@@ -359,6 +367,18 @@ describe('MembersPage roster', () => {
     await screen.findByTestId('member-threads-error-row', undefined, PANE_READY)
   })
 
+  it('a folder chip opens the folder tab and closes an open reply thread that would cover it', async () => {
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ dashboard: { crewmate_threads: true } })
+    await renderPage([row()], 'kirocrew', { route: '/members?member=oncall' })
+    await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+    fireEvent.click(await screen.findByTestId('chat-open-thread', undefined, PANE_READY))
+    await screen.findByTestId('thread-panel', undefined, PANE_READY)
+    fireEvent.click(screen.getByTestId('chat-open-folder'))
+    // The folder tab is on the strip, and the opaque thread no longer covers it.
+    expect(await screen.findByText('evidence', undefined, PANE_READY)).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByTestId('thread-panel')).toBeNull())
+  })
+
   it('a failed config read is said with a Retry, not rendered as threads off', async () => {
     vi.mocked(api.kirocrewConfig).mockRejectedValue(new Error('boom'))
     await renderPage([row()], 'kirocrew', { route: '/members?member=oncall' })
@@ -448,7 +468,7 @@ describe('MembersPage roster', () => {
     const heroes = await screen.findAllByTestId('crewmate-empty-hero')
     expect(heroes).toHaveLength(2)
     for (const title of screen.getAllByTestId('crewmate-empty-title')) {
-      expect(title).toHaveTextContent('No Bots yet')
+      expect(title).toHaveTextContent('No bots yet')
     }
     expect(screen.getAllByText(/Give it a job; it keeps working while you are away/i)).toHaveLength(2)
     // The roster's old one-line copy and in-list button are gone: one call to
@@ -511,7 +531,9 @@ describe('MembersPage roster', () => {
 
   it('shows the load-failure state when the roster call rejects', async () => {
     ;(api.members as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'))
-    renderWithProviders(<MembersPage />)
+    // The roster read retries on its own (`retryThroughRestart`); no backoff,
+    // so the failure shows at once.
+    renderWithProviders(<MembersPage />, { queryDefaults: { retryDelay: 0 } })
     // Both columns say it: the roster's own notice, and — since no chat can
     // open and the hero is gated on a good read — the chat column's, so a
     // wide window is never half blank.
@@ -532,7 +554,7 @@ describe('MembersPage roster', () => {
     // read the dialog cannot refuse a name that clashes with an unseen
     // crewmate (ONCALL beside oncall would share one slug and its chat could
     // never open). New team, which has no part in that check, stays live.
-    expect(await probeAddCrewmate()).toEqual({ held: true, reason: 'Could not load your Bots.' })
+    expect(await probeAddCrewmate()).toEqual({ held: true, reason: 'Could not load your bots.' })
     ;(api.members as ReturnType<typeof vi.fn>).mockResolvedValue({ members: [row()], default_agent: 'kirocrew' })
     fireEvent.click(screen.getByTestId('member-column-load-retry'))
     expect(await rosterRow('oncall')).toBeInTheDocument()
@@ -569,7 +591,7 @@ describe('MembersPage roster cache (React Query)', () => {
     utils.rerender(page)
     expect(roster().getByText('oncall')).toBeInTheDocument()
     expect(roster().getByText('research')).toBeInTheDocument()
-    expect(screen.queryByText(/No Bots yet/i)).toBeNull()
+    expect(screen.queryByText(/No bots yet/i)).toBeNull()
     // The roster carries its own 30s staleTime (membersRosterQuery), which
     // wins over the test client's 0: a return inside that window is served
     // from cache with NO refetch — that is the request the user stopped
@@ -671,7 +693,7 @@ describe('MembersPage roster cache (React Query)', () => {
     expect(await rosterRow('research')).toBeInTheDocument()
     // In place: the row that was already there never left the screen.
     expect(roster().getByText('oncall')).toBeInTheDocument()
-    expect(screen.queryByText(/No Bots yet/i)).toBeNull()
+    expect(screen.queryByText(/No bots yet/i)).toBeNull()
   })
 
   it('a refetch failure after a good read keeps the last roster instead of flipping to the error state', async () => {
@@ -681,7 +703,9 @@ describe('MembersPage roster cache (React Query)', () => {
     await act(async () => {
       await queryClient.invalidateQueries({ queryKey: ['kirocrew-agents'] })
     })
-    await waitFor(() => expect(api.members).toHaveBeenCalledTimes(2))
+    // The re-read and the one retry an answered failure gets
+    // (`retryThroughRestart`).
+    await waitFor(() => expect(api.members).toHaveBeenCalledTimes(3))
     expect(roster().getByText('oncall')).toBeInTheDocument()
     expect(screen.queryByText(/Could not load your Bots/i)).toBeNull()
   })
@@ -696,6 +720,24 @@ describe('MembersPage thread', () => {
     expect(api.memberThread).toHaveBeenCalledExactlyOnceWith('review-qa')
   })
 
+  it('a relay teammate sees the Bots and is told plainly that only the owner can chat', async () => {
+    // A teammate's roster row carries no slot or preview (`_teammate_roster`), and
+    // the thread POST answers the owner gate's 403 `owner_only`.
+    localStorage.setItem(LAST_MEMBER_KEY, 'oncall')
+    const refusal = Object.assign(new Error('owner authorization required'), {
+      status: 403,
+      body: JSON.stringify({ error: 'owner authorization required', code: 'owner_only' }),
+    })
+    const teammateRow = { name: 'oncall', slug: 'oncall', dashboard_created: true, source: 'kirocrew' } as unknown as ReturnType<typeof row>
+    await renderPage([teammateRow], 'kirocrew', { thread: refusal })
+    expect(await rosterRow('oncall')).toBeInTheDocument()
+    const notice = await screen.findByTestId('member-thread-owner-only', undefined, PANE_READY)
+    expect(notice).toHaveTextContent("Only this bot's owner can chat with it.")
+    expect(screen.queryByTestId('member-thread-error')).toBeNull()
+    expect(screen.queryByText(/Could not load your bots/i)).toBeNull()
+    expect(screen.queryByText(/Could not open this bot's chat/i)).toBeNull()
+  })
+
   it('shows the concrete private memory refusal when opening a member conversation fails', async () => {
     // A remembered member drives the restore that fails here (a fresh visit
     // no longer auto-opens anyone, #11763); the failing POST is that restore.
@@ -707,7 +749,7 @@ describe('MembersPage thread', () => {
     })
     const { queryClient } = await renderPage([row()], 'kirocrew', { thread: new Error(rawReason) })
     const notice = await screen.findByTestId('member-thread-error', undefined, PANE_READY)
-    expect(notice).toHaveTextContent(/Could not open this Bot's chat/i)
+    expect(notice).toHaveTextContent(/Could not open this bot's chat/i)
     expect(notice).not.toHaveTextContent('Private memory database is unreadable')
     expect(queryClient.getQueryData(memberThreadQueryKey('oncall'))).toEqual({
       slot_key: '', failed: true, errorReport: report,
@@ -798,7 +840,7 @@ describe('MembersPage thread', () => {
     localStorage.setItem(LAST_MEMBER_KEY, 'oncall')
     await renderPage([row()], 'kirocrew', { thread: new Error('Create private memory in the member editor.') })
     expect(
-      await screen.findByText(/Could not open this Bot's chat/i, undefined, PANE_READY),
+      await screen.findByText(/Could not open this bot's chat/i, undefined, PANE_READY),
     ).toBeInTheDocument()
     // Non-API exceptions have no journal report; do not invent a diagnostic
     // object or leak an unredacted thrown message into the localized banner.

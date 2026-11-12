@@ -41,6 +41,7 @@ the two have different caps for that reason.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -164,6 +165,14 @@ def active_custom_agent(params: dict[str, Any], agent: str) -> dict[str, Any] | 
         if entry.get("id") == agent:
             return entry
     return None
+
+
+def mounted_servers(params: dict[str, Any], agent: str) -> tuple[str, ...]:
+    """Every server sent for the ACTIVE agent and session, named as frames name them."""
+    active = active_custom_agent(params, agent) or {}
+    block = [{"name": name} for name in active.get("mcpServers", {})]
+    servers = params.get("mcpServers")
+    return roster_names([*(servers if isinstance(servers, list) else []), *block])
 
 
 def required_managed_servers(params: dict[str, Any], agent: str) -> tuple[str, ...]:
@@ -418,18 +427,36 @@ class KasMcpReadiness:
             self.seen.update(self.advertised_by_tag)
 
     @property
-    def failure(self) -> str:
+    def all_pending_connecting(self) -> bool:
+        """Whether every pending server is one the host reports as ``connecting``.
+
+        Only such a server can be waiting in the host's connect queue. A server
+        that is unreported, filtered, re-attempting or connected without its
+        tools is not, so progress elsewhere says nothing about it.
+        """
+        pending = self.pending_names
+        return bool(pending) and all(self.states.get(name) == "connecting" for name in pending)
+
+    @property
+    def failed_name(self) -> str:
+        """The first required server, in required order, whose state ends the start."""
         for name in self.required:
-            state = self.states.get(name)
-            if state in (
+            if self.states.get(name) in (
                 "failed",
                 "disabled",
                 "authorization failed",
                 STATE_CONNECTED_WITHOUT_PROVENANCE,
             ):
-                detail = self.errors.get(name)
-                return f"{name}: {state}" + (f" ({detail})" if detail else "")
+                return name
         return ""
+
+    @property
+    def failure(self) -> str:
+        name = self.failed_name
+        if not name:
+            return ""
+        detail = self.errors.get(name)
+        return f"{name}: {self.states[name]}" + (f" ({detail})" if detail else "")
 
     @property
     def pending_names(self) -> tuple[str, ...]:
@@ -626,6 +653,19 @@ def _joined(names: list[str]) -> str:
     return f"{joined} (+{rest} more)" if rest > 0 else joined
 
 
+def _guard_entries(entries: Any) -> tuple[str, ...]:
+    """A guard's ``server (...)`` entries as a bucket: strings only, each sanitized
+    and bounded at :data:`_ERROR_CAP`, de-duplicated, capped at :data:`_BUCKET_CAP`."""
+    seen: list[str] = []
+    for raw in entries if isinstance(entries, (list, tuple)) else ():
+        if not isinstance(raw, str):
+            continue
+        entry = sanitize_sink_text(raw, _ERROR_CAP)
+        if entry and entry not in seen:
+            seen.append(entry)
+    return tuple(seen[:_BUCKET_CAP])
+
+
 @dataclass
 class McpSessionReport:
     """Mutable accumulator for one session's MCP registration frames.
@@ -655,6 +695,12 @@ class McpSessionReport:
     #: Affected servers past the guard's or this report's cap, counted rather
     #: than dropped without a word.
     header_secret_refs_omitted: int = 0
+    #: stdio servers whose ``env`` references a variable that is not set, each as
+    #: ``server ('NAME', ...)``; such a server starts with the literal text. Set by
+    #: :meth:`record_env_placeholder_refs`.
+    env_placeholder_refs: tuple[str, ...] = ()
+    #: Affected servers past the guard's cap, counted like the header bucket's.
+    env_placeholder_refs_omitted: int = 0
     #: Servers that started and that the spec grants, yet gave this session no
     #: tool (see :func:`servers_exposing_no_tools`). Usually a tool-name clash
     #: with another server: the backend kept the other server's tools and
@@ -711,6 +757,8 @@ class McpSessionReport:
         self.unresolved_refs = ()
         self.header_secret_refs = ()
         self.header_secret_refs_omitted = 0
+        self.env_placeholder_refs = ()
+        self.env_placeholder_refs_omitted = 0
         self.no_tools = ()
         self.no_tools_omitted = 0
         self.pruned_omitted = 0
@@ -738,7 +786,8 @@ class McpSessionReport:
 
         The guard's claim, not a stronger one: Crew's projection delivers none of
         them, and the harness may still mount a same-named server from its own
-        configuration, which neither the guard nor this report reads.
+        configuration beyond the ``mcp.json`` files the spec opts in to, which
+        neither the guard nor this report reads.
 
         Sanitized and capped on the same terms as a server name: a ref is
         config-derived, so an installed app chooses the text, and it reaches a log
@@ -760,31 +809,44 @@ class McpSessionReport:
                 seen.append(ref)
         self.unresolved_refs = tuple(seen[:_BUCKET_CAP])
 
-    def record_declared(self, spec: Any) -> None:
+    def record_declared(self, spec: Any, mcp_json: Iterable[str] = ()) -> None:
         """Record the servers the agent spec *spec* declares and leaves enabled.
 
         Set rather than accumulated, like :meth:`record_unresolved_refs`: it is
         read from the one spec the session started on. A muted server (any
         ``disabled`` but an absent or literal ``false``, the same rule the launch
-        uses) is not expected to start, so it is left out. Names
+        uses) is not expected to start, so it is left out. *mcp_json* names the
+        servers the spec's opt-in mounts from the user's ``mcp.json``
+        (``agent_sdk.mcp_json_reach.mcp_json_server_names``), which the host starts
+        and reports like the spec's own; they follow the spec's. Names
         are sanitized and capped like a frame's, so they compare equal to the
         names the frames report.
         """
         servers = spec.get("mcpServers") if isinstance(spec, dict) else None
-        seen: list[str] = []
-        for raw, entry in servers.items() if isinstance(servers, dict) else ():
-            if mcp_entry_is_muted(entry):
-                continue
-            name = sanitize_sink_text(str(raw), _NAME_CAP)
-            if name and name not in seen:
-                seen.append(name)
-        self.declared = tuple(seen[:_BUCKET_CAP])
+        names = [
+            str(raw)
+            for raw, entry in (servers.items() if isinstance(servers, dict) else ())
+            if not mcp_entry_is_muted(entry)
+        ]
+        names += [raw for raw in mcp_json if isinstance(raw, str)]
+        # Called on the event loop: an insertion-ordered dict dedupes in linear
+        # time, where a list scan per name grows with the square of the count.
+        seen: dict[str, None] = {}
+        for raw in names:
+            name = sanitize_sink_text(raw, _NAME_CAP)
+            if name:
+                seen[name] = None
+        self.declared = tuple(seen)[:_BUCKET_CAP]
         self.declared_omitted = max(0, len(seen) - _BUCKET_CAP)
 
     def declared_unreported(self) -> tuple[str, ...]:
         """Declared servers that have not reported at all yet, in spec order."""
+        return self.unreported(self.declared)
+
+    def unreported(self, names: tuple[str, ...]) -> tuple[str, ...]:
+        """*names* with no ready, failed or awaiting-authorization report yet, in order."""
         reported = {*self._ready, *self._failed, *self._awaiting_auth}
-        return tuple(name for name in self.declared if name not in reported)
+        return tuple(name for name in names if name not in reported)
 
     def declared_never_reported(self) -> tuple[str, ...]:
         """Declared servers with no report at all, for the run's notice.
@@ -871,15 +933,19 @@ class McpSessionReport:
         bounded at :data:`_ERROR_CAP`. *omitted* is the guard's own count of
         servers it did not list; the guard caps its entries below the bucket.
         """
-        seen: list[str] = []
-        for raw in entries if isinstance(entries, (list, tuple)) else ():
-            if not isinstance(raw, str):
-                continue
-            entry = sanitize_sink_text(raw, _ERROR_CAP)
-            if entry and entry not in seen:
-                seen.append(entry)
-        self.header_secret_refs = tuple(seen[:_BUCKET_CAP])
+        self.header_secret_refs = _guard_entries(entries)
         self.header_secret_refs_omitted = omitted if isinstance(omitted, int) and omitted > 0 else 0
+
+    def record_env_placeholder_refs(self, entries: Any, omitted: int = 0) -> None:
+        """Record the stdio servers whose ``env`` references an unset variable.
+
+        The twin of :meth:`record_header_secret_refs`, for
+        ``mcp_ref_guard.warn_unset_env_placeholders``.
+        """
+        self.env_placeholder_refs = _guard_entries(entries)
+        self.env_placeholder_refs_omitted = (
+            omitted if isinstance(omitted, int) and omitted > 0 else 0
+        )
 
     def record_no_tools(self, names: Any) -> bool:
         """Record the servers that started but gave this session no tool.
@@ -1063,6 +1129,7 @@ class McpSessionReport:
             self.configured
             or self.unresolved_refs
             or self.header_secret_refs
+            or self.env_placeholder_refs
             or self.no_tools
             or self._ready
             or self._failed
@@ -1100,7 +1167,9 @@ class McpSessionReport:
         control characters and length, none of which neutralizes a natural-language
         instruction. That is harmless in a log a person reads and is not harmless
         in a model's prompt, so the sink that feeds a model asks for the summary
-        without it instead of trusting a scrubber to disarm prose.
+        without it instead of trusting a scrubber to disarm prose. That reading
+        also leaves out the env-placeholder bucket: such a server did start, and
+        the model sink tells a run its servers are not mounted.
         """
         parts: list[str] = []
         if self._failed:
@@ -1142,6 +1211,17 @@ class McpSessionReport:
                 + (
                     f" (+{self.header_secret_refs_omitted} not listed)"
                     if self.header_secret_refs_omitted
+                    else ""
+                )
+            )
+        if self.env_placeholder_refs and include_reasons:
+            parts.append(
+                "stdio server env references a variable that is not set, so the server "
+                "starts with the literal ${NAME} text: "
+                + _joined(list(self.env_placeholder_refs))
+                + (
+                    f" (+{self.env_placeholder_refs_omitted} not listed)"
+                    if self.env_placeholder_refs_omitted
                     else ""
                 )
             )

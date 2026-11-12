@@ -209,6 +209,23 @@ class TestListSourceFiles:
             assert data["failed"] == 1
             assert data["skipped"] == 1
 
+    @pytest.mark.asyncio
+    async def test_a_deduped_file_counts_as_done_so_the_scan_can_finish(self, store):
+        sid = store.add_source("test", "local_folder", "/tmp/vault")
+        for name, status in (("a.md", "done"), ("b.md", "deduped")):
+            store.db.execute(
+                "INSERT INTO folder_file_state (source_id, file_path, last_seen, status, item_ids)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (sid, f"/tmp/vault/{name}", "2026-01-01", status, "[]"))
+        store.db.commit()
+
+        async with TestClient(TestServer(_make_app(store))) as client:
+            resp = await client.get(f"/api/knowledge/sources/{sid}/files")
+            data = await resp.json()
+        assert data["total"] == 2
+        assert data["done"] == 2
+        assert data["done"] + data["failed"] + data["skipped"] == data["total"]
+
 
 class TestRetryFile:
     @pytest.mark.asyncio
@@ -325,6 +342,52 @@ class TestRenameSource:
             resp = await client.patch(f"/api/knowledge/sources/{sid}", data="not json",
                                       headers={"Content-Type": "application/json"})
             assert resp.status == 400
+
+
+class TestEditIgnorePatterns:
+    @pytest.mark.asyncio
+    async def test_a_folder_source_takes_trimmed_patterns_and_keeps_its_other_properties(
+            self, store, tmp_path):
+        sid = store.add_source("Notes", "local_folder", str(tmp_path),
+                               properties={"recursive": True, "ignore_patterns": [".trash/*"]})
+        async with TestClient(TestServer(_make_app(store))) as client:
+            resp = await client.patch(f"/api/knowledge/sources/{sid}",
+                                      json={"ignore_patterns": [" generated/** ", "", ".trash/*"]})
+            assert resp.status == 200
+            assert (await resp.json())["ignore_patterns"] == ["generated/**", ".trash/*"]
+        row = store.db.execute("SELECT name, properties FROM sources WHERE id = ?", (sid,)).fetchone()
+        assert row["name"] == "Notes"
+        assert json.loads(row["properties"]) == {
+            "recursive": True, "ignore_patterns": ["generated/**", ".trash/*"]}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source_type,patterns", [
+        ("local_file", ["*.md"]),
+        ("local_folder", "sub/*"),
+        ("local_folder", ["sub/*", 3]),
+    ])
+    async def test_a_non_folder_source_or_a_non_list_is_refused_unwritten(
+            self, store, tmp_path, source_type, patterns):
+        sid = store.add_source("Old", source_type, str(tmp_path / "x"))
+        async with TestClient(TestServer(_make_app(store))) as client:
+            resp = await client.patch(f"/api/knowledge/sources/{sid}",
+                                      json={"name": "New", "ignore_patterns": patterns})
+            assert resp.status == 400
+        row = store.db.execute("SELECT name, properties FROM sources WHERE id = ?", (sid,)).fetchone()
+        assert row["name"] == "Old"
+        assert "ignore_patterns" not in json.loads(row["properties"] or "{}")
+
+    @pytest.mark.asyncio
+    async def test_a_source_deleted_before_the_write_is_a_404_not_a_success(
+            self, store, tmp_path, monkeypatch):
+        sid = store.add_source("Notes", "local_folder", str(tmp_path))
+        # The row goes between the handler's read and its write.
+        monkeypatch.setattr(store, "merge_source_properties", lambda *a, **k: None)
+        async with TestClient(TestServer(_make_app(store))) as client:
+            resp = await client.patch(f"/api/knowledge/sources/{sid}",
+                                      json={"ignore_patterns": ["generated/**"]})
+            assert resp.status == 404
+            assert (await resp.json())["code"] == "source_not_found"
 
 
 class TestFilePathType:

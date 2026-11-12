@@ -32,8 +32,8 @@ from kiro_crew.agent_files import AGENT_FILENAME
 from kiro_crew.agent_sdk import spec_hooks
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
-    ACP_BACKEND_CODEX,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS,
     ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS,
 )
@@ -131,9 +131,12 @@ def test_every_backend_crew_fires_all_events_for_also_gets_the_observer_events()
     assert ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS <= ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS
 
 
-@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_CODEX])
+@pytest.mark.parametrize("backend", [ACP_BACKEND_KIRO, ACP_BACKEND_PI])
 def test_a_harness_outside_the_set_gets_no_observer_hooks_from_crew(backend, agents_dir, notices):
-    """kiro-cli runs the field itself; firing it here too would run each hook twice."""
+    """kiro-cli runs the field itself, so firing it here too would run each hook twice.
+
+    pi is not in the set either: Crew does not fire its spec's hooks yet.
+    """
     assert backend not in ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS
     _write_spec(agents_dir, "a1", _ALL_EVENTS)
     assert _prepare(_client(backend), "a1")[0] == []
@@ -260,7 +263,7 @@ def test_a_claude_bash_call_fires_an_execute_bash_post_tool_hook(
     assert finished.kind == EVENT_TOOL_RESULT and finished.tool_status == "completed"
     ran = _fake_runs(monkeypatch)
     _post_tool_fire(tmp_path, hooks, started)
-    assert ran == [(HOOK_EVENT_POST_TOOL_USE, "post.sh", "execute_bash")]
+    assert ran == [(HOOK_EVENT_POST_TOOL_USE, "post.sh", "shell")]
 
 
 def test_the_default_agents_audit_hook_fires_on_a_claude_bash_call(
@@ -279,7 +282,7 @@ def test_the_default_agents_audit_hook_fires_on_a_claude_bash_call(
     started, _finished = _claude_bash_call()
     ran = _fake_runs(monkeypatch)
     _post_tool_fire(tmp_path, hooks, started)
-    assert ran == [(HOOK_EVENT_POST_TOOL_USE, audit["command"], "execute_bash")]
+    assert ran == [(HOOK_EVENT_POST_TOOL_USE, audit["command"], "shell")]
 
 
 def test_a_claude_edit_its_permission_request_named_fires_an_fs_write_post_tool_hook(
@@ -314,7 +317,7 @@ def test_a_claude_edit_its_permission_request_named_fires_an_fs_write_post_tool_
             tool_match_names=_all,
         )
     )
-    assert ran == [(HOOK_EVENT_POST_TOOL_USE, "write.sh", "fs_write")]
+    assert ran == [(HOOK_EVENT_POST_TOOL_USE, "write.sh", "write")]
 
 
 def test_a_claude_call_that_is_not_shell_keeps_title_matching():

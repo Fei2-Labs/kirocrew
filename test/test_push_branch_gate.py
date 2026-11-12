@@ -336,6 +336,27 @@ class TestGitPushEnforcement:
             "Blocked by security policy"
         )
 
+    def test_protected_push_after_a_multi_line_commit_message_blocked(
+        self, captured_sel_events
+    ) -> None:
+        """A push to main after a multi-line quoted commit message is refused by the
+        push floor, bare or behind a PATH prefix."""
+        for prefix in ("", "env PATH=/x:$PATH ", "PATH=/x "):
+            cmd = f"git commit -m 'a\n\nb' && {prefix}{PUSH} origin main"
+            assert "rule=git-publish-" in (is_denied(cmd) or ""), cmd
+
+    def test_protected_push_beside_a_multi_line_gh_body_blocked(self, captured_sel_events) -> None:
+        """A push to main beside a multi-line gh body stays refused: before or after the
+        body, through a quote-stripping filter, or on a line inside the body itself."""
+        for cmd in (
+            f'gh pr create --body "notes"\n{PUSH} origin main',
+            f'gh pr create --body "x\n" && {PUSH} origin main',
+            f'{PUSH} origin main\ngh pr create --body "a\n"',
+            f"echo 'gh pr create --body \"n\n{PUSH} origin main\n\"' | tr -d '\"' | bash",
+            f'gh pr create --body "notes\n{PUSH} origin main\nmore"',
+        ):
+            assert "rule=git-publish-" in (is_denied(cmd) or ""), cmd
+
     def test_an_unquoted_expansion_before_the_subcommand_is_unverifiable(
         self, captured_sel_events, monkeypatch
     ) -> None:

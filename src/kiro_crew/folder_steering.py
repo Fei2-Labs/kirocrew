@@ -102,7 +102,7 @@ def every_session_body(body: str, *, truncated: bool = False) -> str | None:
     """*body* with its front matter stripped, or ``None`` when it is not for every session.
 
     The one inclusion rule both steering loads apply: this module's folder
-    collection and the Claude Code backend's ``[Steering resources]`` load
+    collection and the Claude Code and Codex ``[Steering resources]`` load
     (``context_assembly.agent_spec._load_steering_resources``). A leading
     byte-order mark is dropped, since it would hide the column-0 fence and turn
     a ``manual`` document into an always-loaded one, and line endings are
@@ -597,6 +597,17 @@ def _walk_markdown_pinned(
             _release(fd)
 
 
+def _file_identity(path: str) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of the canonical *path*, or ``None`` when unknown."""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if not st.st_ino:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 def collect_folder_steering(
     steering_dirs: Sequence[str],
     *,
@@ -609,7 +620,8 @@ def collect_folder_steering(
 
     Roots are read in the order given (the resolver hands them over root-first)
     and each document is emitted at most once across all of them, keyed by
-    realpath. A missing root and an unreadable document are debug-logged and
+    realpath and by file identity, so one file reached under two letter cases
+    on a case-insensitive volume counts once. A missing root and an unreadable document are debug-logged and
     skipped so one stale path never breaks a turn.
 
     Two ceilings bound the pass -- ``_MAX_FOLDER_STEERING_DOCUMENTS`` on what is
@@ -623,11 +635,11 @@ def collect_folder_steering(
     *skip_delivered_roots* says whether documents under the project's and the
     operator's ``.kiro/steering`` trees are ALREADY reaching the model by the
     provider's own steering path (kiro-cli loads them natively while the
-    workspace inherits kiro-cli's default resources, the Claude Code seam loads
-    them explicitly, KAS reports ``native_steering``) and so must not be re-sent
-    here. A provider with no such path -- Codex, and the other
-    harnesses that neither load ``.kiro/steering`` nor receive the explicit
-    load -- passes ``False`` and receives them through the folder like any other
+    workspace inherits kiro-cli's default resources, the Claude Code seam and
+    Codex load them explicitly, KAS reports ``native_steering``) and so must not
+    be re-sent here. A provider with no such path -- the harnesses that neither
+    load ``.kiro/steering`` nor receive the explicit load -- passes ``False``
+    and receives them through the folder like any other
     document; skipping there would drop the rules with nothing delivered in
     their place. The default keeps the dedup for callers that know their
     provider delivers.
@@ -678,6 +690,7 @@ def collect_folder_steering(
         return result
     silos = fence.roots
     seen: set[str] = set()
+    seen_files: set[tuple[int, int]] = set()
     for raw in steering_dirs:
         # ``validate_file_path`` is the hardened canonicalizer, not a bare
         # ``resolve()``: it refuses an untrusted UNC shape and screens Windows
@@ -727,6 +740,13 @@ def collect_folder_steering(
                 continue
             if key in seen:
                 continue
+            # ``realpath`` keeps the letter case it was given, so on a
+            # case-insensitive volume one file can arrive under two spellings.
+            # The file's own identity catches that; the reader below refuses
+            # hardlinks, so two distinct documents never share one.
+            identity = _file_identity(key)
+            if identity is not None and identity in seen_files:
+                continue
             if os.path.normcase(key) in delivered_source_keys:
                 continue
             if any(_is_within(resolved, skip_root) for skip_root in skip_roots):
@@ -771,6 +791,8 @@ def collect_folder_steering(
                 logger.debug("folder steering document not for every session: %s", key)
                 continue
             seen.add(key)
+            if identity is not None:
+                seen_files.add(identity)
             # Retain the prompt-safe label, not the raw path: the collection is
             # the ONE boundary both consumers (the section renderer and the
             # member envelope) read from, so the fold happens once, here.

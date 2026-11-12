@@ -14,7 +14,7 @@
 #   ``usage_context`` -- context-window occupancy and a session's context trace
 #   ``usage_cost`` -- the Telemetry panel's spend breakdown
 #   ``usage_history`` -- the Usage page's per-day token history
-#   ``usage_sessions`` -- the Usage page's kiro-cli session activity and its cached parse
+#   ``usage_sessions`` -- the Usage page's kiro-cli and KAS session activity and its cached parse
 
 from __future__ import annotations
 
@@ -33,6 +33,8 @@ from aiohttp import web
 
 from kiro_crew import _facade_mirror
 from kiro_crew.acp.types import TurnUsage
+from kiro_crew.dashboard.handlers.codex_usage import read_codex_rate_limits
+from kiro_crew.dashboard.handlers.usage_history import _parse_token_history
 from kiro_crew.dashboard.handlers.usage_sessions import _CACHE_TTL, _usage_sessions_snapshot
 from kiro_crew.dashboard.handlers.usage_store import (  # noqa: F401 - usage_series reads these per row
     _coerce_int,
@@ -220,6 +222,8 @@ def _build_token_record(
     context_window: int = 0,
     elapsed_ms: int = 0,
     app: str = "",
+    delivered: bool | None = None,
+    transcript: str = "",
 ) -> dict[str, Any]:
     """Build the JSONL token-usage record dict (no I/O).
 
@@ -248,6 +252,16 @@ def _build_token_record(
     This mirrors the precedence the OTEL emit path already uses
     (``chat_runner._attach_turn_stats``: ``value = duration_ms or elapsed_ms``),
     so the histogram and the row store cannot disagree about one turn.
+
+    ``delivered`` is whether the turn streamed any reply text, so a billed turn
+    that ran only tools can be told from one that answered. Only a caller that
+    watched the stream knows it; ``None`` leaves the key off the row.
+
+    ``transcript`` is the key of the transcript the dashboard tab writes to. A
+    tab linked to another session (a task review, a workflow, a cron run)
+    writes under a key its name cannot reach, and this row is the one record
+    that outlives the tab, so it is what names a closed tab's transcript.
+    ``""`` leaves the key off the row.
     """
     # Usage lives on event.usage (TurnUsage). Fall back to the event itself when
     # it isn't a real TurnUsage (legacy / non-AcpEvent producers, test doubles).
@@ -266,7 +280,7 @@ def _build_token_record(
     # can be joined against the row's ``agent`` field retroactively — this is
     # where per-agent stall analysis happens, deliberately NOT on metric attrs.
     _stop = getattr(event, "stop_reason", "")
-    return {
+    record: dict[str, Any] = {
         "_type": "tokens",
         "ts": now.isoformat(),
         "slot": slot_key,
@@ -297,6 +311,11 @@ def _build_token_record(
         # can't break json.dumps.
         "stop_reason": _stop if isinstance(_stop, str) else "",
     }
+    if delivered is not None:
+        record["delivered"] = delivered
+    if transcript:
+        record["transcript"] = transcript
+    return record
 
 
 def _finite_only(record: dict[str, Any]) -> dict[str, Any]:
@@ -494,6 +513,8 @@ async def persist_token_record_async(
     emit_metric: bool = True,
     trigger: str = TRIGGER_OTHER,
     origin: str | None = None,
+    delivered: bool | None = None,
+    transcript: str = "",
 ) -> None:
     """Async variant: builds the record on-loop, offloads the file write.
 
@@ -510,7 +531,7 @@ async def persist_token_record_async(
     (no fsync, exceptions swallowed), so off-loop write loses no durability.
     See :func:`persist_token_record` for the ``surface`` / ``agent`` /
     ``context_used`` / ``context_window`` / ``elapsed_ms`` / ``model_source``
-    fields.
+    fields, and :func:`_build_token_record` for ``delivered`` and ``transcript``.
 
     ALSO emits the per-turn OTEL family — ``kirocrew.turn.duration`` plus the
     turn's usage (``kirocrew.turn.tokens`` and whichever of
@@ -553,6 +574,8 @@ async def persist_token_record_async(
             context_window=context_window,
             elapsed_ms=elapsed_ms,
             app=app,
+            delivered=delivered,
+            transcript=transcript,
         )
         # Before the offloaded write: a file-write failure must not cost the
         # latency sample, which needs nothing from disk.
@@ -560,7 +583,7 @@ async def persist_token_record_async(
             # The harness is read off model_source, the live provider every
             # surface already hands in to name the model that ran: it is the one
             # object here that knows the session's EFFECTIVE backend, overrides
-            # included. Not written to the row; it labels the latency sample only.
+            # included. Not written to the row; it labels the turn samples only.
             _emit_turn_histogram(
                 record,
                 slot_key,
@@ -633,6 +656,7 @@ def _emit_turn_histogram(
         cost_usd=record.get("cost"),
         model=model,
         provider=provider,
+        harness=harness,
     )
 
 
@@ -648,7 +672,7 @@ def get_usage_cache() -> dict:
 
 
 async def api_kiro_usage(request: web.Request) -> web.Response:
-    """GET /api/usage/kiro — local session analytics + cached billing."""
+    """GET /api/usage/kiro — local session analytics, cached billing and Codex's windows."""
     global _CACHE, _CACHE_TS
     now = time.time()
 
@@ -688,6 +712,13 @@ async def api_kiro_usage(request: web.Request) -> web.Response:
             "username": username,
             "sessions": sessions,
             "billing": billing,
+            "codex": await asyncio.to_thread(read_codex_rate_limits),
+            # Every turn's tokens and dollar cost from the usage shards: what a
+            # harness that bills in dollars has instead of a credit plan.
+            "tokens": await asyncio.to_thread(_parse_token_history),
+            # The gateway's local calendar day, the key its usage rows file days
+            # under, so a browser in another zone picks today's bucket by it.
+            "local_day": datetime.now().strftime("%Y-%m-%d"),
             "refreshing": refreshing,
         }
 
@@ -757,28 +788,38 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _TOKEN_CACHE_TS,
         _TOKEN_CACHE_TTL,
         _TOKEN_HISTORY_DAYS,
-        _parse_token_history,
     )
     from kiro_crew.dashboard.handlers.usage_sessions import (  # noqa: F401
+        _BACKGROUND_CALL_SURFACE_PREFIX,
         _SESSIONS_CACHE,
         _SESSIONS_CACHE_LOCK,
         _SESSIONS_CACHE_TS,
+        _TRANSCRIPT_COUNTS,
         _USAGE_SESSION_REFRESH_TASK,
         _USAGE_SESSION_WAIT_SECONDS,
         _cached_parse_sessions,
         _configured_acp_backend,
+        _count_row,
+        _count_transcript,
         _empty_session_summary,
+        _kas_transcripts,
         _parse_sessions,
         _sessions_from_own_records,
+        _pin_listing_dir,
+        _row_messages,
+        _shard_sessions,
     )
     from kiro_crew.dashboard.handlers.usage_spend import (  # noqa: F401
         _BARE_CHAT_SLOT_RE,
+        _DAILY_SPEND_FIELDS,
         _SLOT_SPEND_CACHE,
         _SLOT_SPEND_CACHE_AT,
         _SLOT_SPEND_CACHE_SIG,
         _SLOT_SPEND_TTL_S,
         TURN_USAGE_FIELDS,
+        _finite_number,
         daily_credits,
+        daily_spend,
         slot_spend,
         slot_turn_usage,
         spend_key_for_slot,
@@ -790,6 +831,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _NON_SESSION_CHANNELS,
         _SESSIONS_DIR,
         _SESSIONS_HISTORY_DAYS,
+        _SHARD_COUNTED_PROVIDERS,
         _TOKEN_USAGE_DIR,
         MAX_WINDOW_DAYS,
         NAVIGABLE_CATEGORY,
@@ -806,7 +848,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
 
 if TYPE_CHECKING:  # names it serves from outside the family, from their homes
-    from kiro_crew import model_registry  # noqa: F401
+    from kiro_crew import model_registry, platform_compat  # noqa: F401
+    from kiro_crew.agent_sdk.provider_identity import PROVIDER_CLAUDE_CODE  # noqa: F401
     from kiro_crew.config.paths import data_home, kiro_sessions_dir  # noqa: F401
     from kiro_crew.constants import crew_log_enabled, env_file_display  # noqa: F401
     from kiro_crew.context_blocks import USER_LABEL  # noqa: F401

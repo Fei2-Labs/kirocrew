@@ -15,8 +15,8 @@ Instance fields written: ``_dead_reason``, ``_init_deadline_task``, ``_init_firs
 ``_pending_requests``, ``_upstream_init_frame``, ``attempt_id``, ``reports_inflight``,
 ``supports_caller_identity``.
 
-Instance fields read: ``_inbox_lock``, ``_init_done_event``, ``_stub_inboxes``,
-``initialize_timeout_secs``, ``pool_key``, ``stdin``.
+Instance fields read: ``_gateway_ending``, ``_inbox_lock``, ``_init_done_event``,
+``_stub_inboxes``, ``initialize_timeout_secs``, ``pool_key``, ``process``, ``stdin``.
 """
 
 from __future__ import annotations
@@ -66,6 +66,13 @@ _DEFAULT_INITIALIZE_TIMEOUT_SECS = 10.0
 # room to spare; a hung backend still fails, only 20s later. See
 # ``_effective_initialize_timeout_secs``.
 _INITIALIZE_TIMEOUT_COLD_START_FLOOR_SECS = 30.0
+
+#: The start of the reason ``_init_deadline`` fails a backend with; the stub
+#: hands it to its host as ``backend init failed: <reason>``. A KAS session reads
+#: it back off the server's failed status entry
+#: (``acp.mcp_reattempt.is_start_timeout_failure``) to re-attempt a managed server
+#: that only ran out of time, so both sides spell it from this one constant.
+INITIALIZE_DEADLINE_REASON = "initialize did not complete within"
 
 
 def _effective_initialize_timeout_secs(configured: float) -> float:
@@ -310,10 +317,21 @@ async def _init_deadline(self: Backend, timeout: float) -> None:
     # only a still-in-flight window is this timer's to close.
     if self._init_state != "in_flight":
         return
-    reason = f"initialize did not complete within {timeout:g}s"
-    self._dead_reason = self._dead_reason or reason
-    with contextlib.suppress(Exception):
-        await self._fail_init(reason, log_event="initialize_timed_out", log_reason="deadline")
+    if (
+        self.process.returncode is not None
+        and self._dead_reason is None
+        and not self._gateway_ending
+    ):
+        # The server died inside the handshake while a helper it spawned holds
+        # its stdout open, so the pump never ended: the backend's own death,
+        # named, and every queued stub answered, as for any other.
+        with contextlib.suppress(Exception):
+            await self._report_backend_exit(f"exit rc={self.process.returncode}")
+    else:
+        reason = f"{INITIALIZE_DEADLINE_REASON} {timeout:g}s"
+        self._dead_reason = self._dead_reason or reason
+        with contextlib.suppress(Exception):
+            await self._fail_init(reason, log_event="initialize_timed_out", log_reason="deadline")
     with contextlib.suppress(Exception):
         await self.shutdown()
 
@@ -402,6 +420,15 @@ async def prime_initialize(
     try:
         await asyncio.wait_for(self._init_done_event.wait(), timeout=timeout)
     except asyncio.TimeoutError as exc:
+        if (
+            self.process.returncode is not None
+            and self._dead_reason is None
+            and not self._gateway_ending
+        ):
+            # Dead, not wedged: the server died inside the handshake while a
+            # helper it spawned holds its stdout open, as in ``_init_deadline``.
+            with contextlib.suppress(Exception):
+                await self._report_backend_exit(f"exit rc={self.process.returncode}")
         self._dead_reason = self._dead_reason or "initialize timed out on respawn"
         # The backend answered neither the handshake nor EOF within the
         # window: it is wedged (process alive, initialize never completing).
@@ -546,7 +573,14 @@ async def _on_upstream_initialize(self: Backend, response: dict[str, Any]) -> No
     queued stubs with an explicit error response. Without this a stub
     that registered during the in-flight window would hang forever
     waiting for a cached-initialize that never arrives.
+
+    A reply that lands after the handshake already failed (the deadline
+    fired, or the backend died) is dropped: ``"failed"`` is terminal, and
+    reading it as ``"ready"`` would serve later stubs from a reaped process.
     """
+    if self._init_state == "failed":
+        logger.info("backend pid=%s ignored initialize reply after the handshake failed", self.pid)
+        return
     try:
         result, self.supports_caller_identity = _parse_initialize_response(response)
     except ValueError as exc:

@@ -222,6 +222,7 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
         # Parser diagnostics reject a manifest; they are not declarations copied
         # into a valid builtin's persisted manifest.
         declared.discard("config_keys_error")
+        declared.discard("credential_masks_errors")
 
         manifest = AppManifest.from_dict(
             {
@@ -241,6 +242,7 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
                 "tags": ["t"],
                 "mcpServers": {"m": {"command": "c"}},
                 "config_keys": ["probe-owned"],
+                "credentialMasks": ["secrets.json"],
                 "platform": {"requiresDesktopApp": True},
                 "permissions": {"storage": True},
                 "ui": {"entry": "ui/dist/index.js"},
@@ -251,6 +253,17 @@ class TestBuiltinDeclaredResourcesActuallyRegister:
                 "publishProvider": {"id": "p", "label": "P"},
                 "notifications": {"channels": [{"id": "n", "name": "N"}]},
                 "l10n": {"de": {"displayName": "Sonde"}},
+                "desktop": {"windows": [{"id": "w", "entry": "ui/w.js", "kind": "overlay"}]},
+                "agentTools": {
+                    "route": "agent-tools",
+                    "tools": [
+                        {
+                            "name": "probe_note",
+                            "description": "d",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        }
+                    ],
+                },
                 "contributes": {
                     "commands": [
                         {
@@ -814,6 +827,48 @@ class TestPruneAbortsOnUnreadableAgent:
             keep.is_file()
         ), "prune must retain the agent — a non-object spec is unreadable, not removed"
 
+    def test_non_object_mcp_servers_manifest_is_unreadable_not_empty(self, tmp_path, app_env):
+        """A non-object ``mcpServers`` makes the manifest UNPARSEABLE, not empty.
+
+        ``from_dict`` raises on it, so ``get_app_manifest`` returns None and the boot
+        prune (``_prune_stale_app_resources``) is never handed a malformed manifest
+        whose empty map it would read as "declares none" and use to delete every
+        live bridge. The empty forms ``dict()`` accepted (``[]``, ``""``) still parse
+        to an empty map, so this does not newly reject a manifest main accepted.
+        """
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        app_dir = app_env["home"] / "apps" / "test-app"
+        from kiro_crew.apps.manager_records import get_app_manifest
+
+        with pytest.raises(ValueError, match="mcpServers must be an object"):
+            AppManifest.from_dict(
+                {
+                    "name": "test-app",
+                    "version": "1.0.0",
+                    "displayName": "Test App",
+                    "description": "d",
+                    "author": "a",
+                    "mcpServers": 5,
+                }
+            )
+        # On disk: a non-object mcpServers makes get_app_manifest fail closed (None),
+        # the same signal an otherwise-unreadable manifest gives.
+        (app_dir / APP_MANIFEST_FILENAME).write_text(
+            json.dumps(
+                {
+                    "name": "test-app",
+                    "version": "1.0.0",
+                    "displayName": "Test App",
+                    "description": "d",
+                    "author": "a",
+                    "mcpServers": 5,
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert get_app_manifest("test-app") is None
+
 
 class TestShippedAgentTemplatesAreRenderedByTheGateway:
     """A shipped template is rendered BY THE GATEWAY, from values it computes itself.
@@ -1336,12 +1391,33 @@ class TestRefreshAppAgentsReportsIoFailures:
 
 
 class TestRenderFailureIsClassifiedByCause:
-    """`_render_shipped_agent` returns None for three reasons; one is retryable.
+    """`_render_shipped_agent` returns None for four reasons; two are retryable.
 
     An unresolved placeholder and invalid rendered JSON are properties of the template
     and fail identically forever — reporting them to a caller that retries would spin
-    without converging. Only the write failure can succeed later.
+    without converging. Only the read and write failures can succeed later.
     """
+
+    def test_a_read_failure_registers_nothing_even_if_the_next_read_succeeds(
+        self, monkeypatch, tmp_path, app_env
+    ):
+        root, manifest = _installed_templated_app(tmp_path, app_env["home"], _HOST_TEMPLATE)
+        template = root / "agents" / "my-agent.json"
+        real_read_text = Path.read_text
+        failed: list[Path] = []
+
+        def _locked_once(self, *args, **kwargs):
+            if self == template and not failed:
+                failed.append(self)
+                raise PermissionError("sharing violation")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _locked_once)
+
+        collected: list[str] = []
+        assert _register_agents("test-app", manifest, root, io_failures=collected) == []
+        assert collected == [str(template)]
+        assert not (app_env["kiro_agents"] / "test-app--my-agent.json").exists()
 
     def _template(self, tmp_path, body: str):
         src = tmp_path / "agent.json"

@@ -24,6 +24,7 @@ def reset_module_state(monkeypatch):
     """Reset the module-level cache between tests."""
     mcp_shared._excluded_tools_by_session.clear()
     mcp_shared._last_failure_time = 0.0
+    mcp_shared._last_probe_time = 0.0
     mcp_shared._last_startup_race_time = 0.0
     mcp_shared._last_startup_race_key = ""
     mcp_shared._failure_count = 0
@@ -31,6 +32,7 @@ def reset_module_state(monkeypatch):
     yield
     mcp_shared._excluded_tools_by_session.clear()
     mcp_shared._last_failure_time = 0.0
+    mcp_shared._last_probe_time = 0.0
     mcp_shared._last_startup_race_time = 0.0
     mcp_shared._last_startup_race_key = ""
     mcp_shared._failure_count = 0
@@ -314,17 +316,17 @@ class TestLongCacheFailures:
         ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
         assert "tool_policy.forbidden" in ops
 
-    def test_403_from_a_closed_enterprise_gate_refuses_the_call(
+    def test_403_from_a_closed_lts_gate_refuses_the_call(
         self, fake_sel, patch_session_setup, monkeypatch
     ):
-        """The enterprise gate's 403 is not a decision about this caller.
+        """The LTS gate's 403 is not a decision about this caller.
 
         It refuses every route while closed, this read included, so the exclusion
         list is unread: the call must be refused, not served as ``policy_forbidden``.
         Not cached, so the first read after the gate reopens succeeds.
         """
         monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
-        body = b'{"error": "locked", "code": "enterprise_gate_closed", "reason": "login_required"}'
+        body = b'{"error": "locked", "code": "lts_gate_closed", "reason": "login_required"}'
         urlopen = MagicMock(side_effect=_make_http_error(403, body))
         with patch.object(mcp_shared, "loopback_urlopen", urlopen):
             policy = mcp_shared._resolve_tool_policy()
@@ -555,7 +557,11 @@ class TestFailureCause:
         assert policy.detail == "ConnectionRefusedError"
         event = self._failed_event(fake_sel)
         assert event["error"] == "ConnectionRefusedError: gateway port closed"
-        assert event["resources"] == "error_class=ConnectionRefusedError"
+        # The port it dialled and the chain rung that chose it ride beside the
+        # class, so a foreign ``env`` port is visible in the audit row itself.
+        assert event["resources"] == (
+            "error_class=ConnectionRefusedError,port=5476,port_source=config"
+        )
 
     def test_message_is_redacted_and_capped(self, fake_sel, patch_session_setup, monkeypatch):
         monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")

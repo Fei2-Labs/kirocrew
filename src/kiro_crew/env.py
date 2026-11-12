@@ -18,8 +18,13 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import env_node_windows, env_own_kirocrew, platform_compat
+from kiro_crew import env_node_pins, env_node_windows, env_own_kirocrew, platform_compat
 from kiro_crew.config.paths import data_home
+from kiro_crew.env_krb5_keyring import (  # noqa: F401  (re-exported from env)
+    KRB5_KEYRING_REMEDY,
+    _warn_keyring_ccache_once,
+    krb5_keyring_ccache,
+)
 from kiro_crew.env_mise import _mise_bin
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -85,6 +90,8 @@ _EXTRA_PATH_DIRS = (
 # resolution alone would exit rc=127. :func:`mcp_runtime_path` wraps
 # :func:`augmented_path` rather than altering it, and nothing is persisted.
 # Exception 2, the agent child (kiro-cli): see :func:`append_mcp_path_dirs`.
+# A script or command cron child gets the same PATH as the agent child
+# (``cron_script_child_env._clean_cron_env``).
 #
 # Liveness: resolution callers read the current snapshot on every call. The
 # daemon's PATH is fixed when ``manager._spawn_once`` spawns it, and an ADOPTED
@@ -805,9 +812,22 @@ def user_tool_bin_dirs(home: str) -> list[str]:
     mise_data = mise_data_dir(home)
     return [
         e
-        for d in _EXTRA_PATH_DIRS
+        for d in _extra_path_templates()
         if (e := _validated_bin_dir(os.path.normpath(d.format(home=home, mise_data=mise_data))))
     ]
+
+
+def _extra_path_templates() -> tuple[str, ...]:
+    """:data:`_EXTRA_PATH_DIRS`, minus the fixed POSIX roots on Windows.
+
+    ``/opt/homebrew/bin`` and ``/usr/local/bin`` name nothing on Windows, where
+    Python 3.12's ``isabs`` still accepts them and they resolve against the
+    current drive (``C:\\opt\\homebrew\\bin``), a folder any local account can
+    create. Every ``{home}``/``{mise_data}`` template stays.
+    """
+    if platform_compat.IS_WINDOWS:
+        return tuple(d for d in _EXTRA_PATH_DIRS if not d.startswith("/"))
+    return _EXTRA_PATH_DIRS
 
 
 # Where a POSIX PATH's system section starts. An inherited well-known dir only
@@ -825,6 +845,15 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     ``PATH`` without dirs like ``~/.local/bin``; the MCP probe and the kiro-cli
     spawn share this one augmentation. ``home`` pins user-relative candidates to
     a specific account instead of the process owner.
+
+    Node (:mod:`kiro_crew.env_node_pins`): an operator's ``KIROCREW_NODE_BIN_DIR``
+    follows :func:`_own_kirocrew_dirs` and is always prepended, ahead of every
+    guess and every inherited entry: it is never an anchor, and a *base_path*
+    copy of it is dropped. The data
+    home's glibc-2.17 tree sits just ahead of the per-version manager dirs, so
+    an ``npx`` server and its ``#!/usr/bin/env node`` reach a Node chosen for
+    this host before nvm's newest, which may not load (Amazon Linux 2). Each
+    must hold an executable ``node``; a pinned ``home`` gets neither.
 
     The interpreter's own dir and its console-scripts dir (they differ only on
     the Windows desktop backend, ``python.exe`` at the root and scripts in
@@ -852,13 +881,24 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     """
     resolved_home = home or os.path.expanduser("~")
     mise_data = mise_data_dir(resolved_home)
+    own = home is None
     # Absolute-only (_validated_bin_dir): a relative MISE_DATA_DIR would put a
     # relative shims entry on PATH, re-resolved against the CHILD's cwd, so a
     # work-dir-relative executable could shadow the configured command.
-    extra = _own_kirocrew_dirs() if home is None else []
+    extra = _own_kirocrew_dirs() if own else []
+    pinned = (
+        env_node_pins.override_bin_dirs(_NODE_BIN_DIR_ENV, _validated_bin_dir, _has_node)
+        if own
+        else []
+    )
+    # With an override, this install's own dirs lead with it: an inherited copy of
+    # either (a PATH this function already built) is dropped and both are
+    # prepended in this order, so the override's own ``kirocrew`` never shadows it.
+    lead = extra + pinned if pinned else []
+    extra += pinned
     extra += [
         e
-        for d in _EXTRA_PATH_DIRS
+        for d in _extra_path_templates()
         if (e := _validated_bin_dir(d.format(home=resolved_home, mise_data=mise_data)))
     ]
     if platform_compat.IS_WINDOWS and (
@@ -866,13 +906,17 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
     ):
         extra.append(toolbox_bin)
     extra += env_node_windows.manager_dirs(resolved_home, home)
+    if own:
+        extra += env_node_pins.data_home_tree_dirs(
+            _NODE_TREE_DATA_HOME_DIRS, _validated_bin_dir, _has_node
+        )
     windows_globs = env_node_windows.manager_globs(resolved_home, home)
     extra += _node_all_bin_dirs(
         resolved_home, mise_data, _xdg_config_dir(resolved_home), windows_globs
     )
     # No anchors on Windows: System32 comes first there and _SYSTEM_BIN_DIRS never
     # matches, so anchoring would push every extra behind System32.
-    entries = base_path.split(os.pathsep) if base_path else []
+    entries = env_node_pins.without_dirs(base_path.split(os.pathsep) if base_path else [], lead)
     anchors: dict[str, int] = {}
     for i, p in enumerate(entries if not platform_compat.IS_WINDOWS else ()):
         n = os.path.normcase(os.path.normpath(p)) if p else ""
@@ -889,7 +933,7 @@ def augmented_path(base_path: str = "", *, home: str | None = None) -> str:
             # Never move back left: a lower-ranked extra stays behind every
             # higher-ranked anchor, whatever order the user listed them in.
             anchor = anchors[n] if anchor is None else max(anchor, anchors[n])
-        elif anchor is None:
+        elif anchor is None or e in lead:
             before.append(e)
         else:
             after.setdefault(anchor, []).append(e)
@@ -1488,6 +1532,10 @@ def expand_spec_args(args: Any, *, server: str | None = None) -> Any:
     text substitution, never a shell. The import is function-local because the
     rewriter imports this module.
 
+    On Windows a missing ``HOME``/``USER`` is filled from ``USERPROFILE``/
+    ``USERNAME``, so a POSIX-written ``${HOME}`` resolves to the same home
+    ``Path.home()`` uses there instead of reaching the child literally.
+
     Returns a NEW list, leaving the caller's config untouched. Non-string
     elements and a non-list ``args`` pass through, so a malformed spec keeps
     its own error.
@@ -1497,6 +1545,16 @@ def expand_spec_args(args: Any, *, server: str | None = None) -> Any:
     from kiro_crew.mcp_gateway.rewriter import _expand_env_placeholders
 
     source = {name: value for name in _SPEC_ARG_VARS if (value := os.environ.get(name))}
+    # On Windows the home and login-name live under USERPROFILE/USERNAME, not
+    # HOME/USER, so a POSIX-written ``${HOME}``/``${USER}`` would stay literal
+    # (the process has no HOME). Fill each missing name from its Windows twin so
+    # the one home Path.home() already resolves there (see managed_mcp.py's
+    # _HOME_DERIVING_ENV_KEYS) reaches the spec. A set HOME/USER still wins, and
+    # no name outside _SPEC_ARG_VARS is read, so no other value reaches argv.
+    if platform_compat.IS_WINDOWS:
+        for name, twin in (("HOME", "USERPROFILE"), ("USER", "USERNAME")):
+            if name not in source and (value := source.get(twin)):
+                source[name] = value
     return [
         _expand_env_placeholders(a, source=source, server=server) if isinstance(a, str) else a
         for a in args
@@ -1569,13 +1627,15 @@ def activate_mise(env: MutableMapping[str, str] | None = None) -> list[str]:
 def resolve_krb5_ccname(env: dict[str, str]) -> None:
     """Point *env* at a FILE: Kerberos ccache, mutating it in place.
 
-    The gateway is a long-lived, non-login process.  On AL2023 the default
-    ``krb5.conf`` uses ``KEYRING:persistent:<uid>`` for the ccache, and kernel
-    keyrings are session-scoped — they are NOT visible to subprocesses spawned
-    by a background daemon.  So a child (kiro-cli / claude / a pooled MCP
-    backend) inheriting ``os.environ`` sees no usable ticket, and Kerberos-gated
-    MCP servers (e.g. an SSO-backed MCP server) fail with
-    "no Kerberos ticket" even though ``kinit`` succeeded in the user's shell.
+    On AL2023 the default ``krb5.conf`` uses ``KEYRING:persistent:<uid>`` for
+    the ccache.  The Linux sandbox starts every agent child in a new user
+    namespace, and the kernel keeps persistent (and user) keyrings per user
+    namespace, so inside the sandbox ``KEYRING:persistent:<uid>`` resolves to a
+    fresh, EMPTY keyring rather than the one ``kinit`` filled in the user's
+    terminal.  A child (kiro-cli / claude / an MCP server it starts) inheriting
+    that default sees no ticket, and Kerberos-gated MCP servers fail with
+    "no Kerberos ticket" even though ``klist`` in the user's shell shows one.
+    A FILE: cache is a plain file, so it reads the same on both sides.
 
     This mirrors :func:`_resolve_ssh_auth_sock` in ``acp.client``: repair the
     credential pointer at spawn time rather than trusting the daemon's stale
@@ -1592,7 +1652,10 @@ def resolve_krb5_ccname(env: dict[str, str]) -> None:
     * Else, if ``/tmp/krb5cc_<uid>`` resolves to a regular file we own, point
       at it.
     * Else, do nothing — no ticket to find; let the MCP surface its own
-      auth error rather than masking it.
+      auth error rather than masking it.  When the cache the child is left on
+      is a per-namespace keyring (``KEYRING:persistent:`` / ``KEYRING:user:``),
+      log a single warning per process naming the remedy (see
+      :func:`krb5_keyring_ccache`), so the failure is not silent.
 
     The candidate lives in ``/tmp`` (world-writable, sticky-bit), so we ``lstat``
     it first and require ownership by the current uid.  We do NOT reject a
@@ -1622,6 +1685,20 @@ def resolve_krb5_ccname(env: dict[str, str]) -> None:
     # and gives Windows the same no-op behaviour it needs (no ``os.getuid``).
     if not platform_compat.IS_LINUX:
         return
+    cache = usable_file_ccache()
+    if cache is not None:
+        env["KRB5CCNAME"] = f"FILE:{cache}"
+        logger.debug("resolved KRB5CCNAME to FILE:%s", cache)
+        return
+    _warn_keyring_ccache_once(env)
+
+
+def usable_file_ccache() -> str | None:
+    """Return the ``/tmp/krb5cc_<uid|user>`` path a child can use, else ``None``.
+
+    Linux only (callers gate on :data:`platform_compat.IS_LINUX`).  A candidate
+    that exists but fails :func:`_reject_reason` is logged at debug.
+    """
     # The kernel's default FILE ccache is named by numeric UID
     # (``/tmp/krb5cc_<uid>``) — this is also what the documented workaround
     # ``kinit -c /tmp/krb5cc_$(id -u)`` produces.  Some setups instead use the
@@ -1636,9 +1713,7 @@ def resolve_krb5_ccname(env: dict[str, str]) -> None:
     for cache in candidates:
         reason = _reject_reason(cache)
         if reason is None:
-            env["KRB5CCNAME"] = f"FILE:{cache}"
-            logger.debug("resolved KRB5CCNAME to FILE:%s", cache)
-            return
+            return cache
         if reason != "absent":
             # A candidate physically exists but failed the ownership/type gate.
             # Log it so this is distinguishable from the plain "no ccache" case —
@@ -1646,6 +1721,7 @@ def resolve_krb5_ccname(env: dict[str, str]) -> None:
             rejected.append(f"{cache} ({reason})")
     if rejected:
         logger.debug("KRB5CCNAME left unset; rejected ccache candidate(s): %s", ", ".join(rejected))
+    return None
 
 
 def _reject_reason(cache: str) -> str | None:

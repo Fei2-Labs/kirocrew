@@ -121,6 +121,7 @@ from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_disconnect,
     api_connections_mint,
     api_connections_mint_state,
+    api_connections_oauth_callback,
     api_connections_oauth_client_delete,
     api_connections_oauth_client_put,
     api_connections_oauth_clients,
@@ -165,6 +166,7 @@ from kiro_crew.dashboard.handlers.cron import (  # noqa: E402, F401
     api_lessons,
     api_lessons_create,
     api_lessons_delete,
+    api_lessons_update,
 )
 
 # ── Diagnostics / Report a Problem (handlers/diagnostics.py) ──
@@ -177,6 +179,7 @@ from kiro_crew.dashboard.handlers.diagnostics import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     _validate_dashboard_path,
     _write_file_restricted,
+    api_browse_create_dir,
     api_browse_dirs,
     api_browse_files,
     api_channel_upload_file,
@@ -270,6 +273,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_toggle,
     api_mcp_toggle_all,
     api_mcp_toggle_tool,
+    api_mcp_unreadable_files,
 )
 
 # ── Crew Members (handlers/members.py) ──
@@ -350,6 +354,7 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_imessage_config_get,
     api_imessage_config_save,
     api_notification_ack,
+    api_notification_agent_dismiss,
     api_notification_agent_push,
     api_notification_channel_settings,
     api_notification_channels,
@@ -362,11 +367,13 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_slack_code_channel_agents,
     api_slack_config_get,
     api_slack_config_save,
+    api_slack_history,
     api_slack_manifest,
     api_slack_manifest_status,
     api_slack_pins,
     api_slack_profile,
     api_slack_reactions,
+    api_slack_reconnect,
     api_spawn,
     api_spawn_continue,
     api_spawn_delete,
@@ -572,6 +579,12 @@ async def api_task_detail(request):
     return await handler(request)
 
 
+async def api_task_timeline(request):
+    from kiro_crew.dashboard.handlers.tasks import api_task_timeline as handler
+
+    return await handler(request)
+
+
 async def api_tasks_list(request):
     from kiro_crew.dashboard.handlers.tasks import api_tasks_list as handler
 
@@ -661,6 +674,9 @@ from kiro_crew.dashboard.handlers.usage import (  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.usage_series import api_usage_series  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.wakatime import (  # noqa: E402, F401
     api_wakatime_export,
+    api_wakatime_oauth_authorize,
+    api_wakatime_oauth_callback,
+    api_wakatime_oauth_disconnect,
     api_wakatime_stats,
 )
 
@@ -1037,6 +1053,13 @@ from kiro_crew.dashboard.handlers.computer_use import (  # noqa: E402, F401
     api_computer_use_invoke,
 )
 
+# Owner review of a hand-edited sealed keystone file (Settings > Security).
+from kiro_crew.dashboard.handlers.config_pending import (  # noqa: E402, F401
+    api_config_pending_apply,
+    api_config_pending_discard,
+    api_config_pending_list,
+)
+
 # ── Core (extracted to handlers/core.py) ──
 from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     _DIST_DIR,
@@ -1098,6 +1121,8 @@ from kiro_crew.dashboard.handlers.decisions_sagemaker import (  # noqa: E402, F4
     api_decisions_provider_sagemaker_test,
 )
 from kiro_crew.dashboard.handlers.notifications_push import (  # noqa: E402, F401
+    api_own_notification_ack,
+    api_own_notifications,
     api_push_notification,
     api_push_subscribe,
     api_push_unsubscribe,
@@ -1117,6 +1142,12 @@ from kiro_crew.dashboard.handlers.portability import (  # noqa: E402, F401
     api_portability_export,
     api_portability_import,
     api_portability_preview,
+)
+
+# The per-folder project-hooks choice (see ``kiro_crew.project_hooks_consent``).
+from kiro_crew.dashboard.handlers.project_hooks_consent import (  # noqa: E402, F401
+    api_project_hooks_consent_get,
+    api_project_hooks_consent_put,
 )
 
 # Owner reveal of a removed credential -- the ONE reader of the in-memory

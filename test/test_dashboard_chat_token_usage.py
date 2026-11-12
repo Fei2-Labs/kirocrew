@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -530,6 +531,49 @@ class TestTokenUsageSurface:
 
         assert [(r["slot"], r["surface"]) for r in rows()] == [(slot.key, "slack")]
 
+    @pytest.mark.asyncio
+    async def test_a_closed_linked_tab_keeps_its_title_on_the_telemetry_card(
+        self, tmp_path, monkeypatch
+    ):
+        """A task-review tab writes under its linked key, which its name cannot reach.
+
+        Only the turn's usage row outlives the tab, so the row has to name that
+        transcript for the Telemetry card to title the tab once it is closed.
+        """
+        from kiro_crew.dashboard.handlers import usage as usage_mod
+        from kiro_crew.dashboard.handlers.telemetry import _with_conversation_titles
+        from kiro_crew.dashboard.slot_ownership import task_review_session_key
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        complete = LLMEvent(
+            kind=EVENT_COMPLETE,
+            usage=TurnUsage(input_tokens=1, output_tokens=1, duration_ms=25),
+        )
+        state = TestTokenPersistenceBackfill._make_state_for_run_chat(tmp_path, monkeypatch)
+        linked = task_review_session_key("task-1", "abc")
+        slot = state.get_or_create_slot("task-review-abc", linked_session_key=linked)
+        slot._titled = True
+        client = TestTokenPersistenceBackfill._make_mock_client(
+            [LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok"), complete]
+        )
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        _stored_token_rows(monkeypatch, tmp_path)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        log = ConversationLog(tmp_path / "history")
+        log.set_title(linked, "Review the parser fix")
+        closed = SimpleNamespace(
+            app={"state": SimpleNamespace(get_slot=lambda key: None, conversation_log=log)}
+        )
+        out = await _with_conversation_titles(closed, usage_mod.cost_breakdown(7))
+
+        assert [r.get("title") for r in out["conversations"]] == ["Review the parser fix"]
+        assert "transcripts" not in out
+
 
 class TestCostOnlyTurnPersistGate:
     """The chat_runner turn-end persist gate must fire on ``cost_usd`` alone.
@@ -578,6 +622,36 @@ class TestCostOnlyTurnPersistGate:
         await _run_chat(state, slot, "hello")
 
         assert rows() == []
+
+
+class TestTurnRowDelivery:
+    """A billed turn that streamed no reply text must read apart from one
+    that answered, on the per-turn rows the Spend drill-down reads."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("replied", [True, False], ids=["reply", "no_reply"])
+    async def test_the_turn_row_says_whether_a_reply_was_delivered(
+        self, tmp_path, monkeypatch, replied
+    ):
+        from kiro_crew.dashboard.handlers.usage import slot_turn_usage
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        events = [LLMEvent(kind=EVENT_TEXT_CHUNK, text="done")] if replied else []
+        events.append(
+            LLMEvent(kind=EVENT_COMPLETE, stop_reason="end_turn", usage=TurnUsage(credits=0.45))
+        )
+        state = TestTokenPersistenceBackfill._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = TestTokenPersistenceBackfill._make_mock_client(events)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        _stored_token_rows(monkeypatch, tmp_path)
+
+        from kiro_crew.dashboard.chat import _run_chat
+
+        await _run_chat(state, slot, "hello")
+
+        (turn,) = slot_turn_usage("s1")
+        assert turn.get("delivered") is replied
 
 
 class TestKiroBackfillProfileGuard:

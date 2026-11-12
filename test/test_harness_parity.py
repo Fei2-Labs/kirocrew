@@ -1294,6 +1294,22 @@ _RUNTIME_PATH_MODULES = (
 #: :func:`test_every_runtime_path_identity_test_is_declared`.
 _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     (
+        "src/kiro_crew/acp/runtime_spawn_entry.py",
+        "spawn",
+    ): "moving kiro-cli's broken KAS extract aside and retrying is a repair for the "
+    "KAS relay alone (kiro-cli's v3 engine copy); every other harness, Kiro CLI "
+    "included, starts exactly as before",
+    (
+        "src/kiro_crew/acp/runtime_liveness.py",
+        "_drain_stderr",
+    ): "the broken-KAS-extract stderr latch feeds only the KAS repair; a non-KAS "
+    "runtime never latches it. "
+    '"V3 is currently not supported on this system" is kiro-cli refusing the v3 '
+    "engine KAS runs on, so the host verdict it records is KAS's alone "
+    "(``mark_backend_unservable`` of KAS). No other harness runs that engine, and "
+    "recording it from another child would move KAS off a host on a line about "
+    "something else.",
+    (
         "src/kiro_crew/acp/session_handle_turn.py",
         "_build",
     ): (
@@ -1309,6 +1325,12 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     "(kas_custom_agents). KAS is the only host that sends that allowlist, so a "
     "positive identity test refuses every other harness instead of letting one run "
     "the agent's local tools on the gateway machine.",
+    (
+        "src/kiro_crew/acp/session_handle_permissions.py",
+        "reject_tool",
+    ): "``_meta.kiro.rejectionReason`` on a one-time Deny is a key only the KAS engine "
+    "reads (it hands the text to the model); every other harness must be sent the bare "
+    "reject, so a positive identity test keeps the key off their wire.",
     (
         "src/kiro_crew/acp/session_handle_permissions.py",
         "_build_permission_event",
@@ -1398,6 +1420,26 @@ _DECLARED_IDENTITY_TESTS: dict[tuple[str, str], str] = {
     ): "``_kiro/session/compact`` is KAS's own extension verb, advertised in its "
     "``initialize`` extensionMethods. Every other ``ACP_BACKENDS_COMPACT`` member "
     "compacts on the ``/compact`` prompt, so the positive test keeps them on it.",
+    (
+        "src/kiro_crew/acp/runtime_session_registry.py",
+        "__aenter__",
+    ): "The chat turn gate on a shared process is skipped on KAS only: the KAS engine "
+    "names the session on every ``session/update`` and orders turns itself, so no "
+    "ownerless control frame needs one turn in flight. Of the two "
+    "``ACP_BACKENDS_CHAT_RUNTIME_SHARING`` members, kiro-cli is the one that emits "
+    "frames without a sessionId; a positive KAS test keeps every other host gated.",
+    (
+        "src/kiro_crew/acp/session_handle_kas.py",
+        "kas_command_call",
+    ): "``_kiro/session/context``, ``_kiro/knowledge`` and ``_kiro/codeIntelligence`` are "
+    "KAS's own extension verbs behind a person's ``/context``, ``/knowledge`` and "
+    "``/code``. The positive test keeps them off every other harness's wire.",
+    (
+        "src/kiro_crew/acp/session_handle_dispatch.py",
+        "_dispatch_events",
+    ): "Only kiro-cli answers a cancelled prompt ahead of the ``_kiro.dev/metadata`` frame "
+    "that bills it (live probe, 3.1.0), so only there does the stopped turn read one more "
+    "frame. No other harness sends that frame, and the read would spend its grace on every Stop.",
     (
         "src/kiro_crew/acp/session_handle_updates.py",
         "_handle_update",
@@ -1773,3 +1815,34 @@ def test_the_identity_test_declarations_are_all_still_live():
 
     stale = sorted(set(_DECLARED_IDENTITY_TESTS) - seen)
     assert not stale, f"prune these dead _DECLARED_IDENTITY_TESTS entries: {stale}"
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
+def test_merge_card_kept_prompt_rule_is_kiro_only(backend: str) -> None:
+    """H5: only the Kiro "kept the prompt" contract consumes an unlanded merge card.
+
+    The turn below left before landing after a real ``end_turn``: on kiro-cli
+    and on KAS (the default, which also runs the Kiro CLI pick) the live
+    session kept the prompt, so its card is consumed. No other harness has been
+    checked against that contract, so its card stays queued and a wrong guess
+    sends it twice instead of losing it.
+    """
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard.chat_runner import STOP_REASON_END_TURN
+    from kiro_crew.dashboard.chat_turn.turn_stats import _merge_cards_reached_the_model
+
+    turn = SimpleNamespace(
+        client=providers_acp.AcpProvider(acp_backend=backend),
+        _turn_lands=False,
+        _empty_verdict_left_prompt_unanswered=False,
+        _compaction_completed=False,
+        _had_empty_response_verdict=False,
+        _recovering_compaction=False,
+        _stop_reason=STOP_REASON_END_TURN,
+        _terminal_synthetic=False,
+        _turn_emitted=True,
+        needs_conversation_discard=False,
+        needs_session_reset=False,
+    )
+    assert _merge_cards_reached_the_model(turn) is (backend in ACP_BACKENDS_KIRO_FAMILY)

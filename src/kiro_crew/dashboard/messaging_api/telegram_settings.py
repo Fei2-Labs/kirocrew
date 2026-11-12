@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import json
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -34,7 +33,6 @@ if TYPE_CHECKING:
         ensure_channel_folder,
         is_direct_local_request,
         live,
-        read_config_text,
         run_to_completion,
         stored_folder_name,
     )
@@ -69,11 +67,13 @@ async def _validate_telegram_token(token: str) -> str | None:
         # client's own method calls.
         async with session.get(verify_url, allow_redirects=False, proxy=proxy) as resp:
             data = await resp.json(content_type=None)
-            if isinstance(data, dict) and data.get("ok"):
+            if not isinstance(data, dict) or "ok" not in data:
+                # Not a Bot API reply (empty body, or a proxy's own JSON error):
+                # unverifiable, not rejected.
+                raise ConnectionError(f"getMe got no Bot API reply (HTTP {resp.status})")
+            if data.get("ok"):
                 return None
-            desc = ""
-            if isinstance(data, dict):
-                desc = str(data.get("description", "") or "")
+            desc = str(data.get("description", "") or "")
             return (desc or "rejected")[:60]
 
 
@@ -223,7 +223,10 @@ async def _telegram_config_save_locked(request: web.Request) -> web.Response:
     path = config_path()
 
     def _read_config() -> dict:
-        data = json.loads(read_config_text(path)) if path.exists() else {}
+        # The read half of this read-modify-write starts from what the load reads.
+        from kiro_crew.config.loader import read_config_for_update
+
+        data = read_config_for_update(path)
         if not isinstance(data, dict):
             raise ValueError("config.json is not a JSON object")
         return data

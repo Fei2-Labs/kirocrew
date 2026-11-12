@@ -1,6 +1,8 @@
 # App Manifest Reference
 
 The app manifest (`app.json`) declares your app's identity, resources, and requirements.
+Save it as UTF-8. One leading UTF-8 byte-order mark, which Windows editors write for
+"UTF-8 with BOM", is accepted.
 
 ## Required Fields
 
@@ -44,6 +46,39 @@ no port other than 443. Entries past the sixth, and entries that break a rule,
 are dropped with one log line; the rest of the manifest still loads. There is
 no host allowlist: each button shows the URL's host under its label, so the
 reader sees where it goes, and it opens in a new tab.
+
+### Writing `useCases`
+
+`highlights` lists what the app can do. `useCases` says when an operator should
+reach for it. Write each entry as a situation, in the shape "when X, do Y to get
+Z", not a restated feature list.
+
+- **Write 3-5 entries.**
+- **Ground every entry in what the app ships.** Each entry must follow from the
+  app's own `highlights` and from what it declares, such as its `agents`,
+  `skills` and `crons`, so a reviewer can check it against the manifest. Do not
+  describe a feature or an integration the app does not have.
+- **Name what the app declares.** If the app declares an agent, skill or cron,
+  at least one entry should show the operator using it, by name.
+
+Bad, because it restates the features and names no situation:
+
+```json
+"useCases": [
+  "Triage issues and pull requests across connected providers while retaining summaries, suggested labels, and investigation history."
+]
+```
+
+Good, for the same app (it declares no agent, skill or cron, so each entry rests
+on a highlight):
+
+```json
+"useCases": [
+  "When the morning queue fills up, read each new issue's AI summary and suggested labels, and apply the ones you agree with",
+  "When a pull request is ready, approve, merge or re-run CI from the app; the merge cannot land until the host's required reviews and checks pass",
+  "When a report looks familiar, open its investigation notes instead of investigating it again"
+]
+```
 
 ## Admission metadata
 
@@ -120,7 +155,11 @@ installed against:
   argument after the script are left as written. The rewrite applies only when the
   operand resolves (links followed) to an existing file inside the app root; an
   absolute path, or a relative one that is not such a file, is left as written. A
-  relative path in `command` itself is still never rewritten.
+  relative path in `command` itself is still never rewritten. This is also the only
+  stdio shape a former built-in's repository may declare and still be adopted in
+  place of the built-in, and then only for servers the built-in declared, with no
+  `autoApprove` tool the built-in did not have and no `env` entry it did not set
+  with the same value.
 - The host CLI name `kirocrew` is pinned to the running gateway before any of
   the above applies.
 
@@ -197,6 +236,60 @@ server should treat a missing label as "unknown session":
 The server's `command`, `args` and `env` are exactly what it would have started
 with without the label.
 
+### `agentTools` — MCP tools your app serves
+
+An app can give agents tools of its own without shipping an MCP server: declare them
+here, and serve every call from one route of your own API. The gateway lists each tool
+in its `kirocrew-core` MCP server under the name you give it, checks every call against
+your schema, and posts the call to your route. Your code runs where it already runs
+(your backend process, or your `backend.routes` in the gateway); none of it runs in the
+MCP server. Needs App Kit seam level 2 (`ctx.sdk_level >= 2`); an older host ignores
+the block and installs the app without the tools.
+
+Today the gateway lists the tools of first-party apps only (the apps that ship with
+Kiro Crew, including one that moved to its own repository, up to the tools its shipped
+copy declares). `kirocrew-core` is auto-approved as a whole server, and a third-party
+app's tools do not get that approval, so an installed or registry app's block
+validates and installs but lists nothing yet. Until it does, ship an MCP server of your
+own (`mcpServers`); the user approves each of its calls.
+
+```json
+"agentTools": {
+  "route": "agent-tools",
+  "tools": [
+    {
+      "name": "my_app_note",
+      "title": "Post a note",
+      "description": "Post one progress note to an item.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "item_id": {"type": "string", "maxLength": 64},
+          "status": {"type": "string", "enum": ["done"]}
+        },
+        "required": ["item_id"]
+      },
+      "maxResultChars": 20000
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `route` | string | The route that serves every call, below your app's API: a process backend receives `POST /api/<route>` through the signed app proxy; `backend.routes` receive `POST /<route>`. Lowercase segments only; no leading `/`, query, host or `..` |
+| `tools[].name` | string | Must begin with your app's name with `-` read as `_`, then `_` (app `my-app`: `my_app_...`). A name a built-in core tool already has is never yours |
+| `tools[].description` | string | What the model reads, up to 4,000 characters |
+| `tools[].title` | string | Optional one-line display title, up to 80 characters |
+| `tools[].inputSchema` | object | An object schema using only `string` (`enum`, `maxLength`), `integer` and `number` (`minimum`, `maximum`), `boolean`, and arrays of strings or integers (`maxItems`, item `maxLength`). A string with no `maxLength` is capped at 65,536 characters and an array with no `maxItems` at 256 items; a bool is refused where an integer is declared; `additionalProperties` may only be `false` |
+| `tools[].maxResultChars` | number | Where your answer is cut after redaction, 1 to 60,000; default 20,000 |
+| `tools[].strictSession` | boolean | `true`: the call is forwarded only from a directly identified session, whose key your route reads from `X-Session-Key`. Only for `backend.routes`; refused on an app with a process backend, whose proxy strips that header. Default `false` |
+
+Your route receives `{"tool": "<name>", "arguments": {...}}` holding only arguments your
+schema allows, and its JSON answer goes back to the agent, redacted. At most 16 tools per
+app. The tools are listed only while your app is enabled, and a call to a disabled app is
+refused.
+
 ## Scheduling
 
 ### `crons` — Cron Job Definitions
@@ -232,7 +325,7 @@ with without the label.
 | `every` | number | Interval in seconds (mutually exclusive with `cron_expr`) |
 | `cron_expr` | string | Cron expression (mutually exclusive with `every`) |
 | `message` | string | Prompt sent to the agent on each run |
-| `agent` | string | Agent to run (optional, uses default if omitted) |
+| `agent` | string | Agent template to run (optional, uses default if omitted). Name a template, never a Bot: an app cron is never bound to a Bot, so naming one runs that Bot's agent and workspace on the default memory store, not the Bot's own. Only the owner can give a Bot a schedule: `kirocrew cron add NAME MESSAGE --every SECONDS --agent <bot-key>`, or **New schedule** on the Bot's **Schedules** tab |
 | `agent_sequence` | string[] | Ordered agents to run |
 | `command` | string | Shell command executed without a model call; mutually exclusive with `script`. A present non-string value is rejected rather than treated as absent |
 | `script` | string | Synchronous Python callable (`file.py:function`) executed without a model call; mutually exclusive with `command`. A present non-string value is rejected rather than treated as absent. The path resolves against the app's own bundle, must stay inside it, must name a `.py` file, and is stored as an absolute path; re-enable the app after its bundle moves |
@@ -930,8 +1023,12 @@ Two ways to draw:
   pointer leaves or the chat scrolls; the next hover then gets a fresh frame, and
   at most 8 cards stay pinned. `card.dragBy` moves it (use `screenX`/`screenY`
   deltas: the frame moves under the pointer) and `card.dock` sticks it to an edge.
-  A scroll inside the card stays in the frame and never closes it, and a scroll
-  elsewhere closes it only when it moved the hovered link.
+  A scroll inside the card stays in the frame and never closes it. A scroll
+  elsewhere never closes a card that is already open, even when it moves the
+  hovered link (a streaming reply pulling the chat along): the card stays where
+  it is, and the module gets `leave` on the first pointer move outside the card
+  and the link. A scroll that moves the link while its show is still in the
+  hover delay cancels that show.
 - **Overlay mode**, for a provider that keeps windows of its own (pinned cards, a
   dock, a settings dialog). Its first `ctx.setRegions` makes the frame cover the
   viewport, clipped to the rects it reports; outside them the page stays
@@ -1555,10 +1652,11 @@ waiting for a Gateway restart.
 
 `kirocrew app enable` and `kirocrew app disable` apply live when a running
 Gateway is reachable through the CLI's owner-only Unix socket (POSIX only),
-including starting or stopping the backend. Otherwise the CLI records the change
-for the next Gateway start. On that file-only path, enabling an app that declares
-`backend.hooks` also prints the hooks reminder so the delayed activation is
-explicit.
+including starting or stopping the backend. Otherwise the CLI edits the files
+alone: a Gateway that is running anyway loads or unloads the hooks within a
+minute, and the backend process starts or stops at the next Gateway start. On
+that file-only path, enabling an app that declares `backend.hooks` also prints
+the hooks reminder so the timing is explicit.
 
 **Importing your own modules.** Hook entry files are loaded from their file path
 into a synthetic package named after the app, never via `sys.path`, so use a
@@ -1717,9 +1815,13 @@ packages at all.
     "memory": "app-scoped",
     "network": false,
     "sessionApproval": false,
+    "memberThreads": false,
     "spawn": false,
     "jobs": false,
     "proposeCrewmate": false,
+    "agentTurns": false,
+    "workerAutoApprove": false,
+    "reachableByUserSessions": [],
     "exposeToApps": []
   }
 }
@@ -1735,9 +1837,13 @@ packages at all.
 | `permissions.memory` | string | Memory access: `""` (none), `"app-scoped"`, or `"shared"` |
 | `permissions.network` | boolean | Can make external network requests |
 | `permissions.sessionApproval` | boolean | Controls existing local user sessions: send messages (including generated response-option choices, but not a change to the session's agent binding, persona settings, or a harness slash command), approve or deny pending tool requests, and change approval modes within the limits below |
+| `permissions.memberThreads` | boolean | Widens `sessionApproval` to a Bot's pinned DM thread (the live `member-*` slot the owner opened): the same actions, nothing else about the Bot. Grants nothing without `sessionApproval`; see [the scope below](#permissionsmemberthreads--a-bots-own-thread) |
 | `permissions.spawn` | boolean | May start a background agent through the host's subagent manager (`ctx.spawn`) |
 | `permissions.jobs` | boolean | May run durable background work through `ctx.job` and the app-owned `_jobs/*` routes |
 | `permissions.proposeCrewmate` | boolean | **Preview, switched off**: `ctx.crewmate` stays `None` until the owner view that lists the cards lands (#21718). May propose one Bot from a `.crewmate` bundle through `ctx.crewmate`. Gates a real capability like `spawn`: `ctx.crewmate` is absent unless the value is literally `true`. Each proposal is an owner change card; only the owner's press creates the Bot ([api-reference](api-reference.md#bot-proposals-ctxcrewmate)) |
+| `permissions.agentTurns` | boolean | May run agent turns on sessions keyed `<app>-<id>` through `ctx.turns`: every tool goes through the host's tool gate under this app's identity, and every turn is admitted as Crew automation. Gates a real capability like `spawn`: `ctx.turns` is absent unless the value is literally `true` ([api-reference](api-reference.md#agent-turns-ctxturns)) |
+| `permissions.workerAutoApprove` | boolean | May hold a bounded, audited auto-approve grant on the app's OWN worker slots through `ctx.auto_approve`, so an unattended session's tool calls run without a prompt. Absent unless the value is literally `true`; shown at the trust prompt; an update that adds it waits for the owner's approval; never above the approval-mode policy; ended when the app is disabled or removed ([api-reference](api-reference.md#worker-auto-approve-ctxauto_approve)) |
+| `permissions.reachableByUserSessions` | string[] | What the owner's own chats may do, through the session tools, to the sessions this app owns: `"read"` (`session_read_message`, `session_summary`) and `"send"` (`session_send`). Empty by default, which keeps every app session refused as `app_scoped_target`. Other entries are ignored. Shown at the trust prompt; an update that adds a verb waits for the owner's approval on the app's page. Only a persistent chat the owner opened is admitted, never an incognito, scheduled, agent-created, channel-linked or Bot session, and stop, close and revive stay refused ([session control](../system-specs/modules/session-control.md#app-sessions-the-owners-chats-may-reach)) |
 | `permissions.exposeToApps` | string[] | App names (or `"*"`) allowed to request cross-app visibility into this app's slots/subagents |
 
 #### `permissions.spawn` — Background Agents
@@ -1755,7 +1861,40 @@ Cost is the app's to bound: an app that spawns on a timer needs its own budget
 the platform does not rate-limit spawns per app today.
 
 API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
-`SpawnError`.
+`build_continue_impl`, `SpawnError`. The calls are described in
+[api-reference](api-reference.md#background-agents-ctxspawn).
+
+#### `permissions.memberThreads` — A Bot's own thread
+
+A scope of `permissions.sessionApproval`, not a grant of its own. With both
+declared, the four actions the grant already gives an app on a user's session —
+send a turn or one of the agent's `[OPTIONS:]` choices, approve or deny a pending
+tool request, switch the approval mode — also reach a Bot's pinned DM
+thread: the live `member-<slug>` slot the owner opened from the Bots page,
+and only that. The thread is recognised by both marks it is born with
+(`mode: "member"` and the `member-` key); a member-mode session under any other
+key stays denied. The routes are the same ones (`POST /api/chat` with
+`slot: "member-<slug>"`, `POST /api/chat/slots/member-<slug>/approve`,
+`POST /api/chat/mode`, `POST /api/approvals/{id}/{action}`), each still needing
+its `permissions.api` prefix, and the thread must be live: a `member-*` key with
+no open thread answers `404 slot_not_found`, and an app never creates one. The
+scope changes nothing else about Bots — `/api/members/*` and `/api/teams*`
+stay owner-only, the thread's transcript is not readable, and
+`POST /v1/chat/completions` still refuses a member key.
+
+Consent follows the grant's. A manifest that newly declares the scope on an app
+whose `sessionApproval` the owner already enabled is treated as a widened grant:
+the update lands disabled with `notice: "session_approval_reconsent"`, the
+detail page and the consent dialog name chats with the user's Bots when the owner
+re-enables it, and until they do no request reaches a Bot thread -- the
+scope is read from the same manifest as the grant's consent, never from a newer
+one. Declaring the scope without `sessionApproval` grants nothing and
+asks for nothing; removing it revokes the reach on the next request.
+
+Why a scope and not a widening of `sessionApproval` itself: an owner who
+consented to "your chats" did not consent to the agents they gave their own
+memory, goals and heartbeat to, and "which apps can speak to my Bots" must
+be answerable from the manifest, as `spawn` and `jobs` are.
 
 > **Not an in-process sandbox.** Most fields remain advisory for app code loaded
 > inside the gateway. The validator functions in `apps/permissions.py`
@@ -1765,25 +1904,74 @@ API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
 > page and in the install or enable consent dialog, and only the dashboard grants it.
 > `kirocrew app enable` has no consent flag or prompt: for an app whose consent is
 > pending it prints what the app asks for and the app's dashboard link, exits 1 and
-> leaves the app off. It is enforced for app-token
+> leaves the app off. A companion program on the same machine can send the user to
+> that page in the desktop app with `kirocrew://apps/detail/<name>`; the link opens
+> the page and nothing more, so the consent click stays the user's. It is enforced for app-token
 > user-session calls, in addition to `permissions.api`. The app must be enabled.
-> The grant reaches existing local user-owned sessions only; cron, system, remote,
-> member-mode, and other apps' sessions are denied. Apps retain their pre-existing
+> The grant reaches existing local user-owned sessions only; cron, system, remote
+> and other apps' sessions are denied, and a member-mode session is denied unless
+> the manifest also declares `permissions.memberThreads`, which admits a
+> Bot's live pinned thread and nothing else. Apps retain their pre-existing
 > access to their own slots. On the per-slot routes (`/api/chat/slots/{slot}/*`)
 > the grant reaches approving or denying a pending tool request only; every other
 > per-slot route answers an app `404 slot_not_found` unless the app owns the slot,
 > whatever `permissions.api` prefix it holds. Mode changes must name a live allowed slot and are
 > limited to Normal, Reads and Trust; YOLO is a process-global override and stays
-> dashboard-only. An update that newly adds the flag disables the app until the user
+> dashboard-only. An update that newly adds the flag, or newly adds
+> `memberThreads` to a held grant, disables the app until the user
 > enables it again from the detail page, which shows why. An update that adds an
 > entry to `permissions.api` or `permissions.events` keeps the app enabled but
 > withholds the new entries until the user approves them on the detail page.
-> Official catalog entries mirror this flag so users see it before
+> Official catalog entries mirror this flag and its scope so users see them before
 > install even when the store skips fetching the app manifest. Install-time path
 > traversal is blocked separately by
 > `_check_path_safety(name)` plus `manifest.validate()`. Full in-process
 > enforcement is tracked in
 > [rfc-app-sandbox-isolation.md](../request-for-change/rfc-app-sandbox-isolation.md).
+
+## Credential masks
+
+### `credentialMasks` — Files the Sandbox Hides
+
+An app that stores a credential on disk (a provider token, a session cookie) lists the
+files, relative to its own data directory (`<data home>/apps/<name>/data/`):
+
+```json
+{
+  "credentialMasks": ["secrets.json", "tokens/oauth.json"]
+}
+```
+
+Every sandboxed process (agent shells, MCP servers, other apps' backends) then sees
+each file masked, as Kiro Crew's own credential files are. A symlink at a listed file,
+or at a directory between the data home and it, refuses every sandboxed spawn until it
+is replaced with a real file or directory, and so does a second hard link outside the
+data home. Your app's own backend still reads and writes the files, and so does any
+in-gateway code your app runs.
+
+- An entry is a relative path inside your data directory: no leading `/`, no `.`, `..`
+  or empty segment, no backslash, colon, control character or lone surrogate, no segment
+  starting or ending with a space or ending with a dot, at most 240 bytes and 16
+  segments. At most 32 entries.
+- It can only add masks. A listed path outside your data directory is refused, and the
+  field never makes anything visible that the sandbox hides.
+- On Linux the mask is placed when a sandboxed process starts, so a file created after
+  that is not masked for that process. A temp file you write beside a listed file is not
+  listed either.
+- An entry names a file. A directory at a listed path refuses every sandboxed spawn, so
+  list the files inside it instead (`"tokens/oauth.json"`).
+- Your backend gets a listed file back only while it is absent or has a single name. A
+  file with a second hard link stays masked for your backend too, until the extra link is
+  removed.
+- The masks follow your data when Kiro Crew moves it: during an update, and after an
+  uninstall that keeps your data. Kiro Crew keeps a copy of the list beside your app
+  folder for that, `apps/.<name>-credential-masks.json`.
+- On macOS a sandboxed process cannot rename or remove the folders above a listed file
+  (`apps/<name>/data` and the ones between); it can still create and edit files in them.
+- The installed app folder is writable from inside the sandbox, so this protects your
+  file from an agent that reads it, not from one that rewrites your `app.json`.
+- Hosts at App Kit seam level 3 or later honour the field; read `ctx.sdk_level` and
+  treat a lower level as "nothing masks the file".
 
 ## Notification channels
 
@@ -1840,15 +2028,18 @@ the endpoint; it does not import provider code.
 |-------|------|---------|-------------|
 | `setup.onInstall` | string | `""` | Shell command run during a registry install **and again on every registry update** (an update re-enters the install transaction), after clone/build and before the installed copy is created. Not run for a local-path install. Make it idempotent |
 | `setup.onUninstall` | string | `""` | Shell command run before uninstall |
-| `setup.onUpdate` | string | `""` | Declared and preserved in the manifest but **not executed** — no code path dispatches it. Put update-time work in an idempotent `onInstall`, which a registry update re-runs |
-| `setup.onEnable` | string | `""` | Shell command run when app is enabled |
+| `setup.onUpdate` | string | `""` | Declared and preserved in the manifest but **not executed**: no code path dispatches it. Put dependency installs into the installed folder in `onEnable`, which an update of an enabled app re-runs, and build steps in an idempotent `onInstall`, which a registry update re-runs |
+| `setup.onEnable` | string | `""` | Shell command run when app is enabled, and again after every update of an enabled app (an update replaces the installed folder, and the fresh copy never carries `node_modules` or `.venv`) |
 | `setup.onDisable` | string | `""` | Shell command run when app is disabled |
 | `setup.onEnableTimeout` | number | `30` | Timeout in seconds for `onEnable` script, 1 to 300. A numeric string such as `"60"` is read as its number and a fraction is truncated. A value below 1 (including `false`) runs at the 30s default; `true` is read as 1 second and one above 300 runs at 300, with a warning logged each time the script runs; the manifest still installs and its signature is unaffected. A value that is not a number (`"abc"`, `null`) fails validation |
 | `setup.onDisableTimeout` | number | `30` | Timeout in seconds for `onDisable` script, 1 to 300, clamped the same way as `onEnableTimeout` |
 | `setup.configSchema` | object | `{}` | JSON Schema for app configuration |
 
 If `onEnable` fails (non-zero exit), the enable is rolled back — the app
-stays disabled and any registered resources are deregistered. `onDisable`
+stays disabled and any registered resources are deregistered. If it fails when
+an update re-runs it, the app stays enabled on the new version: the update
+succeeds with an `onEnableFailed` reason, the user gets a notification, and the
+next enable or update runs the script again. `onDisable`
 failures are logged as warnings but do not block the disable operation. Local-path
 installs do not run `onInstall`; build first, then install. The `onEnable`,
 `onDisable` and `onUninstall` hooks always invoke `/bin/bash`, so they are
@@ -1964,7 +2155,8 @@ Control how Kiro Crew manages the app:
 For a **server-mode** app (every builtin), `platform.os` is a user-facing CLAIM,
 not an access control. It is rendered on the App Store detail page
 (`website/src/pages/AppDetailPage.tsx`), and that is its only non-test consumer.
-`apps/routes_enable.py` reads it once, via `_client_install_manifest()`, which returns
+The `onEnable` runner in `apps/routes_lifecycle.py` reads it, via
+`_client_install_manifest()`, which returns
 `None` unless `platform.installMode == "client"`; `handle_enable_app`'s docstring
 states the rest outright — "nothing else on the enable path consults that field".
 So omitting the block does **not** stop the app being enabled anywhere.
@@ -2033,6 +2225,54 @@ no way to enable the app at all.
 between a caller and a capability. Anything that must not happen in a browser
 belongs behind an app-token scope or a server-side check.
 
+## Desktop windows
+
+### `desktop` — Windows and Global Shortcuts in the Desktop App
+
+The Kiro Crew desktop app can host windows and global shortcuts for your app. You
+declare them; the desktop shell creates every window itself, loads your module into
+it, and registers the shortcuts. No code of yours runs in the shell's main process.
+Pair it with `platform.requiresDesktopApp` when the window is the app's own interface.
+
+```json
+"desktop": {
+  "windows": [
+    { "id": "pet", "entry": "desktop/pet.mjs", "kind": "overlay", "openOnEnable": true },
+    { "id": "panel", "entry": "desktop/panel.mjs", "kind": "panel",
+      "width": 420, "height": 600, "position": "bottom-right" }
+  ],
+  "shortcuts": [
+    { "id": "toggle-panel", "accelerator": "CommandOrControl+Alt+P", "window": "panel" }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `desktop.windows[]` | object[] | 1 to 4 windows |
+| `desktop.windows[].id` | string | `^[a-z][a-z0-9-]{0,31}$`, unique within the app |
+| `desktop.windows[].entry` | string | ESM module mounted in the window, relative to the app's `ui/` directory (like `contributes.panelTabs[].entry`), ending in `.js` or `.mjs` |
+| `desktop.windows[].kind` | `"overlay"` \| `"panel"` | `overlay`: covers the display under the cursor, transparent, always on top, click-through outside the hit regions your page reports, never focused unless it asks. `panel`: a frameless always-on-top window of the size below |
+| `desktop.windows[].openOnEnable` | boolean | Open while the app is enabled (default `false`: opened by a shortcut or by another of your windows) |
+| `desktop.windows[].width` / `height` | integer | Panel only. 160 to 1600 / 120 to 1200 (default 400 / 560) |
+| `desktop.windows[].position` | string | Panel only. `bottom-right` (default), `top-right` or `center` of the work area |
+| `desktop.windows[].transparent` | boolean | Panel only (default `false`) |
+| `desktop.shortcuts[]` | object[] | 0 to 4 global shortcuts |
+| `desktop.shortcuts[].id` | string | Delivered to the page when pressed |
+| `desktop.shortcuts[].accelerator` | string | An Electron accelerator with two different modifier keys on every platform (`CommandOrControl+Control` is one key on Windows), one of them not `Shift`, and one letter, digit, `F1`-`F24`, arrow or `Space` key |
+| `desktop.shortcuts[].window` | string | The window the press is delivered to; it is opened first if closed |
+
+Any other key or value is an install refusal. A shortcut whose chord another
+program, the desktop app or another app already holds is not registered.
+
+In the window, your module reads `window.kirocrewDesktopWindow` (absent in a browser):
+call `ready()` once your first frame is painted (the window stays hidden until then),
+`setHitRegions([{ x, y, width, height }])` on an overlay for the boxes, in CSS pixels,
+that take the pointer, `setFocusable(true)` while an overlay needs the keyboard,
+`open(id)` to open another of your windows, `close()`, and `onShortcut(cb)`. Check
+`level` before using a call newer than the bridge you built against. The window is
+closed when the app is disabled, and a module that fails to load or throws closes it.
+
 ## Open Command
 
 ### `openCommand` — Launch Apps Outside the Dashboard
@@ -2098,11 +2338,18 @@ hints a desktop launch needs:
 The two user-bus locators, `XDG_RUNTIME_DIR` (from the allowlist) and
 `DBUS_SESSION_BUS_ADDRESS` (from the desktop hints), **reach the child** on this
 path. The sandbox's restore-then-drop of those two variables applies to spawns
-that go through `sandbox.sandboxed_spawn_argv`; `openCommand` does not. Whether
-a standard-mode launcher should hold a live user-bus address at all is under
-review in [#16520](https://github.com/kirodotdev/KiroCrew/issues/16520) — do
-not build a launcher that depends on `DBUS_SESSION_BUS_ADDRESS` being set.
-`XDG_RUNTIME_DIR` is not in question: it is where the Wayland socket lives.
+that go through `sandbox.sandboxed_spawn_argv`; `openCommand` does not. Keeping
+them is the stated policy, decided in
+[#16520](https://github.com/kirodotdev/KiroCrew/issues/16520): the standard tier
+does not keep an app's children off the user session bus. The launcher reaches
+it, and so do the app's backend and its lifecycle and install commands, which is
+the same documented residual the agent's own shell has (see
+[security.md § Sandbox Modes](../system-specs/modules/security.md#sandbox-modes)).
+Withholding the two variables would not change what the child can reach, since
+the bus socket itself stays visible to it. `XDG_RUNTIME_DIR` stays in any case:
+it is where the Wayland socket lives. `DBUS_SESSION_BUS_ADDRESS` is copied only
+when the gateway's own environment has one, so do not build a launcher that
+assumes it is set.
 
 Anything not listed above — the gateway's own model credentials, API keys you
 exported in the gateway's shell, `EDITOR`, `BROWSER`, custom `MYAPP_*`
@@ -2158,6 +2405,8 @@ before it runs your command, which is the same silent failure:
 - All required fields must be non-empty strings
 - `config_keys` must be an array of at most 200 non-empty strings, each at most
   200 characters long
+- `credentialMasks` must be an array of at most 32 paths relative to the app's data
+  directory (see [Credential masks](#credential-masks))
 - Each cron entry must specify either `every` or `cron_expr`
 - A non-empty `crons` requires `"cron": true` under `permissions`. Install,
   update and self-registration refuse the manifest otherwise; an app already
@@ -2182,7 +2431,13 @@ before it runs your command, which is the same silent failure:
   "description": "Monitor tickets, pipelines, and alarms for your on-call rotation",
   "author": "kirocrew",
   "tags": ["oncall", "monitoring"],
-  "useCases": ["Keep a shared view of firing alerts and active investigations"],
+  "highlights": ["One board for firing alerts and active investigations"],
+  "useCases": [
+    "When you take over the on-call rotation, open the board to see every firing alert and active investigation in one place",
+    "When you would otherwise watch the queue, let the ticket-refresh cron check for new high-severity tickets every five minutes",
+    "When a new ticket needs a first read, ask the ticket-analyst agent to go through it before you do",
+    "When an alert matches a known failure, ask an agent to follow the oncall-runbook skill instead of rediscovering the fix"
+  ],
   "configuration": ["Connect an alert provider in Settings, then start in read-only mode"],
   "screenshots": ["ui/screenshots/board.png"],
   "agents": ["agents/ticket-analyst.json"],

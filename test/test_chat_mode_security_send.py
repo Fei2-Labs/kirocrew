@@ -277,6 +277,8 @@ _TURN_ONLY_BODY_KEYS = frozenset(
         "send_now",
         # A display label for this send's row; the slot keeps nothing.
         "banner",
+        # Read only on a person's send, for a conversation the send begins.
+        "embed_app",
     }
 )
 _SETTINGS_BODY_KEYS: dict[str, object] = {
@@ -415,6 +417,22 @@ async def test_app_on_user_slot_cannot_steer_past_running_subagents(state) -> No
     assert sent.data["queued"] is True
     sent.run_chat.assert_not_called()
     assert slot.queue_depth == 1
+
+
+@pytest.mark.asyncio
+async def test_app_send_is_held_while_subagents_run(state) -> None:
+    """The session's own human is never held, but an app's send still waits."""
+    _user_slot(state, agent="researcher")
+    state.subagents = MagicMock()
+    state.subagents.running_agents_for.return_value = [{"id": "child"}]
+
+    sent = await _app_send(state, {"slot": "s1"})
+
+    assert sent.status == 200, sent.data
+    assert sent.data["queued"] is True
+    sent.run_chat.assert_not_called()
+    # The gate must query the slot's parent key, not a bare/mismatched one.
+    state.subagents.running_agents_for.assert_any_call("dashboard:s1")
 
 
 @pytest.mark.asyncio
@@ -652,7 +670,7 @@ async def test_app_send_refused_when_the_slot_closes_during_the_permission_read(
     reading = threading.Event()
     release = threading.Event()
 
-    def gated_grant(_app: str) -> bool:
+    def gated_grant(_app: str, **_kw: object) -> bool:
         reading.set()
         assert release.wait(5)
         return True

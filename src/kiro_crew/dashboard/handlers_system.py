@@ -27,7 +27,7 @@ from aiohttp import web
 import kiro_crew
 from kiro_crew import fork_version, platform_compat
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.config.paths import config_dir
+from kiro_crew.config.paths import config_dir, data_home
 from kiro_crew.dashboard import system_windows_probes
 from kiro_crew.dashboard.state import (
     DashboardState,
@@ -38,6 +38,7 @@ from kiro_crew.embeddings import (
     _platform_libs_dirname,
     get_shared_embedder,
     model_file_present,
+    ollama_backend_selected,
 )
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
@@ -256,6 +257,12 @@ async def api_status(request: web.Request) -> web.Response:
     # Off-loop for the same reason: the RSS read is procfs I/O on Linux and the
     # ceiling is a config read.
     gateway_rss_mb, watchdog_rss_max_mb = await asyncio.to_thread(_gateway_memory_fields)
+    # Off-loop: a few stat calls under the data home. The Settings page and the
+    # New Bot dialog read it to say when another account owns the files.
+    from kiro_crew.data_home_owner import check_data_home
+
+    data_home_access = (await asyncio.to_thread(check_data_home, data_home())).to_json()
+    map_writes_refused = bool(state.sessions._session_map.writes_refused())
     data.update(
         {
             "uptime_secs": int(uptime),
@@ -272,6 +279,16 @@ async def api_status(request: web.Request) -> web.Response:
             # operator opening the System page.
             "gateway_rss_mb": gateway_rss_mb,
             "watchdog_rss_max_mb": watchdog_rss_max_mb,
+            "data_home_access": data_home_access,
+            # Why session-map writes fail after an unreadable startup read, and the fix.
+            "session_map_writes_refused": map_writes_refused,
+            "session_map_remedy": (
+                "session_map.json could not be read at startup, so its chat and channel"
+                " bindings are not loaded and no change to the map is saved; restart the"
+                " gateway once the file is readable"
+                if map_writes_refused
+                else ""
+            ),
             **yolo_grant_fields(),
             # The configured ad-hoc duration, and whether policy allows the
             # no-timed-expiry option — the Settings card lock-badges it when not.
@@ -829,8 +846,13 @@ def _collect_system_metrics() -> dict[str, object]:
     # loads; the check is api_memory_embedding_status's, so both surfaces agree.
     try:
         embedder = get_shared_embedder()
-        runtime_failed = _load_llama_class() is None and _platform_libs_dirname() is not None
-        usable = model_file_present() or embedder.is_ready()
+        if ollama_backend_selected():
+            # An Ollama server makes the vectors; the vendored runtime and the
+            # GGUF file are not in use, so only the server probe counts.
+            runtime_failed, usable = False, embedder.is_ready()
+        else:
+            runtime_failed = _load_llama_class() is None and _platform_libs_dirname() is not None
+            usable = model_file_present() or embedder.is_ready()
         data["ollama_running"] = usable and not runtime_failed
         data["ollama_remote"] = False
         data["embedding_model_loaded"] = embedder.is_ready()

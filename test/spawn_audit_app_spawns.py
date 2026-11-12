@@ -30,6 +30,10 @@ BENIGN_APP_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings_clone.py::test_red_base_staging_does_not_dereference_a_credential_symlink",
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings_clone.py::test_the_pin_refuses_a_symlink_and_fails_closed",
         "apps/builtins/auto_improvement/tests/test_dogfood_learnings_clone.py::test_the_pin_survives_a_normal_repo",
+        # Fixed `git` argv (init, add, commit) in a repo under `tmp_path`; the planted host
+        # hook is the fixture, so sandboxing the spawn would test the sandbox instead.
+        "apps/builtins/auto_improvement/tests/test_git_config_isolation.py"
+        "::test_a_host_hook_that_refuses_commits_does_not_reach_a_fixture_commit",
         # Ops Mission Control ledger-sync tests: fixed `git` argv (init --bare / ls-files)
         # against a per-test tempdir. Nothing here is agent-influenced — the repo path is
         # `tempfile.mkdtemp()` and every argument is a literal in the test file. These are
@@ -58,6 +62,7 @@ BENIGN_APP_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/backend/clone_setup.py::_origin_urls",
         "apps/builtins/auto_improvement/backend/clone_setup.py::_repository_is_safe",
         "apps/builtins/auto_improvement/backend/clone_setup.py::_gh_prefers_ssh",
+        "apps/builtins/auto_improvement/profiles/gitlab_repo/glab_cli.py::glab_prefers_ssh",
         "apps/builtins/auto_improvement/backend/clone_setup.py::_run",
         "apps/builtins/auto_improvement/backend/clone_setup.py::list_clone_branches",
         # The git-clone spawn's argv is built from validated owner/repo
@@ -93,7 +98,7 @@ BENIGN_APP_SPAWNS: frozenset[str] = frozenset(
         # Was keyed to `commit_finding` until the checkout+apply block was extracted here so
         # the draft-PR route could reuse it (the detector keys by the ENCLOSING function).
         "apps/builtins/auto_improvement/backend/commit.py::materialize_queued_diff",
-        "apps/builtins/auto_improvement/backend/deps.py::_gh_authenticated",
+        "apps/builtins/auto_improvement/backend/deps.py::_forge_cli_authenticated",
         # `<running interpreter> -m pytest --version` from an empty temp dir: a literal
         # argv, no repo or agent input, so no conftest can load. It asks whether the gate's
         # own interpreter has pytest before a run starts.
@@ -105,15 +110,19 @@ BENIGN_APP_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/auto_improvement/backend/deps.py::install_deps",
         "apps/builtins/auto_improvement/backend/pr_watchers.py::_gh",
         "apps/builtins/auto_improvement/backend/pr_watchers.py::_git",
+        "apps/builtins/auto_improvement/backend/pr_watchers.py::_glab",
         "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_gh_prefers_ssh",
-        "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_git",
+        # Shared recipe plumbing: fixed argv git/forge-CLI calls against the operator's
+        # clone. Was keyed to github_repo/pr_recipe.py until the gh/glab split extracted
+        # the common half here (the detector keys by the enclosing function's file).
+        "apps/builtins/auto_improvement/profiles/pr_recipe_base.py::_git",
         # Fixed `git rev-parse --verify` argv (shell=False) against the OPERATOR-chosen
         # clone, asking whether the operator's `scopeDiffBase` resolves. The ref comes from
         # config (`_CONFIG_WRITABLE`), not from the agent, and it is passed as one argv
         # element — same class as the clone_setup git spawns above.
         # Its test's fixture: literal `git init/add/commit` against a tmp_path repo.
         "apps/builtins/auto_improvement/tests/test_suite_scope.py::_repo",
-        "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::draft",
+        "apps/builtins/auto_improvement/profiles/pr_recipe_base.py::draft",
         # Spine git plumbing: fixed argv (worktree add/remove, diff, rev-parse, status,
         # commit, push) against paths the SPINE derives — a worktree root it created and
         # a branch the operator authorized. The agent never supplies a path or a flag
@@ -549,8 +558,8 @@ BENIGN_APP_SPAWNS: frozenset[str] = frozenset(
         # git_divergence.py::count_divergence below.
         "apps/builtins/dev_fleet/npm_preflight.py::_frontend_worktree_clean",
         # _frontend_tree_complete is the predicate's other guard: the on-disk
-        # node_modules completeness check. One read-only spawn: `<npm> ls --all`
-        # with cwd set to <repo>/website. Fixed list-argv, shell-free, no
+        # node_modules completeness check. One read-only spawn: `<npm> ls --all
+        # --json --long` with cwd set to <repo>/website. Fixed list-argv, shell-free, no
         # agent-supplied component -- the binary is the sync's _trusted_bin npm
         # (the same npm probe() uses), the cwd is the operator-configured
         # checkout's website subtree, and the args are literals. `npm ls` only

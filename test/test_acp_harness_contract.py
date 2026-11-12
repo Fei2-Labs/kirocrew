@@ -458,6 +458,188 @@ async def test_kas_projects_the_agent_spec(kas_projection_stubbed, monkeypatch, 
 
 
 @pytest.mark.asyncio
+async def test_kas_reads_workspace_mcp_settings_beside_the_session(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A session opened in another checkout is finished from THAT checkout's files."""
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    for name in ("runtime", "session"):
+        settings = tmp_path / name / ".kiro" / "settings"
+        settings.mkdir(parents=True)
+        (settings / "mcp.json").write_text(json.dumps({"mcpServers": {name: {}}}))
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras(
+        "a", work_dir=str(tmp_path / "runtime"), session_cwd=str(tmp_path / "session")
+    )
+    (entry,) = extras.custom_agents
+    assert list(entry[CREW_SETTINGS_MCP_KEY]["fileServers"]) == ["session"]
+
+
+@pytest.mark.asyncio
+async def test_kas_stamps_the_servers_the_spec_declares(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A declared server hoisted to the session-level array is still the agent's."""
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    spec = {"name": "a", "prompt": "p", "tools": [], "mcpServers": {"mine": {"command": "m"}}}
+    (tmp_path / "a.json").write_text(json.dumps(spec), encoding="utf-8")
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    (entry,) = extras.custom_agents
+    assert entry[CREW_SETTINGS_MCP_KEY]["declared"] == ["mine"]
+    assert entry[CREW_SETTINGS_MCP_KEY]["legacy"] is True
+
+
+@pytest.mark.asyncio
+async def test_kas_does_not_keep_legacy_mcp_json_for_a_spec_that_states_the_key(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """The fixture's spec has no opt-in key; one that states it is not kept."""
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    spec = {"name": "a", "prompt": "p", "tools": [], "includeMcpJson": False}
+    (tmp_path / "a.json").write_text(json.dumps(spec), encoding="utf-8")
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    (entry,) = extras.custom_agents
+    assert entry[CREW_SETTINGS_MCP_KEY]["legacy"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("key", "opted_in"),
+    [
+        ({"includeMcpJson": True}, True),
+        ({"useLegacyMcpJson": True}, True),
+        ({"includeMcpJson": False}, False),
+    ],
+)
+async def test_kas_stamps_the_specs_own_mcp_json_opt_in(
+    kas_projection_stubbed, monkeypatch, tmp_path, key, opted_in
+):
+    """The wire entry never carries ``true``, so the exclusion reads it from the stamp."""
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    spec = {"name": "a", "prompt": "p", "tools": [], **key}
+    (tmp_path / "a.json").write_text(json.dumps(spec), encoding="utf-8")
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    (entry,) = extras.custom_agents
+    assert entry[CREW_SETTINGS_MCP_KEY]["optedIn"] is opted_in
+
+
+@pytest.mark.asyncio
+async def test_kas_does_not_keep_legacy_mcp_json_for_a_checkout_spec(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """The list names user-level files; a checkout's spec of a listed name is not one."""
+    from kiro_crew.acp import kas_mcp_json_legacy
+    from kiro_crew.acp.kas_permissions import CREW_SETTINGS_MCP_KEY
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "b"}])
+    listed = kas_mcp_json_legacy.list_path()
+    listed.parent.mkdir(parents=True, exist_ok=True)
+    listed.write_text(json.dumps({"agents": ["b"]}), encoding="utf-8")
+    checkout = tmp_path / "checkout"
+    (checkout / ".kiro" / "agents").mkdir(parents=True)
+    spec = {"name": "b", "prompt": "p", "tools": []}
+    (checkout / ".kiro" / "agents" / "b.json").write_text(json.dumps(spec), encoding="utf-8")
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("b", work_dir=str(checkout))
+    (entry,) = extras.custom_agents
+    assert entry[CREW_SETTINGS_MCP_KEY]["legacy"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_checkout_spec_session_still_records_the_list(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """The first KAS session records the list whatever spec it runs."""
+    from kiro_crew.acp import kas_mcp_json_legacy
+
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent-global.json")
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "b"}])
+    checkout = tmp_path / "checkout"
+    (checkout / ".kiro" / "agents").mkdir(parents=True)
+    spec = {"name": "b", "prompt": "p", "tools": []}
+    (checkout / ".kiro" / "agents" / "b.json").write_text(json.dumps(spec), encoding="utf-8")
+    assert not kas_mcp_json_legacy.list_path().exists()
+    await harness_for(ACP_BACKEND_KAS).session_extras("b", work_dir=str(checkout))
+    assert json.loads(kas_mcp_json_legacy.list_path().read_text(encoding="utf-8")) == {
+        "agents": ["a"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_kas_names_an_unreadable_global_mcp_json_in_the_session_notice(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A UTF-16 global mcp.json gets the same reason kiro-cli's refusal gives."""
+    from kiro_crew.acp.session_mcp import _named_path
+
+    settings = tmp_path / "mcp.json"
+    settings.write_bytes(b"\xff\xfe" + json.dumps({"mcpServers": {"x": {}}}).encode("utf-16-le"))
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", settings)
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    assert extras.withheld_credentials_notice == (
+        f"⚠ Kiro Crew could not read the global MCP settings ({_named_path(settings)})"
+        " because it is saved as UTF-16; re-save it as UTF-8. Its MCP server settings"
+        " may not apply to this session."
+    )
+
+
+@pytest.mark.asyncio
+async def test_kas_names_a_glob_it_cannot_match_and_keeps_the_server(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A declared server's global ``[...]`` glob: the server runs, the notice says so."""
+    settings = tmp_path / "mcp.json"
+    settings.write_text(
+        json.dumps({"mcpServers": {"own": {"disabledTools": ["fs_[rw]*"]}}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", settings)
+    (tmp_path / "a.json").write_text(
+        json.dumps({"name": "a", "prompt": "p", "mcpServers": {"own": {"command": "x"}}}),
+        encoding="utf-8",
+    )
+    built = [{"id": "a", "mcpServers": {"own": {"command": "x"}}}]
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: built)
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    assert extras.withheld_credentials_notice == (
+        "⚠ disabledTools pattern `fs_[rw]*` for `own` can't be applied on KAS,"
+        " so that tool stays on."
+    )
+    from kiro_crew.acp.kas_settings_mcp import finish_settings_mcp
+
+    (agent,) = extras.custom_agents
+    sent = finish_settings_mcp(agent)
+    assert "own" in sent["mcpServers"]
+    assert sent["excludedTools"] == ["@own/fs_[rw]*"]
+
+
+@pytest.mark.asyncio
+async def test_kas_says_nothing_of_a_muted_servers_glob(
+    kas_projection_stubbed, monkeypatch, tmp_path
+):
+    """A muted server never starts, so its unmatched glob gets no notice."""
+    monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", tmp_path / "absent.json")
+    own = {"command": "x", "disabled": True, "disabledTools": ["fs_[rw]*"]}
+    (tmp_path / "a.json").write_text(
+        json.dumps({"name": "a", "prompt": "p", "mcpServers": {"own": own}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(kas_agents_mod, "build_kas_custom_agents", lambda *_a, **_kw: [{"id": "a"}])
+    extras = await harness_for(ACP_BACKEND_KAS).session_extras("a", work_dir=str(tmp_path))
+    assert not extras.withheld_credentials_notice
+
+
+@pytest.mark.asyncio
 async def test_kas_projects_nothing_without_an_agent(tmp_path):
     """No agent means nothing to register, not an empty registration."""
     extras = await harness_for(ACP_BACKEND_KAS).session_extras("", work_dir=str(tmp_path))
@@ -1173,6 +1355,20 @@ def test_an_enforced_host_may_not_spawn_without_a_mask():
             f"{backend} is not AGENT_SPEC-routed, so its harness must resolve an "
             f"OS credential mask and put it on the plan"
         )
+
+
+def test_every_enforced_host_module_calls_the_re_exposure_seam():
+    """An enforced host that never calls ``adapter_expose_files`` leaves ``known_hosts`` hidden."""
+    from kiro_crew import acp_tool_gate
+    from kiro_crew.acp.harness import _HARNESSES, _PROCESS_ADAPTERS
+    from kiro_crew.acp_backends import ACP_BACKEND_ROUTING
+
+    hosts = {**_HARNESSES, **_PROCESS_ADAPTERS}
+    enforced = {b for b in ACP_BACKEND_ROUTING if acp_tool_gate.is_enforced(b)}
+    assert enforced <= set(hosts), "every enforced backend has a launch class to read"
+    for backend in sorted(enforced):
+        source = inspect.getsource(inspect.getmodule(hosts[backend]))
+        assert "adapter_expose_files(" in source, backend
 
 
 # ── Seam 1c: the spawn sees the sandbox tier ──

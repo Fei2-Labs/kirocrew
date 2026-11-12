@@ -305,7 +305,7 @@ custom-rules:
         and can run the legacy migration), pins the import-time `~/.kiro`
         bindings via `_isolate_shared_kiro_paths`, scrubs the inherited
         shell-preload and exported-function variables `name_grant` refuses on
-        (`BASH_ENV`/`ENV`/..., `BASH_FUNC_*`), pins the SEL default dir
+        (`BASH_ENV`/`SHELLOPTS`/..., `BASH_FUNC_*`), pins the SEL default dir
         session-wide, redirects `tempfile`'s base with residue reported,
         restores the session CWD in a `tryfirst` teardown hook before fixture
         finalizers run, and fails the run on residue at the repository root.
@@ -580,7 +580,7 @@ custom-rules:
         conditional on an edition, a feature flag, an env var, or a registry
         lookup, or that makes an unusable persisted acp_backend raise instead of
         degrading to kiro with a logged reason. The exceptions are H17 and the
-        enterprise floor (D6), both under Allowed. In the gateway, D6 may refuse
+        LTS floor (D6), both under Allowed. In the gateway, D6 may refuse
         a session whose RESOLVED backend is KAS when the gateway's boot proved KAS
         cannot start on the route it would take (kiro-cli unable to run KAS, or
         no runnable engine bundle), wherever that backend came from
@@ -633,16 +633,16 @@ custom-rules:
         or the fallback reaching a pin this gateway cannot start (that one
         keeps the refusal) or any session that is not that crewmate's DM or
         worker.
-      - D6 (rfc-crew-enterprise-edition.md): in an ENTERPRISE build the floor
-        is KAS, not kiro. The owner chose KAS as the one harness an enterprise
+      - D6 (rfc-crew-lts-edition.md): in an LTS build the floor
+        is KAS, not kiro. The owner chose KAS as the one harness an LTS
         build keeps, so there the kiro harness is selectable only when the
         remote policy allows it, and an unusable persisted acp_backend degrades
         to KAS with a logged reason. The edition is read ONLY from the
-        build-time constant (kiro_crew.edition.is_enterprise()), never from
+        build-time constant (kiro_crew.edition.is_lts()), never from
         config, an env var or the platform context, so the selection gate stays
         free of a context read (H3). A KAS that is proven unable to start on
         the route it would take refuses the gateway start when the main backend
-        runs KAS (enterprise boot, naming the fix) instead of falling back to
+        runs KAS (LTS boot, naming the fix) instead of falling back to
         kiro. When the main backend does not run KAS, the start goes on and the
         boot-recorded verdict refuses each later gateway session whose resolved
         backend is KAS, after the selection gate and before any process exists,
@@ -652,7 +652,7 @@ custom-rules:
         (H13). Still FLAG any of this reaching an oss build, the edition read
         from anything but that constant, the selection gate raising, a refusal
         or change that reaches a session whose resolved backend is kiro, or a
-        silent fall back to kiro in an enterprise build.
+        silent fall back to kiro in an LTS build.
 
   - id: memory-store-seam
     blocking: true
@@ -1186,7 +1186,16 @@ custom-rules:
       Allowed (do NOT flag): the count MOVES to the new true value and the
       comment naming the roles moves with it; a slice/region marker is widened so
       an extracted fragment still executes with every name it references defined;
-      the assertion is genuinely re-derived and stated to be stronger.
+      the assertion is genuinely re-derived and stated to be stronger; a
+      `skipif` on a test this diff adds, and on that test alone (not one
+      moved, renamed or split out of an existing test), whose reason names a
+      host capability (an OS, kernel or platform facility, or an external
+      tool at the version the code needs) and whose predicate checks that
+      capability and cannot fire on the subject failing — the guard
+      testing-conventions.md prescribes. A skip on a tool or link the harness
+      can supply instead (a CLI the shell script under test runs, such as
+      `jq`; a link, via `make_dir_link` or `make_escaping_link`) stays
+      flagged: supply it.
 
       When a ratchet cannot be satisfied without loosening it, that is the
       finding — say so on the PR instead of editing the ratchet.

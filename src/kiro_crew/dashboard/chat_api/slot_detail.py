@@ -39,9 +39,10 @@ if TYPE_CHECKING:
         history_corpus_unreadable,
         logger,
         parse_cls_meta,
-        queue_entry_view,
+        queue_view,
         redact_credentials,
         redact_exfiltration_urls,
+        refused_durable_ids,
         remember_unknown_row_fields,
         slot_history_key,
         slot_not_found,
@@ -61,6 +62,7 @@ async def api_chat_slots(request: web.Request) -> web.Response:
         is_owner_dashboard_request,
         schedule_visibility_refresh,
     )
+    from kiro_crew.dashboard.slot_list_pass import shared_slot_list
     from kiro_crew.dashboard.source_providers.chip_refresh import schedule_tiered_check_refresh
 
     # Same warm-up as the WebSocket connect path: slot source-link extraction is
@@ -73,8 +75,10 @@ async def api_chat_slots(request: web.Request) -> web.Response:
 
     include_check_status = is_owner_dashboard_request(request)
     is_dashboard_user = bool(request.get("is_dashboard_user"))
-    payloads = state.serialize_slots(
-        include_check_status=include_check_status, dashboard_user=is_dashboard_user
+    # Shared with the connects and GETs of a reconnect storm (see slot_list_pass);
+    # the list may be shared, so everything below builds new lists and rows.
+    payloads = await shared_slot_list(
+        state, include_check_status=include_check_status, dashboard_user=is_dashboard_user
     )
     # A crew-member caller admitted here (the chat gate stamped its verified
     # principal) sees ONLY the sessions it owns or created -- the same set the
@@ -404,7 +408,9 @@ def _append_unflushed_tail_from_offset(
     the window rows whose id is not on disk, matched as a MULTISET (a caller can
     post one id twice) and selected by membership, not a prefix boundary, so an
     out-of-order flush never drops a row. ``_UNOWED_WINDOW_ROLES`` are skipped; a
-    pending ``permission`` row is still owed.
+    pending ``permission`` row is still owed. A matched row whose id disk holds
+    once in that region is served as the window's copy; a disk row no window row
+    matches (another writer's append) stays.
 
     Otherwise (a mixed or id-less region) walk window and disk forward together as
     an ordered SUBSEQUENCE: the save merges foreign rows back in time order
@@ -444,6 +450,9 @@ def _append_unflushed_tail_from_offset(
         # and none is dropped; each owed row is only INSERTED before the disk row of
         # the next window row that reached disk, so this is additive.
         owed_before: dict[int, list[dict]] = {}
+        # A repeated id would make the pairing a guess, so only a once-held id
+        # serves the window's copy (an unflushed variant switch must not repaint).
+        once_on_disk = {mid for mid, at in disk_mid_positions.items() if len(at) == 1}
         pending: list[dict] = []
         for m in window:
             if m.get("role", "assistant") in _UNOWED_WINDOW_ROLES:
@@ -455,13 +464,13 @@ def _append_unflushed_tail_from_offset(
             positions = disk_mid_positions.get(mid) if isinstance(mid, str) else None
             if positions:
                 at = positions.pop(0)
+                if mid in once_on_disk:
+                    window_disk[at] = m
                 if pending:
                     owed_before.setdefault(at, []).extend(pending)
                     pending = []
                 continue
             pending.append(m)
-        if not owed_before and not pending:
-            return all_msgs
         merged: list[dict] = list(all_msgs[:local_older_count])
         for i, m in enumerate(window_disk):
             merged.extend(owed_before.get(i, ()))
@@ -991,9 +1000,31 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                 return history_corpus_unreadable()
             requires_full_reader = bool(rotated)
 
+        # A sidebar row whose window has not loaded holds no rows in memory, so
+        # its page is read straight from disk and the window stays unloaded:
+        # opening a restored tab reads the page it shows, not its whole window.
+        if (
+            state.conversation_log
+            and not requires_full_reader
+            and getattr(slot, "window_pending", False) is True
+        ):
+            from kiro_crew.dashboard import slot_window_tail as _window_tail
+
+            row_page = await asyncio.to_thread(
+                _window_tail.read_row_page,
+                state.conversation_log,
+                history_key,
+                limit=read_limit,
+                before=before,
+            )
+            # A load that landed during the read may have appended rows the
+            # page does not hold; the usual path below reconciles them.
+            if row_page is not None and getattr(slot, "window_pending", False) is True:
+                bounded_page = row_page
+
         # A memory-only gateway (no conversation log) has no durable rows to
         # index; the fallback below already serves it from the resident window.
-        if state.conversation_log and not requires_full_reader:
+        if bounded_page is None and state.conversation_log and not requires_full_reader:
             # Imported here, not at module scope: this function runs on the
             # handlers module's globals (``_facade_compose.compose``).
             from kiro_crew.dashboard.transcript_snapshot import (
@@ -1119,6 +1150,11 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         if bounded_page is not None:
             messages, total, has_more, next_before = bounded_page
         else:
+            # The full reader reconciles against the resident window, so a row
+            # that has not loaded it loads it here, with the read off the loop.
+            from kiro_crew.dashboard.state import load_window_off_loop
+
+            await load_window_off_loop(slot)
             try:
                 all_msgs = (
                     await asyncio.to_thread(
@@ -1205,6 +1241,9 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         }
         for q in slot._queue
     ]
+    # Judged on the live entries, in the same tick as the copy: the copy drops
+    # fields the durable writer weighs, so its verdict would differ from the write's.
+    queue_refused = refused_durable_ids(slot._queue)
     context_fields = await _context_snapshot_fields(state, slot)
     # Imported here, not at module scope: this function runs on the handlers
     # module's globals (``_facade_compose.compose``).
@@ -1295,7 +1334,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         )
         tail = json.dumps(
             {
-                "queue": [queue_entry_view(q) for q in queue_snapshot],
+                "queue": queue_view(queue_snapshot, queue_refused),
                 "total": total,
                 **page_fields,
                 # Seeds the context meter on open. Turn-scoped WS frames alone

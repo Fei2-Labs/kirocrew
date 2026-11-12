@@ -4,6 +4,14 @@ import { motion } from 'framer-motion'
 // wrapped or removed line (`inlineToolbarWhileFits`). Short and barely bouncy:
 // it fires mid-typing, so anything longer trails the caret.
 export const COMPOSER_ROW_SPRING = { type: 'spring', stiffness: 520, damping: 38, mass: 0.8 } as const
+// How long after a shape flip the text column still slides rather than jumps:
+// the spring above is settled well inside this.
+export const SHAPE_FLIP_WINDOW_MS = 450
+// How far the one-row text column tucks under the attach cluster (`-ml-2.5`).
+// The text keeps its own px-4 (the paste-highlight layer is drawn at that
+// same inset), so the column moves instead: without the pull the caret sits
+// 18px past the attach button, twice the send side's gap.
+export const ONE_ROW_TEXT_PULL_PX = 10
 
 /**
  * The box's height animator for `inlineToolbarWhileFits`. Enabled, it is a

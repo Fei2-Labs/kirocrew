@@ -54,14 +54,14 @@ from kiro_crew.config.loader_document import (
     _notify_live_watch,
     read_config_for_update,
     stamp_config_meta,
-    unsandboxed_exec_declared,
+    strip_undeclared_resolved_defaults,
     write_config_atomically,
 )
 from kiro_crew.config.loader_locations import (
     _session_work_dir,
     config_local_path,
     config_path,
-    read_config_text,
+    read_endorsed_config_text,
 )
 from kiro_crew.config.loader_snapshots import (
     _read_hardened_agent_spec,
@@ -128,7 +128,6 @@ from kiro_crew.config.sections import (
     coerce_effort,
 )
 from kiro_crew.effort import is_valid_effort, model_supports_effort
-from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
 
 logger = logging.getLogger("kiro_crew.config.loader")
 
@@ -383,12 +382,13 @@ class KiroCrewConfig:
                 },
                 "batch_write_guard": {
                     "type": "boolean",
-                    "default": False,
+                    "default": True,
                     "x-meta": {
                         "label": "Batch write guard",
                         "help": (
-                            "Off by default. When on, refuse a write-class tool call "
-                            "issued in the same parallel tool batch as a read-class "
+                            "On by default; set false to turn it off. Refuses a "
+                            "write-class tool call issued in the same parallel tool "
+                            "batch as a read-class "
                             "call, so the model cannot write arguments that quote a "
                             "read it has not seen returned yet. A discipline guard, not "
                             "a security control: the security floor runs first and is "
@@ -462,9 +462,10 @@ class KiroCrewConfig:
         default=True,
         metadata=_meta(
             "Auto Update",
-            "Where the install can apply updates, true installs them once no work is "
-            "running and restarts; false only notifies. Elsewhere it has no effect. "
-            "On those same installs a policy minimum version applies regardless.",
+            "Where the install can apply updates, true downloads and prepares them "
+            "automatically and they take effect the next time you restart Kiro Crew; "
+            "nothing restarts by itself. False only notifies. Elsewhere it has no "
+            "effect. On those same installs a policy minimum version applies regardless.",
         ),
     )
     #: Opt-in for the Connections gallery, which is merged but held for a later
@@ -875,10 +876,9 @@ class KiroCrewConfig:
         # reader about one host. On a fresh install there is no file yet, which reads
         # as undeclared and is exactly right: the document this call creates should
         # not contain the key at all.
-        if not unsandboxed_exec_declared():
-            agent_section = d.get("agent")
-            if isinstance(agent_section, dict):
-                agent_section.pop("sandbox_allow_unsandboxed_exec", None)
+        # ``agent.kas_bundle`` is stripped the same way: undeclared, it resolves
+        # through ``kas_bundle_build_default()`` (on in a nightly build only).
+        strip_undeclared_resolved_defaults(d)
         # The harness fields go back to disk exactly as ``config.json`` stores
         # them, never from the in-memory value, which is RESOLVED: "no choice"
         # (absent or "") reads as today's default, and a pick this deployment
@@ -897,33 +897,32 @@ class KiroCrewConfig:
         # read there, so a leaf config.json stores keeps its own value.
         overlay_owned: dict | None = None
         local_path = config_local_path()
-        if local_path.is_file():
-            try:
-                raw_local = json.loads(read_config_text(local_path))
-                if isinstance(raw_local, dict):
-                    # Compare CANONICAL values for resource_limits.
-                    # _subtract_overlay recognises an overlay-owned leaf only when
-                    # the emitted value EQUALS the raw overlay value, and this
-                    # section is normalized on load (512.5 -> 512, a refused value
-                    # -> None). A raw comparison therefore stops matching and
-                    # copies an overlay-owned limit into the base file, which is
-                    # the leak the subtraction exists to prevent. Only the keys the
-                    # overlay actually names are canonicalized: feeding the whole
-                    # dataclass would add eight `None` leaves the operator never
-                    # wrote and invite deletions they did not ask for.
-                    rl_overlay = raw_local.get("resource_limits")
-                    if isinstance(rl_overlay, dict):
-                        canonical = asdict(ResourceLimitsConfig.from_raw(rl_overlay))
-                        raw_local = {
-                            **raw_local,
-                            "resource_limits": {
-                                k: canonical[k] for k in rl_overlay if k in canonical
-                            },
-                        }
-                    # Renamed keys compare under the name save() emits.
-                    overlay_owned = _canonical_renamed_keys(raw_local)
-            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-                pass
+        # Read as the load reads it, with no is_file() check first: a deleted overlay
+        # whose endorsed copy is in force still owns its keys.
+        try:
+            raw_local = json.loads(read_endorsed_config_text(local_path))
+            if isinstance(raw_local, dict):
+                # Compare CANONICAL values for resource_limits.
+                # _subtract_overlay recognises an overlay-owned leaf only when
+                # the emitted value EQUALS the raw overlay value, and this
+                # section is normalized on load (512.5 -> 512, a refused value
+                # -> None). A raw comparison therefore stops matching and
+                # copies an overlay-owned limit into the base file, which is
+                # the leak the subtraction exists to prevent. Only the keys the
+                # overlay actually names are canonicalized: feeding the whole
+                # dataclass would add eight `None` leaves the operator never
+                # wrote and invite deletions they did not ask for.
+                rl_overlay = raw_local.get("resource_limits")
+                if isinstance(rl_overlay, dict):
+                    canonical = asdict(ResourceLimitsConfig.from_raw(rl_overlay))
+                    raw_local = {
+                        **raw_local,
+                        "resource_limits": {k: canonical[k] for k in rl_overlay if k in canonical},
+                    }
+                # Renamed keys compare under the name save() emits.
+                overlay_owned = _canonical_renamed_keys(raw_local)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            pass
 
         # Atomic + mode-preserving: a concurrent reader must never observe a
         # half-written config, and the write must not widen who can read a file
@@ -950,7 +949,8 @@ class KiroCrewConfig:
                     f"refusing to save over {p}: this snapshot was loaded while the "
                     "file did not parse, so it holds defaults, not the saved settings"
                 )
-            stored = read_config_for_update(p) if p.exists() else {}
+            # No exists() check: a deleted file reads as its endorsed copy, else {}.
+            stored = read_config_for_update(p)
             if overlay_owned is not None:
                 # What config.json stores keeps its own value under an
                 # overlay-owned leaf, so dropping the overlay later still finds it.
@@ -1411,6 +1411,11 @@ class KiroCrewConfig:
         # backend is ACQUIRED, and on its own routes nothing.
         _gw = self.mcp_gateway
         if _gw.stub_servers:
+            # Imported on the one branch that reads it: the rewriter loads the gateway
+            # manager and the sandbox, which a process that only reads config (every
+            # stdio MCP server, most CLI commands) never uses.
+            from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
+
             _gw_overlay = _gw.overlay_dir or str(default_overlay_dir())
             _gw_socket = _gw.socket_path or str(default_socket_path())
         else:
@@ -1452,6 +1457,10 @@ class KiroCrewConfig:
             # reason: swallowed by the catch-all, a claude side session would
             # start with the user's full tool set under READ_ONLY.
             side_read_only: bool = False,
+            # A sub-agent spawned with ``include_memory=false``. NAMED for the
+            # same reason: swallowed, its claude session would load and write
+            # Claude Code's auto-memory.
+            include_memory: bool = True,
             **_kwargs: object,
         ):  # return type inferred from build_acp_provider (SDK boundary: config may not name AcpProvider)
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -1494,7 +1503,7 @@ class KiroCrewConfig:
             # step logs why.
             # circular import: members sits above config in the layering.
             from kiro_crew.acp_backends import ACP_BACKEND_KAS
-            from kiro_crew.crewmate_harness import crewmate_backend_pin
+            from kiro_crew.crewmate_harness import crewmate_backend_pin, route_pin
             from kiro_crew.members import select_provider_backend
 
             # A crewmate's own harness pin outranks the member route and fails
@@ -1510,11 +1519,11 @@ class KiroCrewConfig:
                     crewmate_backend_pin(self, session_key) if backend_override is None else None
                 ),
             )
-            # Enterprise (RFC D6): a session on KAS is refused here, before any process
+            # LTS (RFC D6): a session on KAS is refused here, before any process
             # exists, when boot proved KAS cannot start on this host. KAS sessions only:
             # the Kiro CLI path gains nothing (H13), and the gate above never raises (H3).
             if _backend == ACP_BACKEND_KAS:
-                from kiro_crew.enterprise_boot import refuse_unstartable_kas
+                from kiro_crew.lts_boot import refuse_unstartable_kas
 
                 refuse_unstartable_kas()
             # Resolved BEFORE the model, and threaded into the resolution: the
@@ -1624,6 +1633,8 @@ class KiroCrewConfig:
                 channel_id=channel_id,
                 extra_env=extra_env,
                 acp_backend=_backend,
+                # The pin the selection above used, for KAS's route rule 2.
+                harness_pin=route_pin(self, session_key, backend_override),
                 effort_per_model=_eff_per_model,
                 unbound_effort=_unbound_effort,
                 inherited_effort=_inherited_effort,
@@ -1640,6 +1651,7 @@ class KiroCrewConfig:
                 on_gate_acquired=on_gate_acquired,
                 on_gate_queued=on_gate_queued,
                 side_read_only=side_read_only,
+                include_memory=include_memory,
                 # Only a work dir DERIVED from a one-run key is the provider's
                 # to reclaim at shutdown; an explicit ``cwd`` is the caller's
                 # directory whatever the key says (session_work_dir).
@@ -1658,6 +1670,7 @@ class KiroCrewConfig:
     ) -> Callable:
         """Build one registry-selected adapter provider factory."""
         from kiro_crew.config.loader_adapter_factory import create_adapter_provider_factory
+        from kiro_crew.mcp_gateway.rewriter import default_overlay_dir, default_socket_path
 
         return create_adapter_provider_factory(
             self,

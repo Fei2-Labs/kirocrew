@@ -855,6 +855,68 @@ class TestSecurityCli:
         assert "Built-in deny patterns" in out
         assert "my-custom-pattern" in out
 
+    @pytest.mark.parametrize("value", [7, "rm", {"a": 1}])
+    def test_deny_list_says_a_non_list_value_enforces_nothing(
+        self, value: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The gate reads only a list of strings, so the CLI must not list letters or
+        keys as enforced patterns, nor crash on a number."""
+        (tmp_path / "config.json").write_text(
+            json.dumps({"hooks": {"auto_deny_tools": value}}), encoding="utf-8"
+        )
+        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
+            cc._security(_ns(sec_action="deny-list"))
+        out = capsys.readouterr().out
+        assert "Built-in deny patterns" in out
+        assert "User-configured deny patterns:" not in out
+        assert "hooks.auto_deny_tools is not a list" in out
+
+    def test_deny_list_shows_only_the_text_entries_the_gate_enforces(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / "config.json").write_text(
+            json.dumps({"hooks": {"auto_deny_tools": ["keep-me", 5, None]}}), encoding="utf-8"
+        )
+        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
+            cc._security(_ns(sec_action="deny-list"))
+        out = capsys.readouterr().out
+        assert "  ✗ keep-me" in out
+        assert "  ✗ 5" not in out and "  ✗ None" not in out
+        assert "2 entries in hooks.auto_deny_tools are not text" in out
+
+    def test_deny_list_reads_the_local_overlay_the_gateway_merges(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        (tmp_path / "config.json").write_text(
+            json.dumps({"hooks": {"auto_deny_tools": ["base-pattern"]}}), encoding="utf-8"
+        )
+        (tmp_path / "config.local.json").write_text(
+            json.dumps({"hooks": {"auto_deny_tools": ["overlay-pattern"]}}), encoding="utf-8"
+        )
+        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
+            cc._security(_ns(sec_action="deny-list"))
+        out = capsys.readouterr().out
+        assert "  ✗ overlay-pattern" in out
+        assert "base-pattern" not in out
+
+    @pytest.mark.parametrize("value", [7, "rm", {"a": 1}, ["keep-me", 5, None], ["a", "b"]])
+    def test_deny_list_lists_exactly_what_the_gate_parses(
+        self, value: object, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from kiro_crew.hooks import HooksConfig
+
+        (tmp_path / "config.json").write_text(
+            json.dumps({"hooks": {"auto_deny_tools": value}}), encoding="utf-8"
+        )
+        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
+            cc._security(_ns(sec_action="deny-list"))
+        out = capsys.readouterr().out
+        user_half = (
+            out.split("User-configured deny patterns:")[1] if "User-configured" in out else ""
+        )
+        listed = [line[4:] for line in user_half.splitlines() if line.startswith("  ✗ ")]
+        assert listed == HooksConfig.from_dict({"auto_deny_tools": value}).auto_deny_tools
+
     def test_deny_list_without_config_file(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -872,7 +934,7 @@ class TestSecurityCli:
         clean audit says nothing about vector memory."""
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
-            patch("kiro_crew.cli_commands.scan_history", return_value=[]),
+            patch("kiro_crew.cli_commands.scan_history", return_value=([], 3)),
             patch("kiro_crew.cli_commands.scan_memory", return_value=[]),
         ):
             cc._security(_ns(sec_action="audit"))
@@ -887,7 +949,7 @@ class TestSecurityCli:
         memory = [{"type": "semantic", "key": "k", "warning": "odd", "value": "v"}]
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
-            patch("kiro_crew.cli_commands.scan_history", return_value=history),
+            patch("kiro_crew.cli_commands.scan_history", return_value=(history, 3)),
             patch("kiro_crew.cli_commands.scan_memory", return_value=memory),
             pytest.raises(SystemExit) as exc,
         ):
@@ -903,7 +965,7 @@ class TestSecurityCli:
         memory = [{"type": "semantic", "key": "k", "warning": "odd", "value": "v"}]
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
-            patch("kiro_crew.cli_commands.scan_history", return_value=[]),
+            patch("kiro_crew.cli_commands.scan_history", return_value=([], 3)),
             patch("kiro_crew.cli_commands.scan_memory", return_value=memory),
             pytest.raises(SystemExit) as exc,
         ):
@@ -918,13 +980,71 @@ class TestSecurityCli:
         history = [{"file": "s.jsonl", "warning": "w", "snippet": "x"}]
         with (
             patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
-            patch("kiro_crew.cli_commands.scan_history", return_value=history),
+            patch("kiro_crew.cli_commands.scan_history", return_value=(history, 3)),
             patch("kiro_crew.cli_commands.scan_memory", return_value=[]),
             pytest.raises(SystemExit) as exc,
         ):
             cc._security(_ns(sec_action="audit"))
         assert exc.value.code == 1
         assert "No suspicious content in vector memory." in capsys.readouterr().out
+
+    def test_audit_reads_session_transcripts(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A flagged shell command in ``sessions/*.jsonl`` is reported, end to end."""
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        rows = [
+            {"_type": "metadata", "title": "t"},
+            {"role": "user", "content": "tidy up"},
+            {
+                "role": "tool",
+                "content": "Run",
+                "meta": {"kind": "execute", "input": json.dumps({"command": "chmod 777 /srv"})},
+            },
+        ]
+        (sessions / "dashboard_chat-1-1.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+        with (
+            patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
+            patch("kiro_crew.cli_commands.scan_memory", return_value=[]),
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._security(_ns(sec_action="audit"))
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "1 suspicious entries found" in out
+        assert "dashboard_chat-1-1.jsonl" in out and "chmod 777 /srv" in out
+
+    def test_audit_with_no_transcripts_says_nothing_was_scanned(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An empty data home is not a clean scan: no green check is printed."""
+        with (
+            patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
+            patch("kiro_crew.cli_commands.scan_memory", return_value=[]),
+        ):
+            cc._security(_ns(sec_action="audit"))
+        out = capsys.readouterr().out
+        assert "No session transcripts scanned" in out
+        assert "No suspicious tool usage" not in out
+
+    def test_audit_of_transcripts_with_no_rows_does_not_say_none_were_found(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Files that held nothing to audit are named as such, not as absent."""
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "empty.jsonl").write_text('{"_type": "metadata"}\n', encoding="utf-8")
+        with (
+            patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path),
+            patch("kiro_crew.cli_commands.scan_memory", return_value=[]),
+        ):
+            cc._security(_ns(sec_action="audit"))
+        out = capsys.readouterr().out
+        assert "held no rows to audit" in out
+        assert "none found" not in out
 
     def test_events_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
         with patch("kiro_crew.cli_commands.sel") as sel:
@@ -1484,7 +1604,7 @@ class TestPolicyCli:
 
     def test_explain_known_scope_prints_verdicts(self, capsys: pytest.CaptureFixture[str]) -> None:
         decision = SimpleNamespace(
-            permitted=False, rule="deny", layer="policy", reason="pinned off"
+            permitted=False, rule="deny", layer="policy", reason="pinned off", explicit_deny=True
         )
         gate = SimpleNamespace(permitted=True, reason="title allowed")
         with (
@@ -1533,7 +1653,7 @@ class TestPolicyCli:
             patch(
                 "kiro_crew.platform.governance.resolve",
                 return_value=SimpleNamespace(
-                    permitted=True, rule="allow", layer=None, reason="default"
+                    permitted=True, rule="allow", layer=None, reason="default", explicit_deny=False
                 ),
             ),
             patch(
@@ -1553,6 +1673,67 @@ class TestPolicyCli:
             )
         out = capsys.readouterr().out
         assert "ALLOWED: s" in out and "(none — policy only)" in out and "allow / —" in out
+
+    def test_explain_batch_answers_each_line_as_single_json_explain_does(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """One ``--batch`` run answers every request exactly as one ``--json`` call each
+        would, and a bad line is an error record that does not stop the run."""
+        from kiro_crew.platform.governance import parse_profile
+
+        profile = parse_profile({"name": "ci", "commands": {"mode": "deny", "deny": ["curl *"]}})
+        items = ("git status", "curl https://example.com")
+        batch = tmp_path / "checks.jsonl"
+        batch.write_text(
+            "".join(json.dumps({"scope": "commands", "item": item}) + "\n" for item in items)
+            + '{"scope": "nope.scope", "item": "x"}\n'
+            + "not json\n"
+            + '{"scope": "commands", "item": "x", "agent": 5}\n',
+            encoding="utf-8",
+        )
+        with (
+            patch(
+                "kiro_crew.platform.context.current_context",
+                return_value=SimpleNamespace(governance=None),
+            ),
+            patch(
+                "kiro_crew.platform.governance_profiles.resolve_active_scope",
+                return_value=profile,
+            ),
+        ):
+            for item in items:
+                cc._policy(
+                    _ns(
+                        policy_action="explain",
+                        scope="commands",
+                        item=item,
+                        session_key="cli_chat",
+                        agent="",
+                        app="",
+                        json=True,
+                    )
+                )
+            singles = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+            with pytest.raises(SystemExit) as exc:
+                cc._policy(
+                    _ns(
+                        policy_action="explain",
+                        scope=None,
+                        item=None,
+                        session_key="cli_chat",
+                        agent="",
+                        app="",
+                        batch=str(batch),
+                    )
+                )
+        assert exc.value.code == 1
+        answers = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert [s["verdict"] for s in singles] == ["ALLOWED", "DENIED"]
+        assert [s["gate_verdict"] for s in singles] == ["ALLOWED", "DENIED"]
+        assert [s["explicit_deny"] for s in singles] == [False, True]
+        assert answers[:2] == [{"line": n, **s} for n, s in enumerate(singles, 1)]
+        assert answers[2] == {"line": 3, "error": "unknown scope 'nope.scope'"}
+        assert [(a["line"], "error" in a) for a in answers[3:]] == [(4, True), (5, True)]
 
     def test_profile_missing(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (

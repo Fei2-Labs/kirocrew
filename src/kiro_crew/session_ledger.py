@@ -191,16 +191,23 @@ def crew_log_units(
                 + units
             )
         excluded = _excluded_units(slot_key)
+        if alias and alias != slot_key:
+            # A delete records an exclusion under the slot its unit's HEADER names, so
+            # an alias unit's exclusion sits under the alias, not the canonical key.
+            excluded |= _excluded_units(alias)
         if excluded:
             units = tuple(unit for unit in units if unit not in excluded)
-        recorded = _recorded_unit_order(slot_key)
-        if recorded:
-            # The order log keeps the NEWEST ids, so a unit absent from it is older
-            # than all of them and applies BEFORE the kept tail; after it, an evicted
-            # old unit would write its stale goal and phase over the current ones.
-            known = [unit for unit in recorded if unit in units]
-            rest = [unit for unit in units if unit not in recorded]
-            units = tuple(rest + known)
+        # The order log keeps the NEWEST ids, so a unit absent from it is older than all
+        # of them and applies BEFORE the kept tail; after it, an evicted old unit would
+        # write its stale goal and phase over the current ones. The one exception is the
+        # slot's newest unit by succession: a reset's new session that has not recorded
+        # yet holds no ledger entry, so its place does not change the record, and
+        # listing it last keeps a read's unit list the one the writer folds (live unit
+        # last). Listed first, its own appends retire the warm cell and the savepoint
+        # and every read after a restart folds the slot cold.
+        from kiro_crew.session_ledger_control import _causal_units as _ordered_units
+
+        units = _ordered_units(slot_key, units, _recorded_unit_order(slot_key))
         if live_session_id and live_session_id in units:
             # The LIVE unit applies LAST, whatever the clock says: units sort by header
             # wall clock, and a clock that moved backward would put a retired
@@ -341,7 +348,7 @@ def read_state(slot_key: str, live_session_id: str = "") -> dict[str, Any]:
         return value
     # An EMPTY folded record is the upgrade trigger, the same one the write path uses,
     # so the two agree on WHEN a carry is owed as well as on what it carries.
-    return _legacy_preview(canonical, base) or value
+    return _legacy_preview(canonical, base, alias=key) or value
 
 
 def has_ledger(slot_key: str) -> bool:
@@ -423,7 +430,7 @@ def record_update(
     # ENTRY, so the log stays the single authority. Triggered by an EMPTY FOLDED
     # RECORD, not an absent unit: the crew log exists from the first turn.
     if not _has_content(projection.projection_of(base).value) and _carry_legacy_forward(
-        slot_key, session_id
+        slot_key, session_id, alias
     ):
         units = crew_log_units(slot_key, session_id)
         base = _fold_checkpoint(slot_key, units)
@@ -526,7 +533,16 @@ def _legacy_carry_payload(slot_key: str, legacy: dict[str, Any]) -> dict[str, An
     holds ONE ``tried``, so earlier approaches and the event tail are counted in the
     event note, not appended per row (unbounded work inside a turn). The phase rides
     with that event, so it never appears without a logged reason.
+
+    The entry must fit one crew log line, or the carry can never land and every
+    record on the slot is refused. Fields within their own clamps can still overflow
+    together, so the newest :data:`_MAX_ARTIFACTS` artifacts are kept, then the
+    oldest artifacts and then the rejected approach are dropped until the entry
+    fits. What was dropped is counted in the note. Goal, next and phase alone always
+    fit.
     """
+    from kiro_crew.crew_log import emit as crew_log_emit
+
     data: dict[str, Any] = {"slot": _clamp(slot_key)}
     for field, key in (("goal", "goal"), ("next", "next")):
         value = legacy.get(key)
@@ -536,12 +552,19 @@ def _legacy_carry_payload(slot_key: str, legacy: dict[str, Any]) -> dict[str, An
     if isinstance(phase, str) and phase:
         data["phase"] = _clamp(phase, _MAX_PHASE)
     artifacts = legacy.get("artifacts")
+    dropped_artifacts = 0
     if isinstance(artifacts, dict) and artifacts:
-        data["artifacts"] = {
+        pointers = {
             _clamp(k, _MAX_ARTIFACT_KEY): _clamp(v)
             for k, v in artifacts.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        # The fold keeps the newest pointers when it trims, so the carry does too.
+        while len(pointers) > _MAX_ARTIFACTS:
+            pointers.pop(next(iter(pointers)))
+            dropped_artifacts += 1
+        if pointers:
+            data["artifacts"] = pointers
     tried = legacy.get("tried")
     dropped_tried = 0
     if isinstance(tried, list) and tried:
@@ -556,20 +579,63 @@ def _legacy_carry_payload(slot_key: str, legacy: dict[str, Any]) -> dict[str, An
             dropped_tried = len(tried)
     events = legacy.get("events")
     dropped_events = len(events) if isinstance(events, list) else 0
-    left = []
-    if dropped_tried > 0:
-        left.append(f"{dropped_tried} earlier rejected approach(es)")
-    if dropped_events > 0:
-        left.append(f"{dropped_events} event(s)")
-    note = "carried forward from this slot's pre-projection ledger document"
-    if left:
-        note += "; not carried: " + " and ".join(left)
-    data["event"] = _clamp(note)
+    dropped_newest_tried = False
+
+    def _note() -> None:
+        left = []
+        if dropped_newest_tried:
+            left.append(f"{dropped_tried} rejected approach(es)")
+        elif dropped_tried > 0:
+            left.append(f"{dropped_tried} earlier rejected approach(es)")
+        if dropped_artifacts > 0:
+            left.append(f"{dropped_artifacts} artifact(s)")
+        if dropped_events > 0:
+            left.append(f"{dropped_events} event(s)")
+        note = "carried forward from this slot's pre-projection ledger document"
+        if left:
+            note += "; not carried: " + " and ".join(left)
+        data["event"] = _clamp(note)
+
     data["event_kind"] = "note"
+    _note()
+    while not crew_log_emit.ledger_entry_fits(data):
+        kept = data.get("artifacts")
+        if kept:
+            kept.pop(next(iter(kept)))
+            dropped_artifacts += 1
+            if not kept:
+                del data["artifacts"]
+        elif "tried" in data:
+            del data["tried"]
+            dropped_tried += 1
+            dropped_newest_tried = True
+        else:
+            break
+        _note()
     return data
 
 
-def _legacy_preview(slot_key: str, base: Any) -> dict[str, Any] | None:
+def _legacy_source(slot_key: str, alias: str) -> str:
+    """The key whose legacy document and ``carried`` marker a carry for *slot_key* uses.
+
+    *slot_key* itself, except for a messaging-channel *alias* folded to *slot_key*
+    (:func:`canonical_slot`): a document written before the fold sits under the raw
+    ``slack:<ts>`` spelling, so it is used when the canonical slot has none. A
+    committed canonical marker ends both, and the raw key's own marker ends the raw
+    document, so a delete that tombstoned either spelling never brings it back. The
+    carried entry still names *slot_key*.
+    Raises :class:`LedgerUnavailable` when the canonical document is unreadable.
+    """
+    if not alias or alias == slot_key or canonical_slot(alias, "") == alias:
+        return slot_key
+    if _carry_committed(_control_file(slot_key, _CARRIED_FILE)):
+        return slot_key
+    if _has_content(_legacy_document(slot_key)):
+        return slot_key
+    return alias
+
+
+def _legacy_preview(slot_key: str, base: Any, alias: str = "") -> dict[str, Any] | None:
     """The record *slot_key*'s pending carry WOULD fold to, or ``None`` for no carry.
 
     The read half of the upgrade carry. Only a write can carry (it appends and takes
@@ -587,9 +653,10 @@ def _legacy_preview(slot_key: str, base: Any) -> dict[str, Any] | None:
     :func:`_legacy_document` refuses files over the size ceiling.
     """
     try:
-        if _carry_committed(_control_file(slot_key, _CARRIED_FILE)):
+        source = _legacy_source(slot_key, alias)
+        if _carry_committed(_control_file(source, _CARRIED_FILE)):
             return None
-        legacy = _legacy_document(slot_key)
+        legacy = _legacy_document(source)
     except LedgerUnavailable:
         # Unreadable is not empty, but a read must not raise into a nudge cycle.
         # Warned, since the carry is still owed and the next write reports it.
@@ -620,7 +687,7 @@ def _legacy_preview(slot_key: str, base: Any) -> dict[str, Any] | None:
         return None
 
 
-def _carry_legacy_forward(slot_key: str, session_id: str) -> bool:
+def _carry_legacy_forward(slot_key: str, session_id: str, alias: str = "") -> bool:
     """Append the pre-projection document as this slot's first entry. Once.
 
     Returns whether anything was carried. The caller takes this only when the slot's
@@ -630,8 +697,10 @@ def _carry_legacy_forward(slot_key: str, session_id: str) -> bool:
 
     What it appends is :func:`_legacy_carry_payload`'s entry, which a READ also folds
     in unappended so the record does not go dark between the upgrade and this call.
+    The claim, the document and the marker are *source*'s (:func:`_legacy_source`).
     """
-    claim = _claim_carry(slot_key)
+    source = _legacy_source(slot_key, alias)
+    claim = _claim_carry(source)
     if claim == _CLAIM_BUSY:
         # Another caller is carrying right now. Recording past it would append this
         # update FIRST and let the carry's legacy goal and phase apply over it, so the
@@ -643,17 +712,17 @@ def _carry_legacy_forward(slot_key: str, session_id: str) -> bool:
     if claim != _CLAIM_TAKEN:
         return False
     try:
-        legacy = _legacy_document(slot_key)
+        legacy = _legacy_document(source)
     except LedgerUnavailable:
         # RELEASED before propagating: the claim is this call's, and leaving it standing
         # would make the retry see a fresh claim, answer BUSY, and refuse again until the
         # marker went stale.
-        _finish_carry(slot_key, landed=False)
+        _finish_carry(source, landed=False)
         raise
     if not _has_content(legacy):
         # RELEASED, not committed: empty may be a transient read failure, and
         # committing would skip real state for good.
-        _finish_carry(slot_key, landed=False)
+        _finish_carry(source, landed=False)
         return False
     data = _legacy_carry_payload(slot_key, legacy)
 
@@ -673,7 +742,7 @@ def _carry_legacy_forward(slot_key: str, session_id: str) -> bool:
         if drained and not landed and seq_before is not None and seq_after is not None:
             # PROVED it never lands (queue empty, seq read twice and unmoved), so
             # RELEASE and let the retry carry at once.
-            _finish_carry(slot_key, landed=False)
+            _finish_carry(source, landed=False)
         # Otherwise the append may still be QUEUED (or a seq was unreadable), so the
         # claim stays ``pending``: releasing would let the retry carry a SECOND time,
         # and two carried entries are PERMANENT. Retries get BUSY until the append
@@ -684,7 +753,7 @@ def _carry_legacy_forward(slot_key: str, session_id: str) -> bool:
             "try the update again"
         )
     try:
-        _finish_carry(slot_key, landed=True)
+        _finish_carry(source, landed=True)
     except (ValueError, OSError):
         # TOLERATED, unlike in a delete: the append is proved landed, so the
         # non-empty fold refuses a second carry and the ``pending`` claim goes stale.
@@ -1029,6 +1098,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.session_ledger_control import (  # noqa: F401
         LedgerExclusionError,
         SlotExclusion,
+        _causal_units,
         _create_exclusive,
         _read_lines,
         _retainable_unit,

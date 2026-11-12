@@ -187,7 +187,7 @@ and install from a local path. The enabled app then appears in the sidebar.
 During development:
 
 1. Edit `ui/src/App.tsx`.
-2. Run `cd ui && npm run build`.
+2. Run `npm run build` in `ui/`.
 3. Use the installed app's **Update** action in the authenticated App Store UI.
 4. Refresh the dashboard.
 
@@ -209,6 +209,7 @@ Available in `@kirocrew/app-sdk`:
 | `useNavigate()` | Navigate to Kiro Crew routes |
 | `useNotify()` | Show toast notifications |
 | `useNavBadge()` | Update sidebar badge count |
+| `useAppNotifications()` | This app's own bell notifications (`items`, `unread`, `status`) and `ack(ts)` / `ackAll()` to clear them; declare `/api/notifications/own` in `permissions.api`; needs `APP_SDK_LEVEL >= 4` |
 | `useChatLauncher()` | Open a new chat or target `slotKey`; set `autoSend: false` for an unsent draft |
 
 `useAppInfo().active` tells your app whether its host surface is the one the user is
@@ -264,6 +265,10 @@ matters to your user. A fresh answer arrives when the store's listing refreshes.
 The field reads the same on every surface your app mounts on — a routed `ui.pages`
 page and a `contributes.panelTabs` side-panel tab both get it — so you write the
 banner once.
+
+`latestVersion` comes from the source your app was installed from, the one its
+Update installs from. Another registry that publishes an app under the same name
+never answers for yours.
 
 The field is advisory. It tells you what to display, not what to do: your app cannot
 update itself from it, and the gateway re-resolves the app's source when an update is
@@ -336,7 +341,8 @@ its message is used; the SDK does not select another session on failure.
 `memoryMode` (`'persistent'`, `'incognito'` or `'temporary'`) and
 `sessionFolder: false` shape a new session and are ignored with `slotKey`.
 Either one opens a new draft session, like `autoSend: false`, so the message is
-staged for the user to send.
+staged for the user to send. If the user leaves that draft session without having
+typed, clicked or changed anything in it, the host discards it.
 
 To tell an older host from one with these seams, read `APP_SDK_LEVEL` through a
 namespace import (`import * as sdk from '@kirocrew/app-sdk'`; an older host has
@@ -348,6 +354,9 @@ For Python app hooks with an existing cron grant, use
 `True` to resume it without replacing its ID. Use `set_enabled` off-loop.
 `update_job` and `update_job_async` reject `enabled` and `user_paused` arguments;
 use the toggle methods instead. Foreign and missing job IDs are refused.
+`await ctx.cron.run_job_async(job_id)` runs an owned job now, paused or not,
+without touching its schedule. It returns `False` when a run of that job is
+already in flight, and has no sync form.
 
 The `add_job*` methods accept `approval_mode`, `timeout_secs` and `timeout` at
 create time. Pass `approval_mode="auto"` for an unattended agent job: the

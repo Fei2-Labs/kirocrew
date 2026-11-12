@@ -30,6 +30,7 @@ if TYPE_CHECKING:
         DashboardState,
         PostedOptions,
         _append_footer_actions,
+        _backfill_late_link,
         _condense_thinking,
         _convert_tables,
         _dashboard_state,
@@ -95,6 +96,9 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
     _replayed = turn._replayed
     _stop_reason = turn._stop_reason
     _turn_completed_ok = turn._turn_completed_ok
+    # The busy memory pool refused the build: nothing reached the model, so the
+    # turn writes no transcript row on any branch below.
+    _unsent = turn._unsent
     answer = turn.answer
     client = turn.client
     linked_session_key = turn.routed_link_key
@@ -185,7 +189,7 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
                     await slack.delete_message(channel, answer.thinking_ts)
                 except Exception:
                     logger.debug("Failed to delete thinking placeholder", exc_info=True)
-            if conversation_log and not _is_slack_restricted(session_key):
+            if conversation_log and not _unsent and not _is_slack_restricted(session_key):
                 await save_conversation_turn_off_loop(
                     conversation_log,
                     session_key,
@@ -328,7 +332,7 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
             # delivered draft into a failed turn — book success first, then persist.
             if _turn_completed_ok:
                 turn.book_success()
-            if conversation_log and not _is_slack_restricted(session_key):
+            if conversation_log and not _unsent and not _is_slack_restricted(session_key):
                 try:
                     await save_conversation_turn_off_loop(
                         conversation_log,
@@ -542,7 +546,7 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
         #
         # Durability-before-invitation is also right on its own terms: a question
         # about a turn that has no record is not answerable after a restart.
-        _skip_writes = _is_slack_restricted(session_key)
+        _skip_writes = _is_slack_restricted(session_key) or _unsent
         _turn_row_ts: str | None = None
         if conversation_log and not _skip_writes:
             # The per-turn hot path: two appends every turn, so this is where the
@@ -723,6 +727,16 @@ async def _deliver_answer(turn: _SlackTurn) -> None:
         # ── Bidirectional sync: mirror to dashboard if routed to a dashboard session ──
         if linked_session_key and _dashboard_state and answer.accumulated and not _skip_writes:
             _mirror_to_dashboard(linked_session_key, text, answer.accumulated)
+        # A Link click while this turn ran may have imported its answer unfinished.
+        if _dashboard_state and answer.accumulated and not _skip_writes:
+            _backfill_late_link(
+                reply_ts,
+                msg_ts,
+                linked_session_key,
+                answer.stream_ts,
+                answer.accumulated,
+                answer.rotated_ts,
+            )
         # ── Auto-title Slack thread (fire-and-forget) ──
         # Claim-early-unclaim-on-failure pattern: ``try_claim`` checks and marks in one
         # synchronous step, so concurrent messages (and the transport path, which

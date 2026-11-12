@@ -23,15 +23,21 @@ _DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 45
 # 42.251775s (run 39911553168); 10x is 422.5s, rounded up to 425s. Fifteen
 # consecutive green main runs (41234261776..41278128347) measured 18.2s-25.2s.
 _WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS = 425
+# The same ceiling off Windows. The slowest of 117 passing calls in
+# linux-pytest-progress-8 artifacts (runs 42132423515..42955291680) took
+# 45.704918s (run 42938841346); 10x is 457.0s, rounded up to 460s.
+_LINUX_BACKEND_SCOPE_TIMEOUT_SECONDS = 460
 # At most half the module timeout, so an expired scan fails by name instead of
 # pytest-timeout killing the xdist worker (Windows has no SIGALRM).
-pytestmark = pytest.mark.timeout(2 * _WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS)
+pytestmark = pytest.mark.timeout(
+    2 * max(_WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS, _LINUX_BACKEND_SCOPE_TIMEOUT_SECONDS)
+)
 
 
 def _backend_scope_timeout_seconds(*, windows: bool) -> int:
-    """Bound Windows scans from the measured shard time; others keep 45s."""
+    """Bound the scan from the shard time measured on Windows or Linux runners."""
     return (
-        _WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS if windows else _DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+        _WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS if windows else _LINUX_BACKEND_SCOPE_TIMEOUT_SECONDS
     )
 
 
@@ -312,7 +318,7 @@ class TestFileShards(unittest.TestCase):
 
     def test_reduced_backend_scope_timeout_accounts_for_windows(self):
         self.assertEqual(
-            _backend_scope_timeout_seconds(windows=False), _DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
+            _backend_scope_timeout_seconds(windows=False), _LINUX_BACKEND_SCOPE_TIMEOUT_SECONDS
         )
         self.assertEqual(
             _backend_scope_timeout_seconds(windows=True), _WINDOWS_BACKEND_SCOPE_TIMEOUT_SECONDS
@@ -452,6 +458,27 @@ class TestFileShards(unittest.TestCase):
             )
             actual.extend(self.items())
         self.assertCountEqual(actual, baseline)
+
+    def test_targets_file_collects_only_listed_files_without_putting_them_on_argv(self):
+        self.write("test/conftest.py", "import pytest\n@pytest.fixture\ndef seeded(): return 1\n")
+        self.write("test/test_listed.py", "def test_ok(seeded): assert seeded == 1\n")
+        self.write("test/nested/test_deep.py", "def test_ok(): pass\n")
+        # Neither the sibling nor a directory holding no target may be imported.
+        self.write("test/test_sibling.py", "raise RuntimeError('sibling imported')\n")
+        self.write("apps/demo/conftest.py", "raise RuntimeError('untargeted directory walked')\n")
+        targets = self.write("targets.txt", "\ntest/test_listed.py\ntest/nested/test_deep.py\n")
+        args = ("--file-shards=1", "--file-shard=1", f"--file-shard-targets={targets}")
+        self.assert_ok(self.run_pytest(*args))
+        self.assertCountEqual(
+            self.items(), ["test/test_listed.py::test_ok", "test/nested/test_deep.py::test_ok"]
+        )
+        # A listed path that is not a file fails, as it did as an argument.
+        missing = self.write("missing.txt", "test/test_listed.py\ntest/test_gone.py\n")
+        result = self.run_pytest(*args[:2], f"--file-shard-targets={missing}")
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        # Without sharding the targets would silently widen to the whole suite.
+        result = self.run_pytest(f"--file-shard-targets={targets}")
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
 
     def test_custom_filename_pattern_norecursedirs_and_cli_ignore_survive(self):
         self.write(
@@ -729,6 +756,14 @@ class TestFileShards(unittest.TestCase):
                 changed_loop = leaf.split("leaf changed files, pass", 1)[1]
                 self.assertNotIn("ci_file_shards", changed_loop)
                 self.assertIn('"${CHANGED[@]}"', leaf)
+                # Subset lists reach pytest as a targets file, never as argv. The
+                # `=` keeps the out-of-checkout path out of rootdir discovery.
+                gates_run = leaf.split("leaf changed files, pass", 1)[0]
+                self.assertIn('--file-shard-targets="$RUNNER_TEMP/leaf-gates.txt"', gates_run)
+                reduced = command.rsplit('if [ "$REDUCED" = "true" ]; then', 1)[1]
+                reduced = reduced.split("exit 0", 1)[0]
+                self.assertIn('--file-shard-targets="$TARGETS_FILE"', reduced)
+                self.assertNotIn("TARGETS[@]", reduced)
                 # Pins are measured on the full suite and apply to it alone; the
                 # leaf and reduced invocations keep pure hash ownership.
                 self.assertEqual(command.count("--file-shard-pins"), 1)

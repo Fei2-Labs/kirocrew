@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     import time
 
     from kiro_crew.subagent import (
+        HostSpawnDecision,
         Iterable,
         Iterator,
         LLMEvent,
@@ -105,7 +106,7 @@ class SpawnApprovalUnreachable(Exception):
 class SpawnApprovalCallback(Protocol):
     async def __call__(
         self, request_id: str, description: str, parent_session_key: str = ""
-    ) -> bool:
+    ) -> bool | HostSpawnDecision:
         pass
 
 

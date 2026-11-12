@@ -82,7 +82,7 @@ After setting the provider and sampling values, enable the switch only if the da
 
 Cloudflare's Clef decision model on Workers AI answers the same questions in the same format as Jev, so it works as the Decisions provider. Cloudflare wraps its answer in a `result` object, and Kiro Crew reads either shape. A failure reply carries no `answers` and is refused like any other unusable answer, and nothing from it is logged.
 
-Set `provider` in `config.json` by hand (the Decision model picker only offers Jev and local models), using your own Cloudflare account id:
+Set `provider` in `config.json` by hand (the Decision model picker only offers Jev and local models), using your own Cloudflare account id. On Linux, where Kiro Crew's sandbox protects `config.json`, an edit made outside the dashboard does not take effect on its own: Settings > Security shows the changed keys, and you choose **Apply** to start using it or **Discard** to put back the version Kiro Crew last saved. The same goes for every hand edit in this page.
 
 ```json
 {
@@ -114,7 +114,7 @@ The easy way is the Decisions card. Under **Decision model**, choose **Your Sage
 
 **Test connection** sends the endpoint one short fixed question, with no message of yours in it, and shows how long the answer took or why there was none. **Use this model** saves it. Kiro Crew builds the `sagemaker://` address itself from the three fields, so the card cannot be used to send decisions anywhere but a SageMaker endpoint. Only the dashboard owner can do either, and both are written to the audit log. Choosing the endpoint, or changing any of the three fields, stops sending until you turn the Decisions switch off and on again. If `boto3` is missing, the card says so and shows the install command.
 
-You can also set `provider` in `config.json` by hand. The card then shows the endpoint selected with its three parts:
+You can also set `provider` in `config.json` by hand (on Linux, apply the edit in Settings > Security, as above). The card then shows the endpoint selected with its three parts:
 
 ```json
 {
@@ -130,7 +130,7 @@ You can also set `provider` in `config.json` by hand. The card then shows the en
 
 - `endpoint` is `sagemaker://<endpoint-name>?region=<aws-region>`, with an optional `&profile=<aws-profile>` naming a profile from your AWS config files. Without `profile` the usual AWS credential chain is used (environment, config files, instance role). Nothing else may appear in the address; anything else is refused.
 - The request is SageMaker's `InvokeEndpoint`, signed with your AWS credentials (SigV4). No API key is read and `api_key` is ignored. The credentials need `sagemaker:InvokeEndpoint` on that endpoint only.
-- Install `boto3` (`pip install 'boto3>=1.34,<2'`) in the environment Kiro Crew runs in. Without it each decision fails with a clear error and falls back.
+- Install `boto3` (`pip install "boto3>=1.34,<2"`) in the environment Kiro Crew runs in. Without it each decision fails with a clear error and falls back.
 - `timeout_ms` is the budget for the whole decision. A throttled or not-ready answer is retried, at most 3 attempts in total, and only while the budget has time left; a timeout is not retried. Set it with the endpoint's latency in mind.
 - Changing the endpoint name, the region or the profile withdraws your consent, the same as changing any other endpoint: turn the Decisions switch off and on again.
 - Requests always go to `runtime.sagemaker.<region>.amazonaws.com` (`.amazonaws.com.cn` in China regions), even if `AWS_ENDPOINT_URL` or your AWS config names another endpoint. An organisation's endpoint allow or deny list is checked against that host. The isolated AWS partitions are not supported.

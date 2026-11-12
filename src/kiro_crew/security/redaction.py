@@ -38,7 +38,7 @@ import posixpath
 import re
 import secrets
 import sys as _sys
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Iterable
 from typing import TYPE_CHECKING, NamedTuple
 
 from kiro_crew.credential_patterns import (  # noqa: F401
@@ -78,12 +78,17 @@ from .redaction_entropy import (  # noqa: F401
     _plantuml_source,
     _text_contains_bare_secret,
 )
-from .redaction_patterns import _is_json_object_segment  # noqa: F401
 from .redaction_patterns import _credential_matches, _might_contain_credential
 
 
-def _plantuml_verdict(encoded: str, limit: int) -> tuple[bool, int]:
-    """Judge one diagram; also return how much text was inflated for it."""
+def _plantuml_verdict(
+    encoded: str, limit: int, token_param_prefixes: tuple[str, ...] | None = None
+) -> tuple[bool, int]:
+    """Judge one diagram; also return how much text was inflated for it.
+
+    ``token_param_prefixes`` is the enclosing call's pass-4 snapshot, so the
+    diagram's source is judged under the same prefix set as the text around it.
+    """
     source = _plantuml_source(encoded, min(limit, _PLANTUML_RATIO_CAP * len(encoded)))
     if source is None:
         return False, min(limit, _PLANTUML_RATIO_CAP * len(encoded))
@@ -92,12 +97,15 @@ def _plantuml_verdict(encoded: str, limit: int) -> tuple[bool, int]:
     previous = _IN_DIAGRAM_SCAN.get()
     _IN_DIAGRAM_SCAN.set(True)
     try:
-        return redact_credentials(source)[0] == source, len(source)
+        cleaned = redact_credentials(source, token_param_prefixes=token_param_prefixes)[0]
+        return cleaned == source, len(source)
     finally:
         _IN_DIAGRAM_SCAN.set(previous)
 
 
-def _document_link_spans(text: str) -> list[tuple[int, int]]:
+def _document_link_spans(
+    text: str, token_param_prefixes: tuple[str, ...] | None = None
+) -> list[tuple[int, int]]:
     """Return the spans of the document links that hold no key.
 
     The :data:`_DOCUMENT_LINK_RE` matches, then the Outlook and Slack links
@@ -107,7 +115,7 @@ def _document_link_spans(text: str) -> list[tuple[int, int]]:
     budget = 0 if _IN_DIAGRAM_SCAN.get() else _PLANTUML_SOURCE_CAP
     for m in _DOCUMENT_LINK_RE.finditer(text):
         if m["diagram"]:
-            kept, spent = _plantuml_verdict(m["diagram"], budget)
+            kept, spent = _plantuml_verdict(m["diagram"], budget, token_param_prefixes)
             budget -= spent
         else:
             kept = not any(
@@ -560,10 +568,18 @@ def _token_param_exempt_prefixes() -> tuple[str, ...]:
         getter = getattr(ctx.credentials, "token_param_exempt_url_prefixes", None)
         if getter is None:
             return ()
-        prefixes = (p for p in getter() if isinstance(p, str))
-        return tuple(sorted(p for p in prefixes if _TOKEN_PARAM_EXEMPT_PREFIX_RE.fullmatch(p)))
+        return _well_formed_token_param_prefixes(getter())
     except Exception:
         return ()
+
+
+def _well_formed_token_param_prefixes(prefixes: Iterable[object]) -> tuple[str, ...]:
+    """The members of *prefixes* pass 4 may honour, sorted; malformed ones drop.
+
+    The one shape gate for the live read and for a caller's snapshot alike.
+    """
+    members = (p for p in prefixes if isinstance(p, str))
+    return tuple(sorted(p for p in members if _TOKEN_PARAM_EXEMPT_PREFIX_RE.fullmatch(p)))
 
 
 #: Single-character wrappers that may open an exempt URL. A ``(`` is accepted only
@@ -755,7 +771,12 @@ def _splice(text: str, spans: list[_RedactionSpan]) -> str:
     return "".join(parts)
 
 
-def redact_credentials(text: str, *, defer_token_param: bool = False) -> tuple[str, list[str]]:
+def redact_credentials(
+    text: str,
+    *,
+    defer_token_param: bool = False,
+    token_param_prefixes: tuple[str, ...] | None = None,
+) -> tuple[str, list[str]]:
     """Redact raw credential patterns from text, including base64-encoded.
 
     Returns (cleaned_text, list_of_warnings).
@@ -768,8 +789,15 @@ def redact_credentials(text: str, *, defer_token_param: bool = False) -> tuple[s
     a value an earlier pass already partly claimed is still redacted here, and
     every other pass still runs. With the empty default prefix set the output is
     byte-identical to a plain call.
+
+    ``token_param_prefixes`` is a SNAPSHOT of that prefix set that stands in for
+    pass 4's live read. A caller that keys a cache on the set passes the set it
+    keyed on, so the output is computed under exactly that set. ``None``, the
+    default, is the live read.
     """
-    spans, warnings, _rules = _credential_redaction_plan(text, defer_token_param=defer_token_param)
+    spans, warnings, _rules = _credential_redaction_plan(
+        text, defer_token_param=defer_token_param, token_param_prefixes=token_param_prefixes
+    )
     if not spans:
         return text, warnings
     return _splice(text, spans), warnings
@@ -861,6 +889,7 @@ def redact_credentials_with_records(
     ``_ELB_TARGET_GROUP_ARN_RE``): a streamed segment's save passes the values
     its deltas removed, so a value a delta boundary cut, which its delta could
     not see whole, keeps that delta's verdict and every other one is kept.
+    A whole-text fail-closed placeholder's record carries an empty ``value``.
     """
     spans, warnings, rules = _credential_redaction_plan(
         text, defer_token_param=defer_token_param, judged_sri_values=judged_sri_values
@@ -873,7 +902,8 @@ def redact_credentials_with_records(
     for start, end, tag in spans:
         ordinal += sum(text.count(t, cursor, start) for t in CREDENTIAL_REDACTION_TAGS)
         rule, label = rules.get(start, ("credential_pattern", ""))
-        matches.append(CredentialMatch(ordinal, rule, label, text[start:end][len(label) :]))
+        value = "" if rule == REDACTION_UNAVAILABLE_RULE else text[start:end][len(label) :]
+        matches.append(CredentialMatch(ordinal, rule, label, value))
         ordinal += 1
         cursor = end
     return _splice(text, spans), warnings, matches
@@ -884,12 +914,14 @@ def _credential_redaction_plan(
     *,
     defer_token_param: bool = False,
     judged_sri_values: Collection[str] = (),
+    token_param_prefixes: tuple[str, ...] | None = None,
 ) -> tuple[list[_RedactionSpan], list[str], dict[int, tuple[str, str]]]:
     """Every span :func:`redact_credentials` rewrites, with its warnings and rules.
 
     Returns ``(spans, warnings, rules)``: ``spans`` sorted and disjoint against
     the input, ``rules`` mapping each span's start to its ``(rule_id, label)``.
-    ``defer_token_param`` is :func:`redact_credentials`'s keyword of that name;
+    ``defer_token_param`` and ``token_param_prefixes`` are
+    :func:`redact_credentials`'s keywords of those names;
     ``judged_sri_values`` is :func:`redact_credentials_with_records`'s.
 
     Unconditional on every surface EXCEPT inside an explicit
@@ -915,13 +947,49 @@ def _credential_redaction_plan(
     character is redacted twice and no character a pass flagged is left behind.
 
     Inside a ``redaction_switch.code_text()`` scope pass 3 alone stands down.
+    With the internal ``compat.use_rule_table()`` switch on (off, no user setting),
+    the structured detectors read the text first and these passes run on the
+    text with their Secret hits tagged
+    (:mod:`kiro_crew.security.redaction_structured.compat`).
     """
     if credential_pass_bypassed():
         return [], [], {}
 
+    # Lazy: the detectors' seam imports this module's tags.
+    from kiro_crew.security.redaction_structured import compat
+
+    if compat.use_rule_table():
+        return compat.credential_plan_via_table(
+            text, defer_token_param, judged_sri_values, token_param_prefixes
+        )
+    return _main_plan(text, defer_token_param, judged_sri_values, token_param_prefixes)
+
+
+def _main_plan(
+    text: str,
+    defer_token_param: bool,
+    judged_sri_values: Collection[str],
+    token_param_prefixes: tuple[str, ...] | None = None,
+) -> tuple[list[_RedactionSpan], list[str], dict[int, tuple[str, str]]]:
+    """Passes 1-4 over ``text``: the plan without the structured detectors."""
     warnings: list[str] = []
     rules: dict[int, tuple[str, str]] = {}
+    taken = _pattern_pass(text, warnings, rules)
+    return _later_passes(
+        text, taken, warnings, rules, defer_token_param, judged_sri_values, token_param_prefixes
+    )
 
+
+#: The ``(rule, label)`` and text of a whole-text placeholder: the detectors could not run.
+REDACTION_UNAVAILABLE_RECORD = ("redaction_unavailable", "")
+REDACTION_UNAVAILABLE_RULE = REDACTION_UNAVAILABLE_RECORD[0]
+REDACTION_UNAVAILABLE_TAG = "[REDACTED: redaction unavailable]"
+
+
+def _pattern_pass(
+    text: str, warnings: list[str], rules: dict[int, tuple[str, str]]
+) -> list[_RedactionSpan]:
+    """Pass 1: the fixed patterns. Returns its spans; fills ``warnings``/``rules``."""
     # 1. Plaintext credential patterns.
     #
     # Gated on the cheap superset pre-filter: when no branch of
@@ -935,6 +1003,8 @@ def _credential_redaction_plan(
     taken: list[_RedactionSpan] = []
     if _might_contain_credential(text):
         for m in _credential_matches(text):
+            # Keep the Bearer branch's non-secret prefix (end() is -1 elsewhere).
+            start = max(m.start(), m.end("bearer_prefix"))
             # Emit ONLY non-sensitive metadata (length). Do NOT slice any part of
             # the match into the warning: `_CREDENTIAL_PATTERNS` matches the raw
             # secret value itself (e.g. `ghp_…`, `sk-ant-…`), so even a short prefix
@@ -943,10 +1013,22 @@ def _credential_redaction_plan(
             # redaction-subsystem output expected to be safe to log/surface, so it
             # must carry no secret bytes. The base64 / bare-secret passes below
             # likewise log length only.
-            warnings.append(f"Redacted credential pattern ({len(m.group())} chars)")
-            taken.append((m.start(), m.end(), _REDACTED_CREDENTIAL_TAG))
-            rules[m.start()] = _pass1_rule(m.group())
+            warnings.append(f"Redacted credential pattern ({m.end() - start} chars)")
+            taken.append((start, m.end(), _REDACTED_CREDENTIAL_TAG))
+            rules[start] = _pass1_rule(m.group())
+    return taken
 
+
+def _later_passes(
+    text: str,
+    taken: list[_RedactionSpan],
+    warnings: list[str],
+    rules: dict[int, tuple[str, str]],
+    defer_token_param: bool,
+    judged_sri_values: Collection[str],
+    token_param_prefixes: tuple[str, ...] | None = None,
+) -> tuple[list[_RedactionSpan], list[str], dict[int, tuple[str, str]]]:
+    """Passes 2-4 after ``taken`` (pass 1's or the table's spans); the whole plan."""
     # Passes 2 and 3 both scan the ORIGINAL `text` for runs of the base64
     # alphabet, and they select the SAME spans: `[A-Za-z0-9+/]{40,}` is greedy and
     # leftmost, so it yields exactly the maximal runs of length >= 40 — which is
@@ -1046,7 +1128,7 @@ def _credential_redaction_plan(
         # never pays for either. The digest lookup is by exact span, so a text of
         # many digests costs one set probe per run, not one pass over them all.
         if link_spans is None:
-            link_spans = _document_link_spans(text)
+            link_spans = _document_link_spans(text, token_param_prefixes)
             # Only a value a key long can be a piece pass 3 cut from a digest;
             # a shorter one would match inside unrelated digests by chance.
             judged = [v for v in judged_sri_values if len(v) >= _SECRET_KEY_LEN]
@@ -1139,8 +1221,16 @@ def _credential_redaction_plan(
     # so an uncovered tail left here would never be revisited. The stream
     # suspension wins when both are set: it pins the prefixes empty, and an empty
     # set defers nothing.
+    #
+    # SNAPSHOT: `token_param_prefixes` replaces the lazy live read with the set a
+    # caller keyed its cache on. It passes the live read's own shape gate, so it
+    # cannot exempt a URL the live read could not, and the suspension still wins.
     pass4: list[_RedactionSpan] = []
-    exempt_prefixes: tuple[str, ...] | None = () if _TOKEN_PARAM_EXEMPT_SUSPENDED.get() else None
+    exempt_prefixes: tuple[str, ...] | None = None
+    if _TOKEN_PARAM_EXEMPT_SUSPENDED.get():
+        exempt_prefixes = ()
+    elif token_param_prefixes is not None:
+        exempt_prefixes = _well_formed_token_param_prefixes(token_param_prefixes)
     exempt_scan = _TokenParamExemptScan(text)
     for m in _TOKEN_PARAM_RE.finditer(text):
         value_start, value_end = m.start(1), m.end(1)
@@ -1374,6 +1464,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _OUTLOOK_HOSTS,
         _OUTLOOK_ID_ESCAPES,
         _OUTLOOK_ID_PREFIXES,
+        _OWA_QUERY_CHARS,
+        _OWA_WEB_LINK_PATH,
+        _OWA_WEB_LINK_QUERIES,
         _PLANTUML_ALPHABET,
         _PLANTUML_DIAGRAM,
         _PRINTABLE_BYTES,
@@ -1403,6 +1496,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _is_whole_exchange_id,
         _lowercase_run_exceeds,
         _outlook_item_id,
+        _outlook_web_link_item,
+        _outlook_web_link_tail,
         _shannon_entropy,
         _steps_up,
         _vowel_ratio,
@@ -1444,9 +1539,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _sans_jwt_start,
         _segment_run_end,
         get_credential_patterns,
+        iter_credential_matches,
     )
 if TYPE_CHECKING:  # project names it serves from outside its owners, from their homes
     import kiro_crew.security.pem_scan as pem_scan  # noqa: F401
     from kiro_crew.credential_patterns import (  # noqa: F401
         JWT_MULTI_SEGMENT,
+    )
+    from kiro_crew.jwt_header import (  # noqa: F401
+        is_jwt_header,
     )

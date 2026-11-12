@@ -818,7 +818,7 @@
       "title": "Worktrees",
       "user_story": "As a developer, I want to create a git worktree for a follow-up session from a card, so that parallel work stays isolated.",
       "start_url": "/chat",
-      "entry_path": "Chat follow-up card → Start in new worktree",
+      "entry_path": "Chat follow-up card → Start in a separate copy",
       "preconditions": {
         "seed": "rich",
         "members": [],
@@ -1589,7 +1589,7 @@
         "seed": "minimal",
         "members": [],
         "feature_flags": [],
-        "notes": "Preference is browser-local under mc-nav-pinned (useNavPinned); clear between runs. CAPABILITY_SUB_ITEMS registered pinnable; promotedTabOwner logic in App.tsx yields active state on the host row."
+        "notes": "Preference is held under mc-nav-pinned (useNavPinned) and backed up in ui-prefs.json; clear both between runs. CAPABILITY_SUB_ITEMS registered pinnable; promotedTabOwner logic in App.tsx yields active state on the host row."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
@@ -1987,7 +1987,7 @@
       "title": "Reply in thread on a mate's bubble opens the thread panel and the bubble gains a replies footer",
       "user_story": "As a user talking to a mate, I want to ask about one thing it said in a reply thread on that message, so that the follow-up stays beside the message it is about instead of pushing the mate's findings up the main chat.",
       "start_url": "/settings",
-      "entry_path": "Settings > Developer > Mates > enable Reply threads on Bot chat messages; Rail > Crew Members > Nova Sky > send a message, get a reply > hover the reply bubble > Reply in thread > Thread panel (quoted parent, 'No replies yet') > send a reply in the panel",
+      "entry_path": "Settings > Developer > Feature Previews > Crew and bots > enable Reply threads on bot chat messages; Rail > Crew Members > Nova Sky > send a message, get a reply > hover the reply bubble > Reply in thread > Thread panel (quoted parent, 'No replies yet') > send a reply in the panel",
       "preconditions": {
         "seed": "rich",
         "members": [
@@ -2478,16 +2478,16 @@
       "title": "Customize › Connections › MCP Servers › MCP Management",
       "user_story": "As a user, I want to see each MCP server's state, opt servers in to stubbing and read the sharing assessment, so that I can manage MCP connections and diagnose tool outages.",
       "start_url": "/capabilities",
-      "entry_path": "Customize → Connections → MCP Servers sub-tab → MCP Management section below the servers list (/capabilities?tab=mcp&view=mcp-servers#mcp-management) → Servers table with share switches, and the Sharing assessment tab",
+      "entry_path": "Customize → Connections → MCP Servers sub-tab → MCP Management section below the servers list (/capabilities?tab=mcp&view=mcp-servers#mcp-management) → Per-server sharing tab with share switches, and the Sharing assessment tab",
       "preconditions": {
         "seed": "connections-two",
         "members": [],
         "feature_flags": [],
-        "notes": "MCP Management renders in the MCP Servers sub-tab of Customize → Connections (ConnectionsPage.tsx), with no Developer Mode needed. The old /settings/developer/mcp-pool and /developer?tab=mcp-pool links redirect there. Two views: Servers and Sharing assessment."
+        "notes": "MCP Management renders in the MCP Servers sub-tab of Customize → Connections (ConnectionsPage.tsx), with no Developer Mode needed. The old /settings/developer/mcp-pool and /developer?tab=mcp-pool links redirect there. Two views: Per-server sharing and Sharing assessment."
       },
       "runnable": "nightly",
       "estimated_steps": 3,
-      "rationale": "The section reads the mcp-gateway status and servers endpoints; the assertions are the Servers table with its share switches and the Sharing assessment view.",
+      "rationale": "The section reads the mcp-gateway status and servers endpoints; the assertions are the Per-server sharing table with its share switches and the Sharing assessment view.",
       "source": [
         "docs/feature-map/README.md",
         "website/src/pages/connections/ConnectionsPage.tsx",
@@ -4821,9 +4821,9 @@
       "id": "settings-channels-weixin-configure",
       "feature": "channels",
       "title": "Configure WeChat (Weixin) channel",
-      "user_story": "As an operator, I want to enable the WeChat channel and set who can message the bot, so that only allowed WeChat users reach the agent.",
+      "user_story": "As an operator, I want to enable the WeChat channel and set who can message the agent, so that only allowed WeChat users reach it.",
       "start_url": "/settings/channels/weixin",
-      "entry_path": "Settings > Messaging Channels > WeChat > Enable > Who can message the bot > Allowed user IDs > Folder",
+      "entry_path": "Settings > Messaging Channels > WeChat > Enable > Who can message the agent > Allowed user IDs > Folder",
       "preconditions": {
         "seed": "minimal",
         "members": [],
@@ -5130,7 +5130,7 @@
           "nova-sky"
         ],
         "feature_flags": [],
-        "notes": "Invoke path needs Electron and OS accessibility permissions. | Off by default; ComputerUsePanel.tsx; live view component mounted in App.tsx. | Permission probe shells out to 'kirocrew computer doctor'; on Linux reports unsupported/unknown. | Linux backend is a typed UnsupportedBackend; the spec says when `supported` is false the panel renders the reason and no toggle."
+        "notes": "Invoke path needs Electron and OS accessibility permissions. | Off by default; ComputerUsePanel.tsx; live view component mounted in App.tsx. | Permission probe spawns 'python -m kiro_crew.computer_use.permission_probe'; on Linux reports unsupported/unknown. | Linux backend is a typed UnsupportedBackend; the spec says when `supported` is false the panel renders the reason and no toggle."
       },
       "runnable": "nightly",
       "estimated_steps": 2,

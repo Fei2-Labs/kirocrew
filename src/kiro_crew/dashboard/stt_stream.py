@@ -23,22 +23,24 @@ from aiohttp import WSMessage, WSMsgType, web
 # can diagnose. api_ws_stt() re-checks and returns a friendly WS error.
 try:
     from amazon_transcribe.client import TranscribeStreamingClient
-    from amazon_transcribe.exceptions import BadRequestException as _TranscribeBadRequest
     from amazon_transcribe.exceptions import UnknownServiceException as _TranscribeUnknownService
 except ImportError:  # pragma: no cover — exercised by test_import_error_*
     TranscribeStreamingClient = None  # type: ignore[assignment,misc]
-    _TranscribeBadRequest = None  # type: ignore[assignment,misc]
     _TranscribeUnknownService = None  # type: ignore[assignment,misc]
 
 from kiro_crew import aws_consent, stt
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.origin import check_origin, mark_audit_claimed
+from kiro_crew.dashboard.stt_adapted_stream import _run_registered_session, run_codex_session
 from kiro_crew.dashboard.stt_stream_transcribe_args import (
     _client_identifies_languages,
     _transcribe_language_kwargs,
+    _vocabulary_rejected,
 )
+from kiro_crew.dashboard.ws_heartbeat import LagTolerantWebSocketResponse
 from kiro_crew.extras import install_hint
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.metrics import voice as voice_metrics
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.start_priority import StartPriority
@@ -57,7 +59,7 @@ PROVIDER_LOCAL = "local"
 # re-decodes a rolling window on a resident whisper.cpp model in this process,
 # `apple` streams on-device via SpeechAnalyzer (macOS 26+), and `transcribe`
 # streams from AWS. The default is first.
-_STREAMING_PROVIDERS = (PROVIDER_LOCAL, "apple", "transcribe")
+_STREAMING_PROVIDERS = (PROVIDER_LOCAL, "apple", "transcribe", "codex")
 
 
 def streaming_providers() -> tuple[str, ...]:
@@ -282,24 +284,6 @@ def _redacted(text: str) -> str:
     return out
 
 
-def _vocabulary_rejected(exc: BaseException, vocabulary: str) -> bool:
-    """Whether a refused stream start was Amazon Transcribe refusing *vocabulary*.
-
-    Narrow on purpose: a vocabulary must be configured, the refusal must be the
-    service's ``BadRequestException`` (raised by ``start_stream_transcription``
-    itself, before any audio is sent), and its message must name the vocabulary. A
-    bad request for any other reason keeps the generic code, so an operator is
-    never sent to change a vocabulary that is not the problem. The stem, not the
-    word: with mixed languages the vocabulary rides as ``VocabularyNames``, whose
-    refusals speak of "vocabularies".
-    """
-    if not vocabulary or _TranscribeBadRequest is None:
-        return False
-    if not isinstance(exc, _TranscribeBadRequest):
-        return False
-    return "vocabular" in str(getattr(exc, "message", "")).lower()
-
-
 def _drop_task_result(task: "asyncio.Task[Any]") -> None:
     """Consume an abandoned task's outcome so asyncio does not warn about it.
 
@@ -323,6 +307,7 @@ async def _send_error(ws: web.WebSocketResponse, message: str, code: str) -> Non
     ``code`` is not optional. The dashboard renders ``message`` verbatim into a
     12-language UI, so a frame without one can only ever be shown in English.
     """
+    voice_metrics.observe_stt_frame({"type": "error", "code": code})
     if ws.closed:
         return
     try:
@@ -341,6 +326,7 @@ def _emit_end_audit(caller: str, *, outcome: str) -> None:
     emits it twice invents a session that never happened. Never raise: a failing SEL
     call must not short-circuit the caller's ``return ws``.
     """
+    voice_metrics.stt_session_end(outcome)
     try:
         sel().log_api_access(
             caller=caller,
@@ -598,6 +584,7 @@ def _make_handler(ws: web.WebSocketResponse, endpointer: "_Endpointer | None" = 
                         # COMPLETE emits, auto-submitting a truncated request.
                         if endpointer is not None:
                             endpointer.note_partial(redacted)
+                        voice_metrics.observe_stt_frame({"type": "partial", "text": redacted})
                         await ws.send_json({"type": "partial", "text": redacted})
                     else:
                         # Feed the stable segment to the endpointer BEFORE the
@@ -606,6 +593,7 @@ def _make_handler(ws: web.WebSocketResponse, endpointer: "_Endpointer | None" = 
                         # never sees an unredacted credential the wire didn't.
                         if endpointer is not None:
                             endpointer.note_final(redacted)
+                        voice_metrics.observe_stt_frame({"type": "final", "text": redacted})
                         await ws.send_json({"type": "final", "text": redacted})
                 except Exception:
                     # Client disconnected mid-send. Stop processing rather
@@ -711,6 +699,7 @@ async def _run_local_session(
     async def _send(frame: dict[str, object]) -> bool:
         """Send one JSON frame. False once the client stopped accepting them."""
         nonlocal client_gone
+        voice_metrics.observe_stt_frame(frame)
         if client_gone or ws.closed:
             return False
         try:
@@ -1235,36 +1224,6 @@ async def _run_apple_session(
     )
 
 
-async def _run_registered_session(
-    ws: web.WebSocketResponse,
-    cfg: "KiroCrewConfig",
-    request: web.Request,
-    caller: str,
-) -> None:
-    """Drive an edition provider's ``open_stream()`` session through the ``apple`` loop.
-
-    Same events, redaction, endpointer, cap and audit; a raise while opening is
-    audited as a setup failure.
-    """
-    from kiro_crew import speech_providers
-
-    with _audited_setup(caller):
-        provider = speech_providers.stt_provider(cfg.stt.provider)
-        if provider is None or not speech_providers.streams(provider):
-            raise RuntimeError(f"STT provider {cfg.stt.provider!r} cannot stream")
-        endpointer = _build_endpointer(ws, cfg, request)
-        session = provider.open_stream(cfg.stt)
-    await _drive_helper_session(
-        ws,
-        caller,
-        session,
-        endpointer,
-        start_failure_code=lambda: _CODE_SESSION_FAILED,
-        label=f"STT provider {cfg.stt.provider!r}",
-        capped=not speech_providers.owns_session_limit(provider),
-    )
-
-
 async def _drive_helper_session(
     ws: web.WebSocketResponse,
     caller: str,
@@ -1274,6 +1233,7 @@ async def _drive_helper_session(
     start_failure_code: Callable[[], str],
     label: str,
     capped: bool = True,
+    relayed_codes: frozenset[str] | None = None,
 ) -> None:
     """Run one started-on-demand helper session to its end; see :func:`_run_apple_session`.
 
@@ -1282,6 +1242,9 @@ async def _drive_helper_session(
     (``speech_providers.owns_session_limit``): core then arms no deadline and
     advertises no ``max_duration_ms``, and the session ends when the backend
     ends it.
+    *relayed_codes* are the ``error`` event codes sent to the client as they
+    are, read from ``RELAYED_SESSION_ERROR_CODES`` at call time when omitted;
+    any other code, or none, is sent as ``stt_session_failed``.
     """
     try:
         problem = await session.start()
@@ -1327,7 +1290,8 @@ async def _drive_helper_session(
                 # the single audit still comes from the one owner, the `finally`.
                 msg_text = str(event.get("message", "speech helper failed"))
                 code = event.get("code")
-                relayed = code if code in RELAYED_SESSION_ERROR_CODES else _CODE_SESSION_FAILED
+                allowed = RELAYED_SESSION_ERROR_CODES if relayed_codes is None else relayed_codes
+                relayed = code if code in allowed else _CODE_SESSION_FAILED
                 # A provider that owns its session limit ends the session at it:
                 # that is the cap reached, audited the way core's own cap is.
                 _claim_fatal("timeout" if relayed == _CODE_MAX_DURATION else "error")
@@ -1355,6 +1319,7 @@ async def _drive_helper_session(
                     endpointer.note_partial(redacted)
                 else:
                     endpointer.note_final(redacted)
+            voice_metrics.observe_stt_frame({"type": kind, "text": redacted})
             try:
                 await ws.send_json({"type": kind, "text": redacted})
             except Exception:
@@ -1634,6 +1599,7 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
     one frame a client may not see at all on the other two providers.
     """
     if not check_origin(request, require=True):
+        voice_metrics.record_stt_unavailable("forbidden_origin")
         _emit_guard_audit(request.remote or "unknown", outcome="forbidden")
         # That record is the specific one; claim the request so the deny-audit
         # boundary does not add a second, generic entry for the same refusal.
@@ -1650,6 +1616,7 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
         # rather than a bare 503 it can only report as a generic 'connection' error.
         # The guard audit records the refusal; no stt_stream_start is emitted, so
         # no stt_stream_end is needed.
+        voice_metrics.record_stt_unavailable(voice_metrics.guard_reason(cfg.stt))
         _emit_guard_audit(request.remote or "unknown", outcome="unavailable")
         ws = web.WebSocketResponse()
         await ws.prepare(request)
@@ -1659,11 +1626,13 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
 
     global _active_sessions
     if _active_sessions >= _MAX_CONCURRENT_SESSIONS:
+        voice_metrics.record_stt_unavailable("busy")
         _emit_guard_audit(request.remote or "unknown", outcome="unavailable")
         raise web.HTTPServiceUnavailable(text="too many concurrent STT sessions")
     _active_sessions += 1
     try:
-        ws = web.WebSocketResponse(heartbeat=30, max_msg_size=_MAX_WS_MSG_SIZE)
+        # A loop stall must not end dictation whose client answered the PING in time.
+        ws = LagTolerantWebSocketResponse(heartbeat=30, max_msg_size=_MAX_WS_MSG_SIZE)
         await ws.prepare(request)
 
         caller = request.remote or "dashboard"
@@ -1674,6 +1643,8 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
                 outcome="ok",
                 resources="/api/ws/stt",
             )
+            # After the start audit: the end audit counts `ended`, so they pair.
+            voice_metrics.stt_session_begin(cfg.stt.provider)
         except Exception:
             # Mirror the ImportError / client-construction paths: if the
             # mandatory start audit fails, close the already-prepare()d WS
@@ -1698,6 +1669,10 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
             # setup below, which is entirely AWS-specific (credentials, region,
             # billing deadline).
             await _run_apple_session(ws, cfg, request, caller)
+            return ws
+
+        if cfg.stt.provider == "codex":
+            await run_codex_session(ws, cfg, request, caller)
             return ws
 
         if cfg.stt.provider not in _STREAMING_PROVIDERS:

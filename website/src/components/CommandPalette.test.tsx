@@ -88,7 +88,7 @@ const H = vi.hoisted(() => {
   // direct hooks. Mock them with stable, empty-search providers
   // so the modal renders without React-Query / Router (matching the P0 mocks).
   const knowledgeProvider = { id: 'knowledge', label: 'Knowledge', icon: null, search: vi.fn(() => []) }
-  const skillsProvider = { id: 'skills', label: 'Skills', icon: null, search: vi.fn(() => []) }
+  const skillsProvider = { id: 'skills', label: 'Skills', icon: null, search: vi.fn(() => []), scope: '' }
   const promptsProvider = { id: 'prompts', label: 'Prompts', icon: null, search: vi.fn(() => []) }
   const artifactsProvider = { id: 'artifacts', label: 'Artifacts', icon: null, search: vi.fn(() => []) }
   const recentsProvider = { id: 'recents', label: 'Recent', icon: null, search: vi.fn(async () => [recentResult]) }
@@ -783,6 +783,22 @@ describe('CommandPalette — keyboard & activation', () => {
     expect(screen.getByRole('textbox', { name: 'Search everywhere' })).toHaveValue('sla')
   })
 
+  it('re-runs the Skills search when the provider scope moves to another chat', async () => {
+    try {
+      const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+      await screen.findByText('Recent Session')
+      fireEvent.change(screen.getByRole('textbox', { name: 'Search everywhere' }), { target: { value: '$' } })
+      await screen.findByPlaceholderText('Search skills…')
+      await waitFor(() => expect(H.skillsProvider.search).toHaveBeenCalled())
+      const before = H.skillsProvider.search.mock.calls.length
+      H.skillsProvider.scope = 'scope-test-chat-b'
+      rerender(<CommandPalette open onClose={vi.fn()} />)
+      await waitFor(() => expect(H.skillsProvider.search.mock.calls.length).toBeGreaterThan(before))
+    } finally {
+      H.skillsProvider.scope = ''
+    }
+  })
+
   it('Backspace on an empty scoped query pops the scope chip', async () => {
     render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
     await screen.findByText('Recent Session')
@@ -1333,6 +1349,15 @@ describe('CommandPalette — focus restore on close', () => {
     rerender(<CommandPalette open={false} onClose={vi.fn()} />)
 
     expect(document.activeElement).not.toBe(composer)
+  })
+
+  it('keeps an outside press from clearing the focus the close gives back', async () => {
+    // In a browser the press's default action runs after the close (#33323).
+    const onClose = vi.fn()
+    render(<CommandPalette open onClose={onClose} />, { wrapper })
+    await screen.findByText('Recent Session')
+    expect(fireEvent.mouseDown(screen.getByRole('dialog'))).toBe(false)
+    expect(onClose).toHaveBeenCalledTimes(1)
   })
 
   it('does not restore after a row is chosen (its action owns focus)', async () => {

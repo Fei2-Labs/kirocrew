@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from functools import partial
 from typing import Any
 
 from aiohttp import web
@@ -79,11 +80,14 @@ async def _stop(state: Any, key: str) -> bool:
     except Exception:
         logger.warning("crew pause: stop failed for %s", key, exc_info=True)
         return False
-    return out.get("info") not in _NOT_STOPPED
+    # A refused stop (``ok: False``, such as a cron run the pause may not cancel)
+    # stopped nothing, so Resume all owes it no Continue.
+    return out.get("ok") is not False and out.get("info") not in _NOT_STOPPED
 
 
-#: One Pause all or Resume all at a time per root, so a Resume still waiting on a
-#: stopped turn's teardown never interleaves with a newer Pause all.
+#: One Pause all, Resume all or held member's own Continue at a time per root, so a
+#: Resume still waiting on a stopped turn's teardown never interleaves with a newer
+#: Pause all, nor a member's refused Continue with the Resume that would drop it.
 _ROOT_LOCKS: dict[str, asyncio.Lock] = {}
 
 
@@ -174,6 +178,36 @@ def _queue_is_restored(slot: Any) -> bool:
 
     queue = list(getattr(slot, "_queue", None) or [])
     return bool(queue) and all(entry.get(RESTORED_QUEUE_KEY) for entry in queue)
+
+
+async def memory_ready_for_drain(state: Any) -> bool:
+    """Wait a turn's own grace for memory preparation; ``False`` when it is still not ready.
+
+    While memory prepares, the queue drain parks instead of starting a card, and
+    the drain that follows can drop that card as stale with no Continue. Resume
+    all and a stopped member's own Continue wait here first, while the pause
+    record still owes the member its hand-back, and change nothing when memory
+    is still not ready; so the card starts or drops while the hand-back can still
+    Continue it.
+    """
+    from kiro_crew.memory_startup import (
+        MemoryStartupUnavailable,
+        memory_startup_preparing,
+        wait_for_memory_preparation,
+    )
+
+    task = getattr(state, "memory_startup_task", None)
+    if task is None:
+        # Startup publishes the task only after the listener is up: until then a
+        # preparing startup refuses every turn, so nothing may be handed back yet.
+        return not memory_startup_preparing()
+    if task.done():
+        return True
+    try:
+        await wait_for_memory_preparation(task)
+    except MemoryStartupUnavailable:
+        return False
+    return True
 
 
 async def drain_held_queue(state: Any, slot: Any, *, send_restored: bool = False) -> str:
@@ -331,6 +365,9 @@ async def _resume(request: web.Request) -> web.Response:
     held = crew_pause.record(root)
     if kind != "crew" and held is None:
         return _not_root()
+    if (held or {}).get("stopped") and not await memory_ready_for_drain(state):
+        # A stopped member's card would only park: the pause stays as it is.
+        return _bad("memory_preparing", "memory is still being prepared; try again", status=503)
     # Read while the hold stands: once it lifts, a stopped turn's own tail may
     # start the next turn before its hand-back looks. Every session the hold
     # covers is read, not just those stopped so far: a held turn reaching the
@@ -352,36 +389,59 @@ async def _resume(request: web.Request) -> web.Response:
         for key in set(record.get("tree") or []) | stopped
         if key != root and state.get_slot(key) is not None
     )
-    try:
-        outcomes = await asyncio.gather(
-            *(
-                _hand_back(
-                    state,
-                    key,
-                    stopped=key in stopped,
-                    started=started.get(key) if key in stopped else None,
-                )
-                for key in [root, *keys]
-            ),
+    done: set[str] = set()
+
+    async def _hand_back_one(key: str) -> str:
+        outcome = await _hand_back(
+            state, key, stopped=key in stopped, started=started.get(key) if key in stopped else None
         )
+        if outcome in _HANDED_BACK:
+            done.add(key)
+            if key in stopped:
+                # Stored as handed back at once: a restart now does not continue it twice.
+                await asyncio.to_thread(crew_pause.forget_resuming, [key])
+        return outcome
+
+    try:
+        outcomes = await asyncio.gather(*(_hand_back_one(key) for key in [root, *keys]))
     finally:
-        crew_pause.forget_resuming(sorted(stopped))
-    # A stopped turn not handed back (still tearing down after the wait, or its
-    # Continue refused) is held again on its own, so the next Resume all
-    # continues it instead of losing it; a refusal is reported as ``failed``.
-    root_pending = outcomes[0] not in _HANDED_BACK and root in stopped
-    pending = [
-        k for k, o in zip(keys, outcomes[1:], strict=True) if o not in _HANDED_BACK and k in stopped
-    ]
+        # A stopped turn not handed back (still tearing down after the wait, its
+        # Continue refused, or the route unwound first) is held again on its own,
+        # in the same write that ends this Resume, so the next Resume all
+        # continues it instead of losing it. Shielded: a second cancel must not
+        # leave the gate ending these turns with nobody to continue them.
+        root_pending = root in stopped and root not in done
+        pending = [k for k in keys if k in stopped and k not in done]
+        # Every write stores the whole state, so this last one decides what the
+        # file holds, whatever the per-member writes above answered.
+        saved = await asyncio.shield(
+            asyncio.to_thread(
+                partial(
+                    crew_pause.forget_resuming,
+                    sorted(stopped),
+                    root=root,
+                    pending=pending,
+                    root_pending=root_pending,
+                )
+            )
+        )
+    # A refusal is reported as ``failed``.
     failed = [
         k
         for k, o in zip([root, *keys], outcomes, strict=True)
         if o not in _HANDED_BACK and o != "running" and (k in stopped)
     ]
-    if pending or root_pending:
-        await asyncio.to_thread(crew_pause.keep_pending, root, pending, root_pending=root_pending)
     state.push_slots_update()
-    _audit(root, "resume", f"handed_back={len(keys)} pending={len(pending)}")
+    _audit(root, "resume", f"handed_back={len(keys)} pending={len(pending)} saved={saved}")
+    if not saved:
+        # The crew runs again in memory; the file still owes its stopped members
+        # until a later write stores this, so a restart before that holds them
+        # again and the next Resume all can continue one a second time.
+        return _bad(
+            "pause_file_unsaved",
+            "the crew resumed, but its pause file could not be saved; the next change retries it",
+            status=500,
+        )
     return web.json_response(
         {
             "ok": True,

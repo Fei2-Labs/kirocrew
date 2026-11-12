@@ -14,6 +14,7 @@ calls here.
 from __future__ import annotations
 
 import filecmp
+import functools
 import os
 from pathlib import Path
 
@@ -46,7 +47,11 @@ from kiro_crew.snapshot_merge import (
     _report_unmerged_databases,
     _serialise_with_notification_writes,
 )
-from kiro_crew.snapshot_restore import _install_locked_document, _lock_down_restored
+from kiro_crew.snapshot_restore import (
+    _endorse_restored,
+    _install_locked_document,
+    _lock_down_restored,
+)
 
 
 def _copy_notifications(src_path: Path, dst_path: Path) -> None:
@@ -127,7 +132,8 @@ def _do_merge(
                 print(f"  ↩️  {_core_file_not_installed(mc / 'memory.db')}")
                 memory_ok = False
         else:
-            _merge_memory(snap / "memory.db", mc / "memory.db")
+            # A refused merge imported nothing, so it must not print the success tick.
+            memory_ok = _merge_memory(snap / "memory.db", mc / "memory.db")
         if memory_ok:
             print("  ✅ memory")
 
@@ -222,6 +228,8 @@ def _do_merge(
                     str(s), str(d), skip_existing=True, on_skip=facade._report_skip
                 ):
                     _lock_down_restored(d, "config")
+                    # The owner's restore takes effect, not held as pending.
+                    _endorse_restored(d, functools.partial(Path.read_bytes, s))
                     print(f"  {f}: restored (was missing)")
                 continue
             if f not in _CONFIG_SETTINGS_DOCUMENTS:

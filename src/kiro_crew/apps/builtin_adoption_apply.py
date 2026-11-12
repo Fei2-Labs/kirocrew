@@ -66,6 +66,7 @@ from kiro_crew.apps.builtin_adoption_state import (
     write_grant_and_marker,
     write_ledger,
 )
+from kiro_crew.sandbox import SandboxUnavailableError
 
 logger = logging.getLogger("kiro_crew.apps.builtin_adoption")
 
@@ -280,6 +281,12 @@ async def staging_pass(*, now: Callable[[], datetime]) -> dict[str, str]:
             outcomes[name] = await _stage_one(pins[name], now())
         except asyncio.CancelledError:
             raise
+        except SandboxUnavailableError as exc:
+            # The fetch runs in the sandbox, and a host with no backend refuses it on
+            # every pass. The refusal's own text names the host's remedy; a stack
+            # trace under it on each gateway start reads as a crash.
+            logger.warning("Adoption staging of %s failed: %s", name, exc)
+            outcomes[name] = "error"
         except Exception:  # noqa: BLE001 - one pin must not stop the others
             logger.exception("Adoption staging of %s failed", name)
             outcomes[name] = "error"
@@ -357,8 +364,8 @@ def _record_eligible(name: str) -> bool:
         return False
     tmp_data = path.parent / f".{name}-data-tmp"
     if _owned_data_dir(tmp_data) and _owned_data_dir(path / "data"):
-        # Data in two places: ``update_app`` would delete the moved-aside copy as
-        # stale, and it may be the only copy a killed swap preserved.
+        # Data in two places: ``update_app`` refuses it, since the moved-aside
+        # copy may be the only one a killed swap preserved.
         logger.warning("Adoption of %s skipped: its data is in two places", name)
         return False
     return not _temp_data_name_obstruction(tmp_data)

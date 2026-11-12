@@ -16,6 +16,11 @@ import { crewModeEnabled, mateSessionsHidden } from '../lib/crewMode'
 import { closeWatchReducer, isCloseWatchAction, type CloseWatchState } from './dashboard/closeWatch'
 import { MANUAL_UNREAD, _relayUnreadToParent, clearSharedUnreadIfCovered, crewMemberKeys, drainUnreadKeys, dropQueuedSharedUnreadCoveredBy, hasUnreadRelayHold, heldOrphanTest, persistManualSentinels, persistSharedUnread, queueSharedUnread, readCovers, relayUnreadCount, relayUnreadIfHolding, relayedUnreadKeys, restoreUnreadBadges, restoreUnreadSince, retireSharedUnreadIfUnchanged, sharedUnreadWatermark } from './dashboard/unread'
 import type { CloseHold } from './dashboard/closeHold'
+
+/** A dashboard socket that the Kiro relay ended for a reason a reconnect cannot
+ *  fix on its own: its token could not be renewed (`session_ended`), or the
+ *  relay refused it with a code from its own block (`refused`). */
+export type OfflineCause = 'session_ended' | 'refused'
 export { selectLiveMateThreads, selectPersonSlots } from './personSlots'
 
 /** The two user-owned mute flags on a slot. */
@@ -32,6 +37,11 @@ export interface DashboardState extends CloseWatchState {
    *  value. Reset by a page load, whose boot read then reads the stored one. */
   savedYoloDuration?: NonNullable<StatusData['yolo_duration']>
   connected: boolean
+  /** Why the socket is down when the Kiro relay said so (see
+   *  `hooks/websocket/relayClose.ts`); null while connected or for a plain
+   *  drop. */
+  offlineCause: OfflineCause | null
+  firstSocketPending: boolean // true until this page's first socket opens or closes: see useGatewayConnecting
   slots: ChatSlot[]
   /** Increments for every accepted authoritative full-slot frame/reply. */
   slotsGeneration: number
@@ -207,6 +217,8 @@ export { MANUAL_UNREAD, restoreUnreadBadges, restoreUnreadSince } from './dashbo
 const initialState: DashboardState = {
   status: null,
   connected: false,
+  offlineCause: null,
+  firstSocketPending: true,
   slots: [],
   slotsGeneration: 0,
   pinOrderRev: 0,
@@ -450,6 +462,9 @@ const reconcileSlots = (
  *  the rest of the reply still applies. */
 /** Wall-clock cap on the in-flight hold; well past any healthy close, short of a reload. */
 const CLOSE_IN_FLIGHT_MAX_MS = 30_000
+/** `deleteSlot`'s argument (`DeleteSlotArg` in chatSlice), restated for the type-string matchers. */
+type DeleteSlotArgShape = string | { key: string }
+const deleteSlotArgKey = (arg: DeleteSlotArgShape): string => (typeof arg === 'string' ? arg : arg.key)
 /** Wall-clock cap on the confirmed hold: however many straggler lists or
  *  unsettled pre-confirmation fetches remain, the row is shown again past this
  *  if the server still lists it. A pre-pop reply cannot legitimately trail the
@@ -1003,6 +1018,7 @@ const dashboardSlice = createSlice({
     // began before the save can carry the older token. The live-grant fields
     // (`yolo_expires_at`, `yolo_until_shutdown`) are deliberately NOT carried:
     // they change on every activation, and a stale expiry is worse than none.
+    // Never touches `connected`: only the socket helpers in gatewayConnectivity move it.
     sseStatus(state, action: PayloadAction<StatusData>) {
       const prev = state.status
       const next: StatusData = { ...action.payload }
@@ -1017,7 +1033,6 @@ const dashboardSlice = createSlice({
         next.disabled_approval_modes = prev.disabled_approval_modes
       }
       state.status = next
-      state.connected = true
       // Sync YOLO from backend (authoritative source)
       if (action.payload.yolo !== undefined) {
         state.approvalMode = action.payload.yolo ? 'yolo' : (state.approvalMode === 'yolo' ? 'normal' : state.approvalMode)
@@ -1046,6 +1061,8 @@ const dashboardSlice = createSlice({
     sseConnected(state) {
       const hadUnreadRelayHold = hasUnreadRelayHold(state)
       state.connected = true
+      state.firstSocketPending = false
+      state.offlineCause = null
       state.slotsLoaded = false
       state.unreadDrainHeld = true
       state.slotsListPartial = false
@@ -1053,7 +1070,7 @@ const dashboardSlice = createSlice({
       state.slotsHoldChannels = false
       relayUnreadIfHolding(state, hadUnreadRelayHold)
     },
-    sseDisconnected(state) { state.connected = false; state.unreadDrainHeld = true },
+    sseDisconnected(state, action: PayloadAction<OfflineCause | null | undefined>) { state.connected = false; state.firstSocketPending = false; state.offlineCause = action.payload ?? null; state.unreadDrainHeld = true },
     /** The `slotsPartial` label on a `slots` frame (see `unreadDrainHeld`).
      *  Dispatched for every frame, before its list: an absent field is an
      *  older gateway and reads as complete. */
@@ -1683,8 +1700,9 @@ const dashboardSlice = createSlice({
         //
         // Deliberately NOT gated on `slotsLoaded`, unlike the stale-close filter
         // above. `sseConnected` clears that flag on every reconnect while
-        // LEAVING the rows in place, and reconnect is the one caller that
-        // refetches while the WS replay backlog writes into those same rows — so
+        // LEAVING the rows in place, and a read a reconnect sends (after an
+        // empty or missing connect snapshot, `createReconnectSnapshotWait`)
+        // lands while the new socket's frames write into those same rows, so
         // gating here would switch the guard off precisely where the race is
         // most likely. A true cold boot needs no gate: `patchSlotRow` can only
         // stamp a row it found, an empty list has none, and the set is therefore
@@ -1832,17 +1850,18 @@ const dashboardSlice = createSlice({
       // BEFORE the thunk body's `removeSlotOptimistic`, so the hold is armed by
       // the time the row leaves the list and no frame can slip between the two.
       .addMatcher(
-        (action): action is { type: string; meta: { arg: string; requestId: string } } => action.type === 'chat/deleteSlot/pending',
+        (action): action is { type: string; meta: { arg: DeleteSlotArgShape; requestId: string } } => action.type === 'chat/deleteSlot/pending',
         (state, action) => {
+          const key = deleteSlotArgKey(action.meta.arg)
           // The key is server-minted, but it is still a dynamic property name on
           // a plain record: refuse the prototype keys the way every other
           // per-slot map here does, rather than let Immer throw inside `pending`
           // and leave the DELETE undispatched.
-          if (isUnsafeKey(action.meta.arg)) return
+          if (isUnsafeKey(key)) return
           if (!state.closingSlots) state.closingSlots = {}
           // A retry on the same key takes over the hold; the earlier attempt's
           // later lifecycle actions no longer match and are ignored.
-          state.closingSlots[action.meta.arg] = {
+          state.closingSlots[key] = {
             requestId: action.meta.requestId,
             inFlightUntil: Date.now() + CLOSE_IN_FLIGHT_MAX_MS,
             graceFrames: CLOSE_CONFIRMED_GRACE_FRAMES,
@@ -1862,7 +1881,7 @@ const dashboardSlice = createSlice({
         },
       )
       .addMatcher(
-        (action): action is { type: string; meta: { arg: string; requestId: string } } => action.type === 'chat/deleteSlot/rejected',
+        (action): action is { type: string; meta: { arg: DeleteSlotArgShape; requestId: string } } => action.type === 'chat/deleteSlot/rejected',
         (state, action) => {
           // Belt and braces: the thunk releases the hold itself before its
           // recovery refetch (see `releaseCloseHold`), because `rejected` only
@@ -1870,7 +1889,7 @@ const dashboardSlice = createSlice({
           // reply can land first. This covers a rejection that never reached
           // that catch (a thrown `switchSlot` peer selection, a test harness).
           // Owner-checked: this `rejected` can trail a same-key retry's `pending`.
-          releaseHold(state, action.meta.arg, action.meta.requestId)
+          releaseHold(state, deleteSlotArgKey(action.meta.arg), action.meta.requestId)
         },
       )
       .addMatcher(isCloseWatchAction, closeWatchReducer)
@@ -1974,9 +1993,4 @@ export const selectSlotListPending = (state: { dashboard: DashboardState }): boo
 
 export default dashboardSlice.reducer
 
-/** True when the local bundled gateway's policy provider governs this install.
- * Shared by `usePolicyGovernedNotification`, `UpdateFoundModal`, `AboutPanel`. */
-export function selectPolicyGoverned(s: { dashboard: DashboardState }): boolean {
-  const st = s.dashboard.status
-  return st?.update_bundled_by_app === true && st?.update_managed_by === 'command' && st?.update_can_apply === true
-}
+export { selectPolicyGoverned } from './dashboard/policyGoverned'

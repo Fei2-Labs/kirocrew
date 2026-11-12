@@ -45,12 +45,19 @@ export interface NormalizedUsage {
     thisMonth: UsagePeriod
     avgMsgsPerSession: number
     /**
-     * Transcripts the path validator refused while scanning the sessions dir
-     * (#6733). On a Windows roaming-profile (UNC) home every transcript is
-     * refused, so a `total` of 0 with a positive count here is the silent
-     * failure the usage page must not render as a confident zero.
+     * Transcript files that did not load while scanning the sessions dirs: the
+     * path validator refused them, or they could not be stat'd or read. A
+     * positive count means the totals are incomplete by that many chats.
      */
     refusedTranscripts: number
+    /**
+     * Session directories that did not load: refused by the path validator or
+     * not listable. On a Windows roaming-profile (UNC) home both session
+     * directories are refused, so a `total` of 0 with a positive count here is
+     * the silent failure the usage page must not render as a confident zero.
+     * The transcripts inside were never counted, so the page states no number.
+     */
+    unreadableSessionDirs: number
     dailyHistory: {
       date: string
       sessions: number
@@ -58,6 +65,8 @@ export interface NormalizedUsage {
       toolCalls: number
       /** Credits billed that local day; absent when the provider does not report per-day spend. */
       credits?: number
+      /** Dollars a dollar-billed harness reported that local day; absent when there were none. */
+      costUsd?: number
     }[]
   }
   billing: {
@@ -86,6 +95,8 @@ export interface NormalizedUsage {
   tokenProviders?: string[]
   tokenModels?: string[]
   tokenProviderModels?: Record<string, string[]>
+  /** The gateway's local calendar day (`YYYY-MM-DD`), the key `tokenDailyHistory` files days under. */
+  localDay?: string
 }
 
 export interface NormalizedProviderHook {

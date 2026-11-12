@@ -9,14 +9,15 @@ name tables E10 consults are read from their owning modules.
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.apps.builtin_adoption_mcp import adopted_mcp_servers_refusal
 from kiro_crew.apps.builtin_adoption_pins import AdoptionPin
 from kiro_crew.apps.builtin_adoption_state import GrantPlan
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,14 @@ NEVER_RETRIED_CODES = frozenset(
 
 #: Transient failures: retried with backoff.
 TRANSIENT_CODES = frozenset(
-    {"network_unreachable", "network_timeout", "http_status", "disk_full", "config_unreadable"}
+    {
+        "network_unreachable",
+        "network_timeout",
+        "http_status",
+        "disk_full",
+        "config_unreadable",
+        "stage_io_failed",
+    }
 )
 
 ALL_REASON_CODES = RECHECKED_CODES | NEVER_RETRIED_CODES | TRANSIENT_CODES
@@ -77,16 +85,6 @@ def core_named_apps() -> frozenset[str]:
     """
     names: set[str] = set()
     try:
-        from kiro_crew.mcp_tools.apps import TOOL_APPS
-
-        names.update(TOOL_APPS.values())
-        from kiro_crew.channel import CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS
-
-        names.update(
-            TOOL_APPS[tool]
-            for tool in CHANNEL_AGENT_BLOCKED_DISPATCH_OPERATIONS
-            if tool in TOOL_APPS
-        )
         from kiro_crew import webhook_sources
 
         names.update(
@@ -105,7 +103,7 @@ def core_named_apps() -> frozenset[str]:
 
 def _raw_manifest(tree_root: Path) -> dict[str, Any]:
     try:
-        raw = json.loads((tree_root / "app.json").read_text(encoding="utf-8"))
+        raw = loads_user_json((tree_root / "app.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
         return {}
     return raw if isinstance(raw, dict) else {}
@@ -123,7 +121,9 @@ def pinned_tree_refusal(
 
     *manifest* is the parsed ``AppManifest`` at *tree_root*; *shipped_manifest* the
     wheel built-in's (its version must equal the pin's, which keeps a one-release
-    downgrade data-safe); *record_version* the installed record's.
+    downgrade data-safe, and its ``mcpServers`` are the ceiling of the stdio servers
+    the tree may carry, :mod:`kiro_crew.apps.builtin_adoption_mcp`); *record_version*
+    the installed record's.
     """
     if manifest is None or getattr(manifest, "name", None) != pin.name:
         return "manifest_identity_mismatch"
@@ -134,8 +134,11 @@ def pinned_tree_refusal(
     if any((tree_root / name).exists() for name in _BUILD_INPUTS):
         return "tree_requires_build"
     raw = _raw_manifest(tree_root)
-    if manifest.mcpServers or manifest.ui.overlays or raw.get("defaultEnabled") is True:
+    if manifest.ui.overlays or raw.get("defaultEnabled") is True:
         return "pinned_feature_unsupported"
+    refusal = adopted_mcp_servers_refusal(manifest, tree_root, shipped_manifest)
+    if refusal is not None:
+        return refusal
     try:
         if pin.name in core_named_apps():
             return "pinned_feature_unsupported"

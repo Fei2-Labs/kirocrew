@@ -374,7 +374,15 @@ _GATEWAY_SINKS: tuple[tuple[str, str, str], ...] = (
         "Provider observations are arbitrary nested JSON and can quote credentials "
         "or exfiltration URLs, so every string key and value in the monitor mapping "
         "passes through the platform-aware redaction chain before the response leaves "
-        "the backend.",
+        "the backend. A loop's own text fields -- `message` and `stopped_reason` -- go "
+        "through the same chain on `GET /api/autonudge`, its per-loop detail and the "
+        "`POST`/`PATCH` replies, because several producers reach `svc.add` without the "
+        "arming authorizer and a hand-edited `autonudge.json` skips it too. Every value "
+        "is scrubbed except four: `id` and `slot_key`, which address the row; "
+        "`goal_token`, random hex the popover sends back as `expect_fingerprint`; and "
+        "`monitor`, walked above. Dicts and lists are walked, so `judge` keeps its shape. "
+        "The ungated `autonudge_state` WebSocket frame, built in "
+        "`slack/gateway_runtime/nudge_wiring.py`, applies this module's per-field rule.",
     ),
     (
         "Project-scan warning reasons",
@@ -718,10 +726,11 @@ _GATEWAY_SINKS: tuple[tuple[str, str, str], ...] = (
     ),
     (
         "Auto-Improvement PR prose",
-        "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py",
-        "The pull-request TITLE and BODY are agent-authored prose published by `gh pr "
-        "create`, and a PR description cannot be un-published. Redacted in place because "
-        "prose survives rewriting; the DIFF beside it is instead detected-and-refused by "
+        "apps/builtins/auto_improvement/profiles/pr_recipe_base.py",
+        "The pull/merge-request TITLE and BODY are agent-authored prose published by "
+        "`gh pr create` or `glab mr create`, and a published description cannot be "
+        "un-published. Redacted in place because prose survives rewriting; the DIFF "
+        "beside it is instead detected-and-refused by "
         "`spine/push_policy.py:scan_content_for_secrets`, since rewriting a patch would "
         "corrupt the fix the gate proved.",
     ),
@@ -834,6 +843,12 @@ _GATEWAY_SINKS: tuple[tuple[str, str, str], ...] = (
         "redacting it would overwrite the user's own file with markers.",
     ),
     (
+        "Per-chat steering list",
+        "dashboard/handlers/chat_steering.py",
+        "Display paths in the /api/chat/slots/{slot}/steering listing, through the "
+        "Steering tab's _redact_meta. No document body leaves this route.",
+    ),
+    (
         "Telemetry spend ranking",
         "dashboard/handlers/telemetry.py",
         "Session titles attached to the conversations-by-spend rows of "
@@ -876,5 +891,41 @@ _GATEWAY_SINKS: tuple[tuple[str, str, str], ...] = (
         "Each claimant's `description` and package label, read from a spec file an "
         "agent may have written, pass the exfiltration-URL and credential redactors "
         "before they are carried in the chat metadata of the spec chooser card.",
+    ),
+    (
+        "Fork merge-back summaries",
+        "dashboard/chat_merge_back.py",
+        "The summary the background model writes of a fork's new messages, on its way "
+        "to the merge dialog, where the person edits it before Merge writes it into "
+        "the parent chat, and the fork's title the merge card shows. Both pass through "
+        "the active credential policy before they leave the gateway; the summary is cut "
+        "to the merge limit only after that.",
+    ),
+    (
+        "Settings changed outside Kiro Crew",
+        "config/loosening_provenance.py",
+        "The before and after values in the changed-key diff of a hand-edited "
+        "settings file, on their way to the owner's Settings -> Security pending "
+        "card in the browser. Runs the credential redactor "
+        "only, as a test: a string it would alter is withheld from the diff and "
+        "the row is marked redacted, as is any value under a credential-like key, "
+        "an env or headers section, an over-long string or a nested value.",
+    ),
+    (
+        "Session reload failure notice",
+        "dashboard/system_notices.py",
+        "The error a reload's failed respawn raised, as `session_reload_failed_notice` "
+        "writes it into the chat row that closes the reload's notice. That row is kept "
+        "in the slot's transcript and broadcast to every connected browser, so the "
+        "whole error passes `redact_and_truncate` before it is cut to the row's bound.",
+    ),
+    (
+        "Worktree create refusals",
+        "dashboard/handlers/worktree.py",
+        "git's own line saying why it cannot open a project as a work tree, returned "
+        "as the `detail` of the 400 a follow-up card's worktree create gets and shown "
+        "under the suggestion. The line can echo a `gitdir:` path from a `.git` file "
+        "whoever can write the folder chose, so it passes `redact_via_context` "
+        "before it leaves the gateway.",
     ),
 )

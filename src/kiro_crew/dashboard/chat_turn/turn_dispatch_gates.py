@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.recipient import (
         _MIRROR_THINKING,
         _deliver_cross_surface_user_message,
+        _mirror_echo_text,
         _prepare_mirror_msg,
         _prompt_typed_in_dashboard,
     )
@@ -69,7 +70,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_turn.turn_context import _detach_appended_context
     from kiro_crew.dashboard.chat_turn.turn_entry import _stop_pressed
     from kiro_crew.dashboard.chat_turn.turn_locals import _ChatTurn, _Flow
-    from kiro_crew.dashboard.chat_turn.turn_spec_hooks import _fire
+    from kiro_crew.dashboard.chat_turn.turn_spec_hooks import _fire, _on_kas
 
 
 async def _turn_dispatch_prep(turn: _ChatTurn) -> None:
@@ -317,6 +318,17 @@ async def _turn_dispatch_gates(turn: _ChatTurn) -> _Flow | None:
         return _Flow.END
     if is_new and _sends_prompt:
         spawn_injected = await _fire(turn, HOOK_EVENT_AGENT_SPAWN, session_key)
+        # Defensive on the accessor, like ``turn_bracket.consume_reinjection``.
+        remember = getattr(state.sessions, "remember_agent_spawn_context", None)
+        if callable(remember):
+            remember(session_key, spawn_injected)
+    elif _sends_prompt and turn._needs_reinjection and _on_kas(client):
+        # kiro-cli sends the agentSpawn output with every request; on KAS it
+        # lives only in the history, which a compaction summarized away. Send
+        # the kept output once more, on this first turn after it, unrun.
+        read_kept = getattr(state.sessions, "agent_spawn_context", None)
+        kept = read_kept(session_key) if callable(read_kept) else ()
+        spawn_injected = list(kept) if isinstance(kept, tuple) else []
     else:
         spawn_injected = []
 
@@ -564,6 +576,9 @@ async def _turn_dispatch_gates(turn: _ChatTurn) -> _Flow | None:
                     session_key,
                     source="slack" if slot._turn_channel_origin else "dashboard",
                     on_bound=_owe_code_channel_turn_end,
+                    # What the person asked, without this runner's prepends: a
+                    # cancelled-turn preamble may quote an older prompt.
+                    prompt=str(turn._jev_route_text or ""),
                 )
             except Exception:
                 logger.debug("code channel turn-start hooks failed", exc_info=True)
@@ -585,7 +600,9 @@ async def _turn_dispatch_gates(turn: _ChatTurn) -> _Flow | None:
                     # or stray bracket is escaped. Redaction runs first.
                     await state.slack_client.post_message(
                         _mirror_chan,
-                        mirror_prompt_echo(_prepare_mirror_msg(_user_msg_for_mirror)),
+                        mirror_prompt_echo(
+                            _prepare_mirror_msg(await _mirror_echo_text(turn, _user_msg_for_mirror))
+                        ),
                         _mirror_post_ts,
                     )
                 # A separate placeholder, not the task stream's opening text:
@@ -610,7 +627,8 @@ async def _turn_dispatch_gates(turn: _ChatTurn) -> _Flow | None:
     # proactive channel (e.g. Telegram) so the remote conversation reads
     # coherently (question then reply), matching the Slack echo above.
     if not _slash_withholds_mirror and _prompt_typed_in_dashboard(turn):
-        await _deliver_cross_surface_user_message(state, session_key, _user_msg_for_mirror)
+        _echo = await _mirror_echo_text(turn, _user_msg_for_mirror)
+        await _deliver_cross_surface_user_message(state, session_key, _echo)
     # Past this point every echo this turn owes has been made (or the surfaces it
     # would go to were unlinked), so a recovery requeue of it owes none.
     turn._mirror_echo_posted = True
@@ -662,6 +680,8 @@ async def _turn_dispatch_gates(turn: _ChatTurn) -> _Flow | None:
     turn._turn_cost_usd = _turn_cost_usd
     _turn_model = ""
     turn._turn_model = _turn_model
+    # Set at EVENT_COMPLETE when the turn rebuilt the prompt cache (``cache_rewrite``).
+    turn._turn_cache_rewrite = False
     # Set once EVENT_COMPLETE has filled the four figures above.
     _turn_stats_captured = False
     turn._turn_stats_captured = _turn_stats_captured

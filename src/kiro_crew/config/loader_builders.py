@@ -17,6 +17,7 @@ from kiro_crew.config import sections as _sections
 from kiro_crew.config.loader_document import (
     _raw_agent_section,
     _raw_stt_provider,
+    kas_bundle_build_default,
     unsandboxed_exec_platform_default,
 )
 from kiro_crew.config.loader_locations import config_path
@@ -82,6 +83,7 @@ from kiro_crew.config.sections import (
     coerce_role_models,
 )
 from kiro_crew.constants import SUBAGENT_TIMEOUT_MAX, SUBAGENT_TIMEOUT_MIN
+from kiro_crew.crewmate_worktree import coerce_branch_prefix
 from kiro_crew.session_start_sizing import AUTO as _SESSION_START_AUTO
 from kiro_crew.session_start_sizing import is_auto as _session_start_is_auto
 
@@ -189,6 +191,22 @@ def _clamp_compact_wait_secs(raw: object, default: float) -> float:
     return value if value == 0 else max(_sections.COMPACT_WAIT_SECS_MIN, value)
 
 
+def _lane_weights_from(
+    raw: object, default: dict[str, int], lo: int | None = None, hi: int | None = None
+) -> dict[str, int]:
+    """``agent.lane_weights``: each named lane's weight as an int in [*lo*, *hi*].
+
+    A weight it cannot read takes 1; a non-dict takes *default*, the field's.
+    """
+    if not isinstance(raw, dict):
+        return default
+    return {
+        lane: _safe_int(weight, 1, lo, hi)
+        for lane, weight in raw.items()
+        if isinstance(lane, str) and lane
+    }
+
+
 _DEFAULT_MEMORY_MODES = frozenset({"persistent", "incognito", "temporary"})
 
 
@@ -284,6 +302,15 @@ _SECURITY_BOUNDED_FIELDS: tuple[tuple[str, str, int, int], ...] = (
     # dashboard's write gate. The floor is 0 because 0 is this field's OFF value, so
     # a negative clamps toward observe-only rather than toward killing.
     ("session", "reconcile_max_kills", 0, _sections.RECONCILE_MAX_KILLS_MAX),
+    # How many live sessions one creator may hold. The value bounds what one
+    # automated creator can take from the shared live-session ceiling, and a
+    # hand-edited config.json never passes the dashboard's write gate.
+    (
+        "session",
+        "max_per_creator",
+        _sections.MAX_PER_CREATOR_MIN,
+        _sections.MAX_PER_CREATOR_MAX,
+    ),
 )
 
 
@@ -467,7 +494,9 @@ def _session_start_concurrency(raw: object, ceiling: int = 64) -> int | str:
     return max(1, min(ceiling, value))
 
 
-def _read_backend_choice(section: _sections.SectionReader, agent_data: dict, key: str) -> str:
+def _read_backend_choice(
+    section: _sections.SectionReader, agent_data: dict, key: str, *, inherit: str | None = None
+) -> str:
     """Resolve a stored harness field to a runtime backend id at the one gate.
 
     The config-file vocabulary is translated first
@@ -485,6 +514,14 @@ def _read_backend_choice(section: _sections.SectionReader, agent_data: dict, key
     member thread needs. Mapping here, before the gate, gives every reader of the
     field the backend the member thread actually gets, and the mapped value still
     crosses the gate like any other pick.
+
+    *inherit* is the already resolved ``agent.acp_backend``. With it, an
+    ``agent.member_acp_backend`` that holds no choice (absent or ``""``) does not
+    read the field default: Crew bots follow the Settings harness through
+    :func:`~kiro_crew.agent_sdk.backends.crewmate_inherited_backend` (Kiro CLI
+    reads as KAS; a harness Crew bots cannot run on runs them on KAS, logged).
+    So the loaded field is the one answer every reader of the Crew bot backend
+    gets, and a stored value, the legacy setting, still wins over inheritance.
     """
     from kiro_crew.acp_backends import (
         ACP_BACKEND_KAS,
@@ -502,13 +539,20 @@ def _read_backend_choice(section: _sections.SectionReader, agent_data: dict, key
 
         return governance_floor_backend()
     value = backend_from_stored(agent_data.get(key))
-    if value is None:
+    if value is None and key == _MEMBER_HARNESS_KEY and inherit is not None:
+        from kiro_crew.agent_sdk.backends import crewmate_inherited_backend
+
+        inherited, fell_back = crewmate_inherited_backend(inherit)
+        if fell_back:
+            _note_member_fallback(inherit, inherited)
+        value = inherited if inherited in selectable_backends() else None
+    elif value is None:
         default = section.default(key)
         value = default if default in selectable_backends() else None
     elif key == _MEMBER_HARNESS_KEY and value == ACP_BACKEND_KIRO:
         value = ACP_BACKEND_KAS
         _note_member_remap(agent_data.get(key), value)
-    elif value == ACP_BACKEND_KIRO and not section.read("kas_bundle", _safe_bool):
+    elif value == ACP_BACKEND_KIRO and not _resolved_kas_bundle(agent_data):
         # The one place a stored Kiro CLI pick in ``agent.acp_backend`` moves onto
         # KAS: once the gateway's probe confirmed v3 and while KAS is selectable.
         # Here, not in the gate, so a Kiro CLI id the gate already answered (a
@@ -517,6 +561,17 @@ def _read_backend_choice(section: _sections.SectionReader, agent_data: dict, key
         # there spawns Kiro Crew's bundled engine instead.
         value = kiro_cli_pick_backend()
     return _normalize_acp_backend(value)
+
+
+def _resolved_kas_bundle(agent_data: Mapping[str, object]) -> bool:
+    """``agent.kas_bundle`` as loaded: the stored value, else the build's default.
+
+    An undeclared key reads :func:`kas_bundle_build_default` (on in a nightly build
+    only), not the field's ``False``, the way ``sandbox_allow_unsandboxed_exec``
+    reads its platform default; ``save()`` keeps the undeclared key off disk.
+    """
+    default = kas_bundle_build_default()
+    return _safe_bool(agent_data.get("kas_bundle", default), default)
 
 
 #: Whether the member-backend remap was logged in this process (see below).
@@ -533,6 +588,24 @@ def _note_member_remap(stored: object, used: str) -> None:
         "agent.member_acp_backend is stored as %r; Bot DMs run on %r, the Kiro "
         "backend that carries their dispatch tools (config.json is left as it is)",
         stored,
+        used,
+    )
+
+
+#: The inherited harnesses whose Crew bot fallback was logged in this process.
+_member_fallback_logged: set[str] = set()
+
+
+def _note_member_fallback(inherited: str, used: str) -> None:
+    """Say once per process per harness that Crew bots cannot follow ``agent.acp_backend``."""
+    if inherited in _member_fallback_logged:
+        return
+    _member_fallback_logged.add(inherited)
+    logger.warning(
+        "agent.acp_backend is %r, which Crew bots cannot run on (no saved spec, dispatch "
+        "tools or worker kit there); Crew bot chats and their workers run on %r instead. "
+        "Pin a harness in a Crew bot's settings to choose another.",
+        inherited,
         used,
     )
 
@@ -666,6 +739,38 @@ def _builtin_adoption_nav(raw: object) -> dict[str, dict[str, str]]:
 
 
 def _build_agent_config(agent_data: dict) -> AgentConfig:
+    agent = _agent_section_fields(agent_data)
+    mark_member_backend_inherited(agent, member_backend_inherited(agent_data))
+    return agent
+
+
+def member_backend_inherited(agent_data: dict) -> bool:
+    """Whether *agent_data* holds no ``agent.member_acp_backend`` choice of its own.
+
+    Then the loaded field follows ``agent.acp_backend`` (:func:`_read_backend_choice`)
+    and a Crew bot with no pin may still fall back to KAS on its own
+    (``crewmate_harness.inherited_falls_back``). A stored value, the legacy setting,
+    or the floor for a malformed one is a choice and never falls back that way.
+    """
+    from kiro_crew.acp_backends import backend_from_stored
+    from kiro_crew.config.validation import MALFORMED_BACKEND_FLOOR
+
+    raw = agent_data.get(_MEMBER_HARNESS_KEY)
+    return raw != MALFORMED_BACKEND_FLOOR and backend_from_stored(raw) is None
+
+
+#: The attribute :func:`mark_member_backend_inherited` sets on a loaded agent section.
+#: A plain attribute, not a dataclass field, so ``asdict`` (``to_dict``, every
+#: config writer) and the schema never see it: it describes this load, not a setting.
+MEMBER_BACKEND_INHERITED_ATTR = "_member_backend_inherited"
+
+
+def mark_member_backend_inherited(agent: AgentConfig, inherited: bool) -> None:
+    """Record on *agent* whether its ``member_acp_backend`` was inherited."""
+    setattr(agent, MEMBER_BACKEND_INHERITED_ATTR, inherited)
+
+
+def _agent_section_fields(agent_data: dict) -> AgentConfig:
     section = _sections.SectionReader(AgentConfig, agent_data)
     return AgentConfig(
         approval_mode=section.get("approval_mode"),
@@ -683,11 +788,14 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         provider=section.get("provider"),
         mcp_registry_mode=section.read("mcp_registry_mode", _safe_bool),
         mcp_quarantine_after_failures=section.read("mcp_quarantine_after_failures", _safe_int),
-        acp_backend=_read_backend_choice(section, agent_data, "acp_backend"),
-        member_acp_backend=_read_backend_choice(section, agent_data, "member_acp_backend"),
+        acp_backend=(main_backend := _read_backend_choice(section, agent_data, "acp_backend")),
+        member_acp_backend=_read_backend_choice(
+            section, agent_data, "member_acp_backend", inherit=main_backend
+        ),
         acp_failover=_sections.normalize_acp_failover(section.get("acp_failover")),
-        kas_bundle=section.read("kas_bundle", _safe_bool),
+        kas_bundle=_resolved_kas_bundle(agent_data),
         kas_persist_mcp_sign_in=section.read("kas_persist_mcp_sign_in", _safe_bool),
+        kas_repair_kiro_cli_extract=section.read("kas_repair_kiro_cli_extract", _safe_bool),
         kas_refuse_plain_http_mcp_headers=section.read(
             "kas_refuse_plain_http_mcp_headers", _safe_bool
         ),
@@ -717,6 +825,16 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             )
         ),
         apps_allow_third_party=section.read("apps_allow_third_party", _safe_bool),
+        sandbox_readonly_paths=(
+            [p for p in _ro_paths if isinstance(p, str) and p]
+            if isinstance(_ro_paths := section.get("sandbox_readonly_paths"), list)
+            else section.default("sandbox_readonly_paths")
+        ),
+        sandbox_readonly_exceptions=(
+            [p for p in _ro_exceptions if isinstance(p, str) and p]
+            if isinstance(_ro_exceptions := section.get("sandbox_readonly_exceptions"), list)
+            else section.default("sandbox_readonly_exceptions")
+        ),
         apps_trusted=(
             [a for a in _trusted if isinstance(a, str) and a]
             if isinstance(_trusted := section.get("apps_trusted"), list)
@@ -755,6 +873,9 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         tool_search_min_pct=section.read("tool_search_min_pct", _safe_int),
         tool_search_min_tokens=section.read("tool_search_min_tokens", _safe_int),
         session_sharing=bool(section.get("session_sharing")),
+        chat_runtime_sharing_max_sessions=section.read(
+            "chat_runtime_sharing_max_sessions", _safe_int, 1, 64
+        ),
         agent_started_turns=bool(section.get("agent_started_turns")),
         max_subagents=section.read("max_subagents", _safe_int, 0, SUBAGENT_AUTO_MAX_CEILING),
         max_stop_hook_nudges=section.read("max_stop_hook_nudges", _safe_int, 0),
@@ -798,6 +919,10 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # the `_validate_config_data` call. `_safe_bool` here is the
         # final guard for a real bool.
         member_dispatch=section.read("member_dispatch", _safe_bool),
+        member_branch_prefix=coerce_branch_prefix(section.get("member_branch_prefix")),
+        # Default true; a present-but-malformed value is coerced to False upstream,
+        # with the other fail-closed agent switches.
+        conductor_own_child_verbs=section.read("conductor_own_child_verbs", _safe_bool),
         # Default true is the zero-configuration panel grant, and the guard is the
         # one above: a present-but-malformed value was already coerced to False
         # upstream, BEFORE schema validation, so it cannot ride the missing-field
@@ -836,15 +961,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         start_collect_timeout_secs=section.read("start_collect_timeout_secs", _safe_int, 10, 3600),
         # Fairness lanes (taskq/lanes.py): weights shape the share of
         # picks; the reserve keeps children startable under full parents.
-        lane_weights=(
-            {
-                lane: _safe_int(weight, 1, 1, 64)
-                for lane, weight in _lane_weights.items()
-                if isinstance(lane, str) and lane
-            }
-            if isinstance(_lane_weights := section.get("lane_weights"), dict)
-            else section.default("lane_weights")
-        ),
+        lane_weights=section.read("lane_weights", _lane_weights_from, 1, 64),
         child_reserve=section.read("child_reserve", _safe_int, 0, 8),
         # Shared recovery ladder schedule (recovery/policy.py bounds).
         recovery_backoff_base_secs=section.read(
@@ -923,14 +1040,10 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             else section.default("log_level")
         ),
         bot_name=_sanitize_bot_name(section.get("bot_name")),
-        max_channels=section.get("max_channels"),
-        max_channel_agents=section.get("max_channel_agents"),
-        soft_stop_budget_secs=max(
-            SOFT_STOP_BUDGET_MIN,
-            min(
-                SOFT_STOP_BUDGET_MAX,
-                section.read("soft_stop_budget_secs", _safe_float),
-            ),
+        max_channels=section.read("max_channels", _safe_int, 1, 5),
+        max_channel_agents=section.read("max_channel_agents", _safe_int, 1, 10),
+        soft_stop_budget_secs=section.read(
+            "soft_stop_budget_secs", _safe_float, SOFT_STOP_BUDGET_MIN, SOFT_STOP_BUDGET_MAX
         ),
     )
 
@@ -1045,7 +1158,9 @@ def _build_session_config(session_data: dict) -> SessionConfig:
         # hand-edited negative collapses to 0 (fallback) and an oversized value
         # is capped. Bounds are referenced via the module handle, not imported:
         # this module's top-level names are a frozen compatibility facade.
-        compact_wait_secs=section.read("compact_wait_secs", _clamp_compact_wait_secs),
+        compact_wait_secs=section.read(
+            "compact_wait_secs", _clamp_compact_wait_secs, unclamped=_safe_float
+        ),
         pool_size=_safe_int(
             session_data.get("pool_size", DEFAULT_POOL_SIZE),
             DEFAULT_POOL_SIZE,
@@ -1078,12 +1193,22 @@ def _build_session_config(session_data: dict) -> SessionConfig:
             _sections.SEARCH_SCAN_WINDOW_MAX,
         ),
         watchdog_rss_max_mb=section.read("watchdog_rss_max_mb", _safe_int),
+        watchdog_end_leftovers_mid_turn=section.read("watchdog_end_leftovers_mid_turn", _safe_bool),
         harness_background_hold_secs=_load_background_hold_secs(section),
         # Clamped HERE as well as in the `_SECURITY_BOUNDED_FIELDS` sweep, for the
         # reason `_safe_int` states: that sweep runs over the raw dict and skips
         # non-int values, so a numeric STRING passes it and coerces here.
         reconcile_max_kills=section.read(
             "reconcile_max_kills", _safe_int, 0, _sections.RECONCILE_MAX_KILLS_MAX
+        ),
+        # Clamped here as well as in the sweep, as ``reconcile_max_kills`` is: a
+        # numeric string passes the sweep and coerces here, and a value that is
+        # not a number loads as the default.
+        max_per_creator=section.read(
+            "max_per_creator",
+            _safe_int,
+            _sections.MAX_PER_CREATOR_MIN,
+            _sections.MAX_PER_CREATOR_MAX,
         ),
     )
 
@@ -1116,6 +1241,7 @@ def _build_telemetry_config(telemetry_data: dict) -> TelemetryConfig:
         # checked where destinations are resolved (metrics/otlp_endpoints.py),
         # which skips a bad one with a warning rather than failing the load.
         otlp_endpoints=section.read("otlp_endpoints", _otlp_endpoint_rows),
+        traces_enabled=bool(section.get("traces_enabled")),
         beacon_enabled=bool(section.get("beacon_enabled")),
         beacon_endpoint=str(section.get("beacon_endpoint")),
     )
@@ -1204,7 +1330,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         avatar=section.get("avatar"),
         merge_queued_messages=section.get("merge_queued_messages"),
         title_refresh_every_turns=section.read(
-            "title_refresh_every_turns", _title_refresh_every_turns
+            "title_refresh_every_turns", _title_refresh_every_turns, unclamped=_safe_int
         ),
         title_ticket_prefix=section.read("title_ticket_prefix", _safe_bool),
         upload_max_mb=section.read(
@@ -1264,11 +1390,13 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         side_panel_pin_summary=section.read("side_panel_pin_summary", _safe_bool),
         session_card_source_links=section.read("session_card_source_links", _safe_bool),
         default_memory_mode=_default_memory_mode_from(section.get("default_memory_mode")),
+        new_chat_crew_mode=section.read("new_chat_crew_mode", _safe_bool),
         widget_density=section.get("widget_density"),
         browser_local_origins=_sections.coerce_browser_local_origins(
             section.get("browser_local_origins")
         ),
         verbosity=_sections.normalize_verbosity(section.get("verbosity")),
+        preferred_language=section.get("preferred_language"),
         link_previews=section.read("link_previews", _safe_bool),
         tail_fork_enabled=section.get("tail_fork_enabled"),
         terminal=section.get("terminal"),
@@ -1292,6 +1420,13 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             if isinstance(nudge := section.get("update_nudge"), dict)
             else section.default("update_nudge")
         ),
+        # Read raw: the branding endpoint drops any editor or host outside the
+        # schema before the browser sees it.
+        remote_editor=(
+            editor
+            if isinstance(editor := section.get("remote_editor"), dict)
+            else section.default("remote_editor")
+        ),
         translucent_panels=_translucent_panels_from(section.get("translucent_panels")),
         onboarded=bool(section.get("onboarded")),
         import_onboarded=_safe_bool(
@@ -1306,6 +1441,12 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             dashboard_data.get("privacy_acked"),
             section.read("onboarded", _safe_bool),
         ),
+        # No fallback to `onboarded`, unlike `privacy_acked`: the version exists
+        # so an existing user sees a changed notice once, and seeding it from
+        # an older flag would skip exactly those users.
+        privacy_ack_version=section.read(
+            "privacy_ack_version", _safe_int, 0, _sections.PRIVACY_ACK_VERSION_MAX
+        ),
         crewmates_onboarded=section.read("crewmates_onboarded", _safe_bool),
         user_role=str(section.get("user_role")),
         user_role_other=str(section.get("user_role_other")),
@@ -1317,6 +1458,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         ),
         milestones_enabled=section.read("milestones_enabled", _safe_bool),
         folder_suggestions_enabled=bool(section.get("folder_suggestions_enabled")),
+        project_tags_enabled=section.read("project_tags_enabled", _safe_bool),
         topic_tags_enabled=section.read("topic_tags_enabled", _safe_bool),
         tips_cadence_hours=section.read("tips_cadence_hours", _safe_float, lo=0.0),
         tips_snooze_hours=section.read("tips_snooze_hours", _safe_float, lo=0.0),

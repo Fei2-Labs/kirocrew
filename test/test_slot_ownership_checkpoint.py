@@ -27,11 +27,13 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from slot_ownership_checkpoint_helpers import (  # noqa: F401 -- fixtures are requested by name
     _GRANT,
+    _MANIFEST,
     _NOT_FOUND,
     APP,
     _client,
     _persist,
     _persist_and_close,
+    _scoped,
     _with_reply,
     chat_run_fixture,
     regen_run_fixture,
@@ -39,6 +41,7 @@ from slot_ownership_checkpoint_helpers import (  # noqa: F401 -- fixtures are re
     state_fixture,
 )
 
+from kiro_crew.config import KiroCrewConfig
 from kiro_crew.dashboard import slot_ownership
 from kiro_crew.dashboard.slot_ownership import (
     SLOT_ROUTE_POLICIES,
@@ -299,6 +302,75 @@ class TestTheLiveTableRefusesANonOwnerApp:
             async with _sweep_client(state, routes, reached) as client:
                 result = await _call(client, "POST", "/api/chat/slots/c1/approve", APP)
         assert (result, reached) == ((404, _NOT_FOUND), [])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scope", [False, True])
+    async def test_the_grant_reaches_a_member_thread_only_with_the_scope(
+        self, state, sel_spy, scope: bool
+    ) -> None:
+        """A member's pinned DM thread is a user session the grant alone stops at."""
+        from kiro_crew.members import DM_SLOT_MODE
+
+        state.get_or_create_slot(
+            "member-mate", agent="mate", mode=DM_SLOT_MODE, origin=SlotOrigin.USER
+        )
+        reached: list[str] = []
+        routes = [("POST", "/api/chat/slots/{slot}/approve")]
+        with patch(_GRANT, return_value=True), patch(_MANIFEST, return_value=_scoped(scope)):
+            async with _sweep_client(state, routes, reached) as client:
+                result = await _call(client, "POST", "/api/chat/slots/member-mate/approve", APP)
+        if scope:
+            assert (result, reached) == (
+                (200, {"ok": True}),
+                ["POST /api/chat/slots/member-mate/approve"],
+            )
+        else:
+            assert (result, reached) == ((404, _NOT_FOUND), [])
+            assert [d["error"] for d in sel_spy.denials()] == [
+                slot_ownership.SESSION_CONTROL_DENIED
+            ]
+
+    @pytest.mark.asyncio
+    async def test_the_scope_alone_reaches_nothing(self, state, sel_spy) -> None:
+        from kiro_crew.members import DM_SLOT_MODE
+
+        state.get_or_create_slot(
+            "member-mate", agent="mate", mode=DM_SLOT_MODE, origin=SlotOrigin.USER
+        )
+        _seed_family(state)
+        reached: list[str] = []
+        routes = [("POST", "/api/chat/slots/{slot}/approve")]
+        with patch(_GRANT, return_value=False), patch(_MANIFEST, return_value=_scoped(True)):
+            async with _sweep_client(state, routes, reached) as client:
+                for name in ("member-mate", "u1"):
+                    assert await _call(client, "POST", f"/api/chat/slots/{name}/approve", APP) == (
+                        404,
+                        _NOT_FOUND,
+                    )
+        assert reached == []
+
+    @pytest.mark.asyncio
+    async def test_the_manifest_is_read_once_with_the_grant_whatever_the_slot_is(
+        self, state, sel_spy
+    ) -> None:
+        """One manifest read per request serves the grant and its member-thread
+        scope: the cost of a refusal never depends on whether the name addressed a
+        member thread, and the scope can never come from a later read than the
+        grant's."""
+        from kiro_crew.members import DM_SLOT_MODE
+
+        state.get_or_create_slot("u1", origin=SlotOrigin.USER)
+        state.get_or_create_slot(
+            "member-mate", agent="mate", mode=DM_SLOT_MODE, origin=SlotOrigin.USER
+        )
+        manifest = MagicMock(return_value=_scoped(False))
+        routes = [("POST", "/api/chat/slots/{slot}/approve")]
+        with patch(_GRANT, return_value=True), patch(_MANIFEST, manifest):
+            async with _sweep_client(state, routes, []) as client:
+                for name in ("absent", "u1", "member-mate"):
+                    manifest.reset_mock()
+                    await _call(client, "POST", f"/api/chat/slots/{name}/approve", APP)
+                    assert (name, manifest.call_count) == (name, 1)
 
     @pytest.mark.asyncio
     async def test_the_grant_is_read_once_whatever_the_slot_is(self, state, sel_spy) -> None:
@@ -579,6 +651,8 @@ class TestRegenerateAndSwitchVariant:
         self, state, regen_run, monkeypatch
     ) -> None:
         """The checkpoint judged the app's slot; the handler must not act on its successor."""
+        # The gate asks only when the applied harness signs in via kiro-cli.
+        state.sessions._cfg = KiroCrewConfig.load()
         state.get_or_create_slot("s1", app=APP)
         replacement = _ChatSlot("s1")
         replacement._origin = SlotOrigin.USER
@@ -934,6 +1008,57 @@ class TestTranscriptOwnershipWithoutALiveSlot:
             assert resp.status == 200, await resp.text()
             assert (await resp.json())["key"] == "a1"
         assert published and state._slots["a1"] is published[0]
+        assert "b1" not in state._slots
+        assert "b1" not in state._slots_under_construction
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "published_incarnation", ["pinned", "replacement"], ids=["pinned", "replacement"]
+    )
+    async def test_a_pinned_resume_dedups_onto_a_concurrent_publish_only_of_the_pinned_transcript(
+        self, state, monkeypatch, published_incarnation
+    ) -> None:
+        from kiro_crew.dashboard import chat_handlers
+
+        log = state.conversation_log
+        source_key = "dashboard:a1"
+        await asyncio.to_thread(
+            log.update_metadata, source_key, {"app": APP, "closed": True, "closed_at": 1.0}
+        )
+        pinned_created_at = (await asyncio.to_thread(log.get_metadata, source_key))["created_at"]
+        published_created_at = (
+            pinned_created_at if published_incarnation == "pinned" else "1999-01-01T00:00:00+00:00"
+        )
+        loop = asyncio.get_running_loop()
+        hop = LoopHop(loop)
+        read_owner = chat_handlers.transcript_acquisition_reason
+        published = []
+
+        async def publish_same_transcript():
+            slot = state.get_or_create_slot("a1", app=APP)
+            slot._disk_meta_created_at = published_created_at
+            published.append(slot)
+
+        def inspect_destination(log_arg, key, app):
+            reason = read_owner(log_arg, key, app)
+            if key == "dashboard:b1" and "b1" in state._slots_under_construction:
+                hop.run(publish_same_transcript(), "the concurrent publish of a1")
+            return reason
+
+        monkeypatch.setattr(chat_handlers, "transcript_acquisition_reason", inspect_destination)
+        async with _client(state, APP) as client:
+            resp = await client.post(
+                "/api/chat/slots/b1/resume",
+                json={"key": source_key, "expected_created_at": pinned_created_at},
+            )
+            hop.check()
+            body = await resp.json()
+        assert published, "the publish during the destination read did not occur"
+        if published_incarnation == "pinned":
+            assert (resp.status, body.get("key")) == (200, "a1"), body
+        else:
+            assert (resp.status, body.get("code")) == (409, "resume_identity_mismatch"), body
+        assert state._slots["a1"] is published[0]
         assert "b1" not in state._slots
         assert "b1" not in state._slots_under_construction
 

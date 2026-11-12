@@ -8,8 +8,11 @@ import { pickerQueryKey, type FileKind, type FileResult, type FileSearchResponse
 import ErrorNotice from './ErrorNotice'
 import { RETRYABLE_SEARCH_CAUSES, SEARCH_FAILURE_KEYS, searchErrorCause, type SearchErrorCause } from '../lib/searchErrorCause'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
-import { splitPathToken } from './composerTokens'
+import { useAnchorTracking } from '../hooks/useAnchorTracking'
+import { matchSpecQuery, SPEC_DIR, splitPathToken } from './composerTokens'
 import { menuGeometry, bottomUpOrder } from '../lib/pickerMenu'
+import { buildFileLabels } from '../utils/fileTokens'
+import { backslashIsSeparator, stripTrailingSeparators } from '../utils/pathBasename'
 import type { SendMode } from '../pages/chat/ChatSettings'
 
 import { i18nT } from '../i18n/t'
@@ -108,6 +111,41 @@ export function resultKind(f: { kind?: FileKind }): FileKind {
 }
 
 /**
+ * Per-row sub-line text for one result set.
+ *
+ * The row's sub-line cuts at the END (text-overflow ellipsis), which is right
+ * for a unique name. For rows that share a name (search matches basenames, so
+ * one answer can hold six README.md files) the cut lands inside their common
+ * parent chain and the rows read identical. Such a row instead shows the
+ * shortest trailing path that tells it apart, from `buildFileLabels` (the rule
+ * the attachment chips use), head-anchored with an ellipsis
+ * (`…/core/README.md`) so the distinguishing segment survives the cut.
+ * Unique-named rows keep the full path.
+ *
+ * `buildFileLabels` splits on `/` only, so a Windows-shaped path's `\` becomes
+ * `/` for the computation and `\` again for display, but only where
+ * `backslashIsSeparator` says `\` IS a separator (on POSIX it is a legal name
+ * character). Folder rows drop their trailing separator first.
+ */
+export function disambiguatedPaths(results: Array<{ path: string }>): Map<string, string> {
+  const norm = (p: string) => {
+    const s = stripTrailingSeparators(p)
+    return backslashIsSeparator(s) ? s.replaceAll('\\', '/') : s
+  }
+  const labels = buildFileLabels(results.map(r => norm(r.path)))
+  const out = new Map<string, string>()
+  for (const r of results) {
+    const n = norm(r.path)
+    const label = labels.get(n) ?? n
+    // A bare basename (unique name), or a label that had to widen to the whole
+    // path, adds nothing over the full path, so the row keeps it.
+    if (!label.includes('/') || label === n) { out.set(r.path, r.path); continue }
+    out.set(r.path, backslashIsSeparator(r.path) ? `…\\${label.replaceAll('/', '\\')}` : `…/${label}`)
+  }
+  return out
+}
+
+/**
  * Build the payload handed to onSelect. Directory paths get a trailing slash on
  * the relative form so the inserted @-token reads unambiguously as a folder.
  */
@@ -140,8 +178,17 @@ export default function FilePickerMenu({ query, anchorRef, open, onSelect, onClo
   const [retrying, setRetrying] = useState(false)
   const retryRef = useRef<HTMLButtonElement | null>(null)
   const lastCauseRef = useRef<SearchErrorCause>('failed')
+  // Read by the timer, not captured by it: a timer armed for an earlier query
+  // can fire after a newer query has rendered but before this effect's cleanup
+  // clears it (passive effects flush after the commit), and publishing that
+  // overtaken query would move the fetch key off the newer query's in-flight
+  // search, cancelling it and leaving the old root's placeholder rows non-busy.
+  const latestQueryRef = useRef(query)
+  latestQueryRef.current = query
   useEffect(() => {
-    const t = setTimeout(() => setDebounced(query), 200)
+    const t = setTimeout(() => {
+      if (latestQueryRef.current === query) setDebounced(query)
+    }, 200)
     return () => clearTimeout(t)
   }, [query])
 
@@ -162,16 +209,32 @@ export default function FilePickerMenu({ query, anchorRef, open, onSelect, onClo
   // results on screen while the next query resolves so the list doesn't flicker
   // to empty.
   const source = usePickerSource()
-  const load = pathMode ? source.pathComplete : source.fileSearch
+  // `@.kiro/specs/<partial>` picks a spec: the rows are one listing of
+  // `.kiro/specs/` (spec folders first, loose files after), not a fuzzy search
+  // whose many `tasks.md` files would bury the spec folders. Needs the listing read and the project it resolves
+  // against; without either the query stays an ordinary fuzzy search.
+  const specPartial = pathMode ? null : matchSpecQuery(debounced)
+  const specMode = specPartial !== null && !!source.pathComplete && !!project
+  const load = pathMode || specMode ? source.pathComplete : source.fileSearch
   const { data, isFetching, isError, isPlaceholderData, error, refetch } = useQuery<PickerPayload>({
     queryKey: pickerQueryKey(source, pathMode
       ? ['path-complete', project, scope.dir, scope.partial]
+      : specMode
+      ? ['spec-list', project, specPartial]
       : ['file-search', debounced, project]),
-    queryFn: async ({ signal }) => pathMode
-      // Stamped with the prefix it was asked for, which is what makes a
-      // placeholder payload self-describing rather than merely stale.
-      ? { ...(await source.pathComplete!(project ?? '', scope.dir, scope.partial, signal)), dir: scope.dir, project: project ?? '' }
-      : { ...(await source.fileSearch!(debounced, project, signal)), project: project ?? '' },
+    queryFn: async ({ signal }) => {
+      if (pathMode) {
+        // Stamped with the prefix it was asked for, which is what makes a
+        // placeholder payload self-describing rather than merely stale.
+        return { ...(await source.pathComplete!(project ?? '', scope.dir, scope.partial, signal)), dir: scope.dir, project: project ?? '' }
+      }
+      if (specMode) {
+        // The listing already puts folders (the specs) first; a loose file under
+        // `.kiro/specs/` stays reachable below them, as the fuzzy search had it.
+        return { ...(await source.pathComplete!(project ?? '', `./${SPEC_DIR}`, specPartial ?? '', signal)), project: project ?? '' }
+      }
+      return { ...(await source.fileSearch!(debounced, project, signal)), project: project ?? '' }
+    },
     // An empty `scope.dir` means the debounced token is not a path token yet —
     // the tick right after the menu opens. Fetching there would ask for the
     // project root under a token that names something else.
@@ -184,6 +247,8 @@ export default function FilePickerMenu({ query, anchorRef, open, onSelect, onClo
     staleTime: 10_000,
   })
   rootRef.current = data?.root || ''
+  // The project folder's own name, for the spec rows' second line.
+  const projectLabel = stripTrailingSeparators(rootRef.current).split(/[\\/]/).pop() ?? ''
   // The prefix an accepted row is rebuilt on is read back out of the PAYLOAD the
   // rows came in, so the two cannot come from different tokens (see `dir` above).
   dirPrefixRef.current = pathMode ? (data?.dir ?? '') : ''
@@ -202,6 +267,11 @@ export default function FilePickerMenu({ query, anchorRef, open, onSelect, onClo
     const above = anchorRef.current ? menuGeometry(anchorRef.current, raw.length, 48).above : false
     return bottomUpOrder(raw, above)
   }, [data, open, ready, staleRetry, anchorRef])
+
+  // Same-named rows show their shortest distinguishing tail (see
+  // `disambiguatedPaths`); keyed on the ordered results so it recomputes
+  // exactly when the rows do. Not used under `pathTail`, which shows folders.
+  const displayPaths = useMemo(() => disambiguatedPaths(results), [results])
 
   // Open the highlighted file in the viewer (the eye/preview action) instead of
   // inserting an @-mention. Shared by the Cmd/Ctrl+Enter path (via onChoose's
@@ -265,6 +335,8 @@ export default function FilePickerMenu({ query, anchorRef, open, onSelect, onClo
     if (!open) return
     itemRefs.current[selectedRef.current]?.scrollIntoView({ block: 'nearest' })
   }, [results, open, itemRefs, selectedRef])
+
+  useAnchorTracking(open, anchorRef)
 
   if (!open || !anchorRef.current) return null
 
@@ -427,11 +499,16 @@ export default function FilePickerMenu({ query, anchorRef, open, onSelect, onClo
             : <FileText size={14} className="shrink-0 lucide-inline" />}
           <div className="flex-1 min-w-0">
             <div className="text-[13px] font-mono font-semibold truncate">{isDir ? f.name + '/' : f.name}</div>
-            {pathTail
+            {specMode
+              // A spec row names the project it belongs to, the way Kiro's own
+              // spec menu does: every row shares the `.kiro/specs/` prefix, so
+              // the path line would repeat it on each row and say nothing.
+              ? <div data-testid="file-picker-row-project" className="text-[11px] text-muted truncate">{projectLabel}</div>
+              : pathTail
               // rtl on the box puts the ellipsis at the START; the inner
               // ltr bdi keeps the path itself reading left to right.
               ? <div dir="rtl" data-testid="file-picker-row-folder" className="text-[11px] text-muted truncate text-left"><bdi dir="ltr">{rowFolder(f.path, rootRef.current)}</bdi></div>
-              : <div className="text-[11px] text-muted truncate">{f.path}</div>}
+              : <div className="text-[11px] text-muted truncate">{displayPaths.get(f.path) ?? f.path}</div>}
           </div>
           <span className="text-[11px] text-muted shrink-0 whitespace-nowrap">
             {isDir ? `${i18nT('components.filePickerMenu.folder_kind')} · ${formatAge(f.mtime)}` : `${formatSize(f.size)} · ${formatAge(f.mtime)}`}

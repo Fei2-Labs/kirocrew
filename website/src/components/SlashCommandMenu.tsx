@@ -7,6 +7,7 @@ import { pickerQueryKey, type PickerWorkflow, type SlashCommand } from '../chat-
 import { SLASH_MENU_QUERY, WORKFLOW_PICK_QUERY } from '../chat-core/composer/slashQuery'
 import { i18nT } from '../i18n/t'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
+import { useAnchorTracking } from '../hooks/useAnchorTracking'
 import { menuGeometry, bottomUpOrder } from '../lib/pickerMenu'
 import type { SendMode } from '../pages/chat/ChatSettings'
 
@@ -49,6 +50,7 @@ const COMMAND_DESC_KEY: Record<string, string> = {
   '/editor': 'components.slashCommandMenu.desc_editor',
   '/exit': 'components.slashCommandMenu.desc_exit',
   '/experiment': 'components.slashCommandMenu.desc_experiment',
+  '/fork': 'components.slashCommandMenu.desc_fork',
   '/help': 'components.slashCommandMenu.desc_help',
   '/hooks': 'components.slashCommandMenu.desc_hooks',
   '/issue': 'components.slashCommandMenu.desc_issue',
@@ -120,6 +122,8 @@ interface Props {
   sendOnEnter?: SendMode
   /** Commands the host refuses; left out of the list. */
   hidden?: readonly string[]
+  /** The chat the menu is for: its own session's advertised commands join the list. */
+  slotId?: string | null
 }
 
 /**
@@ -127,7 +131,7 @@ interface Props {
  * the menu still offers them. Two different kinds live here, and the difference
  * matters when adding a row:
  *
- * - CLIENT-INTERCEPTED (`/btw`, `/kb`, `/onboarding`): the composer recognises
+ * - CLIENT-INTERCEPTED (`/btw`, `/fork`, `/kb`, `/onboarding`): the composer recognises
  *   the text and acts on it locally; the message is never sent. Those also need
  *   a branch in `interceptSlashCommand` (`/btw` rides `/side`'s — it is a pure
  *   alias, matched by the same SIDE_RE).
@@ -138,7 +142,7 @@ interface Props {
  *   expansion — and out of the kiro-cli passthrough set, which would forward it
  *   to a harness that has no such command.
  */
-const FRONTEND_COMMAND_NAMES = ['/btw', '/kb', '/onboarding', '/plain'] as const
+const FRONTEND_COMMAND_NAMES = ['/btw', '/fork', '/kb', '/onboarding', '/plain'] as const
 
 const FRONTEND_COMMANDS: SlashCommand[] = FRONTEND_COMMAND_NAMES.map(name => ({ name }))
 
@@ -150,18 +154,29 @@ const FRONTEND_COMMANDS: SlashCommand[] = FRONTEND_COMMAND_NAMES.map(name => ({ 
  */
 type Row = { kind: 'cmd'; cmd: SlashCommand } | { kind: 'workflow'; workflow: PickerWorkflow }
 
+/** The ref `/workflow` reaches a saved workflow by: its slug, else its id,
+ *  skipping any the read listed in `shadowed_refs`, or null when neither does,
+ *  so a picked row never runs another workflow (`library.command_ref`). */
+function pickerRef(w: PickerWorkflow): string | null {
+  for (const ref of [w?.slug, w?.id]) {
+    if (typeof ref === 'string' && ref.trim() && !w.shadowed_refs?.includes(ref)) return ref
+  }
+  return null
+}
+
 const rowKey = (r: Row) => (r.kind === 'cmd' ? r.cmd.name : `/workflow ${r.workflow.slug}`)
 const rowInsert = (r: Row) => rowKey(r) + ' '
 
 /** Saved workflows are re-read at most this often while the menu is in use. */
 const WORKFLOWS_STALE_MS = 30_000
 
-export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter', hidden }: Props) {
+export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter', hidden, slotId }: Props) {
   const source = usePickerSource()
   const load = source.slashCommands
-  const { data: apiCommands = FALLBACK_COMMANDS, isFetching, isError, refetch } = useQuery<SlashCommand[]>({
-    queryKey: pickerQueryKey(source, ['slash-commands']),
-    queryFn: ({ signal }) => load!(signal),
+  const { data: apiCommands = FALLBACK_COMMANDS, isFetching, isError, isRefetchError, refetch } = useQuery<SlashCommand[]>({
+    // Per chat when the chat is known, so one chat's commands never show in another.
+    queryKey: pickerQueryKey(source, slotId ? ['slash-commands', slotId] : ['slash-commands']),
+    queryFn: ({ signal }) => load!(signal, slotId ?? undefined),
     enabled: typeof load === 'function',
   })
   const allCommands = useMemo(() => {
@@ -179,6 +194,13 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
   const workflowMatch = workflowsOn ? input.match(WORKFLOW_PICK_QUERY) : null
   const workflowMode = !!workflowMatch
   const visible = open && (!!match || workflowMode)
+  // The list carries the user's saved prompts that opted in as commands, which
+  // change outside this page, so each opening of the menu re-reads it.
+  const wasVisible = useRef(visible)
+  useEffect(() => {
+    if (visible && !wasVisible.current && typeof load === 'function') void refetch({ cancelRefetch: false })
+    wasVisible.current = visible
+  }, [visible, load, refetch])
   const filter = match?.[1] ?? ''
   const workflowFilter = workflowMatch?.[1] ?? ''
 
@@ -243,7 +265,10 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
         // must offer `deploy` before a newer `deploy-prod`. Plain code-point
         // order -- a slug is ASCII -- so the order is the same in every locale.
         ? (workflowData?.definitions ?? [])
-            .filter(w => typeof w?.slug === 'string' && w.slug.startsWith(workflowFilter))
+            .flatMap(w => {
+              const ref = pickerRef(w)
+              return ref && ref.startsWith(workflowFilter) ? [{ ...w, slug: ref }] : []
+            })
             .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
             .map(workflow => ({ kind: 'workflow' as const, workflow }))
         : commands.filter(c => c.name.slice(1).startsWith(filter)).map(cmd => ({ kind: 'cmd' as const, cmd }))),
@@ -299,6 +324,8 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
     if (!visible) return
     itemRefs.current[selectedRef.current]?.scrollIntoView({ block: 'nearest' })
   }, [displayed, visible, itemRefs, selectedRef])
+
+  useAnchorTracking(visible, anchorRef)
 
   if (!visible || !anchorRef.current) return null
   // Rows are ordered by an effect, so a matching list is briefly empty here.
@@ -411,11 +438,11 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
             ? <div role="status" className="px-3 py-3 text-[12px] text-muted">{i18nT(loadingKey)}</div>
             : <div role="status" className="px-3 py-3 text-[12px] text-muted">{i18nT(emptyKey)}</div>)
         : <>
-        {/* A refresh of the saved workflows can fail while the last list is
-          * still cached: the rows stay pickable, and the failure is named above
-          * them with its Retry. The command list needs no such row: its rows on
-          * a failed read are the offline fallback list, by design. */}
-        {workflowMode && (listError || retryInFlight) && failureNotice(false)}
+        {/* A refresh can fail while the last list is still cached: the rows
+          * stay pickable, and the failure is named above them with its Retry.
+          * A first command read that fails needs no such row: its rows are the
+          * offline fallback list, by design. */}
+        {(workflowMode ? listError : isRefetchError) || retryInFlight ? failureNotice(false) : null}
         {displayed.map((row, i) => (
         <button
           role="option"

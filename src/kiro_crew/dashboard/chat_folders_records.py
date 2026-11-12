@@ -17,6 +17,8 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.config.resolution import DEGRADED_WHOLE_CONFIG
 from kiro_crew.dashboard.chat_folder_order import next_folder_order
 from kiro_crew.dashboard.chat_folders_icons import _is_single_emoji, _is_valid_folder_color
 from kiro_crew.dashboard.chat_folders_paths import (
@@ -36,6 +38,7 @@ from kiro_crew.dashboard.token_auth import (
 )
 from kiro_crew.instances.crew_ref import clean_crew_ref
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.owner_only_files import OWNER_ONLY_FILE_MODE
 from kiro_crew.sel import sel
 
 logger = logging.getLogger("kiro_crew.dashboard.chat_folders")
@@ -63,6 +66,9 @@ LAYOUT_ONLY_FIELDS = frozenset({"collapsed", "order"})
 #: The longest ``default_prompt`` a folder keeps. Every slots frame carries the
 #: whole folder list, so this bounds what each folder adds to every frame.
 MAX_FOLDER_DEFAULT_PROMPT_CHARS = 4000
+
+#: The data-home file :func:`migrate_folder_member_labels` writes once it has run.
+FOLDER_MEMBER_LABELS_MARKER = "folder_member_labels_migrated"
 
 
 def clean_folder_default_prompt(raw: object) -> str:
@@ -125,7 +131,7 @@ def _folder_history_counts(state: DashboardState) -> dict[str, int]:
     counts: dict[str, int] = {}
     if not state.conversation_log:
         return counts
-    for session in state.conversation_log.list_sessions():
+    for session in state.conversation_log.list_sessions_indexed():
         fid = session.get("folder_id")
         if fid:
             counts[fid] = counts.get(fid, 0) + 1
@@ -187,7 +193,7 @@ def archived_session_names_in_folders(
     if not folder_ids or not log:
         return set()
     names: set[str] = set()
-    for session in log.list_sessions():
+    for session in log.list_sessions_indexed():
         if session.get("folder_id") not in folder_ids:
             continue
         key = ledger_key(str(session.get("key") or ""))
@@ -753,6 +759,64 @@ async def create_folder_record(
     if create_err == "reused":
         return reused[0]
     return folder
+
+
+async def migrate_folder_member_labels(state: DashboardState, cfg: KiroCrewConfig) -> None:
+    """Name, in one notice, each folder whose Default agent holds a crewmate's label.
+
+    The folder picker once listed crewmates by key, so a person who knew a crewmate
+    by its label saved the label, and the create route binds a label as a template,
+    without the crewmate's model, workspace or memory. The picker now saves that same
+    label for a same-named custom agent's row, so the stored value cannot say which
+    was meant: it is left as saved, and the notice asks the person to pick the
+    crewmate where that was meant. A label that is itself a key, or that two
+    crewmates share, is not named. Runs once per data home
+    (:data:`FOLDER_MEMBER_LABELS_MARKER`). A config whose crewmates could not be
+    read, a notice call that raises, a notice whose write fails, or a failed marker
+    write leaves the marker unwritten, so the next start tries again. Never raises.
+    """
+    marker = config_dir() / FOLDER_MEMBER_LABELS_MARKER
+    try:
+        if {DEGRADED_WHOLE_CONFIG, "agents"} & cfg.degraded_sections:
+            return
+        if await asyncio.to_thread(marker.exists):
+            return
+        shown_by: dict[str, list[str]] = {}
+        for key, agent in cfg.agents.items():
+            if agent.display_name and agent.display_name not in cfg.agents:
+                shown_by.setdefault(agent.display_name, []).append(key)
+
+        def _named(folders: list[dict[str, Any]]) -> tuple[bool, list[str]]:
+            named = []
+            for folder in folders:
+                label = str(folder.get("default_agent") or "")
+                if len(shown_by.get(label, [])) == 1:
+                    named.append(f"{folder.get('name') or ''} ({label})")
+            return False, named
+
+        named = await state.mutate_folders(_named)
+        if named:
+            folders = ", ".join(named)
+            state.notify(
+                "agent",
+                "Check a folder's Default agent",
+                f"These folders' Default agent has a bot's name, but new chats there do not "
+                f"run on that bot: {folders}. To use the bot, pick it as the Default agent in "
+                "the folder's settings.",
+                i18n={"id": "folder_agent_label", "params": {"folders": folders}},
+            )
+            # Read before any await: a later note replaces the state-wide future.
+            persisted = state.last_notification_persist
+            if persisted is not None and not await persisted:
+                logger.warning(
+                    "folder Default agent notice was not stored; it runs again next start"
+                )
+                return
+        await asyncio.to_thread(marker.touch, mode=OWNER_ONLY_FILE_MODE)
+    except Exception:
+        logger.warning(
+            "folder Default agent migration failed; it runs again next start", exc_info=True
+        )
 
 
 def _caller_reaches_a_channel(request: web.Request, caller_key: str) -> bool:

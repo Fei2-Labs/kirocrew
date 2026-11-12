@@ -112,29 +112,22 @@ class TestReleaseIsNewer:
         assert updates_fork._release_is_newer("v0.13.0+fork.gfe68bd64")[0] is False
 
 
-class TestApplyRestartsThroughRestartGateway:
-    """A successful apply must restart via ``_restart_gateway``.
-
-    The old code called ``reexec_python_module()`` with no arguments — that
-    helper requires ``(module, args)``, so the delayed task died on a
-    TypeError and the gateway kept running the pre-update code.
+class TestApplyNeverRestartsARunningGateway:
+    """A successful apply installs the wheel and reports ``restart_required`` —
+    it never schedules a restart of the process serving the response (the update
+    replaces the tree this process runs from, so it goes live on the next
+    start).
     """
 
     @pytest.mark.asyncio
-    async def test_successful_apply_schedules_restart_gateway(self, monkeypatch, tmp_path):
+    async def test_successful_apply_schedules_no_restart(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             updates_fork.tempfile, "mkdtemp", lambda **k: str(tmp_path)
         )
-        restarted: list[object] = []
-
-        async def _fake_restart(state):
-            restarted.append(state)
-            return True
 
         def _reexec_never(*args, **kwargs):  # pragma: no cover - must not run
             raise AssertionError("reexec_python_module must not be called directly")
 
-        monkeypatch.setattr(updates_fork, "_restart_gateway", _fake_restart)
         monkeypatch.setattr(
             "kiro_crew.platform_compat.reexec_python_module", _reexec_never
         )
@@ -162,13 +155,6 @@ class TestApplyRestartsThroughRestartGateway:
         monkeypatch.setattr(
             updates_fork.subprocess, "run", lambda *a, **k: _Ok()
         )
-        # The delayed restart sleeps 2s before acting; skip the wait.
-        real_sleep = asyncio.sleep
-
-        async def _fast_sleep(_delay):
-            await real_sleep(0)
-
-        monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
 
         state = SimpleNamespace(_background_tasks=set())
         request = SimpleNamespace(app={"state": state})
@@ -177,10 +163,10 @@ class TestApplyRestartsThroughRestartGateway:
         assert resp.status == 200
         body = json.loads(resp.text)
         assert body["ok"] is True
-
-        (task,) = tuple(state._background_tasks)
-        await task
-        assert restarted == [state]
+        assert body["installed_tag"] == "v0.14.0+fork.gabc123"
+        assert body["restart_required"] is True
+        assert body["message"] == "Installed. Restart the gateway to run it."
+        assert not state._background_tasks
 
 
 async def _none():

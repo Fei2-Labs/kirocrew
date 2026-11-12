@@ -52,6 +52,7 @@ from kiro_crew.discord.transport_dispatch import (
     _QueuedOrigin,
 )
 from kiro_crew.messaging.attachments import cleanup
+from kiro_crew.messaging.commands import COMPACT_ACCOUNT_CHANGED_TEXT
 from kiro_crew.messaging.link import ChannelLink, legacy_dashboard_mirror_key
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.monitoring.completion import MonitorCompletionHook
@@ -306,9 +307,7 @@ class TestDispatcher:
         async def _denied(_channel_type: str) -> bool:
             return False
 
-        monkeypatch.setattr(
-            "kiro_crew.discord.transport_dispatch.channel_inbound_permitted", _denied
-        )
+        monkeypatch.setattr("kiro_crew.messaging.dispatch.channel_inbound_permitted", _denied)
         result = await d.handle_message(
             self._msg("[Monitor wake]"),
             interpret_commands=False,
@@ -997,6 +996,39 @@ class TestDispatcher:
         assert sess._gp.cancelled == 1
         assert sess.queued == []
         assert "Stopped" in cli.sent[-1][0]
+
+    @pytest.mark.asyncio
+    async def test_a_typed_stop_survives_a_channels_governance_deny(self, monkeypatch) -> None:
+        from kiro_crew.messaging import dispatch
+
+        async def _denied(_channel_type: str) -> bool:
+            return False
+
+        # Denied in both namespaces that read the ceiling, so a strict read
+        # anywhere on the way in drops the stop.
+        monkeypatch.setattr(dispatch, "channel_inbound_permitted", _denied)
+        monkeypatch.setattr(td_mod, "channel_inbound_permitted", _denied)
+        d, cli, sess = _dispatcher({"u1"})
+        sess._busy = True
+        # Every other message keeps the strict gate, a cancel word Discord does
+        # not spell included.
+        for text in ("hello", "停止", "!stop now"):
+            await d.handle_message(self._msg(text))
+        assert cli.sent == [] and sess.acquired == [] and sess._gp.steered == []
+        for text in ("!stop", "/cancel"):
+            await d.handle_message(self._msg(text))
+        assert sess._gp.cancelled == 2
+        assert "Stopped" in cli.sent[-1][0]
+
+    @pytest.mark.asyncio
+    async def test_compact_on_a_flagged_session_says_the_account_changed(self) -> None:
+        # The Kiro account check flagged the session without retiring it: try_acquire
+        # refuses it while has_session still answers True, and no reply is running.
+        d, cli, sess = _dispatcher({"u1"})
+        sess.retiring = True
+        await d.handle_message(self._msg("!compact"))
+        assert sess.acquired == [] and sess.released == []
+        assert [text for text, _ in cli.sent] == [COMPACT_ACCOUNT_CHANGED_TEXT]
 
     @pytest.mark.asyncio
     async def test_compact_uses_try_acquire_and_releases(self) -> None:

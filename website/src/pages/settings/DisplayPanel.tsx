@@ -1,4 +1,4 @@
-import { Loader2, Eye, Type, SquareTerminal, Palette, PanelLeft, Monitor, Sun, Moon, FolderOpen } from 'lucide-react'
+import { Loader2, Eye, Type, SquareTerminal, FileCode, Palette, PanelLeft, Monitor, Sun, Moon, FolderOpen } from 'lucide-react'
 import { useState, useMemo, useEffect, useRef } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { useZoomCtx } from '../../hooks/ZoomProvider'
@@ -42,11 +42,14 @@ import { useGatewayPlatform } from '../../hooks/useGatewayPlatform'
 import { ThemeDroppedRulesNotice } from './ThemeDroppedRulesNotice'
 import { ThemeExperienceSettings } from './ThemeExperienceSettings'
 import ErrorNotice from '../../components/ErrorNotice'
+import { REMOTE_EDITORS } from '../../utils/remoteEditorUrl'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { useBranding } from '../../hooks/useBranding'
 import { useLiquidGlass } from '../../hooks/useLiquidGlass'
 import { useExplorePreview } from '../../hooks/usePreviewFlag'
 import { useCloseAction } from '../../hooks/useCloseAction'
+import { useTrayIcon } from '../../hooks/useTrayIcon'
+import { usePersistedBool } from '../../hooks/usePersistedBool'
 import { TranslucentPanelsPreview } from './TranslucentPanelsPreview'
 import { canOpenExternalTerminal, detectExternalTerminals } from '../../lib/externalTerminal'
 import { RadioChipGroup, radioChip } from '../../components/RadioChipGroup'
@@ -93,6 +96,9 @@ const INTENSITY_LABEL_KEYS = {
   intense: 'pages.settings.displayPanel.intensity_intense',
 } as const satisfies Record<IntensityName, string>
 
+/** Why the tray icon switch is locked on, which the switch's description points at. */
+const TRAY_ICON_LOCKED_NOTE_ID = 'tray-icon-locked-note'
+
 export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
   const ime = useImeGuard()
   const { language, detected: detectedLanguage, setLanguage, syncFailed: langSyncFailed, catalogFailed: langCatalogFailed } = useLanguage()
@@ -127,6 +133,10 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
   const editor = useThemeEditor()
   const { liquidGlass, setLiquidGlass } = useLiquidGlass()
   const { closeAction, closeActionSupported, closeActionPending, closeActionFailed, setCloseAction } = useCloseAction()
+  const { trayIcon, trayIconSupported, trayIconPending, trayIconFailed, setTrayIcon } = useTrayIcon(closeAction)
+  // "Show search in the top bar", on by default. useAppShell reads the same key
+  // to draw the header, and usePersistedBool keeps the two readers in step.
+  const [topbarSearch, setTopbarSearch] = usePersistedBool('mc-topbar-search', true)
   const { botName, directLocal } = useBranding()
   const termFont = useTerminalFont()
   // Probed families become picker rows previewed in their own family, so the
@@ -234,6 +244,7 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
       show_unread_dot?: boolean
       milestones_enabled?: boolean
       terminal?: { shell?: string; completion?: { enabled?: boolean }; reuse_current?: boolean; external_app?: string }
+      remote_editor?: { editor?: string; host?: string }
     }
   }
   const mcQ = useQuery<KirocrewCfg>({
@@ -448,6 +459,71 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
     onSupersede: () => setExternalAppError(null),
   }))
 
+  // The side panel ⋯ menu's "Open in <editor>" link (dashboard.remote_editor.*).
+  // Saved on the gateway, which serves it to that menu through branding, so
+  // each save refetches branding too. The host is drafted and committed on blur
+  // like the shell; the gateway refuses a host with a port, path or scheme.
+  const remoteEditorMutOpts = (
+    path: 'dashboard.remote_editor.editor' | 'dashboard.remote_editor.host',
+    setError: (message: string | null) => void,
+    failedMessage: (e: unknown) => string,
+  ) => {
+    const opts = overlay.mutationOpts<string>({
+      queryKey: ['kirocrewConfig'],
+      mutationFn: (value: string) => api.patchConfig(path, value),
+      path: () => path,
+      displayValue: v => v,
+      applyToCache: (cached, value) => setConfigPathValue(cached as KirocrewCfg, path, value),
+      onFailure: e => setError(failedMessage(e)),
+      onSupersede: () => setError(null),
+    })
+    return {
+      ...opts,
+      onSettled: (...args: Parameters<typeof opts.onSettled>) => {
+        opts.onSettled(...args)
+        void qc.invalidateQueries({ queryKey: ['branding'] })
+      },
+    }
+  }
+  const shownRemoteEditor = overlay.shown('dashboard.remote_editor.editor', mcQ.data?.dashboard?.remote_editor?.editor ?? '')
+  const [remoteEditorError, setRemoteEditorError] = useState<string | null>(null)
+  const remoteEditorMut = useMutation(remoteEditorMutOpts(
+    'dashboard.remote_editor.editor', setRemoteEditorError,
+    () => i18nT('pages.settings.displayPanel.remote_editor_save_failed'),
+  ))
+  const shownRemoteHost = overlay.shown('dashboard.remote_editor.host', mcQ.data?.dashboard?.remote_editor?.host ?? '')
+  const [remoteHostDraft, setRemoteHostDraft] = useState<string | null>(null)
+  const [remoteHostError, setRemoteHostError] = useState<string | null>(null)
+  // Shown after a host save lands, until the user types again: the field saves
+  // on blur, so this line is the only sign the save happened.
+  const [remoteHostSaved, setRemoteHostSaved] = useState(false)
+  const remoteHostOpts = remoteEditorMutOpts(
+    'dashboard.remote_editor.host', setRemoteHostError,
+    // A 400 is the gateway refusing the host's format; anything else is not.
+    e => i18nT(e instanceof ApiError && e.status === 400
+      ? 'pages.settings.displayPanel.remote_editor_host_save_failed'
+      : 'pages.settings.displayPanel.remote_editor_host_save_error'),
+  )
+  const remoteHostMut = useMutation({
+    ...remoteHostOpts,
+    onSuccess: (data: unknown, value: string, token: number) => {
+      setRemoteHostDraft(null)
+      setRemoteHostError(null)
+      setRemoteHostSaved(true)
+      return remoteHostOpts.onSuccess(data, value, token)
+    },
+  })
+  const commitRemoteHost = () => {
+    if (remoteHostDraft === null) return
+    const value = remoteHostDraft.trim()
+    if (value === shownRemoteHost) {
+      setRemoteHostDraft(null)
+      setRemoteHostError(null)
+      return
+    }
+    remoteHostMut.mutate(value)
+  }
+
   // ── Install theme from a GitHub repo, a folder on the gateway host, or a
   // `.zip` the browser picks (the only source a phone or a remote browser has) ──
   const [installType, setInstallType] = useState<'github' | 'local' | 'upload'>('github')
@@ -598,6 +674,7 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
     { key: 'view', label: i18nT('pages.settings.displayPanel.view'), icon: <Eye size={16} /> },
     { key: 'zoom', label: i18nT('pages.settings.displayPanel.zoom_font'), icon: <Type size={16} /> },
     { key: 'terminal', label: i18nT('pages.settings.displayPanel.terminal'), icon: <SquareTerminal size={16} /> },
+    { key: 'remote-editor', label: i18nT('pages.settings.displayPanel.remote_editor'), icon: <FileCode size={16} /> },
     { key: 'theme', label: i18nT('pages.settings.displayPanel.theme'), icon: <Palette size={16} /> },
     { key: 'sidebar', label: i18nT('pages.settings.displayPanel.sidebar_colors'), icon: <PanelLeft size={16} /> },
   ]
@@ -686,6 +763,17 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
             onChange={setLiquidGlass}
           />
           <TranslucentPanelsPreview placeholder={i18nT('components.chatInput.message_placeholder', { bot: botName })} />
+          {/* The top bar's search box, on by default. Browser-local like the
+              switch above, because it is about how much room this window gives
+              the top bar: off, the box's centre track goes to the controls on
+              either side (`.topbar-no-search`), so the CPU/MEM/DSK readouts stay
+              inline in narrower windows. The search shortcut does not read it. */}
+          <SettingsToggle
+            label={i18nT('pages.settings.displayPanel.show_topbar_search')}
+            hint={i18nT('pages.settings.displayPanel.show_topbar_search_desc')}
+            checked={topbarSearch}
+            onChange={setTopbarSearch}
+          />
           {milestonesSupported && (
           <SettingsToggle
             configKey="dashboard.milestones_enabled"
@@ -702,7 +790,8 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
         </SettingsCard>
       </SettingsSection>
       {/* Desktop app only: shown once the main process answers for the main
-          window's dashboard (useCloseAction), local or remote gateway. */}
+          window's dashboard (useCloseAction, useTrayIcon), local or remote
+          gateway. */}
       {closeActionSupported && (
         <SettingsSection title={i18nT('pages.settings.displayPanel.desktop_app')}>
           <SettingsCard>
@@ -718,6 +807,30 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
                 `installValue` further down this panel. The switch already
                 shows the unchanged value, so toggling again is the retry. */}
             {closeActionFailed && (
+              <ErrorNotice
+                variant="inline"
+                message={i18nT('pages.settings.displayPanel.keep_running_when_window_closed_save_failed')}
+              />
+            )}
+            {trayIconSupported && (
+              <SettingsToggle
+                settingId="display.show-tray-icon"
+                label={i18nT('pages.settings.displayPanel.show_tray_icon')}
+                hint={i18nT('pages.settings.displayPanel.show_tray_icon_desc')}
+                checked={trayIcon.show}
+                disabled={trayIconPending || !trayIcon.canHide}
+                describedBy={trayIcon.canHide ? undefined : TRAY_ICON_LOCKED_NOTE_ID}
+                onChange={setTrayIcon}
+              />
+            )}
+            {/* Outside the toggle row, so it is not dimmed with the disabled switch. */}
+            {trayIconSupported && !trayIcon.canHide && (
+              <p id={TRAY_ICON_LOCKED_NOTE_ID} className="text-[12px] text-muted">
+                {i18nT('pages.settings.displayPanel.show_tray_icon_locked')}
+              </p>
+            )}
+            {/* No hand-off, for the same drafts as the close row above. */}
+            {trayIconFailed && (
               <ErrorNotice
                 variant="inline"
                 message={i18nT('pages.settings.displayPanel.keep_running_when_window_closed_save_failed')}
@@ -983,6 +1096,48 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
       </SettingsSection>
           )
 
+        case 'remote-editor':
+          return (
+      <SettingsSection title={i18nT('pages.settings.displayPanel.remote_editor')}>
+        <SettingsCard>
+          <SettingsSelect
+            label={i18nT('pages.settings.displayPanel.remote_editor_editor')}
+            description={i18nT('pages.settings.displayPanel.remote_editor_editor_desc')}
+            value={shownRemoteEditor}
+            options={['', ...Object.keys(REMOTE_EDITORS)]}
+            optionLabels={[i18nT('pages.settings.displayPanel.remote_editor_off'), ...Object.values(REMOTE_EDITORS)]}
+            onChange={v => remoteEditorMut.mutate(v)}
+            disabled={remoteEditorMut.isPending || !mcQ.isSuccess}
+            configKey="dashboard.remote_editor.editor"
+          />
+          {/* No hand-off: `remoteHostDraft` below is unsaved local state the
+              hand-off's navigation would discard. */}
+          <ErrorNotice message={remoteEditorError} variant="inline" />
+          <SettingsInput
+            label={i18nT('pages.settings.displayPanel.remote_editor_host')}
+            description={i18nT('pages.settings.displayPanel.remote_editor_host_desc')}
+            value={remoteHostDraft ?? shownRemoteHost}
+            placeholder={i18nT('pages.settings.displayPanel.remote_editor_host_placeholder')}
+            onChange={v => {
+              setRemoteHostSaved(false)
+              setRemoteHostDraft(v)
+            }}
+            onBlur={commitRemoteHost}
+            disabled={remoteHostMut.isPending || !mcQ.isSuccess}
+            configKey="dashboard.remote_editor.host"
+            aria-label={i18nT('pages.settings.displayPanel.remote_editor_host')}
+          />
+          {/* No hand-off: a refused host stays in the field to fix. */}
+          <ErrorNotice message={remoteHostError} variant="inline" />
+          {remoteHostSaved && !remoteHostError && (
+            <span role="status" className="text-[12px] text-muted">
+              {i18nT('pages.settings.displayPanel.remote_editor_host_saved')}
+            </span>
+          )}
+        </SettingsCard>
+      </SettingsSection>
+          )
+
         case 'theme':
           return (
       <>
@@ -1174,13 +1329,15 @@ export function DisplayPanel({ basePath }: { basePath?: string } = {}) {
           discards the draft unconditionally: on an untouched form both
           accidental exits still work (Escape is the capability the issue asks
           for), and once a name or a colour has been entered only the explicit
-          exits — the header close button and the panel's own Cancel — close it. */}
+          exits — the header close button and the panel's own Cancel — close it.
+          It is also held while the delete confirmation is open above it, so the
+          Escape that cancels that confirmation does not close the editor too. */}
       <Modal
         open={editor.editorOpen}
         onClose={editor.closeEditor}
         title={editor.isEditing ? i18nT('pages.settings.displayPanel.edit_theme') : i18nT('pages.settings.displayPanel.create_theme')}
         maxWidth={672}
-        guardAccidentalDismiss={editor.isDirty}
+        guardAccidentalDismiss={editor.isDirty || editor.confirmingDelete}
       >
         <ThemeEditorPanel editor={editor} />
       </Modal>

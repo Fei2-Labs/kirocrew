@@ -15,6 +15,7 @@ from kiro_crew.dashboard.state import (
     DENY_CAUSE_APPROVAL_UNDELIVERABLE,
     DENY_CAUSE_BATCH_CASCADE,
     _mark_permission_resolved,
+    row_mid,
 )
 from kiro_crew.dashboard.turn_dispatch import (
     APPROVAL_EXPIRED_NOTE_TITLE,
@@ -30,8 +31,15 @@ from kiro_crew.security.readonly_bash import (
 )
 from kiro_crew.shared_crew.decisions import open_slot_approval, settle_slot_approval
 from kiro_crew.slack.handler import resolve_linked_approval
-from kiro_crew.trust_patterns import approval_command, approval_display_command
+from kiro_crew.trust_patterns import (
+    approval_command,
+    approval_display_command,
+)
 from kiro_crew.trust_patterns import extract_bash_command as _extract_bash_command
+from kiro_crew.trust_patterns import (
+    path_trust_target,
+    path_trust_unresolved,
+)
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
@@ -42,12 +50,15 @@ if TYPE_CHECKING:
         _validate_tool_name,
         code_channel_post_thread,
         crew_log_emit,
+        finish_worker_approval,
+        keep_code_channel_card,
         logger,
         pin_human_approval,
         post_linked_approval,
         redact_credentials,
         redact_exfiltration_urls,
         sel,
+        start_worker_approval_relay,
         tool_approval_timeout_secs,
     )
     from kiro_crew.dashboard.chat_turn.deny_chokepoints import (
@@ -227,12 +238,23 @@ async def _on_permission_prompt(
     # optional there: a card missing them still renders its command.
     perm_meta["tool_kind"] = _redact_tool_field(event.tool_kind or "", limit=64)
     perm_meta.update(_tool_identity_fields(event))
+    # A file grant is offered only for a path that names no link on this host,
+    # read off the loop (it touches the file system); the trusted-pattern tier
+    # checks the same before it honours one.
+    _path_scope_trusted = event.path_scope_trusted
+    if _path_scope_trusted:
+        _grant_path = path_trust_target(
+            event.tool_name, event.mcp_server_name, event.raw_tool_params
+        )
+        if _grant_path:
+            _path_scope_trusted = not await asyncio.to_thread(path_trust_unresolved, _grant_path)
     _trust_key = approval_command(
         event.tool_input or "",
         is_shell=event.is_shell,
         tool_name=event.tool_name,
         mcp_server_name=event.mcp_server_name,
         raw_tool_params=event.raw_tool_params,
+        path_scope_trusted=_path_scope_trusted,
     )
     _display_command = approval_display_command(
         event.tool_input or "",
@@ -240,6 +262,7 @@ async def _on_permission_prompt(
         tool_name=event.tool_name,
         mcp_server_name=event.mcp_server_name,
         raw_tool_params=event.raw_tool_params,
+        path_scope_trusted=_path_scope_trusted,
     )
     _full = _extract_full_command(_display_command)
     _safe_full, _ = redact_exfiltration_urls(_full)
@@ -279,6 +302,12 @@ async def _on_permission_prompt(
     # unconditional grant and only content-matching paths need the
     # canonical command.
     perm_meta["trust_grantable"] = "1"
+    _override_offer = getattr(turn, "_deny_override", None)
+    if event.takes_rejection_reason and _override_offer is None:
+        # The card may ask why: this backend hands a rejection's reason to the
+        # model. Not on a deny-rule override card, whose rejection is the rule's
+        # own refusal (``_refuse_overridden_call``) and carries no reason.
+        perm_meta["rejection_reason_accepted"] = "1"
     _base = _extract_base_command(_trust_key) if event.is_shell else ""
     _safe_base, _ = redact_exfiltration_urls(_base)
     _safe_base, _ = redact_credentials(_safe_base)
@@ -287,7 +316,6 @@ async def _on_permission_prompt(
         perm_meta["trust_base_grantable"] = "1"
     # A deny-rules refusal the person may override (tool_approval): the card
     # names the rule and offers no standing grant.
-    _override_offer = getattr(turn, "_deny_override", None)
     if _override_offer is not None:
         _deny_override_card_meta(perm_meta, _override_offer)
         if _safe_full:
@@ -323,8 +351,8 @@ async def _on_permission_prompt(
     # never sees it — the turn then parks here for the whole approval
     # window, holding the slot lock and silently dropping inbound
     # messages.
-    # The Slack click resolves THIS future (via state.resolve_approval);
-    # we remain the sole caller of approve_tool/reject_tool below.
+    # The Slack click resolves THIS future on this slot (request ids recur
+    # across slots); we remain the sole caller of approve_tool/reject_tool below.
     _slack_approval_ts: str | None = None
     if (
         # A row pre-declined at its append is not mirrored. The
@@ -368,6 +396,14 @@ async def _on_permission_prompt(
                 session_key,
                 (f"{_child_lf_warning}{event.title}" if _child_lf_warning else event.title),
                 event.tool_input or "",
+                # The identity as the event carries it: the Slack card names the
+                # server only when the flag proves the pair.
+                mcp_server_name=event.mcp_server_name,
+                tool_name=event.tool_name,
+                mcp_identity_trusted=event.mcp_identity_trusted,
+                slot_key=slot.key,
+                future=fut,
+                channel_trust=_approval_thread is None,
             )
             if _slack_approval_ts is None and not fut.done():
                 # Delivery failed — do not park for the whole
@@ -418,6 +454,31 @@ async def _on_permission_prompt(
                 fut.set_result("rejected")
                 _host_deny_cause = DENY_CAUSE_APPROVAL_UNDELIVERABLE
                 _host_deny_reason = "the approval prompt could not be delivered to Slack"
+    # A worker that a Slack Code channel's session created asks in that
+    # channel too (top-level, owner-only); the dashboard prompt stays.
+    # Started, not awaited: nothing here may await before the `try`. An override
+    # is answered on the dashboard alone, as the linked mirror above rules: a
+    # Slack Approve would be read as a decline.
+    _worker_relay = (
+        start_worker_approval_relay(
+            state,
+            slot,
+            session_key,
+            event.request_id,
+            # The same title the linked card carries, warning included.
+            (f"{_child_lf_warning}{event.title}" if _child_lf_warning else event.title),
+            event.tool_input or "",
+            fut,
+            perm_meta=perm_meta,
+            linked_ts=_slack_approval_ts,
+            # The card names the proven MCP server/tool, as the linked card does.
+            mcp_server_name=event.mcp_server_name,
+            tool_name=event.tool_name,
+            mcp_identity_trusted=event.mcp_identity_trusted,
+        )
+        if _override_offer is None
+        else None
+    )
     # Pre-seeded so the `finally` backstop below is total over EVERY
     # exit from the await — including CancelledError, which slot
     # deletion / cleanup endpoints raise by cancelling slot.task.
@@ -505,6 +566,28 @@ async def _on_permission_prompt(
             _host_deny_cause = DENY_CAUSE_APPROVAL_NO_BUDGET
             _host_deny_reason = "the turn had no budget left to wait for approval"
         else:
+            # Only a prompt that will really wait is bridged: one declined above for
+            # lack of budget, or already answered, is not pending. One plain call,
+            # never awaited, inside the try whose finally cleans the approval up.
+            from kiro_crew.notifications.bridge_approval_note import schedule_pending_approval
+
+            schedule_pending_approval(
+                state,
+                fut,
+                slot_key=slot.key,
+                session_key=session_key,
+                request_id=str(event.request_id),
+                tool_title=event.tool_name or "",
+                session_title=slot.display_title,
+                slack_card=_slack_approval_ts is not None,
+                approval_detail=event.tool_input or event.title or "",
+                # An override card is answered on the dashboard alone, and an
+                # unverified child request shows only agent-authored text.
+                answerable=_override_offer is None and not _child_lf_warning,
+                ttl_s=_approval_window,
+                crew_log_session=_crew_log_sid,
+                turn=_crew_log_turn_no,
+            )
             outcome = await asyncio.wait_for(fut, timeout=_approval_window)
     except asyncio.TimeoutError:
         outcome = "rejected"
@@ -591,10 +674,14 @@ async def _on_permission_prompt(
             outcome, _override_offer.scope = override_decision(outcome)
         if _approval_card is not None:
             try:
+                # Stays English: ``_approval_card`` is the approval formatter's
+                # own output (the tool and its decision), carried verbatim.
                 slot.append("error", _approval_card, "msg msg-err")
             except Exception:
                 logger.debug("Failed to render approval card", exc_info=True)
         _owns_approval = slot.unregister_approval(str(event.request_id), fut)
+        # Taken on every path out, so a reason never outlives its request.
+        _rejection_reason = slot.take_rejection_reason(str(event.request_id), fut)
         if _owns_approval and _decision_id:
             settle_slot_approval(state, _decision_id, fut, withdrawn=_host_cancelled)
         # The decision is final here and nowhere earlier: every path
@@ -686,6 +773,10 @@ async def _on_permission_prompt(
             only_if_pending=True,
         ):
             slot._dirty = True
+            # Imported here: the runner does not bind this helper.
+            from kiro_crew.dashboard.interaction_coordinator import native_resolution_target
+
+            _resolved_mid = row_mid(permission_row)
             state.broadcast_ws(
                 "approval_resolved",
                 {
@@ -693,6 +784,8 @@ async def _on_permission_prompt(
                     "approved": _approved,
                     # Keys the frame for the slot-scoped WS gate.
                     "slot": slot.key,
+                    # The runner's own request, named by its row.
+                    **native_resolution_target(_resolved_mid),
                 },
             )
             state.push_slots_update()
@@ -709,13 +802,24 @@ async def _on_permission_prompt(
         if _slack_approval_ts is not None:
             try:
                 resolve_linked_approval(slot._slack_channel, _slack_approval_ts)
-                if state.slack_client:
+                # A code-channel card its Trust answered says so in
+                # place; every other card goes once decided.
+                if state.slack_client and not keep_code_channel_card(
+                    slot._slack_channel, _slack_approval_ts
+                ):
                     await state.slack_client.delete_message(slot._slack_channel, _slack_approval_ts)
             except Exception:
                 logger.debug(
                     "Failed to clean up linked Slack approval message",
                     exc_info=True,
                 )
+        # A relayed worker card says how it was answered (never raises).
+        await finish_worker_approval(
+            _worker_relay,
+            outcome,
+            deny_cause=_host_deny_cause,
+            host_ended=bool(_host_cancelled or _host_stopped),
+        )
     if _override_offer is not None and outcome != "approved":
         # Declined, timed out, or answered by anything but an override click: the
         # call is refused as the policy refusal it was, never as a person's
@@ -765,33 +869,39 @@ async def _on_permission_prompt(
                 state=state,
             )
             return _Flow.BREAK
-        try:
-            _parsed_input = json.loads(event.tool_input) if event.tool_input else None
-        except Exception:
-            _parsed_input = None
-        try:
-            pre_hook_results = await _fire(
-                turn,
-                HOOK_EVENT_PRE_TOOL_USE,
-                tool_name=validated_tool,
-                tool_input=_parsed_input,
-                tool_id=event.harness_tool_id,
-                tool_identity=event.tool_name,
-                mcp_server=event.mcp_server_name,
-            )
-        except Exception as hook_exc:
-            await _reject_hook_error(
-                client,
-                slot,
-                event,
-                session_key=session_key,
-                error=str(hook_exc),
-                metadata={"reason": "interactive"},
-                refusal_reasons=_refusal_reasons,
-                refusal_notices=_refusal_notices,
-                state=state,
-            )
-            return _Flow.BREAK
+        # When the gate fired this call's PreToolUse hooks before the card and they
+        # passed, the answer does not run them a second time. A deny-rules override
+        # card is drawn before that fire, and with no context builder the gate never
+        # runs, so those calls fire them here.
+        pre_hook_results: list[str] = []
+        if not turn._pre_tool_hooks_fired:
+            try:
+                _parsed_input = json.loads(event.tool_input) if event.tool_input else None
+            except Exception:
+                _parsed_input = None
+            try:
+                pre_hook_results = await _fire(
+                    turn,
+                    HOOK_EVENT_PRE_TOOL_USE,
+                    tool_name=validated_tool,
+                    tool_input=_parsed_input,
+                    tool_id=event.harness_tool_id,
+                    tool_identity=event.tool_name,
+                    mcp_server=event.mcp_server_name,
+                )
+            except Exception as hook_exc:
+                await _reject_hook_error(
+                    client,
+                    slot,
+                    event,
+                    session_key=session_key,
+                    error=str(hook_exc),
+                    metadata={"reason": "interactive"},
+                    refusal_reasons=_refusal_reasons,
+                    refusal_notices=_refusal_notices,
+                    state=state,
+                )
+                return _Flow.BREAK
         if _pre_tool_hooks_should_block(pre_hook_results):
             await _reject_hook_blocked(
                 client,
@@ -931,8 +1041,15 @@ async def _on_permission_prompt(
         # above never fires for it and this exemption stays true for
         # exactly the branch it covers; the host auto-declines are
         # that steer's job, not this marker's.
+        # The person's own words go with their own rejection only: a host
+        # auto-decline carries none, and only a request that takes one gets it.
         await _reject_attributed(
-            client, event.request_id, attribution="exempt: interactive user denial"
+            client,
+            event.request_id,
+            attribution="exempt: interactive user denial",
+            reason=(
+                _rejection_reason if event.takes_rejection_reason and not _host_deny_cause else ""
+            ),
         )
         if _safety_reason:
             _reject_label = f"🚫 {_safe_reject_title} (cancelled — {_safety_reason})"

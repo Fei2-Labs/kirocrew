@@ -63,16 +63,26 @@ class SectionReader:
         value = self._data.get(key, _ABSENT)
         return self.default(key) if value is _ABSENT else value
 
-    def read(self, key: str, coerce: Callable[..., _T], *bounds: Any, **options: Any) -> _T:
+    def read(
+        self,
+        key: str,
+        coerce: Callable[..., _T],
+        *bounds: Any,
+        unclamped: Callable[..., Any] | None = None,
+        **options: Any,
+    ) -> _T:
         """``coerce(stored-or-default, default, *bounds, **options)`` for *key*.
 
         For the ``_safe_*`` coercer family, whose second argument is the fallback for
         a value they cannot read: the fallback is the field's default too. The extra
         arguments are the coercer's bounds, and a stored value they change is logged.
+        A coercer that clamps on its own names *unclamped*, the same reading without
+        its clamp, so a stored value its clamp changes is logged too.
         """
         value, default = self.get(key), self.default(key)
         result = coerce(value, default, *bounds, **options)
-        if (bounds or options) and key in self._data and result != coerce(value, default):
+        plain = unclamped or (coerce if bounds or options else None)
+        if plain is not None and key in self._data and result != plain(value, default):
             seen = (self._dto, key, repr(value))
             if seen not in _REPORTED_CLAMPS:
                 _REPORTED_CLAMPS.add(seen)
@@ -115,8 +125,11 @@ DEFAULT_AUTOCOMPACT_PCT = 70.0
 # a quarter of the range so it cannot widen back into noise.
 CONTEXT_WARN_MARGIN_PCT = 10.0
 # session.pool_size — warm pool OFF by default. Each pooled slot is a full
-# kiro-cli process plus the MCP stdio servers its agent spec spawns (~109 MB per
-# backend), and a non-zero value is also reserved out of the memory term that
+# kiro-cli process plus every MCP stdio server and stub its agent spec spawns,
+# which is hundreds of MB rather than one backend's ~109 MB (a slot carrying a
+# typical operator's MCP set measured ~700 MB of macOS footprint, and the System
+# page's memory breakdown shows the pool's live figure), and a non-zero value is
+# also reserved out of the memory term that
 # sizes the TaskRunner's auto parallel cap
 # (subagent.compute_memory_sized_parallel_cap), so the cost is paid on every host
 # whether or not the pool is ever claimed. Cold start is instead
@@ -161,3 +174,7 @@ DEFAULT_RECONCILE_MAX_KILLS = 5
 # capped in bytes, so the count bounds per-search I/O, not memory; this default
 # keeps the default window of ordinary sessions inside the fold budget.
 DEFAULT_SEARCH_SCAN_WINDOW = 2000
+# session.max_per_creator -- how many live sessions one creator (a conductor, a
+# Bot's own chat) may hold. What an install that never sets the key runs with, and
+# what an unreadable value falls back to. Bounds: ``sections_limits``.
+DEFAULT_MAX_PER_CREATOR = 50

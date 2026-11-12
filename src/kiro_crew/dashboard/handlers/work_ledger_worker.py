@@ -20,6 +20,7 @@ from aiohttp import web
 
 from kiro_crew import work_ledger, work_preview
 from kiro_crew.crew_log import emit as crew_log_emit
+from kiro_crew.crew_log.resolve import unit_for_session_key
 from kiro_crew.dashboard.handlers.work_ledger_caller import (
     _caller_key,
     _contained_channel_caller,
@@ -137,8 +138,8 @@ _CODE_DONE_WITHOUT_EVIDENCE = "done_without_evidence"
 async def api_work_report(request: web.Request) -> web.Response:
     """POST /api/work-ledger/report — this worker's status against its own item.
 
-    ``status`` and ``summary`` are required; ``artifacts``, ``pr`` and ``reason``
-    are optional. There is no ``item_id``, no ``session``, no ``acceptance``, no
+    ``status`` and ``summary`` are required; ``artifacts``, ``pr``, ``reason`` and
+    ``wake_at`` are optional. There is no ``item_id``, no ``session``, no ``acceptance``, no
     ``verdict`` and no ``state``, so no round trip through here can write a
     conductor-owned field.
     """
@@ -156,7 +157,9 @@ async def api_work_report(request: web.Request) -> web.Response:
         return dirty
 
     state: DashboardState = request.app["state"]
-    unit, urefusal = _acting_unit(state, key, "work_report", item_id)
+    unit, urefusal = await asyncio.to_thread(
+        _acting_unit, state, key, "work_report", item_id, conductor_key
+    )
     if urefusal is not None:
         return urefusal
     assert unit is not None
@@ -164,6 +167,10 @@ async def api_work_report(request: web.Request) -> web.Response:
     # ``is not None`` narrowing, so it takes them as ``str`` bindings.
     caller: str = key
     acting_unit: str = unit
+    # The worker's OWN unit, or "" when the record fell back to the board's unit. Only
+    # this unit gets the worker's mirror and is cited as its evidence: the board's log
+    # holds no line the worker wrote.
+    own_unit: str = unit_for_session_key(getattr(state, "sessions", None), key)
 
     body, bad = await _json_object(request)
     if bad is not None:
@@ -220,6 +227,7 @@ async def api_work_report(request: web.Request) -> web.Response:
         round=_WIDEST_COUNTER,
         status=cleaned.get("status"),
         reason=cleaned.get("reason"),
+        wake_at=_WIDEST_STAMP if cleaned.get("wake_at") is not None else None,
         summary=cleaned.get("summary"),
         artifacts=cleaned.get("artifacts") or {},
         pr=work_ledger.MAX_PR,
@@ -285,6 +293,7 @@ async def api_work_report(request: web.Request) -> web.Response:
                     cleaned.get("artifacts"),
                     cleaned.get("pr"),
                     cleaned.get("reason"),
+                    cleaned.get("wake_at"),
                 )
             except WorkLedgerError as exc:
                 _audit(caller, "work_report", "denied", resources=item_id, error=exc.code)
@@ -315,6 +324,7 @@ async def api_work_report(request: web.Request) -> web.Response:
                 round=item.round,
                 status=item.status,
                 reason=item.reason,
+                wake_at=item.wake_at,
                 summary=item.summary,
                 artifacts=item.artifacts,
                 pr=item.pr,
@@ -361,12 +371,12 @@ async def api_work_report(request: web.Request) -> web.Response:
                         landed = await asyncio.to_thread(
                             crew_log_emit.on_work_recorded, acting_unit, entry
                         )
-            if landed and parent_unit and parent_unit != acting_unit:
+            if landed and parent_unit and own_unit and parent_unit != own_unit:
                 # The worker's own copy, marked as a mirror of the board's. Nothing reads
                 # it to rebuild the board, so a failure here is logged and the report
                 # stands.
                 mirrored = await asyncio.to_thread(
-                    crew_log_emit.on_work_recorded, acting_unit, {**entry, "mirror": True}
+                    crew_log_emit.on_work_recorded, own_unit, {**entry, "mirror": True}
                 )
                 if not mirrored:
                     logger.warning(
@@ -394,6 +404,7 @@ async def api_work_report(request: web.Request) -> web.Response:
                 # evidence. An anchor it cannot resolve lands the report
                 # unthreaded rather than dropping it, so a dispatch entry that
                 # never got written cannot silence this item's whole history.
+                # A worker with no unit of its own cites nothing, so none is written.
                 # Written after the work entry landed, best-effort.
                 await asyncio.to_thread(
                     crew_log_emit.on_crew_report,
@@ -403,7 +414,7 @@ async def api_work_report(request: web.Request) -> web.Response:
                         "status": item.status,
                         **({"summary": item.summary} if item.summary else {}),
                     },
-                    cite_unit=acting_unit,
+                    cite_unit=own_unit,
                 )
             _audit(caller, "work_report", "ok", resources=f"{item_id} status={item.status}")
             await asyncio.to_thread(work_ledger.clear_undelivered, caller)
@@ -425,6 +436,7 @@ async def api_work_report(request: web.Request) -> web.Response:
 _WORKER_REPORT_FIELDS: tuple[str, ...] = (
     "status",
     "reason",
+    "wake_at",
     "summary",
     "artifacts",
     "pr",
@@ -441,6 +453,7 @@ def _report(
     artifacts: Any,
     pr: Any,
     reason: Any = None,
+    wake_at: Any = None,
 ) -> dict[str, Any]:
     return work_ledger.apply_worker_report(
         conductor_key,
@@ -450,6 +463,7 @@ def _report(
         artifacts=artifacts,
         pr=pr,
         reason=reason,
+        wake_at=wake_at,
     )
 
 

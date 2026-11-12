@@ -480,9 +480,9 @@ class _EmptyJob:
     """
 
     job_id: str
-    #: What the batches said they held when the job started, so the screen has a
-    #: denominator. Read from the manifests, not remeasured. Filled in just after
-    #: the slot is claimed, so it is 0 for the instant before that.
+    #: What the batches held when the job started, so the screen has a denominator:
+    #: the same things the delete counts as freed (see `staged_targets`). Filled in
+    #: just after the slot is claimed, so it is 0 for the instant before that.
     total_bytes: int = 0
     freed_bytes: int = 0
     done: bool = False
@@ -799,7 +799,7 @@ def _titles_by_stem(conversation_log: Any) -> dict[str, str]:
     cache is shared. A session that never got a title simply has no entry.
     """
     try:
-        rows = conversation_log.list_sessions()
+        rows = conversation_log.list_sessions_indexed()
     except Exception:
         logger.debug("session titles unreadable", exc_info=True)
         return {}

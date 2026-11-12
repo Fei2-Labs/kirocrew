@@ -47,14 +47,20 @@ export interface CronJob {
   effective_tz?: string | null
   skip_dates?: string[] | null
   script?: string | null; command?: string | null; last_result?: string | null; last_error?: string | null
+  /** Epoch seconds at which `last_result` was produced; absent on an older gateway. */
+  last_result_ts?: number | null
   is_running?: boolean; running_since?: number | null
   /** The installed app that owns this job, or null/absent for a person-owned
    * one. Host-derived from the job's `created_by` stamp, which an app never
    * supplies, so it cannot be used to claim another app's jobs. Absent on an
    * older gateway. */
   app?: string | null
-  /** True only when the USER paused the job; execution never sets it. */
+  /** True when the USER paused the job, and also on a one-shot its own run
+   * parked (the store writes the same flags); `parked_after_run` tells them apart. */
   user_paused?: boolean
+  /** True when the pause is a fired one-shot's park, not the user's. Absent on an
+   * older gateway. */
+  parked_after_run?: boolean
   /** Operator-granted vault secrets injected into a script/command job's env at
    * fire time: env-var name -> vault secret NAME (values never leave the vault).
    * Absent/null when the job holds no grant. */

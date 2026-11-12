@@ -68,10 +68,11 @@ the larger of 8px and the space between the list's row and the end of the conten
 the whole list inside the area at the end of the scroll as well. Both are measured off
 the nearest scrolling ancestor rather than computed from the viewport, so the cap also
 holds when Settings is embedded in a split pane. A capped list shows the same
-decorative "More below" cue as SidePanelLayout's tab column (`MoreBelowCue`) while
-rows remain below. The cue is a strip inside the cap, under the scrolling rows, so it
-stays on the list's visible bottom edge as the rows scroll; it hides at the end of the
-list and is absent when the list fits. The narrow single-column layout is unchanged.
+"More below" cue as SidePanelLayout's tab column (`MoreBelowCue`) while rows remain
+below. The cue is a strip inside the cap, under the scrolling rows, so it stays on the
+list's visible bottom edge as the rows scroll; it hides at the end of the list and is
+absent when the list fits. The cue is a button: a click scrolls the list down by most
+of its height. The narrow single-column layout is unchanged.
 
 ### Read every class here narrow-first
 
@@ -331,8 +332,17 @@ rows under 600px tall so a short window still fits both rows above the dock.
 way: one dock root (`composer-dock-root`) over the scroller's bottom edge holding
 the jump pill, the bars, the queue, the question card, the notices and the
 composer, measured by the same `useComposerDockMetrics` and paid for by the same
-`DOCK_CLEARANCE_PX` (`pages/chat/composerDockMetrics.ts`, shared by both hosts).
+`DOCK_CLEARANCE_PX` (`pages/chat/composerDockMetrics.ts`, shared by every host).
 The pane has no welcome hero, so nothing in it ends above the dock.
+
+The crew window (`pages/chat/crew-window/CrewChatWindow.tsx`, a session on a
+connected crew) is the third host: its dock root (`crew-window-dock`) holds the
+window's notices column and the composer, takes the same measurement and
+clearance, and stops short of the scrollbar gutter like the other two. In that
+column a card notice (`ErrorNotice`'s framed default) stands on its own, and
+the frameless lines (an inline read failure, the offline readout, the rewind
+prompt) share one glass chip, so no text paints bare onto the rows passing
+under it.
 
 The same reading applies at the TOP of a chat that a host crowns with a glass
 chip: the Members page's DM header (the Glass identity pill, the switcher, the

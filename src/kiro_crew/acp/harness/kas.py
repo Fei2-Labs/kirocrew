@@ -57,14 +57,30 @@ from kiro_crew.acp.harness.base import (
 from kiro_crew.acp.kas_agents import KasAgentTranslationError
 from kiro_crew.acp.kas_app_identity import resolve_app_identity_launches
 from kiro_crew.acp.kas_host_auth import answer_get_access_token, vault_holds_identity_off_loop
-from kiro_crew.acp.kas_tool_limits import with_switched_off_tools
+from kiro_crew.acp.kas_mcp_json_legacy import legacy_mcp_json
+from kiro_crew.acp.kas_prompt import prompt_unread_notice, spec_prompt
+from kiro_crew.acp.kas_settings_mcp import excluded_whole, include_mcp_json, stamp_settings_mcp
+from kiro_crew.acp.kas_spec_carry import use_aws_notice
+from kiro_crew.acp.kas_start_agent import START_AGENT_ID, with_start_agent
+from kiro_crew.acp.kas_steering import inheritance_off_notice, with_kas_steering
+from kiro_crew.acp.kas_subagent_targets import _excluding_switched_off, project_subagent_targets
+from kiro_crew.acp.kas_tool_limits import (
+    kas_globs,
+    unmatched_disabled_globs,
+    unmatched_globs_notice,
+    with_switched_off_tools,
+)
 from kiro_crew.acp.kas_transport import (
     METHOD_KAS_AUTH_GET_ACCESS_TOKEN,
     build_kas_argv,
     build_kas_bundle_argv,
 )
 from kiro_crew.acp.kas_withheld_notice import withheld_credentials_notice
-from kiro_crew.acp.session_mcp import project_agent_spec, session_mcp_disabled_tools
+from kiro_crew.acp.session_mcp import (
+    project_agent_spec,
+    session_mcp_disabled_servers,
+    session_mcp_disabled_tools,
+)
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
@@ -73,6 +89,7 @@ from kiro_crew.acp.types import (
     METHOD_KAS_SESSION_DELETE,
     METHOD_KAS_TOOLS_CHANGED,
     METHOD_SESSION_CLOSE,
+    METHOD_SESSION_NEW,
 )
 from kiro_crew.agent import ForkGovernanceUnresolved
 from kiro_crew.config import paths as paths_mod
@@ -218,13 +235,93 @@ def _is_operator_override(binary: str, environ: Mapping[str, str]) -> bool:
 PROJECT_SPEC_HONOURED_KEYS = ("name", "description", "prompt", "tools", "excludedTools", "model")
 
 
+def _bot_owns_mate_file(agent: str) -> bool:
+    """Whether a live Bot is bound to its own ``mates/agents/<agent>.json``.
+
+    The registry rule the roster and the capability editor share
+    (``mate_capabilities.binding_is_mate``): a binding named *agent* whose
+    ``kiro_agent`` is *agent*. A file outlives its Bot's delete, so file
+    presence alone does not say a Bot owns it. Blocking (a config load).
+    """
+    from kiro_crew.mate_capabilities import binding_is_mate
+
+    return binding_is_mate(agent)
+
+
+def _crewmate_spec(mate_dir: Path, agent: str) -> dict[str, Any]:
+    """*agent*'s spec read from the crewmate folder, ready to project."""
+    from kiro_crew.mate_worker import drop_partial_platform_servers
+    from kiro_crew.template_mcp_additions import merge_at_spawn
+
+    mate_spec = kas_agents_mod.load_agent_spec(mate_dir, agent)
+    # A platform server switched on with no transport is never launched from
+    # here: the gateway supplies that server.
+    drop_partial_platform_servers(mate_spec)
+    # Trusted like a user-level spec, so its approved additions merge here too.
+    return merge_at_spawn(agent, mate_spec)
+
+
+def _keep_malformed_tool_list(own: dict[str, Any], keys: dict[str, Any]) -> dict[str, Any]:
+    """*keys* without its ``disabledTools`` when *own* carries one that is not a list.
+
+    KAS refuses a session whose spec holds a malformed ``disabledTools``. Joining a
+    checkout's list onto it would replace it with a valid one and start the server
+    with no exclusions, so the malformed value is left for the translator to refuse.
+    """
+    prior = own.get("disabledTools")
+    if prior is None or isinstance(prior, list):
+        return keys
+    return {key: value for key, value in keys.items() if key != "disabledTools"}
+
+
+def _with_project_switch_offs(spec: dict[str, Any], project: dict[str, Any]) -> dict[str, Any]:
+    """*spec* with the checkout spec's switch-off keys layered on its own servers.
+
+    Only narrows: a mute or switched-off tools from *project* reach a server *spec*
+    already declares, and nothing else of the checkout does. A name *spec* does not
+    declare is skipped, so the checkout can add no entry. The same keys the
+    mirrored hosts layer on (``session_mcp._with_restrictions``).
+    """
+    from kiro_crew.acp.session_mcp import _project_restrictions, _with_restrictions
+
+    declared = spec.get("mcpServers")
+    if not isinstance(declared, dict):
+        return spec
+    kept = {
+        name: _keep_malformed_tool_list(declared[name], keys)
+        for name, keys in _project_restrictions(project).items()
+        if isinstance(declared.get(name), dict)
+    }
+    return _with_restrictions(spec, kept)
+
+
+def session_projects_folder_hooks(session_key: str) -> bool:
+    """Whether a session keyed *session_key* projects a folder agent's own hooks.
+
+    False for a ``cron:``-keyed session, whose turns never fire them, so every
+    projection of that session (its own agent and each native sub-agent target)
+    keeps its auto-approvals; ``spec_hooks.kas_hook_checkout`` reads the same rule.
+    """
+    # Deferred: agent_sdk imports this package at load time.
+    from kiro_crew.agent_sdk.spec_hooks import CRON_SESSION_KEY_PREFIX
+
+    return not session_key.startswith(CRON_SESSION_KEY_PREFIX)
+
+
 def resolve_projected_spec(
-    agents_dir: Path, agent: str, work_dir: str | Path | None
+    agents_dir: Path,
+    agent: str,
+    work_dir: str | Path | None,
+    notices: list[str] | None = None,
+    *,
+    project_hooks: bool = True,
 ) -> tuple[dict[str, Any], Path]:
     """The spec KAS is handed for *agent*, and the directory its prompt anchors to.
 
     A name the user level declares resolves to the user-level spec in
-    *agents_dir*, whatever the checkout holds. Only a name the user level does
+    *agents_dir*; a checkout spec of the same name adds only its switch-off keys
+    (a mute, switched-off tools) for the servers that spec declares, as the
+    mirrored hosts do (:func:`_with_project_switch_offs`). Only a name the user level does
     NOT declare is looked up in ``<work_dir>/.kiro/agents/``, through the
     resolver the mirrored hosts use (``acp.session_mcp.project_agent_spec``).
 
@@ -235,16 +332,28 @@ def resolve_projected_spec(
     over the wire and a cloned repository must not choose which of the user's
     files that is.
 
-    Either way the servers and hooks a session runs are user-level, which is why
-    the broker-overlay lookup stays unscoped for this host
-    (``agent_sdk.backends.overlay_project_scope``) and why Crew's spec hooks keep
-    reading the user level (``agent_sdk.spec_hooks``).
+    Either way the servers a session runs are user-level, which is why the
+    broker-overlay lookup stays unscoped for this host
+    (``agent_sdk.backends.overlay_project_scope``). Its hooks are user-level too,
+    except a project-only agent's own ``hooks``, kept when the folder's
+    project-hooks choice is on and *project_hooks* is true (below; Crew fires them
+    through ``agent_sdk.kas_project_hooks``).
 
     A project-only spec that exists but cannot be read raises
     :class:`KasAgentTranslationError`: there is no other spec of that name to run.
     A name no spec declares at either level raises its subclass
     :class:`~kiro_crew.acp.kas_agents.KasAgentSpecAbsent`, so a caller can say
     what is missing rather than quote a failed file open.
+
+    A name the user level does not declare resolves to a file in the crewmate
+    folder before the checkout only while a live Bot is bound to that file
+    (:func:`_bot_owns_mate_file`); a file no Bot owns yields to a checkout spec
+    of the same name.
+
+    *notices* gets one session-start line where this differs from kiro-cli, which
+    runs a checkout's spec over the user's: when a user-level spec or a live
+    Bot's file wins over a checkout spec of the same name, and when a checkout
+    spec's keys are dropped.
     """
     from kiro_crew.agent_files import is_mate_service_agent
 
@@ -264,6 +373,15 @@ def resolve_projected_spec(
         from kiro_crew.template_mcp_additions import merge_at_spawn
 
         spec = merge_at_spawn(agent, kas_agents_mod.load_agent_spec(agents_dir, agent))
+        declared, project = project_agent_spec(agent, work_dir) if work_dir else (False, None)
+        if declared and notices is not None:
+            notices.append(
+                f"ℹ Agent {agent} is defined in this folder's .kiro/agents and in "
+                "your own agents folder. Your own one runs here. kiro-cli would run "
+                "the folder's, but Crew does not let a cloned folder replace your agent."
+            )
+        if isinstance(project, dict):
+            spec = _with_project_switch_offs(spec, project)
         # A user-level custom agent gets Crew's default servers, through the helper
         # the kiro-cli skill view applies too, so the two paths cannot drift.
         return with_default_crew_servers(agent, spec), agents_dir
@@ -273,22 +391,24 @@ def resolve_projected_spec(
     # the folder is the privacy boundary. It is a full custom-agent spec Crew
     # wrote, trusted like a user-level one (not key-restricted like the untrusted
     # project checkout below) because the governance ceiling re-applies at
-    # projection regardless. Checked BEFORE the project scope so a crewmate id
-    # never resolves to a same-named spec a checkout happens to carry; its prompt
-    # anchors to the crewmate folder.
+    # projection regardless. Its prompt anchors to the crewmate folder.
     mate_dir = paths_mod.mate_agents_dir()
-    if not kas_agents_mod.agent_spec_absent(mate_dir, agent):
-        from kiro_crew.mate_worker import drop_partial_platform_servers
-
-        mate_spec = kas_agents_mod.load_agent_spec(mate_dir, agent)
-        # A platform server switched on with no transport is never launched from
-        # here: the gateway supplies that server.
-        drop_partial_platform_servers(mate_spec)
-        # Trusted like a user-level spec, so its approved additions merge here too.
-        from kiro_crew.template_mcp_additions import merge_at_spawn
-
-        return merge_at_spawn(agent, mate_spec), mate_dir
+    mate_file = not kas_agents_mod.agent_spec_absent(mate_dir, agent)
+    if mate_file and _bot_owns_mate_file(agent):
+        # A live Bot's file is checked BEFORE the project scope, so a Bot id never
+        # resolves to a same-named spec a checkout happens to carry.
+        if notices is not None and work_dir and project_agent_spec(agent, work_dir)[0]:
+            notices.append(
+                f"ℹ Agent {agent} is defined in this folder's .kiro/agents and is "
+                f"also your Bot {agent}. The Bot's own agent runs here, because a "
+                "cloned folder does not replace a Bot."
+            )
+        return _crewmate_spec(mate_dir, agent), mate_dir
     declared, project = project_agent_spec(agent, work_dir)
+    if mate_file and not declared:
+        # A file no Bot is bound to (a deleted Bot's leftover) answers only a name
+        # the checkout does not declare: it never replaces a folder agent.
+        return _crewmate_spec(mate_dir, agent), mate_dir
     # Every branch below hands its spec through ``merge_at_spawn``: the servers the
     # user approved for this template reach whichever spec KAS is given.
     from kiro_crew.template_mcp_additions import merge_at_spawn
@@ -307,12 +427,18 @@ def resolve_projected_spec(
         raise KasAgentTranslationError(
             f"agent {agent!r} is declared by {work_dir}/.kiro/agents but that spec is unreadable"
         )
-    prompt = project.get("prompt")
+    prompt = spec_prompt(project)
+    if "prompt" not in project and prompt is not None:
+        # kiro-cli's ``systemPrompt`` spelling, carried as ``prompt`` so the path
+        # rules below and the honoured-keys filter apply to it.
+        project = {**project, "prompt": prompt}
     if isinstance(prompt, str) and prompt.startswith(kas_agents_mod._PROMPT_FILE_SCHEME):
         ref = prompt[len(kas_agents_mod._PROMPT_FILE_SCHEME) :]
         # ``anchor``, not ``is_absolute``: on Windows ``/etc/x`` is rooted without a
         # drive, so it is not absolute there yet still names a file outside the checkout.
-        if Path(ref).expanduser().anchor:
+        # A leading ``$`` is rooted too: kiro-cli reads ``$HOME/x`` as an absolute path.
+        # So is a leading ``~`` (``~user`` too), checked without expanding it.
+        if ref.startswith(("$", "~")) or Path(ref).anchor:
             raise KasAgentTranslationError(
                 f"agent {agent!r} is declared by a project checkout, so its prompt must be "
                 f"a path inside that checkout's .kiro/agents, not {ref!r}"
@@ -321,8 +447,14 @@ def resolve_projected_spec(
         # checkout's agents directory. ``resolve_prompt`` lets a TRUSTED spec use
         # ``..``; a cloned repository must not choose which of the user's files
         # is shipped over the wire.
-        base = paths_mod.project_agents_dir(work_dir or ".").resolve()
-        target = (base / ref).resolve()
+        try:
+            base = paths_mod.project_agents_dir(work_dir or ".").resolve()
+            target = (base / ref).resolve()
+        except (OSError, RuntimeError) as exc:  # a symlink loop in the checkout
+            raise KasAgentTranslationError(
+                f"agent {agent!r} is declared by a project checkout whose prompt path "
+                f"{ref!r} cannot be resolved: {exc}"
+            ) from exc
         if target != base and base not in target.parents:
             raise KasAgentTranslationError(
                 f"agent {agent!r} is declared by a project checkout, so its relative prompt "
@@ -331,58 +463,94 @@ def resolve_projected_spec(
         # Hand on the target that was checked, not the ref: resolving the ref again
         # at read time would follow a link the checkout repointed in between.
         project = {**project, "prompt": kas_agents_mod._PROMPT_FILE_SCHEME + target.as_posix()}
-    dropped = sorted(k for k in project if k not in PROJECT_SPEC_HONOURED_KEYS)
+    # ``systemPrompt`` is not dropped: it was carried as ``prompt`` above.
+    honoured: tuple[str, ...] = PROJECT_SPEC_HONOURED_KEYS
+    # A cron session's projection (*project_hooks* false) keeps none: cron never
+    # fires a folder agent's own hooks, so none may withhold its auto-approvals.
+    if project_hooks and project.get("hooks"):
+        from kiro_crew.project_hooks_consent import hooks_enabled
+
+        if hooks_enabled(work_dir)[0]:
+            # The folder's hooks run (the owner's choice, or kiro-cli's trust). They
+            # are kept so the projection withholds auto-approval for what their
+            # PreToolUse matchers cover (``kas_agents.pre_tool_hook_matchers``);
+            # KAS itself never receives them (``kas_agents.UNSUPPORTED_SPEC_KEYS``),
+            # Crew fires them (``agent_sdk.spec_hooks._consented_kas_project_hooks``).
+            honoured = (*PROJECT_SPEC_HONOURED_KEYS, "hooks")
+    dropped = sorted(k for k in project if k not in honoured and k != "systemPrompt")
     if dropped:
         logger.info(
             "agent %r: the project checkout's spec is not trusted to grant; ignored keys: %s",
             agent,
             ", ".join(dropped),
         )
-    spec = {k: project[k] for k in PROJECT_SPEC_HONOURED_KEYS if k in project}
+        if notices is not None:
+            # Key names only, never values: they come from a cloned folder.
+            names = ", ".join(k for k in dropped if k.isidentifier()) or "some keys"
+            notices.append(
+                f"ℹ Agent {agent} comes from this folder's .kiro/agents, so it runs "
+                f"without {names}. Crew takes only a folder agent's name, description, "
+                "prompt, tools and model. Copy it to your own agents folder to use the rest."
+            )
+    spec = {k: project[k] for k in honoured if k in project}
     # The checkout's keys are filtered above; the approved additions come from the
     # user's own record, never from the checkout. The checkout's switch-off keys for
     # an approved server (a mute, switched-off tools) are kept, and only those, and
     # are layered onto the servers that one merge produced, so the record is read
     # once and a server approved meanwhile cannot launch unmuted.
-    from kiro_crew.acp.session_mcp import _project_restrictions
-
-    spec = merge_at_spawn(agent, spec)
-    merged = spec.get("mcpServers")
-    if isinstance(merged, dict):
-        for name, kept in _project_restrictions(project).items():
-            if isinstance(merged.get(name), dict):
-                merged[name] = {**merged[name], **kept}
+    spec = _with_project_switch_offs(merge_at_spawn(agent, spec), project)
     if work_dir is None:  # unreachable: ``project_agent_spec`` declares nothing without one
         return spec, agents_dir
     return spec, paths_mod.project_agents_dir(work_dir)
 
 
-def _skill_scope_rules(
+def _skill_scope(
     agent: str,
     spec: dict[str, Any],
     spec_dir: Path,
     work_dir: str | Path | None,
-) -> tuple[dict[str, Any], ...]:
-    """The ``skill`` deny rules that give this KAS session its kiro-cli skill set.
+) -> tuple[tuple[dict[str, Any], ...], tuple[str, ...]]:
+    """The ``skill`` deny rules and the extra ``skill://`` resources that give this
+    KAS session its kiro-cli skill set.
 
     KAS loads ``~/.kiro/skills`` and the workspace's ``.kiro/skills`` for every
     session on top of the agent's ``resources``; kiro-cli under Crew loads only the
-    scope Crew resolves (``acp/kas_skill_scope.py``). A failure here costs the
-    narrowing, never the session: the extra skills are the user's own, and a
-    session that fails to start over them loses more than it protects.
+    scope Crew resolves (``acp/kas_skill_scope.py``). The resources are fixed
+    copies of in-scope skills KAS would drop (``refused_skill_copies``). A failure
+    here costs the narrowing or the copies, never the session: the skills are the
+    user's own, and a session that fails to start over them loses more than it
+    protects.
     """
     from kiro_crew.acp import kas_skill_scope
 
     try:
         globs = kas_skill_scope.scope_globs(agent, spec, agents_dir=spec_dir, work_dir=work_dir)
-        return tuple(kas_skill_scope.skill_scope_rules(globs, work_dir=work_dir))
     except Exception:  # see the docstring: degrade to the unscoped catalog
         logger.warning(
             "KAS skill scope for %r failed; the session loads KAS's default skill trees",
             agent,
             exc_info=True,
         )
-        return ()
+        return (), ()
+    try:
+        copies = kas_skill_scope.refused_skill_copies(
+            agent, spec, globs, agents_dir=spec_dir, work_dir=work_dir
+        )
+    except Exception:  # see the docstring: the session runs without the copies
+        logger.warning("KAS skill copies for %r failed", agent, exc_info=True)
+        copies = []
+    try:
+        rules = kas_skill_scope.skill_scope_rules(
+            globs, work_dir=work_dir, also_allowed=frozenset(c.name for c in copies)
+        )
+    except Exception:  # see the docstring: degrade to the unscoped catalog
+        logger.warning(
+            "KAS skill scope for %r failed; the session loads KAS's default skill trees",
+            agent,
+            exc_info=True,
+        )
+        rules = []
+    return tuple(rules), tuple(c.uri for c in copies)
 
 
 def mate_worker_projection(
@@ -409,22 +577,80 @@ def withdrawn_worker_stubs(spec: dict[str, Any], stub_names: frozenset[str]) -> 
     """The names in *stub_names* whose server *spec* does not mount unmuted.
 
     *spec* is the governed worker spec the KAS payload is built from. A stub
-    whose server it drops, mutes (``mcp_cleanup.mcp_entry_is_muted``) or marks
-    registry-governed (``mcp_cleanup.mcp_entry_is_registry_governed``) is
-    withdrawn, so a mute or a ``type: registry`` saved after the stubs were
-    selected still takes effect.
+    whose server it drops, mutes, or marks registry-governed
+    (``mcp_cleanup.mcp_entry_is_registry_governed``) is withdrawn, so a mute or a
+    ``type: registry`` saved after the stubs were selected still takes effect. The
+    mute is the entry's own or a config scope's
+    (``mcp_cleanup.mcp_scope_muted_aliases``): MCP Management writes it to a scope
+    file, never into a spec it does not own.
     """
-    from kiro_crew.mcp_cleanup import mcp_entry_is_muted, mcp_entry_is_registry_governed
+    from kiro_crew.mcp_cleanup import (
+        mcp_entry_is_muted,
+        mcp_entry_is_registry_governed,
+        mcp_scope_muted_aliases,
+    )
+    from kiro_crew.mcp_utils import mcp_server_alias
 
     servers = spec.get("mcpServers")
     if not isinstance(servers, dict):
         return frozenset(stub_names)
+    scope_muted = mcp_scope_muted_aliases()
     return frozenset(
         name
         for name in stub_names
         if not isinstance(servers.get(name), dict)
         or mcp_entry_is_muted(servers[name])
+        or mcp_server_alias(name) in scope_muted
         or mcp_entry_is_registry_governed(servers[name])
+    )
+
+
+def muted_stubs(spec: dict[str, Any], stub_names: frozenset[str]) -> frozenset[str]:
+    """The names in *stub_names* whose ``mcpServers`` entry in *spec* is muted.
+
+    Narrower than :func:`withdrawn_worker_stubs`: a stub whose server *spec* does
+    not declare is kept, because an ordinary agent's stubs come from the same
+    user-level spec this payload reads and only a mute layered on it since
+    (a checkout's switch-off) can disagree.
+    """
+    from kiro_crew.mcp_cleanup import mcp_entry_is_muted
+
+    servers = spec.get("mcpServers")
+    if not isinstance(servers, dict):
+        return frozenset()
+    return frozenset(
+        name
+        for name in stub_names
+        if isinstance(servers.get(name), dict) and mcp_entry_is_muted(servers[name])
+    )
+
+
+def _kiro_cli_builtin_reason(agent: str) -> str:
+    """Why kiro-cli's built-in *agent* does not start on KAS, naming what to pick instead.
+
+    KAS has no definition of it, and running KAS's own closest mode would decide
+    some tool calls without asking Crew. Reads config for the default template.
+    """
+    from kiro_crew.config.loader_snapshots import (
+        DEFAULT_KIRO_TEMPLATE,
+        KIRO_CLI_BUILTIN_AGENTS,
+        default_template,
+    )
+
+    try:
+        from kiro_crew.config import KiroCrewConfig
+
+        default = default_template(KiroCrewConfig.load())
+    except Exception:  # noqa: BLE001 - the name is a hint, never a gate
+        logger.debug("no default template for the %r refusal", agent, exc_info=True)
+        default = DEFAULT_KIRO_TEMPLATE
+    if default in KIRO_CLI_BUILTIN_AGENTS:
+        # A configured default that is itself refused here is no pick.
+        default = DEFAULT_KIRO_TEMPLATE
+    return (
+        f'The agent "{agent}" is built into kiro-cli and has no safe match on KAS. '
+        f'Pick Kiro Crew\'s default agent "{default}" instead, or run '
+        f"`kiro-cli --agent {agent}` in this chat's Terminal tab."
     )
 
 
@@ -485,6 +711,18 @@ class KasHarness(MembershipHarness):
     #: :func:`kas_agent_prompt_issue` for the process this harness last spawned:
     #: set at each spawn, so it describes the engine running, not the one on disk.
     agent_prompt_notice = ""
+    #: Whether that process is known to apply a custom agent's prompt: a relay
+    #: kiro-cli at or above the floor. Crew's bundled engine and an unknown release
+    #: are not: no capture shows either applying it.
+    agent_prompt_applied = False
+    #: The sandbox tier the process this harness last spawned was asked for, so
+    #: the launch's SSH forward verdict is re-judged on the engine's own tier, never
+    #: on a later config. None until a spawn: then no socket is relayed.
+    spawn_sandbox_mode: str | None = None
+    #: The engine version of the process this harness last spawned, when Crew
+    #: knows it: its own bundle's. ``""`` on the relay, whose ``initialize``
+    #: names no engine version.
+    bundle_engine_version = ""
 
     # ── Seam 1: spawn ──
 
@@ -508,7 +746,8 @@ class KasHarness(MembershipHarness):
         which the runtime maps to the Kiro sign-in prompt. A missing engine is
         installed here, in the gateway, one install at a time
         (:mod:`kiro_crew.acp.kas_engine_install`); a failed install is a refusal
-        naming the cause and the retry command.
+        naming the cause and the retry command, and a host that cannot run the
+        engine is a final refusal (``AcpKasHostUnsupported``) naming the cause alone.
 
         **Relay**: ``kiro-cli`` in relay mode. Crew owns the credential when its
         own vault holds a signed-in identity, and kiro-cli owns it otherwise.
@@ -521,16 +760,20 @@ class KasHarness(MembershipHarness):
         from kiro_crew.acp.kiro_cli_missing import AcpKiroCliMissing
         from kiro_crew.acp.session_handle import AcpRuntimeError
 
+        self.spawn_sandbox_mode = ctx.sandbox_mode
+        self.bundle_engine_version = ""
         if await asyncio.to_thread(_bundle_route_selected):
             return await self._bundle_spawn_plan(
                 ctx, kas_route_mod.KasRoute(bundle=True, reason=kas_route_mod.REASON_CONFIGURED)
             )
 
         kas_bin = await _resolve_kiro_bin_for_spawn(environ=dict(ctx.environ), home=ctx.home)
-        # Read only when the route is still open: a stored Kiro CLI pick never
-        # leaves kiro-cli (``kas_route`` rule 2).
+        # Read only when the route is still open: a stored Kiro CLI pick, the
+        # session's own pin first, never leaves kiro-cli (``kas_route`` rule 2).
         host_auth: bool | None = None
-        switch_allowed = await asyncio.to_thread(kas_route_mod.automatic_switch_allowed)
+        switch_allowed = await asyncio.to_thread(
+            kas_route_mod.automatic_switch_allowed, ctx.harness_pin
+        )
         # Off the loop: on Windows the comparison resolves the override's real path.
         operator_override = False
         if kas_bin:
@@ -576,6 +819,9 @@ class KasHarness(MembershipHarness):
         kiro_cli_version = await asyncio.to_thread(installed_kiro_cli_version)
         warn_kas_vocabulary_drift(kiro_cli_version)
         self.agent_prompt_notice = kas_agent_prompt_issue(kiro_cli_version)
+        self.agent_prompt_applied = (
+            kiro_cli_version is not None and kiro_cli_version >= KAS_AGENT_PROMPT_MIN_KIRO_CLI
+        )
 
         if host_auth is None:
             # Reads the vault off the loop and never raises.
@@ -652,6 +898,7 @@ class KasHarness(MembershipHarness):
         # whether or not that route is used.
         from kiro_crew.acp import kas_bundle as kas_bundle_mod
         from kiro_crew.acp import kas_engine_install
+        from kiro_crew.acp.kas_host_unsupported import AcpKasHostUnsupported
         from kiro_crew.acp.session_handle import AcpRuntimeError
         from kiro_crew.config.loader import KiroCrewConfig
 
@@ -663,6 +910,9 @@ class KasHarness(MembershipHarness):
                 bundle = await asyncio.to_thread(
                     partial(kas_engine_install.install_pinned_engine, base_url, caller="spawn")
                 )
+            except kas_bundle_mod.KasHostUnsupported as exc:
+                # Final, not a failed transfer: the next spawn finds the same host.
+                raise AcpKasHostUnsupported(f"{route.describe()}. {exc}") from exc
             except kas_bundle_mod.KasBundleError as exc:
                 raise AcpRuntimeError(f"{route.describe()}. {exc}") from exc
         logger.info(
@@ -673,6 +923,8 @@ class KasHarness(MembershipHarness):
         )
         # Crew's own engine: kiro-cli's release says nothing about it.
         self.agent_prompt_notice = ""
+        self.agent_prompt_applied = False
+        self.bundle_engine_version = bundle.version
         return SpawnPlan(
             argv=build_kas_bundle_argv(str(bundle.node_bin), str(bundle.acp_server)),
             spawn_label=KAS_BUNDLE_SPAWN_LABEL,
@@ -711,6 +963,13 @@ class KasHarness(MembershipHarness):
 
         ``agent.child_env_defaults`` applies here too, for the same reason: the
         relay is a kiro-cli process with the same core-count-sized pools.
+
+        Crew's own engine bundle also gets ``NODE_USE_SYSTEM_CA=1``, unless the
+        operator already set it (``0`` included). Node trusts only its built-in
+        roots otherwise, so a corporate CA that lives only in the OS store fails
+        every TLS call. kiro-cli sets the same default when it spawns KAS
+        (``apply_node_system_ca_env`` in its ``launch.rs``), so the relay needs
+        nothing from Crew.
         """
         from kiro_crew.config.loader import inject_kiro_cli_api_key, strip_kiro_cli_api_key
 
@@ -720,6 +979,7 @@ class KasHarness(MembershipHarness):
             strip_kiro_cli_api_key(env)
         if _runs_crew_engine_bundle(spawned_binary):
             defer_mandatory_mcps_env(env)
+            env.setdefault("NODE_USE_SYSTEM_CA", "1")
         else:
             pin_mandatory_mcps_env(env, spawned_binary=spawned_binary)
         apply_child_env_defaults(env)
@@ -761,6 +1021,11 @@ class KasHarness(MembershipHarness):
         handle.kas_crew_answered = kas_agents_mod.projected_crew_answered(
             custom_agents, active_agent
         )
+        # The MCP grants a PreToolUse hook kept at ``ask``: answered the same way,
+        # but only on a surface that fires the hooks (``batch-guard-grant`` row).
+        from kiro_crew.acp.kas_hook_coverage import projected_hook_held
+
+        handle.kas_hook_held = projected_hook_held(custom_agents, active_agent)
         handle.kas_crew_answered_commands = kas_agents_mod.projected_crew_answered_commands(
             custom_agents, active_agent
         )
@@ -772,14 +1037,36 @@ class KasHarness(MembershipHarness):
         # A `fallbackAction: "deny"` spec's write allowlist, anchored at the
         # session's own directory: the gate refuses every other file write of this
         # agent (`spec-write-allowlist` tier).
-        from kiro_crew.acp.kas_write_allowlist import projected_write_allowlist
+        from kiro_crew.acp.kas_write_allowlist import (
+            projected_answered_paths,
+            projected_answered_read_paths,
+            projected_write_allowlist,
+        )
 
         handle.kas_spec_write_allowlist = projected_write_allowlist(
+            custom_agents, active_agent, getattr(handle, "_bound_cwd", "")
+        )
+        from kiro_crew.acp.kas_spec_denies import projected_spec_denies
+
+        handle.kas_spec_denies = projected_spec_denies(
+            custom_agents, active_agent, getattr(handle, "_bound_cwd", "")
+        )
+        # `autoAllowReadonly: true` beside `denyByDefault`, and the write tool's
+        # `allowedPaths` the gate answers (`spec-builtin-grant` tier).
+        handle.kas_spec_shell_readonly = kas_agents_mod.projected_shell_readonly(
+            custom_agents, active_agent
+        )
+        handle.kas_crew_answered_paths = projected_answered_paths(
+            custom_agents, active_agent, getattr(handle, "_bound_cwd", "")
+        )
+        handle.kas_crew_answered_read_paths = projected_answered_read_paths(
             custom_agents, active_agent, getattr(handle, "_bound_cwd", "")
         )
         handle.kas_projected_agent = active_agent if custom_agents else ""
         handle.kas_registered_agents = list(custom_agents) if custom_agents else []
         handle.kas_agent_prompt_notice = self.agent_prompt_notice if custom_agents else ""
+        handle.kas_agent_prompt_applied = self.agent_prompt_applied
+        handle.kas_bundle_engine_version = self.bundle_engine_version
 
     async def session_extras(
         self,
@@ -791,6 +1078,10 @@ class KasHarness(MembershipHarness):
         crew_panel: bool = False,
         session_key: str = "",
         worker_stub_names: frozenset[str] | None = None,
+        engine_features: frozenset[str] = frozenset(),
+        session_cwd: str | Path | None = None,
+        ssh_auth_sock_forwarded: bool = False,
+        governance_app: str | None = None,
     ) -> SessionExtras:
         """Project the agent spec onto KAS, for both session start paths.
 
@@ -849,6 +1140,7 @@ class KasHarness(MembershipHarness):
             # second read is removed rather than re-verified. Every other agent mirrors
             # nothing, has no snapshot, and is resolved nearest-first here.
             agents_dir = paths_mod.kiro_agents_dir()
+            spec_notices: list[str] = []
             # A session bound to an app's own agent projects that app's registered
             # file, read by its path; a bound file that is gone refuses the session
             # instead of falling back to a checkout's spec of the same name.
@@ -866,14 +1158,29 @@ class KasHarness(MembershipHarness):
                 spec, prompt_dir = merge_at_spawn(agent, bound), agents_dir
             else:
                 try:
-                    spec, prompt_dir = resolve_projected_spec(agents_dir, agent, work_dir)
+                    spec, prompt_dir = resolve_projected_spec(
+                        agents_dir,
+                        agent,
+                        # The session's own folder, the one Crew fires its folder
+                        # agent's hooks from (``spec_hooks.kas_hook_checkout``), so a
+                        # sub-agent in another folder projects that folder's choice.
+                        session_cwd or work_dir,
+                        spec_notices,
+                        project_hooks=session_projects_folder_hooks(session_key),
+                    )
                 except kas_agents_mod.KasAgentSpecAbsent as exc:
                     # Nothing defines the agent, so name what removed it (an app
                     # switched off, usually) and the fix, rather than a file open
-                    # that failed. Still a refusal: there is no spec to run.
-                    raise AcpAgentUnavailable(
-                        _missing_agent_reason(agent, session_key), agent=agent
-                    ) from exc
+                    # that failed. Still a refusal: there is no spec to run. A
+                    # kiro-cli built-in no app declares gets its own reason.
+                    from kiro_crew.apps.manager import owning_app_for_agent
+                    from kiro_crew.config.loader_snapshots import KIRO_CLI_BUILTIN_AGENTS
+
+                    if agent in KIRO_CLI_BUILTIN_AGENTS and owning_app_for_agent(agent) is None:
+                        reason = _kiro_cli_builtin_reason(agent)
+                    else:
+                        reason = _missing_agent_reason(agent, session_key)
+                    raise AcpAgentUnavailable(reason, agent=agent) from exc
             if agent == MATE_WORKER_AGENT:
                 # A crewmate's worker: its source base plus that crewmate's own
                 # additions, governed as one spec, with its prompt as literal
@@ -886,6 +1193,13 @@ class KasHarness(MembershipHarness):
                     # Refused, never the bare base: what could not be read may
                     # hold the crewmate's own limits.
                     raise AcpAgentUnavailable(str(exc), agent=agent) from exc
+            # KAS loads workspace steering itself, honouring each file's inclusion, from
+            # the session's own folder (a subagent's may differ from the runtime's).
+            steering_dir = session_cwd or work_dir
+            spec = with_kas_steering(spec, steering_dir)
+            spec_notices.extend(
+                n for n in (inheritance_off_notice(steering_dir), use_aws_notice(agent, spec)) if n
+            )
             try:
                 # A session-injected server outranks an agent-declared one, so
                 # declaring both is a double registration. Only the caller holds
@@ -927,6 +1241,11 @@ class KasHarness(MembershipHarness):
                 # so a server muted or removed in between is withdrawn from the
                 # session-level array too: this payload is the later reading.
                 withdrawn = withdrawn_worker_stubs(spec, worker_stub_names)
+            else:
+                # A server this spec declares muted (a checkout's switch-off,
+                # ``_with_project_switch_offs``) is withdrawn from the session-level
+                # array too, or its broker stub would still mount it.
+                withdrawn = muted_stubs(spec, stubbed)
             if member_dispatch:
                 # The member's dashboard server arrives as a session-level entry
                 # too, so it joins the subtraction set for the same reason: an
@@ -946,22 +1265,104 @@ class KasHarness(MembershipHarness):
             # did not change has to compare against this snapshot rather than against a
             # fresh read of the file.
             withheld: kas_agents_mod.WithheldOut = {}
+            prompt_unread: list[Path] = []
+            scope_rules, skill_copies = _skill_scope(agent, spec, prompt_dir, work_dir)
+            projected = spec
+            if skill_copies:
+                # Crew's own copies of the spec's skills, not a widening of the
+                # spec: each stands in for a skill already in its scope.
+                declared = spec.get("resources")
+                kept = declared if isinstance(declared, list) else []
+                projected = {**spec, "resources": [*kept, *skill_copies]}
+            # The verdict the engine's own sandbox wrap applied, re-judged here
+            # (off the loop) on the tier it was spawned under: a floor raised or a
+            # consent revoked since must not reach new servers. The AND only drops.
+            forward_ssh_auth_sock = bool(
+                ssh_auth_sock_forwarded
+                and self.spawn_sandbox_mode is not None
+                and sandbox_mod._forward_ssh_auth_sock(self.spawn_sandbox_mode, ())
+            )
             custom_agents = kas_agents_mod.build_kas_custom_agents(
                 prompt_dir,
                 agent,
-                spec,
+                projected,
                 stub_server_names=stubbed,
                 member_dispatch=member_dispatch,
                 crew_panel=crew_panel,
                 session_key=session_key,
-                skill_scope_rules=_skill_scope_rules(agent, spec, prompt_dir, work_dir),
+                skill_scope_rules=scope_rules,
                 withheld_out=withheld,
+                prompt_unread_out=prompt_unread,
+                engine_features=engine_features,
+                forward_ssh_auth_sock=forward_ssh_auth_sock,
+                governance_app=governance_app,
             )
             # Every per-tool switch, the global settings file's included: the spec
             # rebuild never copies one onto Crew's own servers. Read here, off the loop.
-            custom_agents = with_switched_off_tools(
-                custom_agents, session_mcp_disabled_tools(agent, spec=spec)
+            switched_off = session_mcp_disabled_tools(agent, spec=spec)
+            custom_agents = with_switched_off_tools(custom_agents, switched_off)
+            # A server the spec mutes whole (a checkout's switch-off included) is
+            # excluded as ``@server`` too, as a sub-agent target's is, so a copy of
+            # the name from the settings file or ``mcp.json`` does not reach it.
+            muted = session_mcp_disabled_servers(spec, None)
+            custom_agents = [
+                (
+                    _excluding_switched_off(a, muted)
+                    if isinstance(a, dict) and a.get("id") == agent
+                    else a
+                )
+                for a in custom_agents
+            ]
+            # Each carried glob KAS cannot match (spec, global settings, and the
+            # mcp.json servers the stamp adds): its server still runs, so say so.
+            unmatched = {pair for pair in switched_off if kas_globs(pair[1]) is None}
+            unmatched.update(unmatched_disabled_globs(projected.get("mcpServers")))
+            # The mcp.json / cli.json reads the wire envelope finishes the block
+            # from, read here off the loop and beside the session's own directory.
+            declared = spec.get("mcpServers")
+            custom_agents = stamp_settings_mcp(
+                custom_agents,
+                agent,
+                session_cwd or work_dir,
+                declared=(
+                    [n for n in declared if n not in muted] if isinstance(declared, dict) else ()
+                ),
+                # Called for every session so the first one records the list; only
+                # a user-level spec can be on it, since a checkout's spec of the
+                # same name is not the file that was recorded.
+                legacy_mcp_json=legacy_mcp_json(agent, agents_dir, spec)
+                and prompt_dir == agents_dir,
+                notices=spec_notices,
+                unmatched=unmatched,
+                # From the spec: the projected entry never carries a ``true``.
+                opted_in=include_mcp_json(spec) is True,
             )
+            # A server KAS does not start at all (muted in the spec, so never
+            # declared, or an mcp.json server the agent does not load) needs no
+            # word on its tools.
+            not_started = set(session_mcp_disabled_servers(spec, None)).union(
+                *(excluded_whole(a) for a in custom_agents if isinstance(a, dict))
+            )
+            line = unmatched_globs_notice(sorted(p for p in unmatched if p[0] not in not_started))
+            if line:
+                spec_notices.append(line)
+            # The agents its sub-agent tool may name: KAS resolves that name only
+            # in the session's registry, which keeps no kiro-cli spec from disk.
+            # A stub withdrawn above is off the session-level array, so a target
+            # that enables that server keeps its own declaration of it.
+            targets, targets_notice = project_subagent_targets(
+                agent,
+                spec,
+                custom_agents,
+                work_dir,
+                stub_server_names=stubbed - withdrawn,
+                session_key=session_key,
+                withheld_out=withheld,
+                engine_features=engine_features,
+                settings_dir=session_cwd or work_dir,
+                forward_ssh_auth_sock=forward_ssh_auth_sock,
+            )
+            custom_agents = [*custom_agents, *targets]
             # Resolved HERE, in this thread, for the runtime's hoist: the managed
             # launch it stamps the session token onto comes from the ``kirocrew``
             # launcher lookup, which probes the filesystem and PATH.
@@ -969,7 +1370,16 @@ class KasHarness(MembershipHarness):
             apps = resolve_app_identity_launches(
                 custom_agents, agent, work_dir, kas_agents_mod.MANAGED_MCP_SERVER_NAMES
             )
-            notice = withheld_credentials_notice(withheld)
+            notice = "\n\n".join(
+                n
+                for n in (
+                    *spec_notices,
+                    prompt_unread_notice(agent, prompt_unread),
+                    targets_notice,
+                    withheld_credentials_notice(withheld),
+                )
+                if n
+            )
             return custom_agents, snapshot, managed, apps, withdrawn, notice
 
         try:
@@ -994,6 +1404,70 @@ class KasHarness(MembershipHarness):
             raise AcpRuntimeError(str(exc)) from exc
         except KasAgentTranslationError as exc:
             raise AcpRuntimeError(f"cannot project agent {agent!r} onto KAS: {exc}") from exc
+
+    def session_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        agent: str | None,
+        *,
+        agent_capabilities: dict[str, Any],
+    ) -> tuple[dict[str, Any], str | None]:
+        """Start a new session in its injected agent: ``_meta.kiro.modeId`` names it.
+
+        Without a mode id the engine starts the session in its own ``vibe`` mode
+        and starts every ``~/.kiro/settings/mcp.json`` server for it, servers the
+        injected agent may not load (``includeMcpJson`` off), until the
+        ``session/set_mode`` that follows closes them again. Naming the agent here
+        starts the session in it and spawns none of them (measured on the 0.66.33
+        bundle).
+
+        The id is read from the batch's first entry, which already carries the
+        wire id (:func:`~kiro_crew.acp._dispatch.attach_kas_custom_agents`), not
+        from *agent*: that is only the caller's override, ``None`` whenever the
+        runtime default runs. The first entry is the session's own agent: the
+        sub-agent targets :meth:`session_extras` registers
+        (:mod:`~kiro_crew.acp.kas_subagent_targets`) follow it. *agent* comes back
+        unchanged, so ``set_mode`` and the activation guards still run.
+
+        When that agent declares MCP servers of its own, the session starts in
+        the start agent instead (:mod:`~kiro_crew.acp.kas_start_agent`), added
+        after the batch's entries, so the ``set_mode`` that follows is what
+        queues the agent's servers, behind Kiro Crew's.
+
+        ``session/load`` and a batch whose first entry has no id are sent as built,
+        as the same object; the caller's dicts are never mutated.
+        """
+        if method != METHOD_SESSION_NEW:
+            return params, agent
+        meta = params.get("_meta")
+        if not isinstance(meta, dict):
+            return params, agent
+        kiro = meta.get("kiro")
+        if not isinstance(kiro, dict):
+            return params, agent
+        batch = kiro.get("customAgents")
+        if not isinstance(batch, list) or not batch or not isinstance(batch[0], dict):
+            return params, agent
+        wire_id = batch[0].get("id")
+        if not isinstance(wire_id, str) or not wire_id:
+            return params, agent
+        held = with_start_agent(batch)
+        if held is not None:
+            kiro = {**kiro, "customAgents": held}
+            wire_id = START_AGENT_ID
+        return {**params, "_meta": {**meta, "kiro": {**kiro, "modeId": wire_id}}}, agent
+
+    def start_mode_ran_servers(self, mode_id: str) -> bool:
+        """``False`` for the start agent: it declares no server.
+
+        Every report staged while a session ran in it names a session-level
+        server, which the switch to the session's own agent leaves running, so
+        those reports still count toward readiness. Without this a start whose
+        Kiro Crew servers all connected before ``set_mode`` went out would wait
+        for a status frame the engine has no reason to send again.
+        """
+        return mode_id != START_AGENT_ID
 
     def activation_refusal(self, agent: str, resp: dict[str, Any]) -> str | None:
         """Refuse an id the engine advertises as ITS OWN built-in rather than ours.

@@ -291,7 +291,7 @@ _LOADER_SIGNATURES = {
     "split_triggered": "(self, names: 'list[str]', project_dir: 'str | Path | None' = None) -> 'tuple[list[str], list[str]]'",
     "stage_skill_candidate": "(self, slug: 'str', *, description: 'str', triggers: 'str', procedure_md: 'str', provenance: 'AutoSkillProvenance', scripts: 'list[dict] | None' = None, source: 'str' = 'consolidation', kind: 'str' = 'new', target: 'str | None' = None, base_version: 'int | None' = None, refusal: 'ClaimRefusal | None' = None, missing_scripts: 'list[str] | None' = None, rejected_scripts: 'dict[str, list[str]] | None' = None) -> 'str | None'",
     "strip_frontmatter": "(content: 'str') -> 'str'",
-    "sync_builtins": "(self) -> 'None'",
+    "sync_builtins": "(self) -> 'list[tuple[str, Path]]'",
     "trigger_hint": "(self, names: 'list[str]', project_dir: 'str | Path | None' = None) -> 'str'",
     "update_auto_skill": "(self, name: 'str', *, description: 'str', triggers: 'str', procedure_md: 'str', provenance: 'AutoSkillProvenance') -> 'bool'",
     "update_skill": "(self, name: 'str', content: 'str') -> 'bool'",
@@ -1000,7 +1000,7 @@ class TestSeamsReachTheRuntime:
         _skill(extra, "ext")
         loader = make_loader(extra_paths=[str(extra)])
         assert [name for name, _p, _w in loader._iter_uncached()] == ["ext"]
-        monkeypatch.setattr(sk, "validate_file_path", lambda _raw: None)
+        monkeypatch.setattr(sk, "validate_file_path", lambda _raw, **_kw: None)
         assert loader._iter_uncached() == []
 
     def test_the_tree_walk_is_read_through_the_facade(

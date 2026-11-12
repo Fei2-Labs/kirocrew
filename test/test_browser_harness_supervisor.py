@@ -792,7 +792,7 @@ async def test_a_daemon_started_before_the_worker_failed_is_stopped(
     monkeypatch.setattr(sup, "_user_browser_ws_url", ws_url)
     daemon = object()
 
-    async def start_daemon(python: Any, relay_url: str) -> Any:
+    async def start_daemon(python: Any, relay_url: str, browser: Any) -> Any:
         return daemon
 
     async def start_worker(handle: Any) -> Any:
@@ -812,6 +812,97 @@ class _Child:
 
     returncode: int | None = None
     stdin = None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the pipe launcher is POSIX-only")
+@pytest.mark.asyncio
+async def test_a_chromium_missing_a_library_fails_the_start_naming_it(
+    short_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kiro's Chromium exits 127 at load when a shared library is missing. The start
+    reports that at once with the loader's line, instead of waiting out the daemon's
+    deadline for "the Harness daemon did not start in time"."""
+    exe = tmp_path / "chrome"
+    exe.write_text(
+        "#!/bin/sh\n"
+        'echo "$0: error while loading shared libraries: libnss3.so:'
+        ' cannot open shared object file: No such file or directory" >&2\n'
+        "exit 127\n",
+        encoding="utf-8",
+    )
+    exe.chmod(0o755)
+    monkeypatch.setattr(
+        supervisor.install,
+        "install_state",
+        lambda home: supervisor.install.InstallState(
+            prefix=home,
+            installed=True,
+            version=HARNESS_VERSION,
+            python=Path(sys.executable),
+            chromium=supervisor.install.chromium.ChromiumState(
+                version="x", platform="linux64", present=True, executable=exe
+            ),
+        ),
+    )
+    sup = HarnessSupervisor(
+        short_home,
+        base_env={"PATH": "/usr/bin:/bin"},
+        config_reader=lambda: {},
+    )
+    choice = supervisor.discover.BrowserChoice("kiro_chromium", exe, True, None)
+    monkeypatch.setattr(sup, "_choose", lambda state: choice)
+
+    class FakeRelay:
+        on_upstream_closed: Any = None
+        closed = False
+
+        async def start(self, upstream: Any) -> str:
+            self.upstream = upstream
+            return "http://127.0.0.1:1/s"
+
+        async def close(self) -> None:
+            await self.upstream.close()
+
+    monkeypatch.setattr(supervisor, "CdpRelay", FakeRelay)
+    real_spawn = sup._spawn
+    daemon = _Child()
+
+    async def spawn(argv: list[str], **kw: Any) -> Any:
+        return await real_spawn(argv, **kw) if argv[0] == supervisor._SH else daemon
+
+    async def no_ping() -> bool:
+        return False
+
+    stopped: list[object] = []
+
+    async def stop(proc: Any) -> None:
+        stopped.append(proc)
+
+    monkeypatch.setattr(sup, "_spawn", spawn)
+    monkeypatch.setattr(sup, "_ipc_ping", no_ping)
+    monkeypatch.setattr(supervisor, "_stop_process", stop)
+    with pytest.raises(supervisor.BrowserUnavailable, match="exited with code 127"):
+        await sup.ensure()
+    assert "error while loading shared libraries: libnss3.so" in sup.status()["detail"]
+    assert daemon in stopped
+
+
+def test_a_key_chromium_wrapped_across_lines_withholds_its_stderr(short_home: Path) -> None:
+    """A secret split over two stderr lines matches no pattern line by line, so the
+    whole tail is withheld rather than published in two halves."""
+    from kiro_crew.acp.stderr_tail import STDERR_WITHHELD
+
+    key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    sup = HarnessSupervisor(short_home, base_env={}, config_reader=lambda: {})
+    sup._chromium_stderr = bytearray(f"auth key={key[:18]}\n{key[18:]} rejected\n".encode())
+    detail = sup._chromium_exit_detail(1)
+    assert detail == f"Kiro's Chromium exited with code 1: {STDERR_WITHHELD}"
+    sup._chromium_stderr = bytearray(b"one\ntwo\nthree\nfour\n")
+    assert sup._chromium_exit_detail(1) == "Kiro's Chromium exited with code 1: two | three | four"
+    # A full buffer starts mid-line where the cap cut it; that piece is never shown.
+    cut = b"x" * (supervisor._CHROMIUM_STDERR_TAIL_BYTES - 4) + b"\nok\n"
+    sup._chromium_stderr = bytearray(cut)
+    assert sup._chromium_exit_detail(1) == "Kiro's Chromium exited with code 1: ok"
 
 
 @pytest.mark.asyncio
@@ -909,3 +1000,37 @@ async def test_a_pipe_upstream_that_fails_closes_both_gateway_ends(
     finally:
         for fd in (to_r, from_w):
             os.close(fd)
+
+
+def test_a_headless_shell_build_is_chosen_headless_even_with_a_display(tmp_path, monkeypatch):
+    """The headless shell has no window, so a windowed pin on a display host is still headless.
+
+    Status, the live card and the startup warm all read ``choice.headless``; they must
+    not offer a window the launched binary cannot show.
+    """
+    discover = supervisor.discover
+    chromium = supervisor.install.chromium
+    monkeypatch.setattr(discover, "probe_host", lambda *a, **kw: discover.HostFacts())
+    sup = HarnessSupervisor(tmp_path, config_reader=lambda: {"choice": "kiro_chromium"})
+
+    def state(build: str) -> Any:
+        return supervisor.install.InstallState(
+            prefix=tmp_path,
+            installed=True,
+            version=HARNESS_VERSION,
+            python=Path(sys.executable),
+            chromium=chromium.ChromiumState(
+                chromium.CHROMIUM_VERSION, "linux64", True, tmp_path / "exe", build
+            ),
+        )
+
+    full = sup._choose(state(chromium.BUILD_FULL))
+    assert full is not None and full.headless is False
+    shell = sup._choose(state(chromium.BUILD_HEADLESS_SHELL))
+    assert shell is not None and shell.kind == "kiro_chromium" and shell.headless is True
+    # Only Kiro's own Chromium is affected: the person's Chrome keeps its window.
+    chrome = tmp_path / "chrome"
+    monkeypatch.setattr(discover, "probe_host", lambda *a, **kw: discover.HostFacts(chrome=chrome))
+    sup_auto = HarnessSupervisor(tmp_path, config_reader=lambda: {"choice": "auto"})
+    user = sup_auto._choose(state(chromium.BUILD_HEADLESS_SHELL))
+    assert user is not None and user.kind == "user_chrome" and user.headless is False

@@ -25,6 +25,7 @@ from uuid import uuid4
 from kiro_crew import memory_stores, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.atomic_write import atomic_write, replace_with_retry
+from kiro_crew.bounded_read import bounded_read
 from kiro_crew.owner_only_files import owner_only_opener
 
 logger = logging.getLogger(__name__)
@@ -90,7 +91,10 @@ def backup_directory(db_path: Path) -> Path:
 def _open_store_use_lock(db_path: Path) -> int:
     """Open the stable owner-only lock outside the directory restore swaps."""
     out = backup_directory(db_path)
-    platform_compat.make_owner_only_dir(out)
+    # A read-only mount cannot be tightened: trying only logs an errno traceback
+    # before the open below is refused the same way.
+    if not (out.is_dir() and platform_compat.is_readonly_filesystem(out)):
+        platform_compat.make_owner_only_dir(out)
     lock_path = out / _STORE_USE_LOCK
     if lock_path.resolve() != lock_path.absolute():
         raise ValueError("Member memory use lock is redirected")
@@ -318,7 +322,7 @@ def _read_json(path: Path) -> dict:
         raise ValueError("Invalid member snapshot metadata")
     with path.open("rb") as handle:
         try:
-            value = json.loads(handle.read(MAX_MANIFEST_BYTES + 1))
+            value = json.loads(bounded_read(handle, MAX_MANIFEST_BYTES + 1))
         except RecursionError as exc:
             # Nesting past the interpreter's limit is not a ValueError, so it
             # would skip every caller's invalid-metadata arm.

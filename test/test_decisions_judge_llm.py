@@ -195,6 +195,10 @@ class TestParserRefuses:
             ("not json at all", "the loop looks quiet to me"),
             ("empty", "   "),
             ("a list, not an object", "[0.8, 0.2]"),
+            (
+                "bare option names",
+                '{"needs_owner": "quiet", "outcome": "nothing_new", "urgency": "none"}',
+            ),
         ],
     )
     def test_shape(self, label: str, text: str) -> None:
@@ -446,6 +450,12 @@ class TestPromptRendering:
         state = "if a < b and <div>ok</div> -> <evidence_of_progress"
         body = _evidence_body(impl_llm.render_prompt(state, QUESTIONS))
         assert "if a < b and <div>ok</div> -> &lt;evidence_of_progress" in body
+
+    def test_the_prompt_forbids_bare_option_names(self) -> None:
+        """The live provider-error cause: a confident model answered with bare option
+        names, which the parser refuses. The prompt now names that shape as invalid."""
+        prompt = impl_llm.render_prompt("evidence", QUESTIONS)
+        assert "Never answer with a bare option name" in prompt
 
     def test_every_question_is_rendered_with_its_ids_and_options(self) -> None:
         prompt = impl_llm.render_prompt("evidence", QUESTIONS)
@@ -715,6 +725,20 @@ class TestRunnerSeam:
         assert sessions.acquired == 1
         assert handle.prompts == ["prompt"]
         assert handle.destroyed
+
+    def test_a_judge_call_still_runs_while_memory_is_critical(self, monkeypatch) -> None:
+        """The helpers' critical-memory refusal must not reach the judge.
+
+        A refused judge answers FALLBACK, and FALLBACK fires the full wake turn the
+        judge exists to suppress: more load on the host, not less.
+        """
+        import kiro_crew.resource_status as resource_status
+
+        monkeypatch.setattr(resource_status, "_read_available_gb", lambda: 0.5)
+        sessions = _BgSessions(_FakeBgHandle([_body()]))
+        runner = impl_llm.build_session_runner(sessions, model="claude-haiku-4.5")
+        assert asyncio.run(runner("prompt")) == _body()
+        assert sessions.acquired == 1
 
     def test_the_gate_budget_ends_the_wait_but_never_the_acquisition(self) -> None:
         """A budget that expires mid-acquisition stops the caller, not the call.
@@ -1334,6 +1358,46 @@ class TestDecideThroughTheLlmLane:
 
     def test_no_runner_returns_none(self) -> None:
         assert self._decide(_config(NudgeWakeConfig(provider="llm")), None) is None
+
+    @staticmethod
+    def _flaky(failures: int, body: str) -> tuple[object, list[int]]:
+        """A runner whose first *failures* calls raise, then answers *body*."""
+        calls: list[int] = []
+
+        async def _runner(prompt: str) -> str:
+            calls.append(1)
+            if len(calls) <= failures:
+                raise impl_llm.LlmProtocolError("response is not one JSON object")
+            return body
+
+        return _runner, calls
+
+    def test_one_provider_error_then_a_quiet_answer_is_quiet(self) -> None:
+        """The retry: a single failed call does not cost a full wake turn."""
+        from kiro_crew import irq
+        from kiro_crew.decisions.points import nudge_wake
+
+        quiet = _body(
+            needs_owner={"choice": "quiet", "probabilities": {"quiet": 0.9, "wake": 0.1}},
+            outcome={"choice": "nothing_new", "probabilities": {"nothing_new": 0.9}},
+            urgency={"choice": "none", "probabilities": {"none": 0.9}},
+        )
+        runner, calls = self._flaky(1, quiet)
+        answers = self._decide(_config(NudgeWakeConfig(provider="llm")), runner)
+        assert len(calls) == 2
+        assert nudge_wake.map_answers(answers).outcome is irq.Outcome.QUIET
+
+    def test_two_provider_errors_still_fall_back(self) -> None:
+        """No second retry, and no dropped wake: FALLBACK fires the turn
+        (``test_autonudge_wake_judge_tick.test_a_fallback_marks_it_too``)."""
+        from kiro_crew import irq
+        from kiro_crew.decisions.points import nudge_wake
+
+        runner, calls = self._flaky(2, _body())
+        answers = self._decide(_config(NudgeWakeConfig(provider="llm")), runner)
+        assert answers is None
+        assert len(calls) == 2
+        assert nudge_wake.map_answers(answers).outcome is irq.Outcome.FALLBACK
 
     def test_no_consent_and_no_scope_still_answers(self) -> None:
         """Named explicitly, because this is the case the lane exists for."""

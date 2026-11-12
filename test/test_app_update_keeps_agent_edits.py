@@ -1,11 +1,11 @@
 """An app update keeps the user's own edits in the app's materialized agent configs.
 
-Both update branches of ``POST /api/apps/{name}/update`` deregister the app before they
-re-register it, and deregistering deletes ``<agents dir>/<app>--<agent>.json``. The
-registration that follows can only carry a user's edits (``model``, ``description``,
-``welcomeMessage``...) across the refresh if it is handed what was on disk BEFORE that
-delete, so the route snapshots the files first. A framework-owned key still refreshes
-from the new template, and the failed-update restore keeps the edits too.
+Every update (both branches of the update route, a registry install over an installed
+app) keeps ``<agents dir>/<app>--<agent>.json`` through its take-down and the
+registration rewrites each file in place, so one it cannot rewrite keeps its last good
+copy. The user's edits (``model``, ``description``, ``welcomeMessage``...) survive, a
+framework-owned key still refreshes from the new template, and the failed-update
+restore keeps the edits too.
 """
 
 from __future__ import annotations
@@ -87,12 +87,26 @@ class TestUpdateKeepsAgentEdits:
         _assert_edits_kept(tmp_path, tools=_V2["tools"])
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "body", "status"),
+        [
+            (f"/api/apps/{APP}/update", {}, 200),
+            ("/api/apps/registry/install", {"name": APP}, 201),
+            ("/api/apps/registry/install-stream", {"name": APP}, 200),
+        ],
+    )
     async def test_a_registry_update_keeps_the_users_agent_edits(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        body: dict[str, Any],
+        status: int,
     ) -> None:
         v2 = _installed_with_edits(tmp_path, monkeypatch)
 
         async def _install_v2(name: str, **kwargs: Any) -> dict[str, Any]:
+            await kwargs["before_replace"]()
             result = await asyncio.to_thread(update_app, v2, expected_name=name)
             return {"ok": result.ok, "name": name, "error": result.error}
 
@@ -101,10 +115,117 @@ class TestUpdateKeepsAgentEdits:
         monkeypatch.setattr(routes_mod, "install_from_registry", _install_v2)
 
         async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
-            resp = await client.post(f"/api/apps/{APP}/update", json={})
-            assert resp.status == 200, await resp.text()
+            resp = await client.post(path, json=body)
+            text = await resp.text()  # the stream route installs while it streams
+            assert resp.status == status, text
 
         _assert_edits_kept(tmp_path, tools=_V2["tools"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cause", ["declined", "disk full"])
+    @pytest.mark.parametrize(
+        ("path", "body", "status"),
+        [
+            (f"/api/apps/{APP}/update", None, 200),
+            (f"/api/apps/{APP}/update", {}, 200),
+            ("/api/apps/registry/install", {"name": APP}, 201),
+            ("/api/apps/registry/install-stream", {"name": APP}, 200),
+        ],
+        ids=["local", "update", "install", "install-stream"],
+    )
+    async def test_an_update_keeps_an_agent_file_it_cannot_rewrite(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        body: dict[str, Any] | None,
+        status: int,
+        cause: str,
+    ) -> None:
+        """A data home that does not own a shared agents directory declines the
+        rewrite, and a full disk fails it: the user's file must still be there.
+        A ``None`` body is the update route's local-source branch."""
+        from kiro_crew import agent as agent_mod
+        from kiro_crew.apps import bridges
+
+        v2 = _installed_with_edits(tmp_path, monkeypatch)
+        before = _agent_file(tmp_path).read_bytes()
+
+        async def _install_v2(name: str, **kwargs: Any) -> dict[str, Any]:
+            await kwargs["before_replace"]()
+            result = await asyncio.to_thread(update_app, v2, expected_name=name)
+            return {"ok": result.ok, "name": name, "error": result.error}
+
+        def _no_space(*_a: Any, **_k: Any) -> None:
+            raise OSError(28, "No space left on device")
+
+        if body is None:
+            body = {"source": str(v2)}
+        else:
+            monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
+            monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
+            monkeypatch.setattr(routes_mod, "install_from_registry", _install_v2)
+        if cause == "declined":
+            monkeypatch.setattr(agent_mod, "_declined_foreign_spec_write", lambda p: True)
+        else:
+            monkeypatch.setattr(bridges, "atomic_write", _no_space)
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(path, json=body)
+            text = await resp.text()
+            assert resp.status == status, text
+
+        assert _agent_file(tmp_path).read_bytes() == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "body", "ok", "status"),
+        [
+            (f"/api/apps/{APP}/update", None, True, 200),
+            (f"/api/apps/{APP}/update", {}, True, 200),
+            (f"/api/apps/{APP}/update", {}, False, 400),
+            ("/api/apps/registry/install", {"name": APP}, True, 201),
+            ("/api/apps/registry/install", {"name": APP}, False, 400),
+            ("/api/apps/registry/install-stream", {"name": APP}, True, 200),
+        ],
+    )
+    async def test_an_update_that_needs_consent_leaves_no_agent_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        path: str,
+        body: dict[str, Any] | None,
+        ok: bool,
+        status: int,
+    ) -> None:
+        """A new ``sessionApproval`` leaves the app disabled, so the agent files the
+        take-down kept must go, on success and on a failure after the copy alike.
+        A ``None`` body is the update route's local-source branch."""
+        v2 = _installed_with_edits(tmp_path, monkeypatch)
+        manifest_path = v2 / APP_MANIFEST_FILENAME
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["permissions"] = {"sessionApproval": True}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        async def _install_v2(name: str, **kwargs: Any) -> dict[str, Any]:
+            await kwargs["before_replace"]()
+            result = await asyncio.to_thread(update_app, v2, expected_name=name)
+            assert result.ok, result.error
+            return {"ok": ok, "name": name, "error": "" if ok else "provenance write failed"}
+
+        if body is None:
+            body = {"source": str(v2)}
+        else:
+            monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
+            monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
+            monkeypatch.setattr(routes_mod, "install_from_registry", _install_v2)
+
+        async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
+            resp = await client.post(path, json=body)
+            text = await resp.text()
+            assert resp.status == status, text
+
+        assert not _agent_file(tmp_path).exists()
 
     @pytest.mark.asyncio
     async def test_a_failed_registry_update_restores_the_users_agent_edits(
@@ -113,7 +234,8 @@ class TestUpdateKeepsAgentEdits:
         _installed_with_edits(tmp_path, monkeypatch)
 
         async def _failed_install(name: str, **kwargs: Any) -> dict[str, Any]:
-            return {"ok": False, "name": name, "error": "clone failed"}
+            await kwargs["before_replace"]()
+            return {"ok": False, "name": name, "error": "copy failed"}
 
         monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
         monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
@@ -139,22 +261,37 @@ class TestUpdateKeepsAgentEdits:
         _assert_edits_kept(tmp_path, tools=_V1["tools"])
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("registry", [False, True])
     async def test_an_agent_the_new_version_drops_does_not_come_back(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registry: bool
     ) -> None:
         _installed_with_edits(tmp_path, monkeypatch)
         v2 = _source(tmp_path, "2.0.0", {**_V2, "name": "renamed"})
+        body: dict[str, Any] = {"source": str(v2)}
+        if registry:
+            # The registry take-down keeps the agent files, so the dropped one has to
+            # be pruned after the install.
+
+            async def _install_v2(name: str, **kwargs: Any) -> dict[str, Any]:
+                await kwargs["before_replace"]()
+                result = await asyncio.to_thread(update_app, v2, expected_name=name)
+                return {"ok": result.ok, "name": name, "error": result.error}
+
+            monkeypatch.setattr(routes_mod, "is_registry_source", lambda s: True)
+            monkeypatch.setattr(routes_mod, "registry_name_from_source", lambda s: APP)
+            monkeypatch.setattr(routes_mod, "install_from_registry", _install_v2)
+            body = {}
 
         async with TestClient(TestServer(_make_app(dashboard_user="owner"))) as client:
-            resp = await client.post(f"/api/apps/{APP}/update", json={"source": str(v2)})
+            resp = await client.post(f"/api/apps/{APP}/update", json=body)
             assert resp.status == 200, await resp.text()
 
         assert not _agent_file(tmp_path).exists()
         renamed = json.loads(
             (tmp_path / "kiro-agents" / f"{APP}--renamed.json").read_text(encoding="utf-8")
         )
-        # The snapshot is keyed by the materialized file, so another agent's edits
-        # are never grafted onto the new one.
+        # Edits are read from the agent's own materialized file, so another agent's
+        # edits are never grafted onto the new one.
         assert renamed["model"] == "auto"
         assert renamed["description"] == "v2 text"
 

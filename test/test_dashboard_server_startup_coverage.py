@@ -778,7 +778,7 @@ class TestStartDashboardWiring:
         cfg.tunnel = dataclasses.replace(cfg.tunnel, relay_enabled=relay_enabled)
         monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: cfg))
         if locked:
-            # The enterprise lock on the ``tunnel`` control alone, without the
+            # The LTS lock on the ``tunnel`` control alone, without the
             # edition's policy and login boot.
             monkeypatch.setattr(edition_locks, "local_enable_locked", lambda c: c == "tunnel")
         monkeypatch.setattr(srv, "data_home", lambda: tmp_path)
@@ -1171,7 +1171,29 @@ class TestStartDashboardWiring:
             assert callable(state.resume_channel_agents)
             assert state.memory_startup_task is prepared
             assert state.ready is True
-            schedule_memory.assert_called_once_with()
+            schedule_memory.assert_called_once_with(state)
+
+    @pytest.mark.asyncio
+    async def test_memory_preparation_is_published_before_session_restore_runs(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Memory preparation overlaps the restore instead of following it."""
+        prepared = asyncio.get_running_loop().create_future()
+        prepared.set_result(None)
+        seen: dict[str, Any] = {}
+
+        async def _restore(state, cfg) -> None:
+            seen["task_at_restore"] = state.memory_startup_task
+            seen["ready_at_restore"] = state.ready
+
+        monkeypatch.setattr(srv, "_restore_dashboard_sessions", _restore)
+        schedule_memory = MagicMock(return_value=prepared)
+        async with _dashboard(
+            tmp_path, monkeypatch, schedule_memory_preparation=schedule_memory
+        ) as (_runner, state, _spies):
+            assert seen == {"task_at_restore": prepared, "ready_at_restore": False}
+            assert state.memory_startup_task is prepared
+            schedule_memory.assert_called_once_with(state)
 
     @pytest.mark.asyncio
     async def test_the_mcp_and_dashboard_routes_are_both_mounted(

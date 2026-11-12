@@ -28,6 +28,14 @@ from kiro_crew.acp.compaction_errors import (  # noqa: F401 - re-exported via th
     compaction_failure_detail,
     compaction_failure_is_transient,
 )
+from kiro_crew.acp.delegate_launch_signatures import (  # noqa: F401 - re-exported
+    DELEGATE_LAUNCH_FAILURE_MESSAGE,
+    KIRO_CLI_TOO_OLD_MESSAGE,
+    KIRO_CLI_TOO_OLD_TERMINAL_MESSAGE,
+    delegate_launch_failure_message,
+    is_delegate_launch_failure_output,
+)
+from kiro_crew.acp.error_frames import raw_error_detail
 from kiro_crew.acp.image_dimension_wedge import (
     format_many_image_dimension_message,
     is_many_image_dimension,
@@ -47,7 +55,12 @@ from kiro_crew.acp.runtime_models import (
     model_is_unusable,
     resolve_pin_spelling_on,
 )
-from kiro_crew.acp.structured_error_data import provider_data_text, structured_data_prose
+from kiro_crew.acp.structured_error_data import (
+    OVERSIZE_REPLY_DATA,
+    _error_kind_from_frame,
+    provider_data_text,
+    structured_data_prose,
+)
 from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
@@ -113,9 +126,12 @@ class AcpError(Exception):
             self.rejected_model: str | None = None
         if not hasattr(self, "advertised"):
             self.advertised: list[str] = []
-        # Sign-in failure tag, set by :func:`_raise_acp_error` when the raw frame
-        # is a session-expiry / rejected-credential answer, so the dashboard's
-        # error row can offer the Kiro sign-in card instead of a retry.
+        # Sign-in failure tags, set by :func:`_raise_acp_error` when the raw frame
+        # is a session-expiry / rejected-credential answer. ``sign_in_needed`` is
+        # set for every harness, so the task queue fails the row as auth without
+        # reading the prose; ``auth_required`` only for a harness that signs in
+        # through Crew, so the dashboard's error row offers the Kiro sign-in card.
+        self.sign_in_needed: bool = False
         self.auth_required: bool = False
         # Spent-allowance tag, set by :func:`_raise_acp_error` when the raw
         # frame is a usage-limit answer ("The monthly usage limit has been
@@ -174,12 +190,19 @@ class AcpError(Exception):
         # ``connection_failure``. The interactive ladder waits longer for it and
         # rewinds the failed prompt before re-sending. ``None`` means unclassified.
         self.throttle: bool | None = None
+        # A TRANSIENT capacity/rollout refusal (raw frame); its card offers the picker.
+        self.model_unavailable: bool = False
         # Set by :func:`_raise_acp_error` when the frame's ``data`` names
         # ``errorKind: cloud_credential_error``: the process cached credentials
         # it cannot reload, so the remedy is a fresh process, not a retry.
         # ``llm_helpers.acp_error_is_session_not_found`` routes it down the
         # reset-and-reload-once path a dropped session takes.
         self.credential_reload: bool = False
+        # The AWS exception name of a credential rejection (``ExpiredTokenException``),
+        # set by :func:`_raise_acp_error` from the raw frame, so a caller compares a code.
+        self.auth_error_code: str = ""
+        # Redacted harness frame behind curated wording; see error_frames.raw_error_detail.
+        self.raw_detail: str = ""
 
 
 class AcpTimeoutError(AcpError):
@@ -309,10 +332,35 @@ class AcpDelegateLaunchFailed(AcpError):  # noqa: N818
     :class:`AcpSandboxInitFailed` is not: that tag renders the start-failure
     card, whose Resume and repeat-start "restart the gateway" affordances cannot
     fix an install and would contradict the repair this message names.
+
+    The message is one of the curated texts :func:`delegate_launch_failure_message`
+    picks from the child's stderr: the install repair by default, or the update
+    remedy when the CLI rejected the ``--auth-method`` option because it is too
+    old (:data:`KIRO_CLI_TOO_OLD_MESSAGE`, or :data:`KIRO_CLI_TOO_OLD_TERMINAL_MESSAGE`
+    where no dashboard latched the Kiro CLI check). Never the child's own text.
     """
 
-    def __init__(self) -> None:
-        super().__init__(DELEGATE_LAUNCH_FAILURE_MESSAGE, transient=False, user_worded=True)
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message or DELEGATE_LAUNCH_FAILURE_MESSAGE, transient=False, user_worded=True
+        )
+
+
+async def delegate_launch_failed(message: str | None) -> AcpDelegateLaunchFailed:
+    """The delegate-launch error for the curated *message*, latching a too-old CLI.
+
+    The one build site both ACP transports call. A too-old CLI latches the Kiro CLI
+    check (``mark_registered_cli_too_old``), and its error names the dashboard's
+    Update Kiro CLI button only when the latch is set, so the button will show;
+    otherwise it names ``kiro-cli update``.
+    """
+    if message == KIRO_CLI_TOO_OLD_MESSAGE:
+        # circular import: the prerequisite service sits above the ACP layer.
+        from kiro_crew.kiro_prerequisite import mark_registered_cli_too_old
+
+        if not await mark_registered_cli_too_old():
+            message = KIRO_CLI_TOO_OLD_TERMINAL_MESSAGE
+    return AcpDelegateLaunchFailed(message)
 
 
 class AcpRegistrationRateLimited(AcpProcessDied):  # noqa: N818
@@ -763,49 +811,6 @@ def is_sandbox_init_failure_output(haystack: str) -> bool:
         if classified is not None and classified[0] == "no_backend":
             return True
     return False
-
-
-# The POSIX ``kiro-cli`` launcher execs a SIBLING ``kiro-cli-chat`` for ``acp``
-# and ``chat``; when that sibling is absent, empty or version-skewed (a stale
-# symlink pointing at a removed binary is the field case) the launcher
-# itself answers ``--version``/``whoami`` but the exec fails with this line and
-# the child never starts. Classified for the same reason as the sandbox-init and
-# auth signatures: the condition is DETERMINISTIC, so the reconnect ladder's
-# respawn reproduces it exactly, and without this the operator gets the generic
-# "process exited (rc=None/rc=1)" card -- which points at retry or model-switch,
-# neither of which can fix an install problem -- instead of the one line that
-# names the fix (reinstall/repair Kiro CLI).
-#
-# Anchored on the ``kiro-cli-chat`` launch token specifically. A bare
-# ``failed to launch`` or a generic spawn error is ordinary output for an
-# unrelated death a respawn legitimately fixes, so matching either alone would
-# latch a permanent wrong verdict; requiring the delegate name costs no coverage
-# because the launcher always names the sibling it could not exec.
-_RE_DELEGATE_LAUNCH_FAILURE = re.compile(
-    r"failed\s+to\s+launch\s+kiro-cli-chat",
-    re.IGNORECASE,
-)
-
-
-def is_delegate_launch_failure_output(haystack: str) -> bool:
-    """True when *haystack* (a child's stderr) shows the ``kiro-cli-chat`` delegate failing to launch.
-
-    Shared by both ACP transports for the same anti-drift reason
-    :func:`is_sandbox_init_failure_output` and :func:`is_auth_failure_output`
-    are each a single function: the two transports must not come to disagree
-    about what the signature IS.
-    """
-    return bool(_RE_DELEGATE_LAUNCH_FAILURE.search(haystack))
-
-
-#: Actionable, non-retryable message for a ``kiro-cli-chat`` delegate that would
-#: not launch. Fixed recovery wording (``user_worded``), naming the install
-#: repair rather than a retry or model switch.
-DELEGATE_LAUNCH_FAILURE_MESSAGE = (
-    "The Kiro CLI chat delegate (kiro-cli-chat) failed to launch. This usually "
-    "means a stale or partial Kiro CLI install (for example a stale symlink "
-    "pointing at a removed binary). Reinstall or repair Kiro CLI and try again."
-)
 
 
 async def sandbox_init_failure(
@@ -1432,7 +1437,9 @@ def _format_acp_error_worded(
     being raised to the dashboard / Slack / CLI surfaces.
     """
     worded = True
-    if isinstance(error, dict):
+    if isinstance(error, dict) and error.get("data") == OVERSIZE_REPLY_DATA:
+        formatted = str(error.get("message", "") or "")  # wire can send it: redact below
+    elif isinstance(error, dict):
         data = provider_data_text(error)  # a structured `data` reads its prose from `message`
         prose = structured_data_prose(error)
         message = str(error.get("message", "") or "")
@@ -1629,8 +1636,8 @@ def _format_acp_error_worded(
             )
         elif _is_session_expired(haystack):
             # Session expiry (401/403, or prose saying as much) — distinct from
-            # the Bedrock credential errors above. Retrying or switching models
-            # cannot succeed, so the message must not suggest either.
+            # the Bedrock credential errors above. Switching models cannot
+            # succeed, so the message must not suggest it.
             #
             # The sign-in half comes from the harness's own declaration: which
             # command re-authenticates is a per-harness fact. This arm HAS
@@ -1642,13 +1649,16 @@ def _format_acp_error_worded(
             # kiro id IS the empty string. That is correct rather than a fallback:
             # a caller reaching here with no backend in hand is on the shared
             # runtime, whose harnesses are the two on the host identity store.
-            # The retry verdict stays hard-coded -- that is this arm's own finding
-            # about the error, not sign-in advice.
+            # The model-switch verdict stays hard-coded -- that is this arm's own
+            # finding about the error, not sign-in advice.
+            #
+            # No "Your session has expired." lead: these signals also fire for a
+            # host that was never signed in, and the signed-out message is true
+            # in both cases.
             formatted = (
-                "Your session has expired. "
                 f"{host_auth.signed_out_message(backend)} "
-                "Retrying or switching models will not help — this is a "
-                "sign-in issue, not a backend error."
+                "Switching models will not help — this is a sign-in issue, not "
+                "a backend error."
                 f"{req_id_suffix}"
             )
         elif is_model_registry_unavailable(error.get("data")):
@@ -1829,27 +1839,6 @@ def _rejected_model_from_error(error: object) -> str | None:
     return m.group(1) if m else None
 
 
-def _error_kind_from_frame(error: object) -> str:
-    """Return the structured ``errorKind`` a raw ACP frame's ``data`` carries.
-
-    claude-agent-acp names some provider answers with a machine-readable kind
-    alongside the prose (``{"code": -32603, "message": "Internal error",
-    "data": {"errorKind": "cloud_credential_error"}}`` -- the same field the
-    ``{'errorKind': 'unknown'}`` wrapper note at ``_RE_5XX_HINT`` describes).
-    Only a ``data`` that IS a mapping is read: the formatter pastes a
-    non-mapping ``data`` verbatim into the user-visible message, so matching
-    the kind out of that string would be the prose path structured readers
-    exist to avoid. Returns "" when the frame names no kind.
-    """
-    if not isinstance(error, dict):
-        return ""
-    data_field = error.get("data")
-    if isinstance(data_field, dict):
-        kind = data_field.get("errorKind")
-        return kind if isinstance(kind, str) else ""
-    return ""
-
-
 def _raise_acp_error(
     error: object,
     available_models: Sequence[str] | None = None,
@@ -1878,8 +1867,12 @@ def _raise_acp_error(
     raw_data = ""
     if isinstance(error, dict):
         raw_data = f"{error.get('data', '')} {error.get('message', '')}"
+    # Curated wording hides the provider's text; keep the frame for the log.
+    raw_detail = raw_error_detail(error) if worded else ""
     if _PROMPT_BUSY_RE.search(raw_data):
-        raise AcpPromptBusy(formatted, user_worded=worded)
+        busy = AcpPromptBusy(formatted, user_worded=worded)
+        busy.raw_detail = raw_detail
+        raise busy
     # A binding mismatch changes only the exception TYPE and its retry verdict;
     # it is built here, not raised early, so the tags below still read the frame.
     err: AcpError
@@ -1891,15 +1884,15 @@ def _raise_acp_error(
             transient=_is_transient_raw_error(error, available_models),
             user_worded=worded,
         )
+    err.raw_detail = raw_detail
     # Tag a network-path drop so the interactive retry ladder can wait out a
     # short outage instead of spending the fixed provider-error budget. Only a
     # transient verdict qualifies, so a terminal frame never becomes waitable.
-    err.connection_failure = (
-        bool(err.transient) and classify_provider_error(raw_data).kind == PROVIDER_ERROR_CONNECTION
-    )
-    err.throttle = (
-        bool(err.transient) and classify_provider_error(raw_data).kind == PROVIDER_ERROR_THROTTLE
-    )
+    _frame_kind = classify_provider_error(raw_data).kind
+    err.connection_failure = bool(err.transient) and _frame_kind == PROVIDER_ERROR_CONNECTION
+    err.throttle = bool(err.transient) and _frame_kind == PROVIDER_ERROR_THROTTLE
+    verdict = classify_provider_error(raw_data)
+    err.auth_error_code = verdict.matched if verdict.kind == PROVIDER_ERROR_AUTH else ""
     # Tag deterministic STRUCTURAL rejections so self-driving callers can
     # stop resending identical context. Keep the classifier data-scoped: a phrase
     # echoed only in JSON-RPC ``message`` cannot stamp an unrelated error, except
@@ -1911,6 +1904,8 @@ def _raise_acp_error(
     # the same context.
     raw_data_field = provider_data_text(error)  # the same field the verdict above read
     raw_message_field = str(error.get("message", "") or "") if isinstance(error, dict) else ""
+    _data_kind = classify_provider_error(raw_data, data=raw_data_field).kind
+    err.model_unavailable = bool(err.transient) and _data_kind == PROVIDER_ERROR_MODEL_UNAVAILABLE
     # The claude adapter's overflow rides in ``message`` (anchored match, see
     # _RE_ADAPTER_INPUT_TOO_LONG), and the model service's size cap may ride in
     # either field (anchored, see _RE_REQUEST_SIZE_EXCEEDED); every other tag
@@ -1965,15 +1960,14 @@ def _raise_acp_error(
     # happens to carry a 401/403 is not a Kiro sign-in problem. Gated on the
     # harness signing in through Crew's own identity (harness parity H6): for a
     # harness with its own credential store the card would sign in the wrong
-    # thing, so its 401 stays a plain error carrying that harness's remedy.
-    if (
+    # thing, so its 401 carries only ``sign_in_needed`` and that harness's remedy.
+    err.sign_in_needed = (
         not rejected
-        and backend in ACP_BACKENDS_HOST_AUTH_CALLBACK
         and _is_session_expired(raw_data)
         and not _RE_AUTH.search(raw_data)
         and not _RE_USAGE_LIMIT.search(raw_data)
-    ):
-        err.auth_required = True
+    )
+    err.auth_required = err.sign_in_needed and backend in ACP_BACKENDS_HOST_AUTH_CALLBACK
     # Tag a spent plan allowance the same way: from the raw frame, and only when
     # the formatter reached its usage-limit branch -- an entitlement rejection
     # that happens to carry limit wording keeps its own (served-model) remedy.

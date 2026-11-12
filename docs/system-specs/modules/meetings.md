@@ -163,7 +163,11 @@ written there into the fenced tree.
 
 Deleting a meeting removes its complete per-meeting directory (metadata,
 transcript, tasks, notes, and diagrams) and both app-owned sidecar directories
-(`edits/<id>` and `notes/<id>`). The route
+(`edits/<id>` and `notes/<id>`). It removes the sidecars first and `session.json`
+last, each through `remove_with_retry`, so a file another program holds open on
+Windows is waited out for about three seconds; a longer hold answers
+`500 meeting_delete_failed` with an error naming the file and leaves
+`session.json`, so deleting again after the program lets go finishes. The route
 refuses a meeting with a live
 in-process session with `409 meeting_active`; the dashboard keeps the row's delete
 affordance visible but disabled for active, paused, and reviewing states. Calendar
@@ -250,7 +254,17 @@ evidence that every caller passed through action-item review.
 
 ## Agent dispatch
 
-`domain/session.py`. One `AgentQueue` per enabled agent plus the always-on task
+`domain/session.py`. Every turn goes through the App Kit's agent-turn seam
+(`apps/agent_turn_sdk.AgentTurnSDK`, app-kit-platform §32a): bounded by this app's
+`capabilities.spawn` row (a refused agent's dispatch fails like any other and
+counts toward the circuit breaker), tool-gated under this app's identity, admitted
+as Crew automation, keyed `meetings-<agent>-<meeting>`
+(an agent id hand-edited into `config.json` outside the seam's key alphabet is
+keyed `meetings-_<digest>-<meeting>` instead, so it is still dispatched);
+live translation is its tool-less `run_oneshot` on `meetings-translate-<hex>`. The
+calendar fence, its screen and the drop audit go through the untrusted-text seam
+(`apps/untrusted_text_sdk.UntrustedTextSDK`). The manifest declares
+`permissions.agentTurns`. One `AgentQueue` per enabled agent plus the always-on task
 extractor. A queue batches lines and flushes every `BATCH_INTERVAL_SECS` (30s),
 so an agent gets a paragraph of context rather than one interruption per
 utterance. Three consecutive dispatch failures trip a circuit breaker (backoff
@@ -272,7 +286,8 @@ the rest of the title is still screened. Any other field is screened as
 written, so a topic phrase with anything else attached is withheld, and every
 other pattern (including `<system>` tags and "ignore prior instructions")
 applies. A match is replaced by `[withheld: failed content screening]` and
-recorded with `audit_injection_dropped` under `meetings_calendar_<field>`.
+recorded through `UntrustedTextSDK.record_dropped` (the core's
+`audit_injection_dropped`) under `meetings_calendar_<field>`.
 Calendar pre-creation writes an empty attachment list, and a test pins that.
 Other fields pass through `neutralize_untrusted_text`, which scrubs every
 untrusted fence marker and the primary prompt boundary markers, so no field can
@@ -406,10 +421,10 @@ teardown OR replace path cannot quietly reintroduce the loss.
 
 **Dispatch is in-process.** Upstream POSTed each batch back to its own gateway
 over authenticated loopback HTTP. Here the routes live ON the gateway, so a batch
-goes straight to the shared `SessionManager` via
-`llm_helpers.stream_and_collect` under `ToolApprovalPolicy.HOOK_BASED` — the
-agents' file writes still traverse the PreToolUse gate (deny patterns,
-sensitive paths, governance) exactly like any other turn.
+goes straight to the shared `SessionManager` through `AgentTurnSDK.run`, which
+approves tools only through the PreToolUse gate under this app's identity — the
+agents' file writes still traverse deny patterns, sensitive paths and governance
+exactly like any other turn.
 
 ## Live translation
 
@@ -588,7 +603,14 @@ and then saves until the CURRENT draft is acknowledged, so a screenshot pasted j
 before Back, or an edit typed while the exit save was on the wire, is on disk before
 the view navigates; a refusal keeps the user in the view, except one no retry can
 clear (403 `dashboard_owner_required` for a caller who is not the owner, or a 404
-for a meeting that is gone), which lets them leave. Every failure the user can act on — a refused
+for a meeting that is gone), which lets them leave. Once the note is saved, every
+exit of the view (Back, Settings, the transcription notice's Voice settings action,
+opening the meeting a refused Start names) asks before it drops what the view
+cannot keep: an unsaved minutes draft, or text typed into an agent's chat line, the
+broadcast bar or quick add and never sent. Unsent text gets a "Leave with unsent
+text?" dialog that names what is lost (and an open minutes draft too); a minutes
+draft alone gets "Leave with unsaved edits?". Both confirm with "Discard and leave",
+so the dialog says that confirming leaves the meeting. Every failure the user can act on — a refused
 save, a refused load (`note_unreadable`, mapped to a catalog string by code), a
 refused paste — renders in the panel through `ErrorNotice`, not only in the
 notification feed.
@@ -742,8 +764,17 @@ Kiro Crew's own `/api/ws/stt` (`dashboard/stt_stream.py`).
 `hooks/useMeetingTranscription.ts` conforms to that endpoint's existing wire
 protocol — connect, wait for `{"type":"ready"}`, send 16 kHz Int16 PCM from
 `/pcm-worklet.js`, receive `partial`/`final`/`error`, send `{"type":"stop"}` and
-let the server close so trailing finals arrive. A meeting outlives any one
-socket: the endpoint caps a connection's wall-clock life
+let the server close so trailing finals arrive. The microphone is the one saved
+in Settings > Voice > Microphone, opened through `hooks/mic.ts`'s
+`acquireMicStream` as dictation opens it, so a meeting falls back to the system
+default only when that device is gone or busy. The stall watchdog reconnects a
+socket that has shown no sign of life for `STALL_TIMEOUT_MS`: any server frame is
+one, and after `ready` so is each chunk of audio the socket takes (`bufferedAmount`
+under one second of audio once it is sent), because the server sends a frame only
+on speech or an error and a quiet room must keep one socket and one microphone
+grant. Audio that backs up, audio that stops coming, and the silence an ended
+microphone track still feeds the worklet (an unplugged device) do not count, so
+the watchdog reconnects and re-acquires the microphone. A meeting outlives any one socket: the endpoint caps a connection's wall-clock life
 (`_MAX_STREAM_DURATION_SECS`, advertised as `max_duration_ms` on `ready`; a provider
 whose backend owns the session limit advertises none, and its lease is never
 rotated), so the hook holds
@@ -887,9 +918,26 @@ and Chromium rewrites more characters than a file system refuses), and the date
 is the meeting's start (else creation) day in the viewer's time zone. An export
 is a snapshot, so it works while the meeting runs and after it has ended; the
 item is disabled while there is no text to save, and a save the browser could
-not start shows an error notice above the agent bar. A diagram agent gets no
-item yet: its output only renders inside the sandboxed frame, and its portable
-form is a separate change.
+not start shows an error notice above the agent bar. Each enabled diagram (html)
+agent gets an item of the same shape that saves `<title>-<YYYY-MM-DD>-<agent
+id>.html`: the frame's own document as one self-contained file (see the
+model-generated HTML bullet below), so its diagrams and tables open in any
+browser, offline.
+
+Below those, one `Export all outputs` item (`lib/meetingBundle.ts`) saves every
+enabled agent's output together as one self-contained HTML file,
+`<title>-<YYYY-MM-DD>.html`, with the same title/date rules and snapshot
+behaviour as the single exports (disabled only while no agent has any output).
+It is one HTML file rather than a zip because the frontend ships no zip library
+and the save path hands a file to the gateway only on an Android in-app WebView,
+which accepts `text/html` but not `application/zip`. Inside the bundle, a notes
+agent's output goes in as its Markdown text, HTML-escaped in a `<pre>` (the same
+bytes the single `.md` export preserves, never inserted as raw HTML), and each
+sketch rides in a sandboxed null-origin `<iframe srcdoc>` holding its own
+single-export document (the vendored Mermaid inlined and the frame CSP, with the
+model's scripts scrubbed), so a sketch is at least as isolated here as in its own
+export and its scripts are never inlined onto the bundle page. An agent with no
+output is kept and marked `No output`.
 
 The shared STT settings choose among `local` (resident whisper.cpp, the default),
 `apple` (on-device SpeechAnalyzer on supported macOS), and `transcribe` (paid AWS
@@ -983,6 +1031,12 @@ broadcast bar remains available when speech input is unavailable.
   `website/src/apps/meetings/sketchSrcdoc.test.ts` — nothing executable survives, **and** a
   Mermaid diagram plus an inline-styled HTML table still render (the guards
   against over-stripping the panel into a blank).
+
+  The Export item's file (`buildSketchExport`) is this same document: scrubbed,
+  with the same policy first in `<head>`, the vendored Mermaid runtime inlined
+  (a file has no dashboard origin to load it from) and `script-src
+  'unsafe-inline'` naming no source, so it makes no network request while it
+  renders. Nothing of the sketch is mounted in the dashboard's DOM to export it.
 * **A client-supplied FILE path exists in exactly one place** — the audio import —
   and that route is owner-only. It goes through `hooks.validate_file_path`, then
   pins the validated device/inode while copying through a component-by-component
@@ -1054,7 +1108,8 @@ transition table), `MeetingsPage.test.tsx` and `MeetingsPageCov80.test.tsx` (lis
 refresh, deletion, and calendar rows), `MeetingsSettingsViewCoverage.test.tsx`,
 `MeetingsAgentPillBar.test.tsx`, `MeetingsBroadcastBar.test.tsx`,
 `MeetingsAgentPanel.test.tsx` (including the iframe sandbox),
-`MeetingsExport.test.tsx` (the menu's Markdown export and its file name),
+`MeetingsExport.test.tsx` (the menu's Markdown and HTML exports and their file names),
+`MeetingsExitUnsent.test.tsx` (every exit asks before dropping unsent text),
 `MeetingsTranslation.test.tsx`, `MeetingsNote.test.tsx`, `MeetingsNoteDraft.test.tsx`, and
 `MeetingsTranscriptPanel.test.tsx` (durable/live rows, follow mode, and the
 split-to-primary layout transition), `UseMeetingSessionCoverage.test.tsx` and the two

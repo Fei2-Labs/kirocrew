@@ -19,6 +19,7 @@ from kiro_crew.dashboard.handlers.secrets import (
     _unused_stored_secrets,
     setup_secrets_routes,
 )
+from kiro_crew.platform_compat import symlink_or_junction
 from kiro_crew.secrets import SecretVault
 
 
@@ -402,6 +403,12 @@ class TestGerritManagedRows:
     def test_no_hosts_no_rows(self) -> None:
         assert _managed_secret_catalog([], [], False, False, []) == []
 
+    def test_stored_wakatime_oauth_tokens_stay_labelled_while_wakatime_is_off(self) -> None:
+        # The vault routes refuse this entry whether or not WakaTime is enabled,
+        # so a disabled integration must not turn it into a deletable custom row.
+        catalog = _managed_secret_catalog(["WAKATIME_OAUTH_TOKENS"], [], False, False, [])
+        assert catalog == [{"name": "WAKATIME_OAUTH_TOKENS", "kind": "wakatime_oauth"}]
+
     def test_lone_host_offers_the_global_name(self) -> None:
         catalog = _managed_secret_catalog([], [], False, False, [_GERRIT_ONE])
         assert catalog == [
@@ -547,8 +554,10 @@ class TestApiSecretsSet:
         data_home.mkdir()
         link_target = tmp_path / "elsewhere"
         link_target.mkdir()
-        # The data home's .vault is a symlink to another folder.
-        (data_home / ".vault").symlink_to(link_target, target_is_directory=True)
+        # The data home's .vault redirects to another folder: a symlink, or on a
+        # Windows host without symlink privilege a junction, which the handler
+        # and ``atomic_write`` treat the same way.
+        symlink_or_junction(link_target, data_home / ".vault")
 
         with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(data_home)):
             async with TestClient(TestServer(app)) as client:
@@ -1187,3 +1196,27 @@ class TestApiSecretsChannelCredentialRemote:
             status, _ = await self._call(tmp_path, "delete", name, headers=_REMOTE)
             assert status == 200, name
             assert SecretVault(tmp_path).get(name) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["post", "delete"])
+async def test_wakatime_oauth_tokens_entry_is_not_edited_here(vault_dir: Path, method: str) -> None:
+    """The OAuth flow rotates WAKATIME_OAUTH_TOKENS under its own lock, so the
+    generic routes refuse it with 409 and leave the stored entry untouched."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from kiro_crew.config.loader import CRED_WAKATIME_OAUTH_TOKENS
+
+    SecretVault(vault_dir)._set_sync(CRED_WAKATIME_OAUTH_TOKENS, "{}")
+    with patch("kiro_crew.dashboard.handlers.secrets.config_dir", return_value=str(vault_dir)):
+        async with TestClient(TestServer(_app())) as client:
+            if method == "post":
+                resp = await client.post(
+                    "/api/secrets", json={"name": CRED_WAKATIME_OAUTH_TOKENS, "value": "x"}
+                )
+            else:
+                resp = await client.delete(f"/api/secrets/{CRED_WAKATIME_OAUTH_TOKENS}")
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "managed_by_wakatime_oauth"
+    stored = SecretVault(vault_dir).get(CRED_WAKATIME_OAUTH_TOKENS)
+    assert stored is not None and stored.reveal() == "{}"

@@ -138,9 +138,9 @@ and — because every Kiro Crew server lives behind one package — a
 derives `uvx <identifier> <packageArguments>`, so an entry without the argument
 launches `uvx kirocrew` with no subcommand, which prints CLI help instead of
 speaking MCP and fails the handshake. Kiro Crew releases are not published to
-the public Python Package Index; the `pypi` example below therefore requires
-your organisation to mirror the matching `kirocrew` wheel into the Python index
-that `uvx` uses:
+the public Python Package Index; the `pypi` example below therefore launches
+only once `uvx` is pointed at an index that hosts the matching `kirocrew` wheel,
+as the steps after it show:
 
 ```json
 {
@@ -294,6 +294,42 @@ that `uvx` uses:
 
 Set `version` to the Kiro Crew version your fleet runs.
 
+> **Without that index, the servers are accepted but do not start.**
+> `kiro-cli mcp list` shows each entry, kiro-cli starts it as
+> `uvx kirocrew@<version> <subcommand>`, and `uvx` fails with
+> `kirocrew was not found in the package registry`, so the session has none of
+> the Kiro Crew tools those entries serve.
+
+Point `uvx` at the index through uv's own configuration on every client
+machine, for example in the user's `uv.toml` (`~/.config/uv/uv.toml` on macOS
+and Linux, `%APPDATA%\uv\uv.toml` on Windows). Kiro Crew's release CDN serves
+one index per release channel, and each version is listed only on the channel
+that released it (see
+[Installing a published wheel with pip](install.md#installing-a-published-wheel-with-pip)),
+so clients that can reach the CDN can put that index directly in `url`. Pick
+the channel in the URL by your fleet's version: `stable` (as below) for a
+version with no prerelease suffix, `insider` for an `rc` version, `nightly` for
+a `.dev` version:
+
+```toml
+[[index]]
+url = "https://updates.crew.kiro.dev/feed/stable/simple/"
+# The CDN answers 403, not 404, for a package it does not host. Without this
+# line uv stops at that answer instead of moving on to PyPI.
+ignore-error-codes = [403]
+```
+
+Clients that cannot reach the CDN need your organisation's own index carrying
+the `kirocrew` wheel for your fleet's version: put its URL in `url`, and keep
+`ignore-error-codes` only if that index also answers 403 for a missing package.
+uv checks an index listed this way before public PyPI and moves on to PyPI for
+any package the index does not host, so `kirocrew`'s dependencies still
+resolve. Do not add `default = true` unless the index also proxies PyPI or hosts
+every dependency: that setting removes PyPI as the fallback for every `uv` and
+`uvx` call that reads this file. Set the index in uv rather than in a package's
+`registryBaseUrl` field, which this guide has not verified kiro-cli passes on to
+`uvx`.
+
 ## Known limitation: the registry launches the server, not your install
 
 Kiro Crew's MCP servers are not standalone tools — they are the gateway's own
@@ -305,14 +341,66 @@ resolves the package and, when a locally installed server's version differs from
 the registry's, relaunches it at the registry's version. For a `pypi` entry that
 means `uvx` fetching Kiro Crew into its own ephemeral environment from its
 configured Python index. Because the project is not on public PyPI, that route
-works only when your organisation mirrors the wheel and version into an index
-visible to `uvx`. The process serving your MCP tools can then still be a
-*different* Kiro Crew from the gateway serving your dashboard. Your `env`
-overrides (including `KIROCREW_HOME`) do flow through, which keeps the data home
-aligned, but the code does not.
+works only with the index set up above. The process serving your MCP tools can
+then still be a *different* Kiro Crew from the gateway serving your dashboard.
+Your `env` overrides (including `KIROCREW_HOME`) do flow through, which keeps the
+data home aligned, but the code does not.
 
 Keep the registry `version` in step with your fleet's installed version. If your
 organisation pins Kiro Crew centrally, that pin now governs the MCP side too.
+
+## Session identity for Kiro Crew's own tools: an admin opt-in, off by default
+
+Many `kirocrew-core` tools act for *one session* — `artifact_save`, `spawn_run`,
+memory, monitors — and need to prove which session is calling. Outside registry
+mode Kiro Crew gives each session's `kirocrew-core` and `kirocrew-cron` a signed
+session identity by mounting its own copy of them on the session. Under registry
+mode that copy would be launched as given, from the local install, past your
+catalog. So by default Kiro Crew mounts nothing there (except on a Builder ID or
+social sign-in no admin registry can govern, described above): the servers run from your
+catalog entry, which carries no session identity, and their tool calls refuse with
+
+```
+identity_unattestable ... This host is MCP registry-governed (agent.mcp_registry_mode),
+and the admin's MCP registry is blocking Kiro Crew's own tools ...
+```
+
+This field requires Kiro Crew **0.13.0** or later. Kiro Crew 0.12.1 and
+earlier reject `mcp_registry_local_control_plane` as an unknown governed key,
+and with `boot.fail_closed` set Kiro Crew then does not start. On those
+releases, leave the field out. Run `kirocrew policy validate` before you
+restart.
+
+To enable session identity, set one field at the top level of the security policy
+(`~/.kiro/crew/security_policy.json`, or your centrally distributed document) and
+restart Kiro Crew:
+
+```json
+{
+  "version": 1,
+  "boot": { "fail_closed": true },
+  "mcp_registry_local_control_plane": true
+}
+```
+
+What that changes, and what it does not:
+
+- `kirocrew-core` and `kirocrew-cron` then run from the **local Kiro Crew install**
+  for each session, not from your catalog entry. A catalog `version` pin no longer
+  governs those two servers, and they are mounted even if your catalog omits them.
+  The code that runs is the same Kiro Crew as the gateway, which also removes the
+  version mismatch described in the previous section.
+- Nothing else widens. `kirocrew-computer`, `kirocrew-dashboard`, builtin app
+  servers and every third-party server stay under your catalog exactly as before.
+- Only you can set it. `security_policy.json` is mounted read-only in the sandbox
+  and the agent's file tools refuse to write it; a per-surface profile that sets the
+  field is rejected; and a lower policy tier cannot supply it — with a central
+  document, only the central document's value counts.
+- It must be a JSON `true` or `false`; any other value fails the policy load.
+- A new security policy file brings the rest of the ceiling with it. The `boot`
+  object is required, and the boot flags you leave out take their documented
+  defaults (see the governance spec), so start from the example above or add the
+  field to the policy you already have.
 
 ## Known limitation: registry mode cannot work on the KAS backend
 
@@ -361,6 +449,11 @@ Enforcement in the V2 TUI arrived in **2.2.2**, and **2.6.0** made personal
 `mcp.json` servers load alongside registry-managed ones. Kiro Crew's servers
 live in an agent spec (`~/.kiro/agents/kirocrew.json`), not in personal
 `mcp.json`, so that last change does not exempt them.
+
+The `mcp_registry_local_control_plane` security policy field
+([session identity](#session-identity-for-kiro-crews-own-tools-an-admin-opt-in-off-by-default))
+requires Kiro Crew **0.13.0** or later. Earlier releases reject it as an
+unknown governed key, and with `boot.fail_closed` set they do not start.
 
 ## Central policy distribution: one security policy, every host
 

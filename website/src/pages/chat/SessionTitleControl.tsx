@@ -254,8 +254,8 @@ export default function SessionTitleControl({
   const [focused, setFocused] = useState(false)
   useHeldWindow(undoable, UNDO_WINDOW_MS, hovered || focused, () => setUndoable(null))
 
-  const report = (e: unknown, leadKey: string) =>
-    onError?.(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT(leadKey))
+  const report = (e: unknown, leadKey: string, vars?: Record<string, string>) =>
+    onError?.(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT(leadKey, vars))
 
   const commit = (draft: string) => {
     const refused = draft.trim()
@@ -318,7 +318,8 @@ export default function SessionTitleControl({
       // (they already renamed again), and surfacing it would re-raise the
       // notice a newer attempt's start just cleared. The recovery below still
       // runs, gated the same way, so the store is never left on a refused value.
-      if (rec.gen === myGen) report(e, 'pages.chatPage.could_not_rename_session')
+      // Names the refused title as the header showed it ("Untitled session", never a key).
+      if (rec.gen === myGen) report(e, 'pages.chatPage.could_not_rename_session_to', { title: sessionDisplayTitle({ key, title: refused }) })
       // A refused rename must also revert the optimistic title. Re-read the
       // server truth (deduped through queryClient.fetchQuery so overlapping
       // failures share one request) and apply ONLY this slot's title — never
@@ -540,7 +541,7 @@ export default function SessionTitleControl({
             // Named by the label the header showed, "Untitled session" when the
             // previous name was empty or the key (#20871); the commit below still
             // restores the raw previous value.
-            aria-label={`${i18nT('pages.chatPage.undo_auto_title')}: ${sessionDisplayTitle({ key: slotKey, title: undo.previous })}`}
+            aria-label={i18nT('pages.chatPage.undo_auto_title_named', { title: sessionDisplayTitle({ key: slotKey, title: undo.previous }) })}
             title={sessionDisplayTitle({ key: slotKey, title: undo.previous })}
             className={`shrink-0 flex items-center gap-1 text-accent hover:underline cursor-pointer bg-transparent border-none p-0 ${compact ? 'text-[11px]' : 'text-xs'} leading-none whitespace-nowrap`}
             onClick={(e) => { e.stopPropagation(); commit(undo.previous) }}

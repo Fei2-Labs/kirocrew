@@ -91,6 +91,8 @@ import { dashboardPreviewRef, dashboardPreviewTargetFromHref } from '../utils/da
 import { ClosedSessionNotice } from './markdown/ClosedSessionNotice'
 import { activatePath, isFileLinkDest, isPathCandidate, splitLineRef, usePathResolution } from './markdown/pathReferences'
 import { ELEMENT_OVERRIDES, sp, textOf } from './markdown/elements'
+import { wearsRefusedLinkCue } from './markdown/refusedLinkCue'
+import { linkAddress, useLinkAddressTip } from './markdown/linkAddressTip'
 import { MD_FLOW_ROOT_CLS, MD_PARAGRAPH_CLS } from './markdown/typography'
 import { InlineCode } from './markdown/InlineCode'
 import { MarkdownTable } from './markdown/MarkdownTable'
@@ -98,6 +100,8 @@ import { ImgWithFallback } from './markdown/ImgWithFallback'
 import { DeferredMedia, MdSourceEl } from './markdown/remoteMedia'
 import { MermaidBlock } from './markdown/MermaidBlock'
 import { PlantUmlBlock } from './markdown/PlantUmlBlock'
+import { APPROVAL_COMMAND_TAG } from '../lib/approvalNotificationBody'
+import { FormattedPayloadCard } from '../pages/chat/ToolDetails'
 import { isGenericLang, looksLikeMarkdown } from './markdown/markdownSniff'
 import { ALLOWED_TAGS, VERBATIM_CONTENT_TAGS, rehypeSanitize, remarkVerbatimUnknownTags } from './markdown/sanitize'
 import { holdsSessionRef, rehypeMarkFencedCode, rehypeSessionRefPunctuation, rehypeSourcepos, rehypeStableRootKeys, rehypeUnwrapBlocks, remarkSoftBreaks, SESSION_REF_TRAILING } from './markdown/treeTransforms'
@@ -356,6 +360,40 @@ function MdAnchor({ node, href, children, [SESSION_REF_TRAILING]: trailing }: Md
   // session link is the sentence's own; whatever this anchor renders as, it
   // goes back right after it, so no branch can swallow a full stop.
   const keep = (el: React.ReactElement) => (trailing ? <>{el}{trailing}</> : el)
+  // Where a plain link goes, shown when the pointer rests on it or keyboard
+  // focus lands on it; only the plain anchor below renders it. A session link
+  // already explains itself on hover; `linkAddress` decides which other links
+  // have an address to show.
+  const addressTip = useLinkAddressTip(
+    href && !sessionHrefNamesSession ? linkAddress(href) : undefined,
+  )
+  // The inert label carries the refused-link cue: a muted dotted underline and
+  // a generic reason, as the hover title and as visually-hidden generated
+  // content for touch, keyboard and screen-reader users. The reason lives in a
+  // `::after` pseudo-element rather than a text node, so the label's DOM text
+  // stays exactly what the source renders: inline commenting's sourcePos
+  // alignment walks text nodes against the source span, and copying a message
+  // must not paste the reason into the sentence. Both forms of a refusal reach
+  // here: urlTransform's '' sentinel (a custom scheme, an empty destination)
+  // and an href the sanitizer deleted outright (`javascript:`, `data:`), which
+  // arrives absent exactly like a raw `<a>` that never had one, so the absent
+  // case wears the cue too, except a named in-page anchor or an empty one
+  // (`wearsRefusedLinkCue`), which stay plain prose. The reason never names
+  // the destination: it is already gone by the time this component runs.
+  if (!href && wearsRefusedLinkCue(node)) {
+    const reason = i18nT('components.markdownRenderer.refused_link_destination')
+    return keep(
+      <span
+        {...sp(node)}
+        data-refused-link=""
+        data-refused-reason={` (${reason})`}
+        title={reason}
+        className="text-muted underline decoration-dotted decoration-muted underline-offset-2 after:sr-only after:content-[attr(data-refused-reason)]"
+      >
+        {children}
+      </span>,
+    )
+  }
   if (!href) return keep(<span {...sp(node)}>{children}</span>)
   if (claimed) return keep(<>{claimed}</>)
   if (source?.provider === 'jira') {
@@ -444,6 +482,7 @@ function MdAnchor({ node, href, children, [SESSION_REF_TRAILING]: trailing }: Md
       className={missingFileLink || (sessionHrefNamesSession && !sessionLink && sessionRouting)
         ? 'text-muted'
         : 'text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent'}
+      {...addressTip.handlers}
     >
       <InsideLinkCtx.Provider value={linkKind}>{children}</InsideLinkCtx.Provider>
       {/* The not-open explanation reaches touch / keyboard / AT users as a
@@ -460,6 +499,7 @@ function MdAnchor({ node, href, children, [SESSION_REF_TRAILING]: trailing }: Md
         <span className="sr-only">{` (${i18nT('components.markdownRenderer.session_closed_link_disabled')})`}</span>
       )}
     </a>
+    {addressTip.bubble}
     {/* The sentence's own punctuation, before the notice: "See the old run."
         keeps its full stop beside the link, and the notice follows the
         sentence instead of splitting it. */}
@@ -771,17 +811,27 @@ export function fixCodeFences(s: string): string {
   // after optional whitespace) plus an optional `{...}` attribute block, and
   // nothing more: a ``` run followed by more words is a mid-sentence mention,
   // and moving it onto its own line would open a fence over the prose after it.
-  s = s.replace(/([^\n])(\n?)(```(?:[ \t]*[^`\s]+)?(?:[ \t]+\{[^`\n]*\})?[ \t\r]*\n)/g, (_, pre, nl, fence) =>
-    nl ? pre + nl + fence : pre + '\n\n' + fence
+  // Indentation alone is not glued text: it is how a list item holds its fence,
+  // and moving that fence to column 0 would take it out of the item.
+  s = s.replace(/([^\n])(\n?)(```(?:[ \t]*[^`\s]+)?(?:[ \t]+\{[^`\n]*\})?[ \t\r]*\n)/g, (match, pre, nl, fence, at: number, src: string) =>
+    nl || /^[ \t]*$/.test(src.slice(src.lastIndexOf('\n', at) + 1, at + 1)) ? match : pre + '\n\n' + fence
   )
   // Split closing fences glued to trailing text: ```358KB → ```\n358KB
   // Preserves valid opening fences (```diff, ``` python, ```c++, ```asp.net)
   // via negative lookahead: optional info-string whitespace may precede a tag
   // that starts with a letter and continues as a backtick-free info string,
   // while a size like ```358KB still splits.
-  s = s.replace(/^(```)(?!\s*[a-zA-Z][^`]*$)(.+)$/gm, '$1\n$2')
-  // Split opening fences glued to uppercase text
-  s = s.replace(/```([A-Z])/g, '```\n$1')
+  // An indented fence (inside a list item) splits too, with the split line at
+  // the fence's indentation so both stay in the item. An indented line whose
+  // rest holds another ``` run is inline code (```npm i``` then ...), left alone.
+  s = s.replace(/^([ \t]*)(```)(?!\s*[a-zA-Z][^`]*$)(.+)$/gm, (line, indent: string, fence: string, rest: string) =>
+    indent && rest.includes('```') ? line : indent + fence + '\n' + indent + rest
+  )
+  // Split opening fences glued to uppercase text. The split line keeps the
+  // fence's indentation, so a fence inside a list item stays in that item.
+  s = s.replace(/(^[ \t]*)?```([A-Z])/gm, (_, indent: string | undefined, c: string) =>
+    indent === undefined ? '```\n' + c : indent + '```\n' + indent + c
+  )
   return s
 }
 
@@ -892,7 +942,7 @@ function deferIncompleteStreamingTable(content: string): string {
 
 const noSubscribe = () => () => {}
 
-const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, unfurl, markers }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; markers?: RedactionMarkers }) {
+const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLine, glow, smooth, softBreaks, live, typing, unfurl, markers }: { content: string; sourcePos?: boolean; startLine?: number; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; typing?: boolean; unfurl?: boolean; markers?: RedactionMarkers }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const textPreviews = useContext(TextPreviewsCtx) > 0 && !sourcePos
   // Declared before the early return below — Rules of Hooks.
@@ -982,10 +1032,20 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
   const body = sourcePos
     ? <div data-block-start={startLine ?? 1}><MdBlockStartCtx.Provider value={startLine ?? 1}>{md}</MdBlockStartCtx.Provider></div>
     : md
-  // The provider carries no DOM node, so sourcepos / lightbox scoping upstream
-  // is unaffected. It is the only way MdAnchor / MdParagraph — which react-markdown
-  // instantiates deep inside its own tree — can see the gate.
-  return <LinkUnfurlCtx.Provider value={unfurlCtx}>{body}</LinkUnfurlCtx.Provider>
+  // The providers carry no DOM node, so sourcepos / lightbox scoping upstream
+  // is unaffected. They are the only way MdAnchor / MdParagraph / InlineCode,
+  // which react-markdown instantiates deep inside its own tree, can see the
+  // gates. PathProbeCtx follows `typing` per block, not the whole message: the
+  // text still being typed may hold a partial path ('/Users' en route to
+  // '/Users/me/x.ts') that must neither burn requests nor flash the wrong
+  // affordance, while a block the assembler has closed is final, so its chips
+  // open while the turn runs. Not `live`: that also covers the last markdown
+  // block when a fence or widget after it is the stream's tail.
+  return (
+    <PathProbeCtx.Provider value={!typing}>
+      <LinkUnfurlCtx.Provider value={unfurlCtx}>{body}</LinkUnfurlCtx.Provider>
+    </PathProbeCtx.Provider>
+  )
 })
 
 /** Languages whose fenced content IS markdown, so a rendered view is
@@ -1083,7 +1143,7 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs, mdCardToggle, runYourselfCards, readOnlyCode, markers }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; runYourselfCards?: boolean; readOnlyCode?: boolean; markers?: RedactionMarkers }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slotKey, glow, smooth, softBreaks, live, typing, unfurl, collapseDiffs, mdCardToggle, runYourselfCards, readOnlyCode, markers }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; typing?: boolean; unfurl?: boolean; collapseDiffs?: boolean; mdCardToggle?: boolean; runYourselfCards?: boolean; readOnlyCode?: boolean; markers?: RedactionMarkers }) {
   const readOnlyCodeCtx = useContext(ReadOnlyCodeCtx)
   // A fence holding lock tags renders them in place whatever its language:
   // the diagram, diff and formatted-markdown renderers would show the
@@ -1168,9 +1228,12 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
         ? <CodeBlock code={block.content} lang={block.language} complete={block.complete} />
         : <EditableCodeBlock code={block.content} lang={block.language} complete={block.complete} sourceStartLine={sourcePos ? block.startLine : undefined} runYourselfCard={runYourselfCards} info={block.info} unclosed={block.unclosed} />
       // A closed ```plantuml fence becomes the host's PlantUML picture when it
-      // can be drawn, and stays this code block when it cannot.
-      const shown = block.complete && block.language === 'plantuml'
-        ? <PlantUmlBlock code={block.content}>{node}</PlantUmlBlock>
+      // can be drawn, and stays this code block when it cannot. A closed
+      // approval command opens on the chat approval card's Formatted view when
+      // it is JSON, with this code block as its Raw view.
+      const shown = !block.complete ? node
+        : block.language === 'plantuml' ? <PlantUmlBlock code={block.content}>{node}</PlantUmlBlock>
+        : block.language === APPROVAL_COMMAND_TAG ? <FormattedPayloadCard text={block.content}>{node}</FormattedPayloadCard>
         : node
       // Height-grow only — streaming code renders as one plain <pre> text node
       // so per-line content animation isn't applied here.
@@ -1189,10 +1252,11 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, slo
       }
       return <WidgetFrame html={block.content} title={block.language} slug={block.slug} messageTs={messageTs} slotKey={slotKey} />
     case 'markdown':
-      // `live` = this block is the streaming tail (see MarkdownRenderer). ORed
-      // with the block's own `complete` flag so a provisional block is treated
-      // as live too, whatever produced it.
-      return <MarkdownBlock content={block.content} sourcePos={sourcePos} startLine={block.startLine} glow={glow} smooth={smooth} softBreaks={softBreaks} live={!block.complete || !!live} unfurl={unfurl} markers={markers} />
+      // `live` = this block is the streaming tail (see MarkdownRenderer), and
+      // `typing` = its text is still arriving. Both are ORed with the block's
+      // own `complete` flag so a provisional block is treated as live and
+      // typing too, whatever produced it.
+      return <MarkdownBlock content={block.content} sourcePos={sourcePos} startLine={block.startLine} glow={glow} smooth={smooth} softBreaks={softBreaks} live={!block.complete || !!live} typing={!block.complete || !!typing} unfurl={unfurl} markers={markers} />
   }
 }
 
@@ -1368,6 +1432,10 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
     if (from != null) while (i > 0 && blocks[i - 1].split?.from === from) i--
     return i
   }, [blocks, lastMarkdownIdx])
+  // First block of the text still being typed: the live tail, but only while
+  // that markdown ends the message. A fence or widget after it means the
+  // assembler has closed it, even though it still glows. -1 when none is.
+  const typingFromIdx = streaming && lastMarkdownIdx === blocks.length - 1 ? liveFromIdx : -1
   // Each block renders its own sub-document, so the credential ordinal its
   // first tag carries is the count of tags in every block before it.
   const blockMarkers = useMemo<Array<RedactionMarkers | undefined>>(() => {
@@ -1450,12 +1518,9 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
       // Authored content: nothing in it is a control a guide points at.
       {...guideUntrusted}
     >
-      {/* PathProbeCtx: suppress path stat probes while the message is still
-          streaming, so partial paths ('/Users' en route to '/Users/me/x.ts')
-          neither burn requests nor flash the wrong affordance.
-          PathActionCtx: where a confirmed chip sends its click — MD_COMPONENTS is
-          module-level, so the renderer cannot pass these down as props. */}
-      <PathProbeCtx.Provider value={!streaming}>
+      {/* PathActionCtx: where a confirmed chip sends its click. MD_COMPONENTS is
+          module-level, so the renderer cannot pass these down as props. Whether a
+          chip may probe at all is per block (PathProbeCtx in MarkdownBlock). */}
       <PathActionCtx.Provider value={pathActions}>
       <SessionActionCtx.Provider value={sessionActions}>
       {/* CompactImagesCtx: user-message ("sent prompt") callers pass compactImages
@@ -1495,6 +1560,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             // being typed. `streaming` rather than `glow` because a caller may
             // render a streaming transcript without asking for the shimmer.
             live={streaming && liveFromIdx >= 0 && i >= liveFromIdx && block.type === 'markdown'}
+            typing={typingFromIdx >= 0 && i >= typingFromIdx && block.type === 'markdown'}
             unfurl={linkPreviews}
             smooth={smooth}
             softBreaks={softBreaks}
@@ -1511,7 +1577,6 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
       </CompactImagesCtx.Provider>
       </SessionActionCtx.Provider>
       </PathActionCtx.Provider>
-      </PathProbeCtx.Provider>
     </div>
   )
 })

@@ -5,7 +5,8 @@ would interrupt work: chat turns, subagents, workflows, the task runner, channel
 handlers. That is the census the gateway's own scheduled update waits on
 (``GatewayOrchestrator._in_flight_work_counts``). While the gateway is busy this
 waits and asks again, up to ``--max-wait``; once it answers idle, the gateway
-keeps new turns paused and this runs the ordinary :func:`_restart`.
+is asked once more with ``commit``, which pauses and fences new turns, and this
+runs the ordinary :func:`_restart`; if that does not restart, the pause is released.
 
 The Remote Crew "Update" and "Restart" actions run ``restart --when-idle
 --max-wait 0`` on the remote over SSH or SSM, one check per call, and read the
@@ -36,9 +37,7 @@ from kiro_crew.config.loader import read_local_secret
 from kiro_crew.loopback_http import deadline_expired
 from kiro_crew.port_resolution import resolve_client_port
 
-#: Default ``--max-wait``. The same ceiling the gateway gives a mandatory update
-#: it holds back for in-flight work (``_MANDATORY_UPDATE_MAX_DEFER_SECS``); a test
-#: pins the two equal.
+#: Default ``--max-wait``.
 DEFAULT_MAX_WAIT_SECS = 600.0
 
 #: How often a busy gateway is asked again.
@@ -84,26 +83,46 @@ class _Verdict:
     state: str
     turns: int = 0
     background: int = 0
-    #: Whether the gateway that answered was launched by the service definition.
+    #: Whether the gateway that answered is the one the service runs.
     service_managed: bool = False
+    #: The service manager's answer when the marker was missing: ``"service"``,
+    #: ``"other"``, ``"unknown"``, or ``None`` (marker present, or an older gateway).
+    service_identity: str | None = None
 
 
 class _GateFailed(Exception):
     """The idle check could not be answered, so nothing may restart."""
 
 
-def _ask_gate(port: int, *, service_only: bool = False) -> _Verdict:
+class _CommitUnsupported(Exception):
+    """The gateway answered the committing ask with a 400 or 404: it only knows the one-step check."""
+
+
+def _ask_gate(
+    port: int, *, service_only: bool = False, commit: bool = False, release: bool = False
+) -> _Verdict:
     """One ``POST /api/restart/when-idle`` against the gateway on *port*.
 
     *service_only*: the restart will go to the kirocrew service, so a gateway
     the service did not launch answers without pausing its admission.
+    *commit*: an idle answer also pauses and fences admission for the restart
+    that follows. *release* reopens it when that restart did not happen.
     """
     url = f"http://{_CLI_LOOPBACK}:{port}/api/restart/when-idle"
     headers = {"Content-Type": "application/json"}
     secret = read_local_secret(port, dial_host=_CLI_LOOPBACK)
     if secret:
         headers["X-Internal-Secret"] = secret
-    data = b'{"service_managed_only":true}' if service_only else b"{}"
+    flags = {
+        name: True
+        for name, on in (
+            ("service_managed_only", service_only),
+            ("commit", commit),
+            ("release", release),
+        )
+        if on
+    }
+    data = json.dumps(flags, separators=(",", ":")).encode()
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         # The local secret goes only to a listener proven to be this install's
@@ -121,6 +140,11 @@ def _ask_gate(port: int, *, service_only: bool = False) -> _Verdict:
             code = ""
         if code in _GATE_REFUSAL_CODES:
             raise _GateFailed(f"the gateway refused the idle check (HTTP {e.code}, {code})") from e
+        if commit and e.code in (400, 404):
+            # A gateway older than the two-step check rejects the committing
+            # body. It never paused admission, so the first idle answer is all
+            # it can give.
+            raise _CommitUnsupported() from e
         if e.code in (401, 403, 404, 405, 503):
             # No idle route on this gateway: an older build, or one that runs
             # no orchestrator. Its answer to an unknown path is an auth refusal
@@ -140,15 +164,19 @@ def _ask_gate(port: int, *, service_only: bool = False) -> _Verdict:
         raise _GateFailed(f"the idle check on port {port} failed: {type(reason).__name__}") from e
     if not isinstance(body, dict):
         raise _GateFailed("the gateway's idle check answered with an unreadable body")
+    if release:
+        return _Verdict("busy")
     turns = body.get("turns")
     background = body.get("background")
     if not isinstance(turns, int) or not isinstance(background, int):
         raise _GateFailed("the gateway's idle check answered without its counts")
+    identity = body.get("service_identity")
     return _Verdict(
         "idle" if body.get("idle") is True else "busy",
         turns,
         background,
         service_managed=body.get("service_managed") is True,
+        service_identity=identity if isinstance(identity, str) else None,
     )
 
 
@@ -213,6 +241,28 @@ def _refuse(reason: str) -> NoReturn:
     sys.exit(EXIT_GATE_REFUSED)
 
 
+def _refuse_as_restart_would(cli_port: int | None, port: int) -> None:
+    """Exit 1 with :func:`_restart`'s own refusal when it would refuse this restart.
+
+    The two refusals it reaches after the gate has said idle: our service name
+    is an alias of another unit, or the desktop app supervises the gateway.
+    Run before the gate, whose idle answer keeps turns paused for a restart
+    that would then never come. Same helpers, message, audit record and exit
+    status as ``_restart``, so a remote caller reads a failed restart, not an
+    idle check that a forced restart could get past.
+    """
+    from kiro_crew.cli_server_stop import _refuse_desktop_supervised, _refuse_service_alias
+
+    if cli_port is None and _service_active():
+        # ``_restart`` restarts the running service and returns before either
+        # refusal, which guard only its foreground path.
+        return
+    if cli_port is None and _refuse_service_alias("gateway_restart", port):
+        sys.exit(1)
+    if _refuse_desktop_supervised("gateway_restart", port, explicit_port=cli_port is not None):
+        sys.exit(1)
+
+
 def _describe(verdict: _Verdict) -> str:
     return f"{verdict.turns} chat turn(s) and {verdict.background} background task(s)"
 
@@ -234,8 +284,11 @@ def _restart_when_idle(cli_port: int | None, *, max_wait_secs: float | None = No
             f"--when-idle can check only one gateway (port {port}). Restart one with "
             "--port, or run `kirocrew restart` to restart both now."
         )
+    _refuse_as_restart_would(cli_port, port)
     wait = DEFAULT_MAX_WAIT_SECS if max_wait_secs is None else max(0.0, max_wait_secs)
     deadline = _now() + wait
+    confirming = False
+    committed = False
     while True:
         # Without --port the restart below goes to the running service, so only
         # the service's own gateway may answer for it. Asked as part of the
@@ -243,7 +296,14 @@ def _restart_when_idle(cli_port: int | None, *, max_wait_secs: float | None = No
         # pausing its admission for a restart that will not reach it.
         service_only = cli_port is None and _service_active()
         try:
-            verdict = _ask_gate(port, service_only=service_only)
+            verdict = _ask_gate(port, service_only=service_only, commit=confirming)
+        except _CommitUnsupported:
+            # Legacy gateway: fall back to the one-step behavior. The earlier
+            # idle answer stands, and any hold the ask may have taken is released.
+            _release_gate(port)
+            confirming = False
+            committed = False
+            break
         except _GateFailed as e:
             _refuse(f"{e}.")
         if verdict.state == "down" and service_only:
@@ -255,17 +315,42 @@ def _restart_when_idle(cli_port: int | None, *, max_wait_secs: float | None = No
                 "is running. Pass --port for the gateway you mean, or run "
                 "`kirocrew restart` to restart the service now."
             )
-        if service_only and verdict.state in ("idle", "busy") and not verdict.service_managed:
-            # The gateway that answered says no service launched it (another
-            # data home, say), so its answer is not about the service the
-            # restart below would reach.
+        unproven = verdict.service_identity == "unknown"
+        if (
+            service_only
+            and verdict.state in ("idle", "busy")
+            and not verdict.service_managed
+            and not unproven
+        ):
+            # The gateway that answered says the service runs another process
+            # (another data home, say), so its answer is not about the service
+            # the restart below would reach.
             _refuse(
                 f"the gateway on port {port} is not the running kirocrew "
                 "service's gateway, and without --port the restart would go to the "
                 "service. Pass --port for the gateway you mean, or run `kirocrew restart` "
                 "to restart the service now."
             )
+        if verdict.state == "idle" and not confirming:
+            # The census is a snapshot and admission stays open, so a message can
+            # land between this answer and the restart. Ask once more at once,
+            # this time taking the pause and fence: a turn admitted in between
+            # reads busy and is waited on, and one that starts after the answer
+            # is spooled instead of cut.
+            confirming = True
+            continue
+        committed = confirming and verdict.state == "idle"
+        confirming = False
         if verdict.state in ("idle", "down"):
+            if service_only and unproven and verdict.state == "idle":
+                # No marker, and the service manager could not be read: nothing
+                # shows the service runs another process, so the idle answer stands.
+                print(
+                    "ℹ️ Could not verify that this gateway is the kirocrew service's own "
+                    "(its service definition has no marker, and the service manager did not "
+                    "answer). Restarting the service. `kirocrew service install` refreshes "
+                    "an older definition."
+                )
             break
         if verdict.state == "unsupported":
             print(
@@ -289,4 +374,21 @@ def _restart_when_idle(cli_port: int | None, *, max_wait_secs: float | None = No
     # Through the facade, so a patch of ``kiro_crew.cli_server._restart`` reaches it.
     from kiro_crew.cli_server import _restart
 
-    _restart(cli_port)
+    try:
+        _restart(cli_port)
+    except BaseException as e:
+        # A restart that did not replace the process leaves the gateway serving,
+        # so the admission the commit closed must not outlive it. A clean exit
+        # (code 0) is the restart having happened.
+        if committed and not (isinstance(e, SystemExit) and not e.code):
+            _release_gate(port)
+        raise
+
+
+def _release_gate(port: int) -> None:
+    """Reopen the admission a committed idle answer closed; never raises."""
+    try:
+        _ask_gate(port, release=True)
+    except Exception:
+        # The gateway's own hold expires on its own (COMMIT_HOLD_SECS).
+        pass

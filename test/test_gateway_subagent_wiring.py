@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -28,7 +28,7 @@ from kiro_crew import runtime_death
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.dashboard.handlers import messaging as messaging_handlers
 from kiro_crew.slack import gateway as gw_mod
-from kiro_crew.subagent import SubagentInfo
+from kiro_crew.subagent import HostSpawnDecision, SubagentInfo
 
 #: Every wait in these tests is on a condition; this is only the lost-run guard.
 _LOST_RUN_SECS = 30.0
@@ -108,7 +108,12 @@ class _Done:
 
         self.client = MagicMock(name="client")
         self.clients: list[Any] = [self.client]
+        #: Whether the parent's session is live, and the ``is_new`` a claim
+        #: answers: ``True`` is a session the claim started, the parent having ended.
+        self.parent_live = True
+        self.claim_is_new = False
         sessions = MagicMock(name="sessions")
+        sessions.has_session = MagicMock(side_effect=lambda _key: self.parent_live)
         sessions.get_or_create = AsyncMock(side_effect=self._get_or_create)
         sessions.reset = AsyncMock(side_effect=self._reset)
         sessions.cancel_current = AsyncMock(
@@ -190,7 +195,7 @@ class _Done:
     async def _get_or_create(self, key: str, **_kw: Any) -> tuple[Any, bool, bool]:
         self.calls.append(("acquire", key))
         client = self.clients.pop(0) if len(self.clients) > 1 else self.clients[0]
-        return client, True, False
+        return client, self.claim_is_new, False
 
     def _slot_for_parent(self, _state: Any, _key: str) -> Any:
         slot = self.bound_slots.pop(0) if self.bound_slots else self.bound_slot
@@ -479,7 +484,11 @@ async def test_yolo_is_read_from_the_safety_override_at_call_time(
 async def test_a_spawn_request_resolves_the_slot_its_parent_answers_to(done: _Done) -> None:
     (resolver_kwargs, _tool_gate), (spawn_kwargs, _spawn_gate) = done.approvals
     resolve = resolver_kwargs["slot_resolver"]
-    assert spawn_kwargs == {"slot_resolver": resolve, "raise_when_unreachable": True}
+    assert spawn_kwargs == {
+        "slot_resolver": resolve,
+        "raise_when_unreachable": True,
+        "on_host_decision": ANY,
+    }
     done.mgr.get = MagicMock(
         side_effect=lambda agent_id: make_info(agent_id) if agent_id == "a9" else None
     )
@@ -488,6 +497,26 @@ async def test_a_spawn_request_resolves_the_slot_its_parent_answers_to(done: _Do
     assert resolve("spawn:gone") == ""
     assert [c.args for c in done.mgr.get.call_args_list] == [("a9",), ("gone",)]
     assert done.manager_kwargs["on_tool_approval"] is _tool_gate
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_the_gate_answered_with_nobody_asked_returns_a_host_decision(
+    done: _Done, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gw_mod, "deliver_spawn_approval", AsyncMock(return_value=None))
+    approve = done.manager_kwargs["on_spawn_approval"]
+    spawn_kwargs, spawn_gate = done.approvals[1]
+
+    async def _expired(event: Any, _parent: str = "") -> bool:
+        spawn_kwargs["on_host_decision"](event.request_id, "approval_timeout")
+        return False
+
+    spawn_gate.side_effect = _expired
+    answer = await approve("spawn:a1", "run it", "dashboard:main")
+    assert isinstance(answer, HostSpawnDecision)
+    assert answer == (False, "approval_timeout")
+    spawn_gate.side_effect = None
+    assert await approve("spawn:a1", "run it", "dashboard:main") is True, "a person answered"
 
 
 @pytest.mark.asyncio

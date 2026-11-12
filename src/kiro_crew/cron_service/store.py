@@ -33,11 +33,14 @@ from kiro_crew.cron_service.model import (
     _AUTO_PAUSE_THRESHOLD,
     CronJob,
     CronSchedule,
+    parked_by_its_run,
 )
 from kiro_crew.cron_service.zone_default_migration import (
+    _LEGACY_DEFAULT_ZONE,
     LOCAL_DEFAULT_STORE_VERSION,
     predates_local_default,
 )
+from kiro_crew.user_json import MAX_DOCUMENT_NESTING, exceeds_nesting
 
 logger = logging.getLogger("kiro_crew.cron")
 
@@ -51,6 +54,14 @@ _STORE_VERSION = LOCAL_DEFAULT_STORE_VERSION
 #: The top-level keys of the store document this build writes itself. Any other
 #: top-level key came from a newer build and is written back unchanged.
 _STORE_DOCUMENT_KEYS = frozenset({"version", "jobs"})
+
+#: The deepest a job record the store keeps may nest: two levels inside the store
+#: document (``{"jobs": [record]}``), so the saved store stays within
+#: ``MAX_DOCUMENT_NESTING``, the bound a snapshot restore applies. ``_save`` encodes
+#: with ``indent=2``, whose pure-Python encoder recurses once per level and raises
+#: ``RecursionError`` about a thousand levels down, so nothing the store keeps may
+#: nest deeper, whatever ``json.loads`` accepted.
+_MAX_RECORD_NESTING = MAX_DOCUMENT_NESTING - 2
 
 # Bounded non-blocking acquire for the cron-store advisory lock (see
 # CronService._file_lock). The spin never parks the event loop in an
@@ -161,6 +172,15 @@ def _record_user_paused(j: dict[str, Any]) -> bool:
     return bool(j.get("user_paused", not j.get("enabled", True)))
 
 
+def _record_parked_by_run(j: dict[str, Any]) -> bool:
+    """:func:`parked_by_its_run` for a serialized job: a fired one-shot's park, not a user pause."""
+    schedule = j.get("schedule")
+    kind = schedule.get("kind") if isinstance(schedule, dict) else None
+    return parked_by_its_run(
+        kind, _record_user_paused(j), j.get("user_pause_requested"), j.get("last_run_ts")
+    )
+
+
 def _record_is_enabled(j: dict[str, Any]) -> bool:
     """Single owner for the effective-enabled predicate of a serialized job.
 
@@ -187,8 +207,9 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
     """Build one :class:`CronJob` from its serialized record.
 
     Raises ``KeyError``/``TypeError`` when the record is malformed (missing
-    required keys, not shaped like a job object at all, or carrying a
-    non-string where the field decides WHAT the job executes). The caller
+    required keys, not shaped like a job object at all, carrying a
+    non-string where the field decides WHAT the job executes, or a field it
+    keeps nested past ``_MAX_RECORD_NESTING``). The caller
     (:meth:`CronService._load`) isolates that failure to THIS entry — one bad
     record must never discard the rest of the store.
 
@@ -207,7 +228,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
     No ``AttributeError`` is possible for ``json.loads`` output (every ``.get()``
     follows a ``[...]`` subscript, which only a ``dict`` survives), so one here
     is a code defect. ``_load`` lets it propagate: treating it as a malformed
-    record would erase a valid job from disk on the next save.
+    record would quietly stop a valid job from running.
     """
     from kiro_crew import cron as seams  # the facade holds the patched names; it imports us
 
@@ -360,6 +381,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         persistent_session=j.get("persistent_session", True),
         minimal_context=j.get("minimal_context", False),
         hide_in_chat=j.get("hide_in_chat", False),
+        new_chat_per_run=j.get("new_chat_per_run") is True,
         folder_id=_guard_str("folder_id"),
         chat_folder_id=_guard_str("chat_folder_id"),
         project_path=_guard_str("project_path"),
@@ -368,6 +390,7 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         last_retry_run_ts=_guard_num("last_retry_run_ts", 0.0),
         run_generation=_guard_num("run_generation", 0),
         user_pause_generation=_guard_num("user_pause_generation", 0),
+        user_pause_requested=j.get("user_pause_requested") is True,
         agent_sequence=_str_list("agent_sequence"),
         env=j.get("env", {}),
         timeout_secs=_guard_num("timeout_secs", seams._JOB_TIMEOUT_SECS),
@@ -385,7 +408,13 @@ def _job_from_record(j: dict[str, Any], *, warn_on_coercion: bool = True) -> Cro
         secret_env_pending=j.get("secret_env_pending", {}),
         secret_env_pending_pin=_guard_str("secret_env_pending_pin"),
         secret_env_pending_ts=_guard_num("secret_env_pending_ts", 0.0),
+        secret_env_resurfaced_pin=_guard_str("secret_env_resurfaced_pin"),
     )
+    # Measured on what the save writes back, so a coerced field does not count.
+    # Skipping the record rather than clearing the field keeps a too-deep
+    # execution_context or env from running the job under one it was not given.
+    if exceeds_nesting(job_record(job), _MAX_RECORD_NESTING):
+        raise TypeError(f"cron record nests deeper than {_MAX_RECORD_NESTING} levels")
     if coerced and warn_on_coercion:
         logger.warning(
             "Coercing non-string value(s) in cron job entry (id=%r) field(s) %s to unset; "
@@ -563,6 +592,8 @@ def job_record(j: CronJob) -> dict[str, Any]:
     # an older build writes.
     if j.user_pause_generation:
         record["user_pause_generation"] = j.user_pause_generation
+    if j.user_pause_requested:
+        record["user_pause_requested"] = True
     # The optional ownership keys follow the same compatibility rule. An older
     # build reads a newer store's extra key and writes it back.
     if j.managed_by:
@@ -579,17 +610,23 @@ def job_record(j: CronJob) -> dict[str, Any]:
     # A job with no project directory saves to the bytes an older build wrote.
     if j.project_path:
         record["project_path"] = j.project_path
+    # Written only when set, by the same rule.
+    if j.new_chat_per_run:
+        record["new_chat_per_run"] = True
+    if j.secret_env_resurfaced_pin:
+        record["secret_env_resurfaced_pin"] = j.secret_env_resurfaced_pin
     return record
 
 
 #: Every key :func:`job_record` can write, read off the encoder itself so the two
 #: cannot drift: a job that sets each conditionally written key
-#: (``user_pause_generation``, ``managed_by``, ``app_manifest_digest``,
+#: (``user_pause_generation``, ``user_pause_requested``, ``managed_by``, ``app_manifest_digest``,
 #: ``person_owner_key``, ``acked_item_ids`` with ``acked_item_ids_digest``,
-#: ``project_path``, and a non-default ``auto_pause_after_failures`` and
-#: ``alert_after_failures``, which are omitted at the default). A record key
-#: outside this set came from a newer build. A key inside it is this build's to
-#: write or to omit, so a value this build cleared stays cleared.
+#: ``project_path``, ``new_chat_per_run``, ``secret_env_resurfaced_pin``, and a
+#: non-default ``auto_pause_after_failures`` and ``alert_after_failures``, which
+#: are omitted at the default). A record key outside this set came from a newer
+#: build. A key inside it is this build's to write or to omit, so a value this
+#: build cleared stays cleared.
 _KNOWN_JOB_KEYS = frozenset(
     job_record(
         CronJob(
@@ -598,10 +635,13 @@ _KNOWN_JOB_KEYS = frozenset(
             message="",
             schedule=CronSchedule(kind="cron"),
             user_pause_generation=1,
+            user_pause_requested=True,
             managed_by="-",
             app_manifest_digest="-",
             person_owner_key="-",
             project_path="-",
+            new_chat_per_run=True,
+            secret_env_resurfaced_pin="-",
             auto_pause_after_failures=0,
             alert_after_failures=2,
             acked_item_ids=["-"],
@@ -629,7 +669,17 @@ MAX_UNKNOWN_FIELDS_STORE_BYTES = 1024 * 1024
 
 
 def _kept_size(what: str, *parts: Mapping[str, Any]) -> int | None:
-    """The JSON size of the unknown keys in *parts*, or None (logged) past the per-item cap."""
+    """The JSON size of the unknown keys in *parts*, or None (logged) past the per-item cap
+    or nested deeper than ``_MAX_RECORD_NESTING - 1``: a schedule's keys are written back
+    one level inside a record, the deepest place any of them goes."""
+    if any(exceeds_nesting(part, _MAX_RECORD_NESTING - 1) for part in parts):
+        logger.warning(
+            "Cron store: %s has key(s) from a newer build nested deeper than %d levels; "
+            "they are not kept, so the next save writes it without them",
+            what,
+            _MAX_RECORD_NESTING - 1,
+        )
+        return None
     try:
         size = sum(len(json.dumps(part)) for part in parts if part)
     except (TypeError, ValueError, RecursionError):
@@ -653,6 +703,7 @@ def encode_store(
     version: int = _STORE_VERSION,
     extra: Mapping[str, Any] | None = None,
     unknown_fields: Mapping[str, UnknownFields] | None = None,
+    skipped: Iterable[Any] = (),
 ) -> str:
     """The whole store document for ``jobs``, as ``_save`` writes it (two-space indent).
 
@@ -664,6 +715,9 @@ def encode_store(
     with them. ``version`` is written as given: the decoder's, never lower than the
     one read, or the older version a store whose upgrade had to wait keeps. A store with no
     unknown keys encodes exactly as it did before.
+
+    ``skipped`` is :attr:`StoreDocument.skipped`, the records the decoder kept,
+    written back after the jobs.
     """
     fields_by_job = unknown_fields or {}
     records = []
@@ -676,6 +730,7 @@ def encode_store(
             for key, value in unknown.job.items():
                 record.setdefault(key, value)
         records.append(record)
+    records.extend(skipped)
     data: dict[str, Any] = {
         "version": version,
         "jobs": records,
@@ -700,6 +755,9 @@ class StoreDocument:
     ``version`` is the document's version when it is an integer above this build's,
     else this build's. ``extra`` holds the top-level keys other than ``version`` and
     ``jobs``; ``unknown_fields`` maps a loaded job's id to its unknown keys.
+    ``skipped`` holds each ``jobs[]`` object no job could be built from, as read, when
+    the store document still nests within ``MAX_DOCUMENT_NESTING`` with it and its
+    JSON size fits the per-record and shared store retention caps.
     """
 
     jobs: list[CronJob]
@@ -708,6 +766,7 @@ class StoreDocument:
     unknown_fields: Mapping[str, UnknownFields]
     #: Written before an unset zone followed the host; see ``zone_default_migration``.
     predates_local_default: bool = False
+    skipped: tuple[Any, ...] = ()
 
 
 def _unknown_fields_of(record: dict[str, Any]) -> tuple[UnknownFields, int] | None:
@@ -765,21 +824,66 @@ def decode_store(raw: bytes) -> StoreDocument | None:
             kept_total = extra_size
     unknown_fields: dict[str, UnknownFields] = {}
     past_total = 0
-    # Per-entry isolation: a bad record is warned about and skipped, the
-    # rest survive. Only KeyError/TypeError are bad-data signals; an
-    # AttributeError is a code defect and propagates (see _job_from_record).
+    # Per-entry isolation: a bad record is warned about and skipped, and kept for
+    # the save when it is an object a snapshot restore accepts and fits the
+    # per-record and shared store retention caps; the rest survive.
+    # Only KeyError and TypeError are bad-data signals; an AttributeError is a
+    # code defect and propagates (see _job_from_record).
     jobs: list[CronJob] = []
+    skipped: list[Any] = []
+    skipped_total = 0
     for j in records:
         try:
             job = _job_from_record(j)
         except (KeyError, TypeError) as entry_exc:
             entry_id = j.get("id", "<missing id>") if isinstance(j, dict) else "<not an object>"
+            # A kept record must fit both retention caps as well as the nesting
+            # bound a snapshot restore applies, with the two levels above it.
+            # A present name must also be text without lone surrogates, the rule
+            # snapshot_merge._usable_cron_shape applies to the live store: a kept
+            # record that broke it would make every `restore --mode merge` skip crons.
+            name = j.get("name", "") if isinstance(j, dict) else None
+            kept = (
+                isinstance(name, str)
+                and not any("\ud800" <= ch <= "\udfff" for ch in name)
+                and not exceeds_nesting(j, _MAX_RECORD_NESTING)
+            )
+            if kept:
+                # The whole record counts, an empty object included: it was decoded
+                # from JSON and passed the nesting bound, so it encodes. It is charged
+                # at its size with the UTC stamp an older store's save may add
+                # (zone_default_migration), so a record kept now is kept on reload.
+                size = max(
+                    len(json.dumps(j)),
+                    len(json.dumps({**j, "timezone": _LEGACY_DEFAULT_ZONE})),
+                )
+                # Their own total under the same cap, so kept records never take
+                # the budget a loaded job's newer-build keys need.
+                if (
+                    size > MAX_UNKNOWN_FIELDS_BYTES
+                    or skipped_total + size > MAX_UNKNOWN_FIELDS_STORE_BYTES
+                ):
+                    kept = False
+                else:
+                    skipped_total += size
             logger.warning(
-                "Skipping malformed cron job entry (id=%r): %r; "
-                "the entry will be dropped from the store on the next write",
+                "Skipping malformed cron job entry (id=%r): %r; %s",
                 entry_id,
                 entry_exc,
+                (
+                    "it does not run, and the store keeps it until it is fixed or "
+                    "removed by hand"
+                    if kept
+                    else "the store keeps only an object with a plain-text name (or none), "
+                    "nested at most "
+                    f"{_MAX_RECORD_NESTING} levels within the "
+                    f"{MAX_UNKNOWN_FIELDS_BYTES}-byte per-record and "
+                    f"{MAX_UNKNOWN_FIELDS_STORE_BYTES}-byte total size caps, so the entry "
+                    "will be dropped from the store on the next write"
+                ),
             )
+            if kept:
+                skipped.append(j)
             continue
         jobs.append(job)
         found = _unknown_fields_of(j)
@@ -805,6 +909,7 @@ def decode_store(raw: bytes) -> StoreDocument | None:
         extra=extra,
         unknown_fields=unknown_fields,
         predates_local_default=predates_local_default(read_version),
+        skipped=tuple(skipped),
     )
 
 

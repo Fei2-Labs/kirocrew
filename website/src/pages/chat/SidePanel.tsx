@@ -1,6 +1,6 @@
 import { batchCloseConfirm } from '../../components/TabCloseMenu'
 import { useConfirm } from '../../components/ConfirmDialog'
-import { useState, useRef, useEffect, useCallback, useMemo, Fragment, Suspense, lazy, type ReactNode } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, Fragment, type ReactNode } from 'react'
 import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { AllTabsMenu } from '../../components/AllTabsMenu'
 import { useSidePanelTabNav } from './SidePanelTabNav'
@@ -10,10 +10,26 @@ import { Plus, MoreHorizontal, Globe, PanelRight, PanelBottom } from 'lucide-rea
 import { SidePanelDockHost, SidePanelGlyph } from '../../components/SidePanelGlyph'
 import ActivityViewer from './ActivityViewer'
 // Loaded with its tab, not the shell: the panel (attention cards, tile lists,
-// the session card frame) is only mounted once a Dashboard tab exists.
-const CommandCenterPanel = lazy(() => import('./command-center/CommandCenterPanel'))
-// Remote-environment sessions only.
-const RemoteFilesPanel = lazy(() => import('./RemoteFilesPanel'))
+// the session card frame) is only mounted once a Dashboard tab exists. A chunk
+// that fails to load shows its notice in the tab, with Try Again, never the
+// route's card over the whole chat page.
+// No hand-off: the adjacent chat composer holds unsent text and the panel's own
+// answer drafts live in this tab.
+const CommandCenterPanel = lazyRetry(() => import('./command-center/CommandCenterPanel'), {
+  layout: 'block',
+  title: () => i18nT('commandCenter.panel_load_failed'),
+  scope: 'command-center',
+  askAgent: false,
+})
+// Remote-environment sessions only. A chunk that fails to load shows its notice
+// in the Files tab, with Try Again.
+// No hand-off: the chat composer and open files may hold unsaved drafts.
+const RemoteFilesPanel = lazyRetry(() => import('./RemoteFilesPanel'), {
+  layout: 'page',
+  title: () => i18nT('sessionEnvironments.remoteFiles.panelLoadFailed'),
+  scope: 'remote-files',
+  askAgent: false,
+})
 import { CrewWorkersTab } from './command-center/CrewWorkerList'
 import FilesHomePanel from './FilesHomePanel'
 import { slotEnvironmentQueryKey, useSlotEnvironmentPlacement } from '../../components/sessionEnvironmentHooks'
@@ -37,6 +53,7 @@ import { SettingsLink } from '../../components/SettingsLink'
 import type { ExternalTerminalFallbackNote } from '../../lib/externalTerminal'
 import { TOGGLE_SIDE_TERMINAL_EVENT } from '../../lib/panelToggleShortcuts'
 import ErrorBoundary from '../../components/ErrorBoundary'
+import { lazyRetry } from '../../components/lazyRetry'
 import { fetchFileRead } from '../../utils/fileReadQuery'
 import { useAppSelector } from '../../store'
 import { selectSlotSubagents, selectSlotToolLog } from '../../store/chatSlice'
@@ -52,6 +69,7 @@ import type { MarkdownPanelHandle } from '../../components/MarkdownPanel'
 import type { ArtifactPanelHandle } from '../../components/ArtifactPanel'
 import { AppPanelTabBody, AppPanelTabsErrorNotice, McpAppTabBody, TabBody } from './SidePanelTabBodies'
 import { useSidePanelSize } from './useSidePanelSize'
+import { slotHasWorkflowRun } from './workflowRunsPoll'
 import { crewModeRoot, crewRootOf } from '../../lib/crewMode'
 import { useCrewMode } from '../../hooks/usePreviewFlag'
 import { pathBasename, stripTrailingSeparators } from '../../utils/pathBasename'
@@ -62,6 +80,7 @@ import { pathBasename, stripTrailingSeparators } from '../../utils/pathBasename'
 // `useSidePanelSize.ts` (the panel's size). Callers keep importing every name
 // exported below from this module.
 export { NEW_MENU_DESC_KEY, NEW_MENU_LABEL_KEY, newMenuSections, TabChip }
+export { HydratingFileTab } from './SidePanelTabBodies'
 export type { SidePanelWithholdable }
 export { CHAT_PANE_MIN_W, SIDE_PANEL_MIN_W, SIDE_PANEL_RESERVED_W, sidePanelEffectiveWidth, sidePanelFillWidth } from './useSidePanelSize'
 
@@ -157,6 +176,8 @@ interface SidePanelProps {
   selectedSourceUrl?: string
   onSelectSource?: (url: string) => void
   onReconcileSource?: (url: string) => void
+  /** Close a pull request's tab in the Changes strip for this session. */
+  onDismissSource?: (url: string) => void
   /** Issue links mentioned in this session (the `kind: 'issue'` half of the
    *  extractor's output). Separate props — not a merged list — so the Changes
    *  and Issues tabs each keep their own selection. */
@@ -176,6 +197,7 @@ interface SidePanelProps {
   pins?: ChatPin[]
   pinsLoading?: boolean
   onJumpToPin?: (messageTs: string, mid?: string) => void
+  onPutPinInComposer?: (messageTs: string, mid?: string) => void
   onUnpin?: (id: string) => void
   /** Only shape the copyable deep link a pin row offers. */
   slotTitle?: string
@@ -264,10 +286,10 @@ interface SidePanelProps {
  */
 export default function SidePanel({
   tabsCtl, slot, slotOwner, persistSlot, onFileOpen, onOpenWorkingTreeDiff, onArtifactOpen, onAddToContext, onComposerInsert,
-  projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource,
+  projectDir, navLinks, navResolving, sources, selectedSourceUrl, onSelectSource, onReconcileSource, onDismissSource,
   issues, selectedIssueUrl, onSelectIssue, onReconcileIssue,
   onAddSourceToChat, onSubmitComments, connected = true, onFileSave, onClose, panelHidden,
-  pins, pinsLoading, onJumpToPin, onUnpin,
+  pins, pinsLoading, onJumpToPin, onPutPinInComposer, onUnpin,
   slotTitle, chatMode,
   expanded, fillWidth, canDockBottom = true,
   leadingTabs, segments, extraReserveW = 0, defaultWidth = 460, hiddenViews: hostHiddenViews, onActiveTabChange, pinSummary = false,
@@ -319,6 +341,16 @@ export default function SidePanel({
     retry: false,
   })
   const summaryEnabled = summaryMeta?.enabled !== false
+  // Whether to offer the Workflows row: once this chat has a run, listed (the
+  // command center's entry, which the socket refreshes) or live. Fails OPEN like
+  // Summary. No query-level options here: they would apply to that entry's reads.
+  const { data: workflowRunList, isSuccess: workflowRunsRead } = useQuery({
+    queryKey: ['command-center', 'workflows'], queryFn: api.workflowRuns, enabled: !!slot,
+  })
+  const hasLiveWorkflowRun = useAppSelector(st => slotHasWorkflowRun(
+    Object.values(st.chat.workflowRuns ?? {}).map(r => r.sessionKey), slot))
+  const hasWorkflowRuns = !slot || !workflowRunsRead || hasLiveWorkflowRun
+    || slotHasWorkflowRun((workflowRunList?.runs ?? []).map(r => r.session_key), slot)
 
   // The + menu / empty-state launcher hide Terminal when the feature is
   // disabled server-side, and never list the pinned views (Changes / Files /
@@ -348,7 +380,7 @@ export default function SidePanel({
     summaryOn: summaryMeta ? summaryMeta.enabled === true : undefined, summaryWithheld: !!hiddenViews?.has('summary'),
     crewFirst: (crewMode || (freshChat && tabs.some(t => t.id === 'workers'))) && crewModePreview && !hiddenViews?.has('workers'),
   })
-  const menuSections = newMenuSections({ terminalEnabled, summaryEnabled: summaryEnabled && !summaryPinned, hiddenViews, crewMode })
+  const menuSections = newMenuSections({ terminalEnabled, summaryEnabled: summaryEnabled && !summaryPinned, hasWorkflowRuns, hiddenViews, crewMode })
   // The empty-state launcher shows the same entries flat: its two-column grid
   // has nowhere to put a separator, but it must not disagree with the menu
   // about ORDER, so it reads the groups rather than its own list.
@@ -708,7 +740,8 @@ export default function SidePanel({
             trailing strip controls — + menu, dock toggle, close — past the
             panel root's `overflow-hidden` edge, where nothing at that width
             brings them back. The chips inside stay `shrink-0`: they scroll,
-            they never squeeze. */}
+            they never squeeze. The group yields width only once the dynamic
+            group has none left. */}
         {/* Wrapper for the edge cues: the fades anchor to this non-scrolling
             parent, not the scrolled group. min-w-0 keeps the scroller
             shrinkable (the group must stay shrinkable per the comment above). */}
@@ -778,9 +811,13 @@ export default function SidePanel({
         )}
         {/* Wrapper for the edge cues: the fades anchor to this non-scrolling
             parent, not the scrolled group. min-w-0 keeps the scroller
-            shrinkable. The -mb-px (border overlap) stays on the group itself,
-            which the seam-hairline contract pins. */}
-        <div ref={dynamicWrapRef} className="relative min-w-0 flex items-end">
+            shrinkable; `shrink-[10000]` (flex shrinks by factor × base size)
+            spends all its width before the pinned group's, with no floor that
+            could push the controls into the caption reserve, and
+            `overflow-x-clip` keeps its squeezed padding and fades inside. The
+            -mb-px (border overlap) stays on the group itself, which the
+            seam-hairline contract pins. */}
+        <div ref={dynamicWrapRef} className="relative min-w-0 shrink-[10000] overflow-x-clip flex items-end">
         <Reorder.Group
           ref={tabNav.dynamicScrollerRef}
           axis="x"
@@ -1071,16 +1108,7 @@ export default function SidePanel({
           // Keep the authored document and per-question drafts alive on tab switches.
           if (t.kind === 'command-center') return (
             <div key={`${t.id}:${slot}`} className="absolute inset-0" hidden={!isActive}>
-              {/* Local boundary: the panel is a lazy chunk, and a chunk that fails
-                  to load after main.tsx's preload-reload heal declined would
-                  otherwise reject up to the ROUTE boundary and replace the whole
-                  chat page with an error card. The fallback is the shared error
-                  surface, not nothing, so the tab says why it is empty. */}
-              {/* No hand-off: the adjacent chat composer holds unsent text and the
-                  panel's own answer drafts live in this tab. */}
-              <ErrorBoundary scope="command-center" fallback={<ErrorNotice className="m-3" message={i18nT('commandCenter.panel_load_failed')} />}>
-                <Suspense fallback={null}><CommandCenterPanel slot={slot ?? null} active={isActive && !panelHidden} onAct={onComposerInsert} /></Suspense>
-              </ErrorBoundary>
+              <CommandCenterPanel slot={slot ?? null} active={isActive && !panelHidden} onAct={onComposerInsert} />
             </div>
           )
           if (remoteEnvironment === undefined && (
@@ -1148,14 +1176,12 @@ export default function SidePanel({
               if (!isActive) return null
               return (
                 <div key={t.id} className="absolute inset-0">
-                  <Suspense fallback={null}>
-                    <RemoteFilesPanel
-                      slot={slot}
-                      name={remoteEnvironment.name}
-                      workdir={remoteEnvironment.workdir}
-                      onOpenTerminal={terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined}
-                    />
-                  </Suspense>
+                  <RemoteFilesPanel
+                    slot={slot}
+                    name={remoteEnvironment.name}
+                    workdir={remoteEnvironment.workdir}
+                    onOpenTerminal={terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined}
+                  />
                 </div>
               )
             }
@@ -1210,6 +1236,7 @@ export default function SidePanel({
                   selectedSourceUrl={selectedSourceUrl}
                   onSelectSource={onSelectSource}
                   onReconcileSource={onReconcileSource}
+                  onDismissSource={onDismissSource}
                   issues={issues}
                   selectedIssueUrl={selectedIssueUrl}
                   onSelectIssue={onSelectIssue}
@@ -1222,7 +1249,7 @@ export default function SidePanel({
                   // rows as artifact tabs via onArtifactOpen.
                   onFileOpen={onFileOpen}
                   onArtifactOpen={onArtifactOpen}
-                  pins={pins} pinsLoading={pinsLoading} onJumpToPin={onJumpToPin} onUnpin={onUnpin}
+                  pins={pins} pinsLoading={pinsLoading} onJumpToPin={onJumpToPin} onPutPinInComposer={onPutPinInComposer} onUnpin={onUnpin}
                   slotTitle={slotTitle} chatMode={chatMode}
                   remoteEnvironmentName={remoteEnvironment?.name}
                   navLinks={navLinks} navResolving={navResolving}

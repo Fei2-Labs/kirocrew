@@ -240,6 +240,18 @@ def test_a_channel_addressed_send_does_not_claim_a_dm_or_notification(cron_calle
     assert "webex" in result and "room:Y2lzY29z" in result
 
 
+@pytest.mark.parametrize("code", ["channel_delivery_failed", "channel_not_permitted"])
+def test_a_channel_send_that_reached_nobody_is_an_error(cron_caller, code) -> None:
+    """A fault and a permission refusal both return "Error:", the prefix
+    ``call_tool_with_logging`` audits as a failed call."""
+    with patch(
+        "kiro_crew.mcp_core._post",
+        return_value={"ok": False, "code": code, "error": "telegram delivery failed: no"},
+    ):
+        result = _call_tool("send_message", {"text": "hi", "channel_type": "telegram"})
+    assert result.startswith("Error:")
+
+
 def test_an_addressed_send_is_refused_without_a_verifiable_identity() -> None:
     """The forwarded key becomes the governance SUBJECT at the egress chokepoint.
 
@@ -285,7 +297,16 @@ def test_every_slack_only_field_is_covered_by_the_refusal() -> None:
     # and target_id are the OTHER destination mechanism, and include_session_link
     # is a cross-surface opt-in that DEGRADES to a no-op off Slack (never refused
     # -- the message must still deliver), so it must not join _SLACK_ONLY_FIELDS.
-    core = {"text", "title", "session", "channel_type", "target_id", "include_session_link"}
+    # format is the same kind of opt-in, a no-op on a channel that renders nothing.
+    core = {
+        "text",
+        "title",
+        "session",
+        "channel_type",
+        "target_id",
+        "include_session_link",
+        "format",
+    }
     assert set(_SLACK_ONLY_FIELDS) == properties - core
 
 
@@ -408,7 +429,9 @@ async def test_a_body_caller_session_is_ignored_without_internal_auth() -> None:
     """
     seen: list[str] = []
 
-    async def _capture(state, channel_type, target_id, text, *, caller_session="", request_app=""):
+    async def _capture(
+        state, channel_type, target_id, text, *, caller_session="", request_app="", markdown=False
+    ):
         seen.append(caller_session)
         return web.json_response({"ok": True, "delivered_to": channel_type, "parts": 1})
 
@@ -653,7 +676,7 @@ async def test_a_non_cron_channel_session_vets_on_the_headers_attested_identity(
     """
     seen: list[str] = []
 
-    async def _capture(state, channel_type, text, *, caller_session=""):
+    async def _capture(state, channel_type, text, *, caller_session="", markdown=False):
         seen.append(caller_session)
         return True, "", ""
 

@@ -17,6 +17,39 @@ File search backs the `@`-mention picker in the dashboard chat composer. A user 
 
 Results cover both **files** and **directories**. A file is an attachment whose content reaches the agent. A directory is a **path reference only**: the agent receives the path and explores it with its own glob/grep/read tools. No directory listing or recursive content is inlined.
 
+**Same-named rows disambiguate by their shortest distinguishing parent.** Search
+matches basenames, so one result set can hold several rows with the same name,
+and each row's path sub-line cuts at the END — right for a unique name, where
+the cut eats the shared prefix. For a same-named group the cut lands inside
+their common parent chain and the rows read identical down to size and age.
+`disambiguatedPaths` in `website/src/components/FilePickerMenu.tsx` gives every
+row of such a group the shortest trailing path that tells it apart, computed by
+`buildFileLabels` (`website/src/utils/fileTokens.ts`, the rule the attachment
+chips use, with the same Windows-separator handling as the preview strip),
+head-anchored with an ellipsis
+(`…/core/src/README.md`), so the distinguishing segment is the first thing
+after the cut and survives the menu's narrowest width; rows whose name is
+unique in the set keep the full path. Each row's tail is unique among the
+group's displayed tails by construction, and the full path stays on the row's
+tooltip. With `pathTail` (`ChatEmbed`) rows show their folder cut from the
+start instead, and this rule does not apply.
+`website/src/test/FilePickerMenu.sameName.test.tsx` pins the rule.
+
+**A spec pick lists the spec folders, not a fuzzy search.** An `@` query of
+`.kiro/specs/` or `.kiro/specs/<partial>` (`matchSpecQuery` in
+`website/src/components/composerTokens.ts`) asks for a spec, which is a folder
+under the project's `.kiro/specs/`. A fuzzy search would rank every spec's
+`tasks.md` above the spec folders and cut most of them off, so `FilePickerMenu`
+instead reads one listing of `./.kiro/specs/` from `/api/path-complete`, with the
+typed partial as the prefix. The listing puts folders first, so the specs lead
+and a loose file under `.kiro/specs/` stays reachable below them. Each row's second
+line names the project folder, as Kiro's own spec menu does, instead of a path
+every row would share. A picked row
+inserts the same `@.kiro/specs/<name>/` folder mention as any `@` folder, so it
+reaches the agent as a folder reference (see "Folder references" below). A query
+that goes inside a spec, or a host with no listing read or no project, stays an
+ordinary fuzzy search. `website/src/test/FilePickerMenu.specs.test.tsx` pins it.
+
 ## API
 
 ### `GET /api/file-search`
@@ -194,8 +227,9 @@ each flag closes a divergence: `--fixed-strings` (both python passes match
 unconditionally), `--no-ignore` (`os.walk` cannot honour ignore files),
 `--max-filesize` and `--max-count 1` to match the fallback's own ceilings, and
 `--no-config`, because `RIPGREP_CONFIG_PATH` can carry `--pre=<binary>` and the
-child inherits this process's environment. Document containers are excluded with
-`--iglob`, not `--glob`: the document pass claims a file by
+child inherits this process's environment. Both text engines number lines as
+ripgrep does, by `\n` alone, and a preview drops its trailing `\r`. Document containers
+are excluded with `--iglob`, not `--glob`: the document pass claims a file by
 `splitext(name)[1].lower()`, so a case-sensitive exclusion leaves `REPORT.DOCX` in
 ripgrep's pass and the file is reported twice. Directory skips stay
 case-sensitive, matching the walk's own exact-name screen — extensions are folded
@@ -413,7 +447,7 @@ shows literally — the same trade-off inline file mentions make.
 | `website/src/pages/chat/FileBrowserRail.tsx` | Files tab: Name/Content toggle, result rows, status row |
 | `website/src/api/fileGrep.ts` | `/api/file-grep` client and result types |
 | `src/kiro_crew/dashboard/file_index.py` | `FileIndex`, `FileIndexRegistry` |
-| `website/src/components/FilePickerMenu.tsx` | Picker UI, `kind` propagation, trailing-slash insertion, `pathMode`, `pathTail` (rows show their root-relative folder cut from the start, so same-named results stay distinguishable in a narrow menu; `ChatEmbed` and a split pane's composer opt in, the main chat keeps the full path cut at the end) |
+| `website/src/components/FilePickerMenu.tsx` | Picker UI, `kind` propagation, trailing-slash insertion, `pathMode`, `pathTail` (rows show their root-relative folder cut from the start, so same-named results stay distinguishable in a narrow menu; `ChatEmbed` and a split pane's composer opt in), and, without `pathTail` (the main chat), same-name path disambiguation (`disambiguatedPaths`, over `buildFileLabels`) |
 | `website/src/components/composerTokens.ts` | Caret-relative `@` / `$` / `./` token matchers and the shared token replace |
 | `website/src/components/ChatInput.tsx` | Composer wiring: mounts the trigger pickers and the preview strip |
 | `website/src/chat-core/composer/pickers.ts` | Which trigger picker the text at the caret opens (`@` / `$` / `./` / `/`), one rule for the textarea and the Lexical editor; store-free, shared by `ChatInput` and `ChatEmbed` |
@@ -450,6 +484,8 @@ shows literally — the same trade-off inline file mentions make.
 | `test/test_file_index.py` | Index build, refresh, registry refcounting |
 | `test/test_file_search_dirs.py` | Directory results, `kinds` filter, independent scan budgets, dirs-visited ceiling, symlink security |
 | `website/src/test/FilePickerMenu.dirs.test.tsx` | Folder rows, selection payloads, trailing slash |
+| `website/src/test/FilePickerMenu.specs.test.tsx` | Spec pick: lists `.kiro/specs/` (folders first, a loose file still pickable), names the project on each row, passes the typed prefix, inserts a folder mention, falls back to fuzzy search inside a spec or without a project |
+| `website/src/test/FilePickerMenu.sameName.test.tsx` | Same-named rows: shortest distinguishing parent, head-anchored cut, separator awareness, unique-named rows unchanged |
 | `website/src/test/ChatInput.dirStripHeight.test.tsx` | Preview-strip height compensation for a folders-only strip |
 | `website/src/test/fileTokens.dirs.test.ts` | Token parse/serialize/resolve units, label widening, lossless spaced paths |
 | `website/src/chat-core/composer/outgoingTurn.test.ts` | Send and steer serialization at the turn: `[attached_dir N]` + `meta.dirs[N-1]` resolved against the project on a send, `@rel/` kept on a steer |

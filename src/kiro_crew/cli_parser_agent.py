@@ -25,6 +25,7 @@ from kiro_crew.cron_service.model import (
     _AUTO_PAUSE_MAX,
     _AUTO_PAUSE_THRESHOLD,
 )
+from kiro_crew.lesson_validation import LESSON_APPLIES_VALUES
 
 if TYPE_CHECKING:
     _Commands = argparse._SubParsersAction[argparse.ArgumentParser]
@@ -88,7 +89,13 @@ Examples:
         formatter_class=_fmt,
     )
     cron_sub = cron_parser.add_subparsers(dest="cron_action")
-    cron_sub.add_parser("list", help="List cron jobs")
+    cron_list = cron_sub.add_parser("list", help="List cron jobs")
+    cron_list.add_argument(
+        "--folder",
+        default=None,
+        help='Only list jobs in this existing Schedule-page folder, by name or id; "-" '
+        'or "" lists jobs in no folder.',
+    )
     cron_add = cron_sub.add_parser(
         "add",
         help="Add a cron job",
@@ -238,8 +245,9 @@ Examples:
     cron_add.add_argument(
         "--folder",
         default="",
-        help="Schedule-page folder to file the job in (existing folder name or id). "
-        "The CLI does not create folders — create them in the dashboard's Schedule page.",
+        help="Schedule-page folder to file the job in, by name or id. A missing "
+        "name is created through the running gateway (start it first); an unknown id "
+        "is refused.",
     )
     cron_add.add_argument(
         "--project-path",
@@ -316,6 +324,53 @@ Examples:
         choices=["auto", "default"],
         default=None,
         help='Tool approval mode ("auto" to auto-approve, "default" to reset)',
+    )
+    cron_update.add_argument(
+        "--folder",
+        default=None,
+        help='Move the job to this Schedule-page folder, by name or id; "" moves it '
+        "out of its folder. A missing name is created through the running gateway.",
+    )
+    cron_update.add_argument(
+        "--model",
+        dest="model",
+        default=None,
+        help='New model id for the agent wake; "" clears it, back to the default model',
+    )
+    cron_update.add_argument(
+        "--timezone",
+        dest="timezone",
+        default=None,
+        help="New IANA timezone the job's wall clock is read in (e.g. America/New_York, "
+        "or 'local'); \"\" resets it to the configured timezone, else 'local'",
+    )
+    cron_update.add_argument(
+        "--persistent-session",
+        dest="persistent_session",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Resume one long-lived session across wakes, or start a fresh one each wake",
+    )
+    cron_update.add_argument(
+        "--minimal-context",
+        dest="minimal_context",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Wake with a ~200-token context instead of the full memory/lessons/steering load",
+    )
+    cron_update.add_argument(
+        "--hide-in-chat",
+        dest="hide_in_chat",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Keep the job's wakes out of the chat sidebar, or show them again",
+    )
+    cron_update.add_argument(
+        "--silent",
+        dest="silent",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Suppress auto-delivery (the agent controls notifications), or deliver again",
     )
     cron_rm = cron_sub.add_parser("remove", help="Remove a cron job")
     cron_rm_target = cron_rm.add_mutually_exclusive_group(required=True)
@@ -577,6 +632,15 @@ Examples:
         help="Lesson category (default: knowledge)",
     )
     learn_add.add_argument("--negative", help="What NOT to do (optional)")
+    learn_add.add_argument(
+        "--applies",
+        choices=list(LESSON_APPLIES_VALUES),
+        help=(
+            "When the lesson applies: always (a standing rule, loaded into every session) "
+            "or on_topic (a past finding, loaded only when relevant). "
+            "Omitted, the lesson is unstated and is treated as a standing rule"
+        ),
+    )
     learn_sub.add_parser("list", help="List all lessons")
     learn_rm = learn_sub.add_parser("remove", help="Remove lessons matching a substring")
     learn_rm.add_argument("query", help="Substring to match against lesson rules")
@@ -949,6 +1013,8 @@ def register_app_parser(sub: _Commands) -> None:
         epilog="""
 Examples:
   kirocrew app install /path/to/oncall-watchtower
+  kirocrew app install git@github.com:you/my-app.git
+  kirocrew app install https://gitlab.com/you/apps.git --subdirectory my-app --ref v1.2.0
   kirocrew app list
   kirocrew app enable oncall-watchtower
   kirocrew app update oncall-watchtower
@@ -960,8 +1026,27 @@ Examples:
         formatter_class=_fmt,
     )
     app_sub = app_parser.add_subparsers(dest="app_action")
-    app_install = app_sub.add_parser("install", help="Install an app from a local directory")
-    app_install.add_argument("source", help="Path to app directory containing app.json")
+    app_install = app_sub.add_parser(
+        "install", help="Install an app from a local directory or a git URL"
+    )
+    app_install.add_argument(
+        "source",
+        help=(
+            "Path to an app directory containing app.json, or a git URL (https://, "
+            "ssh:// or git@host:org/repo.git) cloned with your own git credentials"
+        ),
+    )
+    app_install.add_argument(
+        "--ref",
+        help="Git URL only: the branch or tag to clone (default: the remote's default branch)",
+    )
+    app_install.add_argument(
+        "--subdirectory",
+        help=(
+            "Git URL only: the repository folder holding app.json (default: the "
+            "repository root, or its one top-level folder holding an app.json)"
+        ),
+    )
     app_import = app_sub.add_parser(
         "import",
         help="Convert a manifest-declared plugin package into an app directory",
@@ -985,7 +1070,11 @@ Examples:
     app_enable.add_argument("name", help="App name to enable")
     app_update = app_sub.add_parser(
         "update",
-        help="Update an installed app to its newest published version (needs a running gateway)",
+        help="Update an installed app to its newest published version (needs a running "
+        "gateway; not on native Windows)",
+        description="Update an installed app in place, as the Update (or Sync) button on "
+        "its page does. It needs a running gateway, and it is not available on native "
+        "Windows, which has no dashboard Unix socket; there, use that button instead.",
     )
     app_update.add_argument("name", help="App name")
     app_update.add_argument(

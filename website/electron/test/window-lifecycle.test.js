@@ -30,6 +30,7 @@ const {
   winCaptionReserveForZoom,
   winDragReserveForZoom,
 } = require("../runtime/window/chrome");
+const { validOptions, trayElectron } = require("./window-lifecycle-test-helpers");
 
 // The gateway supervisor's source: the runtime/gateway/ owners that define code
 // these pins read, then the facade, as one text because the pins hold over all of
@@ -43,22 +44,6 @@ const SUPERVISOR_FILES = [
   "runtime/gateway/reconnect.js",
   "gateway-supervisor.js",
 ];
-
-function validOptions(overrides = {}) {
-  return {
-    electron: {},
-    store: { get: () => null },
-    backendUrl: "http://localhost:5476",
-    port: 5476,
-    mintLocalToken: async () => "",
-    fetchRemoteToken: async () => ({ token: "" }),
-    requestQuit: () => {},
-    connectWindow: async () => {},
-    // Keep construction independent of the host running the suite.
-    platform: "test",
-    ...overrides,
-  };
-}
 
 describe("every token-bearing navigation stays on the configured origin", () => {
   // The invariant, stated once: a navigation that carries a credential is
@@ -1008,14 +993,16 @@ function recordingEmitter(label, log) {
   };
 }
 
-function dashboardWindowHarness({ platform, frameless = false, downloadExpectations = null, dialogResponse = 1, dialogChecked = false } = {}) {
+function dashboardWindowHarness({ platform, frameless = false, remoteHosts = null, downloadExpectations = null, dialogResponse = 1, dialogChecked = false } = {}) {
   const log = [];
   const prompts = [];
   const sessionListeners = new Map();
+  const ipcListeners = new Map();
   const firstLine = (text) => String(text).split("\n").map((line) => line.trim()).find(Boolean);
   const viewEvents = recordingEmitter("view", log);
   const viewContents = {
     ...viewEvents,
+    ipc: { on(channel, listener) { ipcListeners.set(channel, listener); } },
     mainFrame: { url: "http://localhost:5476/" },
     session: {
       webRequest: {
@@ -1100,12 +1087,12 @@ function dashboardWindowHarness({ platform, frameless = false, downloadExpectati
       nativeTheme: { shouldUseDarkColors: false, themeSource: "system" },
       app: { getPath: () => "/virtual/logs", getVersion: () => "0.8.0", name: "Kiro Crew" },
     },
-    store: { get: (key) => (key === "linuxFrameless" ? frameless : null) },
+    store: { get: (key) => (key === "linuxFrameless" ? frameless : key === "remoteHosts" ? remoteHosts : null) },
     platform,
     env: {},
     downloadExpectations,
   }));
-  return { lifecycle, win, viewContents, log, panelViews, openedExternally, prompts, sessionListeners };
+  return { lifecycle, win, viewContents, log, panelViews, openedExternally, prompts, sessionListeners, ipcListeners };
 }
 
 async function wireDashboardWindow(t, options) {
@@ -1114,9 +1101,11 @@ async function wireDashboardWindow(t, options) {
   const harness = dashboardWindowHarness(options);
   harness.lifecycle.setupWindowContents(harness.win, "http://localhost:5476");
   const wiring = harness.log.splice(0);
+  // The preload asks before any load event fires, so read what exists by then.
+  const ipcBeforeLoad = new Map(harness.ipcListeners);
   harness.viewContents.emit("did-finish-load");
   const onLoad = harness.log.splice(0);
-  return { ...harness, wiring, onLoad };
+  return { ...harness, wiring, onLoad, ipcBeforeLoad };
 }
 
 const COMMON_WIRING_HEAD = [
@@ -1140,7 +1129,7 @@ describe("dashboard window wiring order", () => {
       "win.on:enter-full-screen",
       "win.on:leave-full-screen",
       "view.on:enter-html-full-screen",
-      "view.on:leave-html-full-screen",
+      "win.on:enter-full-screen",
       "win.on:leave-full-screen",
       "win.on:show",
       "win.on:restore",
@@ -1186,6 +1175,23 @@ describe("dashboard window wiring order", () => {
     assert.ok(!wiring.some((entry) => entry.startsWith("win.setWindowButtonPosition")));
     assert.equal(onLoad[1], "win.setTitle:Kiro Crew", "the default local port is omitted on Windows");
     assert.equal(onLoad[2], "view.insertCSS:#electron-drag-bar {");
+  });
+
+  it("each load asks whether the window's gateway is remote, so a crew configured or cleared later applies", async (t) => {
+    const remoteHosts = {};
+    const { ipcBeforeLoad } = await wireDashboardWindow(t, { platform: "darwin", remoteHosts });
+    const ask = () => {
+      const event = {};
+      ipcBeforeLoad.get("dashboard:is-remote-gateway")(event);
+      return event.returnValue;
+    };
+    assert.equal(ask(), false, "no crew on the port: local");
+    remoteHosts[5476] = { host: "crew.example.test" };
+    assert.equal(ask(), true, "a crew configured after the view was made");
+    delete remoteHosts[5476];
+    assert.equal(ask(), false, "that crew cleared again");
+    Object.defineProperty(remoteHosts, "5476", { get() { throw new Error("store unreadable"); }, configurable: true });
+    assert.equal(ask(), true, "an unreadable store still answers, as remote");
   });
 
   it("a frameless Linux window injects caption controls after the drag band", async (t) => {
@@ -1793,6 +1799,7 @@ describe("gateway port prompt", () => {
   });
 });
 
+// Enough of Electron for createTray, recording every Tray it makes.
 // ── Close button: background vs quit (#12204) ───────────────────────────────
 
 describe("main window close action", () => {
@@ -1820,7 +1827,8 @@ describe("main window close action", () => {
       get: (key) => data[key],
       set: (key, value) => { writes.push([key, value]); data[key] = value; },
     };
-    const lifecycle = createWindowLifecycle(validOptions({ store }));
+    // Setting the close action re-syncs the tray icon, so Tray must exist.
+    const lifecycle = createWindowLifecycle(validOptions({ store, electron: trayElectron() }));
     return { lifecycle, data, writes };
   }
 
@@ -1862,7 +1870,7 @@ describe("main window close action", () => {
       platform: "linux",
       env: {},
     }));
-    lifecycle.createTray();
+    lifecycle.syncTray();
     assert.deepEqual(
       menus[0].map((item) => item.label || item.type),
       ["Show Kiro Crew", "separator", "New Connection Window…", "separator", "Open Config File", "separator", "Quit"],
@@ -1900,3 +1908,5 @@ describe("main window close action", () => {
     assert.equal(menus[1].find((item) => item.label === "Stop Gateway").enabled, true);
   });
 });
+
+// ── Show tray icon (#21924) ─────────────────────────────────────────────────

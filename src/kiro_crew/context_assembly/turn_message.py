@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.context_assembly import inclusion as _inclusion
@@ -106,6 +106,7 @@ def build_message(
     template_dir: str | None = None,
     directive_user_origin: bool = False,
     conversation_reset: bool = False,
+    tab_notices: list[Callable[[bool], None]] | None = None,
 ) -> tuple[str, HookResult]:
     """Build the full message with context and hook processing.
 
@@ -156,6 +157,12 @@ def build_message(
     admit it. The default ``False`` matches the applier's: a cron, a wake,
     a sub-agent, a peer send or a slot-less channel turn is not offered it.
 
+    Pass *tab_notices*, a list the turn owns, from a channel turn's engine that
+    settles it through ``turn_bracket.rollback_skill_bodies``: the sub-agent notices
+    queued on the dashboard tab showing the conversation go ahead of *text*, as a
+    dashboard turn in that tab sends them, the call that settles them is put in the
+    list, and they leave the queue only once that settle reports the turn landed.
+
     *provider_type* names the harness serving the session. A context
     provider that carries an :class:`EssentialDelivery` names it in place of
     the caller. The essentials builder (and :meth:`build_session_context`,
@@ -174,6 +181,9 @@ def build_message(
     from kiro_crew.agent_sdk import context_provider_of
     from kiro_crew.essential_delivery import EssentialDelivery
 
+    # Before any blocking step: a build its cancelled turn left running on the
+    # worker must not read after the session's next turn has.
+    _notices = "" if tab_notices is None else self._read_tab_notices(session_key, tab_notices)
     execution_context, desk_member, member, memory_store, blocks_reads = _member.resolve_turn_owner(
         execution_context, session_key, member, memory_store, blocks_reads
     )
@@ -181,6 +191,13 @@ def build_message(
     report_user_span = user_text_range is not None
     if user_text_range is None:
         user_text_range = (0, len(text))
+    if _notices:
+        # Ahead of the user's own span, so the turn's scrub covers them as it does
+        # on a dashboard turn, and skill triggers keep reading the caller's text.
+        if skill_trigger_text is None:
+            skill_trigger_text = text
+        text = _notices + text
+        user_text_range = (user_text_range[0] + len(_notices), user_text_range[1] + len(_notices))
     delivery = None
     blocks_reads = blocks_reads or self._session_memory_modes.get(session_key or "") == "temporary"
     native_documents: dict[str, str] = {}
@@ -365,7 +382,9 @@ def build_message(
                 session_start=True,
             )
         )
-        if agent_prompt:
+        # Not when the harness holds this exact text as the agent's own prompt
+        # (recorded from KAS's wire definition); a compaction re-sends the block.
+        if agent_prompt and agent_prompt != native_documents.get(f"template://{agent}#prompt"):
             parts.append(f"[AGENT SYSTEM PROMPT]\n{agent_prompt}\n[END AGENT SYSTEM PROMPT]\n\n")
         with ctx._prompt_build_embedding_deadline(bool(text), query=text):
             session_ctx = self.build_session_context(
@@ -439,7 +458,9 @@ def build_message(
                 _resume_member = ""
                 if _member_turn.deliver_section:
                     _member_section = self._build_member_section(
-                        member, desk_withheld=ctx._desk_withheld(execution_context, desk_member)
+                        member,
+                        include_briefing=not blocks_reads,
+                        desk_withheld=ctx._desk_withheld(execution_context, desk_member),
                     )
                     if _member_section:
                         _resume_member = (
@@ -498,6 +519,7 @@ def build_message(
                 native_steering=context_provider is not None and context_provider.native_steering,
                 project=project,
                 native_launch_sources=native_launch_sources,
+                agent=agent,
             )
             _folder_ctx = ctx._render_folder_steering_section(
                 steering_dirs,
@@ -543,6 +565,18 @@ def build_message(
         _active_model = _sections.active_model_block(served_model)
         if _active_model:
             parts.append(_active_model)
+
+    # Every follow-up re-states the reply language: a nudge, wake or worker-report
+    # turn is all English text, and the session-start frame alone loses to it.
+    # A post-compaction turn re-sends the whole frame below, so it skips this.
+    if (
+        not is_new_session
+        and not needs_reinjection
+        and ctx._response_preferences_apply(session_key or "", runtime_source)
+    ):
+        _lang = _sections.reply_language_refresh(ctx.KiroCrewConfig.load())
+        if _lang:
+            parts.append(_lang)
 
     # Post-compaction re-injection: the skills index was lost when the
     # session-start context was compacted. Re-inject it so the model can
@@ -610,7 +644,9 @@ def build_message(
         # chokepoint consult above).
         if _member_turn.deliver_section:
             _member_section = self._build_member_section(
-                member, desk_withheld=ctx._desk_withheld(execution_context, desk_member)
+                member,
+                include_briefing=not blocks_reads,
+                desk_withheld=ctx._desk_withheld(execution_context, desk_member),
             )
             if _member_section:
                 parts.append(ctx._neutralize_structural_markers(_member_section))

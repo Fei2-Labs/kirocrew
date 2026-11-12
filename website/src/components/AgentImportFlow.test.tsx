@@ -1,6 +1,6 @@
-import { fireEvent, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import type {
   AgentImportApplyResponse,
   AgentImportScanResponse,
@@ -136,6 +136,15 @@ describe('AgentImportFlow', () => {
     expect(within(dialog).queryByText('Codex')).not.toBeInTheDocument()
     expect(within(dialog).queryByText('Quick')).not.toBeInTheDocument()
     expect(api.onboardingImportScan).toHaveBeenCalledOnce()
+  })
+
+  it('shows the Import copy in its left panel', async () => {
+    mockSuccessfulRequests()
+
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Import agent setup' })
+    expect(within(dialog).getByRole('heading', { name: 'Bring your crew with you.' })).toBeInTheDocument()
   })
 
   it('renders the stage counter inside one catalog sentence', async () => {
@@ -293,6 +302,33 @@ describe('AgentImportFlow', () => {
 
     resolveApply?.(APPLY_RESPONSE)
     expect(await screen.findByText('Import complete')).toBeInTheDocument()
+  })
+
+  it('holds the Importing label still under reduced motion', async () => {
+    // The dots are JS-driven text, so the global reduced-motion CSS cut never
+    // reached them and they kept ticking for a user who asked for no motion.
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query.includes('prefers-reduced-motion'),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }))
+    // shouldAdvanceTime keeps userEvent's own delays moving while the clock
+    // is fake; the restore runs even when an await below rejects.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    onTestFinished(() => {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    })
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockReturnValue(new Promise(() => {}))
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+
+    await startImport()
+    const button = await screen.findByRole('button', { name: /^Importing/ })
+    // Two ticks: on a ticking label this lands on "Importing...".
+    await act(async () => { await vi.advanceTimersByTimeAsync(800) })
+    expect(button.textContent).toBe('Importing')
   })
 
   it('treats Escape as "Skip all", not "Skip import"', async () => {
@@ -822,11 +858,29 @@ describe('AgentImportFlow', () => {
     expect(screen.getByText('Skipped')).toHaveAttribute('data-reason', 'a_code_no_one_knows_yet')
     expect(screen.getByText('Secrets are never imported')).toBeInTheDocument()
     expect(screen.queryByText('row_count_limit')).toBeNull()
-    // Pinned until the scan sends a failed flag (#29216): a caught failure
-    // reads in words but is still a note, like every other skip.
+    // A failure-sounding code alone keeps the row a note: only the scan's
+    // `failed` flag makes it an error.
     expect(screen.getByText('Files could not be read')).toHaveAttribute('data-reason', 'read_failed')
     expect(screen.getByText('Could not be read as valid settings')).toHaveAttribute('data-reason', 'invalid_config')
     expect(screen.queryByTestId('agent-import-skip-read-error')).toBeNull()
+  })
+
+  it('shows a skip the scan flags as failed as an error, and a deliberate skip as a note', async () => {
+    mockSuccessfulRequests({
+      ...SCAN_RESPONSE,
+      skipped: [
+        { source: 'Claude Code', category: 'Memories', reason: 'invalid_memory_record', failed: true },
+        { source: 'Claude Code', category: 'MCP servers', reason: 'credential_bearing_server' },
+      ],
+    })
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await goToReview()
+
+    const failures = screen.getAllByTestId('agent-import-skip-read-error')
+    expect(failures).toHaveLength(1)
+    expect(failures[0]).toHaveAttribute('role', 'alert')
+    expect(failures[0]).toHaveTextContent('Could not be read as valid settings')
+    expect(screen.getByText('Holds credentials, so it stays with its source').closest('[role="alert"]')).toBeNull()
   })
 
   it('reads a skip code by its kind, not by a suffix another kind shares', () => {

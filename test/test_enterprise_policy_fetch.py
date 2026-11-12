@@ -1,4 +1,4 @@
-"""The enterprise build's policy transport against a fake control plane.
+"""The LTS build's policy transport against a fake control plane.
 
 The fake answers behind ``policy_distribution._open``, the one seam the network call goes
 through, so nothing opens a socket. The sign-in is a real vault entry in a temporary data
@@ -20,7 +20,7 @@ import pytest
 from governance_distribution_helpers import _hermetic_governance_globals  # noqa: F401
 from governance_distribution_helpers import install_ceiling_fixture  # noqa: F401
 
-from kiro_crew import enterprise_boot
+from kiro_crew import lts_boot
 from kiro_crew.auth.store import KasToken, TokenStore
 from kiro_crew.platform import enterprise_policy_fetch as epf
 from kiro_crew.platform import governance
@@ -45,7 +45,7 @@ rules:
     effect: deny
     exclude: ["slack"]
   - id: other-client
-    capability: shell
+    capability: power
     effect: deny
 """
 
@@ -140,7 +140,7 @@ def cps_fixture(monkeypatch):
 
 @pytest.fixture(name="enterprise")
 def enterprise_fixture(monkeypatch):
-    monkeypatch.setattr("kiro_crew.edition.EDITION", "enterprise")
+    monkeypatch.setattr("kiro_crew.edition.EDITION", "lts")
 
 
 @pytest.fixture(name="kills", autouse=True)
@@ -164,9 +164,9 @@ def _boot_exit_message(capsys) -> str:
         try:
             governance.load_security_policy()
         except PlatformCompositionError as exc:
-            enterprise_boot.refuse_policy_boot(exc)
+            lts_boot.refuse_policy_boot(exc)
             raise
-    assert exited.value.code == enterprise_boot.EXIT_CODE
+    assert exited.value.code == lts_boot.EXIT_CODE
     err = capsys.readouterr().err
     assert _TOKEN not in err
     return err
@@ -736,21 +736,27 @@ class TestTranslation:
         from kiro_crew.platform import enterprise_policy_translate as t
 
         rules = [
-            {"capability": "messaging_channel", "effect": "deny", "exclude": ["t*"]},
-            {"capability": "messaging_channel", "effect": "deny", "match": ["s*"]},
+            {"capability": "messaging_channel", "effect": "deny", "exclude": ["s*"]},
+            {"capability": "messaging_channel", "effect": "deny", "match": ["sl*"]},
         ]
         with pytest.raises(t.Unrepresentable):
             t.ruleset(rules, "messaging_channel")
 
-    def test_a_lone_deny_match_leaves_the_capability_unnamed(self):
-        """A deny-list would replace the enterprise baseline and open every other channel."""
+    def test_a_denied_glob_that_cannot_meet_an_allowed_glob_is_dropped(self):
+        from kiro_crew.platform import enterprise_policy_translate as t
+
+        rules = [
+            {"capability": "messaging_channel", "effect": "deny", "exclude": ["t*"]},
+            {"capability": "messaging_channel", "effect": "deny", "match": ["s*"]},
+        ]
+        assert t.ruleset(rules, "messaging_channel") == {"mode": "allow", "allow": ["t*"]}
+
+    def test_a_lone_deny_match_grants_nothing(self):
+        """Named by a rule, nothing granted: no channel is allowed, not every other one."""
         from kiro_crew.platform import enterprise_policy_translate as t
 
         rules = [{"capability": "messaging_channel", "effect": "deny", "match": ["discord"]}]
-        assert t.ruleset(rules, "messaging_channel") is None
-        assert "channels" not in t.translate(
-            "rules:\n  - {capability: messaging_channel, effect: deny, match: [discord]}\n"
-        )
+        assert t.ruleset(rules, "messaging_channel") == {"mode": "allow", "allow": []}
 
     def test_two_different_globs_are_refused(self):
         from kiro_crew.platform import enterprise_policy_translate as t
@@ -763,7 +769,8 @@ class TestTranslation:
             t.ruleset(rules, "messaging_channel")
 
 
-_FLOOR = ["normal", "trust", "trust_reads"]
+# ``normal`` is the only mode a rule cannot remove (RFC LTS edition, D9).
+_FLOOR = ["normal"]
 
 
 def _translate(*rules: str) -> dict:
@@ -823,14 +830,12 @@ class TestSwitchRows:
         assert doc["capabilities"] == {capability: {"enabled": False}}
 
     @pytest.mark.parametrize("capability", ["memory_writes", "theme_persona"])
-    def test_a_remote_deny_closes_an_open_control_in_an_enterprise_build(
-        self, enterprise, capability
-    ):
+    def test_a_remote_deny_closes_an_open_control_in_an_lts_build(self, enterprise, capability):
         doc = _translate(f"{{capability: {capability}, effect: deny}}")
         ceiling = governance.parse_policy(doc)
         assert not governance.resolve(ceiling, None, f"capabilities.{capability}", "").permitted
 
-    def test_an_unknown_cron_shape_denies_in_an_enterprise_build(self, enterprise):
+    def test_an_unknown_cron_shape_denies_in_an_lts_build(self, enterprise):
         """End to end: an unconditional cron deny beside a conditional allow stays a deny."""
         doc = _translate(
             "{capability: cron, effect: deny}",
@@ -867,9 +872,63 @@ class TestPermissionModeRow:
         doc = _translate("{capability: permission_mode, effect: ask}")
         assert doc["approval_modes"] == {"mode": "allow", "allow": _FLOOR}
 
+    # The owner's rule as the control plane sends it: the grant, and the ``deny
+    # exclude`` it sends beside every grant (see the translator's module docstring).
+    _OWNER_RULE = (
+        "{id: permission-mode-allow-normal, capability: permission_mode, effect: allow, "
+        'match: ["normal", "trust_reads"]}',
+        '{capability: permission_mode, effect: deny, exclude: ["normal", "trust_reads"]}',
+    )
+
+    def test_an_allow_of_normal_and_trust_reads_leaves_trust_out(self):
+        doc = _translate(*self._OWNER_RULE)
+        assert doc["approval_modes"] == {"mode": "allow", "allow": ["normal", "trust_reads"]}
+
+    def test_the_owner_rule_resolves_trust_denied(self, enterprise):
+        ceiling = governance.parse_policy(_translate(*self._OWNER_RULE))
+        allowed = {
+            m: governance.resolve(ceiling, None, "approval_modes", m).permitted
+            for m in ("normal", "trust_reads", "trust", "yolo")
+        }
+        assert allowed == {"normal": True, "trust_reads": True, "trust": False, "yolo": False}
+
+    def test_a_rule_allowing_all_three_keeps_them(self, enterprise):
+        ceiling = governance.parse_policy(
+            _translate(
+                "{capability: permission_mode, effect: allow, match: [normal, trust_reads, trust]}",
+                "{capability: permission_mode, effect: deny, exclude: [normal, trust_reads, trust]}",
+            )
+        )
+        for m in ("normal", "trust_reads", "trust"):
+            assert governance.resolve(ceiling, None, "approval_modes", m).permitted
+
+    def test_a_deny_match_alone_takes_the_mode_out_of_the_baseline(self, enterprise):
+        doc = _translate("{capability: permission_mode, effect: deny, match: [trust]}")
+        assert doc["approval_modes"] == {"mode": "allow", "allow": ["normal", "trust_reads"]}
+        ceiling = governance.parse_policy(doc)
+        assert not governance.resolve(ceiling, None, "approval_modes", "trust").permitted
+        assert not governance.resolve(ceiling, None, "approval_modes", "yolo").permitted
+
+    def test_a_deny_match_of_normal_alone_keeps_the_floor(self):
+        doc = _translate("{capability: permission_mode, effect: deny, match: [normal, trust]}")
+        assert doc["approval_modes"] == {"mode": "allow", "allow": ["normal", "trust_reads"]}
+
+    def test_a_conditional_allow_does_not_bring_the_baseline_back(self):
+        """A dropped (``when``) grant still names the capability, so it only narrows."""
+        doc = _translate(
+            "{capability: permission_mode, effect: allow, match: [normal], when: {a: b}}"
+        )
+        assert doc["approval_modes"] == {"mode": "allow", "allow": ["normal"]}
+
+    def test_no_rule_keeps_all_three(self, enterprise):
+        ceiling = governance.parse_policy(_translate())
+        for m in ("normal", "trust_reads", "trust"):
+            assert governance.resolve(ceiling, None, "approval_modes", m).permitted
+        assert not governance.resolve(ceiling, None, "approval_modes", "yolo").permitted
+
 
 class TestTranslatedRowsResolve:
-    """The translated controls parse in an enterprise build and answer as intended."""
+    """The translated controls parse in an LTS build and answer as intended."""
 
     @pytest.mark.parametrize(
         "rules, cron, messaging, yolo",
@@ -989,7 +1048,7 @@ class TestSandboxMinLevel:
         level = sandbox_tiers._clamp_sandbox_mode_to_floor(local, floor)
         level = sandbox_tiers._SANDBOX_MODE_ALIASES.get(level, level)
         scale = _ORDINAL_SCALES["sandbox"]
-        # An enterprise build already reads a local ``off`` as Crew's default.
+        # An LTS build already reads a local ``off`` as Crew's default.
         local_level = "standard" if local in ("off", "auto") else local
         assert level == max(local_level, policy, key=scale.index)
 
@@ -1139,7 +1198,7 @@ class TestSignInCommands:
         cli = self._main(monkeypatch, tmp_path, ["kas", "status"])
         with pytest.raises(SystemExit) as exited:
             cli.main()
-        assert exited.value.code == enterprise_boot.EXIT_CODE
+        assert exited.value.code == lts_boot.EXIT_CODE
         assert "no Kiro sign-in was found" in capsys.readouterr().err
 
     def test_oss_does_not_exempt_the_sign_in_verbs(self, monkeypatch, tmp_path, capsys):
@@ -1153,7 +1212,7 @@ class TestSignInCommands:
 class TestOss:
     def test_oss_refuses_the_scheme(self, vault, cps):
         vault()
-        with pytest.raises(PlatformCompositionError, match="only in an enterprise build"):
+        with pytest.raises(PlatformCompositionError, match="only in an LTS build"):
             epf.fetch(_request())
         assert cps.requests == []
 
@@ -1176,13 +1235,13 @@ class TestOss:
 
     def test_oss_naming_the_scheme_is_a_configuration_error(self, vault, cps, monkeypatch):
         monkeypatch.setenv(pd.POLICY_URL_ENV, pd.ENTERPRISE_POLICY_URL)
-        with pytest.raises(PlatformCompositionError, match="only in an enterprise build"):
+        with pytest.raises(PlatformCompositionError, match="only in an LTS build"):
             governance.load_security_policy()
         assert cps.requests == []
 
 
 class TestBootWithoutCompanion:
-    """An enterprise build with no companion boots on the core defaults, every gate on.
+    """An LTS build with no companion boots on the core defaults, every gate on.
 
     Each test runs the real ``bootstrap_context`` with no ``kirocrew.plugins`` entry
     point, against the fake control plane, so the policy fetch, the built-in
@@ -1263,9 +1322,54 @@ class TestBootWithoutCompanion:
             try:
                 self._boot(monkeypatch)
             except PlatformCompositionError as exc:
-                enterprise_boot.refuse_policy_boot(exc)
+                lts_boot.refuse_policy_boot(exc)
                 raise
-        assert exited.value.code == enterprise_boot.EXIT_CODE
+        assert exited.value.code == lts_boot.EXIT_CODE
         err = capsys.readouterr().err
         assert "governance rules" in err
         assert _TOKEN not in err
+
+
+class TestOlderTranslationTerminalRefusal:
+    """A ``t2`` translation wrote ``boot.allow_terminal: false``, which nothing enforced.
+    Read as left out, so an upgraded host keeps its terminal before any refresh lands."""
+
+    def test_an_offline_host_with_a_t2_cache_keeps_the_terminal(
+        self, enterprise, vault, cps, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from kiro_crew.dashboard.handlers import terminal_session
+        from kiro_crew.platform import context as platform_context
+        from kiro_crew.platform import policy_distribution_source as src
+
+        vault()
+        governance.load_security_policy()
+        cached = pd.read_cache()
+        doc = json.loads(cached.body)
+        doc["boot"]["allow_terminal"] = False  # what the t2 translation wrote
+        scope = epf.document_scope(cached.body)
+        pd.write_cache(
+            json.dumps(doc).encode("utf-8"),
+            source=src._source_identity(pd.ENTERPRISE_POLICY_URL, cached.body),
+            etag=f"{scope}:t2/{epf.cached_version(cached.etag)}",
+        )
+        _restart(monkeypatch)
+        cps.reply = TimeoutError("down")
+        ceiling = governance.load_security_policy()
+        assert ceiling.boot.allow_terminal is None
+        monkeypatch.setattr(
+            platform_context, "current_context", lambda: SimpleNamespace(governance=ceiling)
+        )
+        assert terminal_session._terminal_enabled({"enabled": True}) is True
+
+    @pytest.mark.parametrize(
+        ("issuer", "expected"),
+        [(epf.ISSUER_PREFIX + "abc", None), ("operator", False)],
+    )
+    def test_only_a_translated_document_has_its_refusal_dropped(self, issuer, expected):
+        from kiro_crew.platform import policy_distribution_boot as boot
+
+        doc = {"version": 1, "boot": {"allow_terminal": False}, "identity": {"issuer": issuer}}
+        ceiling = boot.parse_distributed_policy(json.dumps(doc).encode("utf-8"), source="")
+        assert ceiling.boot.allow_terminal is expected

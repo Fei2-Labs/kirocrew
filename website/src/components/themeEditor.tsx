@@ -6,7 +6,9 @@ import { api } from '../api/client'
 import { applyThemeCss, exampleThemeCss, parseThemeCss, refusedLabel, themeVarsToCss } from '../lib/themeCssImport'
 import { themeDesignPrompt } from '../lib/themeDesign.prompt'
 import { copyToClipboard } from '../utils/clipboard'
+import { askAppConfirm } from '../lib/appConfirm'
 
+import { fmtList } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 import ErrorNotice from './ErrorNotice'
 /* ── CSS variable groups for the color picker ── */
@@ -158,7 +160,7 @@ function themeJson(name: string, emoji: string, dark: Record<string, string>, li
 
 /** Shared theme editor state and actions */
 export function useThemeEditor() {
-  const { addCustomTheme, deleteCustomTheme, loadCustomThemes } = useTheme()
+  const { addCustomTheme, deleteCustomTheme, loadCustomThemes, customThemes } = useTheme()
 
   const [editorOpen, setEditorOpen] = useState(false)
   const [editingSlug, setEditingSlug] = useState<string | null>(null)
@@ -175,6 +177,11 @@ export function useThemeEditor() {
   // hint about the draft, not a failure, so it never reaches `error` or
   // `ErrorNotice`.
   const [hint, setHint] = useState('')
+  // True while the delete confirmation is open. The confirmation is a second
+  // Modal stacked on the editor's, and both listen for Escape on `window`, so
+  // the editor's Modal folds this into its dismissal guard: an Escape that
+  // cancels the delete must leave the editor open.
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
 
   const isEditing = editingSlug !== null
 
@@ -303,10 +310,21 @@ export function useThemeEditor() {
   const handleDelete = async (slug?: string) => {
     const target = slug || editingSlug
     if (!target) return
-    if (confirm(i18nT('components.themeEditor.delete_this_custom_theme'))) {
-      try { await deleteCustomTheme(target); closeEditor() }
-      catch (e: unknown) { setError(e instanceof Error ? e.message : i18nT('components.themeEditor.failed_to_delete_theme')) }
-    }
+    // The in-app dialog, not the browser's `confirm()`: see `lib/appConfirm`.
+    // It names the theme the way the theme list shows it.
+    const name = customThemes.find(t => t.value === `custom-${target}`)?.label ?? target
+    setConfirmingDelete(true)
+    let ok: boolean
+    try {
+      ok = await askAppConfirm({
+        title: i18nT('components.themeEditor.delete_theme_title'),
+        body: i18nT('components.themeEditor.delete_theme_confirm', { name }),
+        confirmLabel: i18nT('components.themeEditor.delete_theme_title'),
+      })
+    } finally { setConfirmingDelete(false) }
+    if (!ok) return
+    try { await deleteCustomTheme(target); closeEditor() }
+    catch (e: unknown) { setError(e instanceof Error ? e.message : i18nT('components.themeEditor.failed_to_delete_theme')) }
   }
 
   const syncJsonToPicker = (text: string) => {
@@ -341,7 +359,7 @@ export function useThemeEditor() {
   const updateLightVar = (key: string, val: string) => setLightVars(prev => ({ ...prev, [key]: val }))
 
   return {
-    editorOpen, isEditing, editingSlug, creatorMode, setCreatorMode, isDirty,
+    editorOpen, isEditing, editingSlug, creatorMode, setCreatorMode, isDirty, confirmingDelete,
     themeName, setThemeName, themeEmoji, setThemeEmoji,
     darkVars, lightVars, updateDarkVar, updateLightVar,
     jsonText, setJsonText, cssText, changeCss, cssImport, saving, error, hint,
@@ -500,10 +518,15 @@ export function ThemeEditorPanel({ editor }: { editor: ReturnType<typeof useThem
     </div>
   )
 
-  /** At most ten names, so a pasted framework stylesheet stays one readable line. */
-  const nameList = (names: string[]) => names.length <= 10
-    ? names.join(', ')
-    : i18nT('components.themeEditor.css_more_names', { names: names.slice(0, 10).join(', '), extra: names.length - 10 })
+  /** At most ten names, so a pasted framework stylesheet stays one readable line.
+   *  "N more" is the last item of the same list, so each language places its one
+   *  conjunction (de: "a, b und 5 weitere"). */
+  const nameList = (names: string[]) => fmtList(
+    names.length <= 10
+      ? names
+      : [...names.slice(0, 10), i18nT('components.themeEditor.css_more_count', { extra: names.length - 10 })],
+    { style: 'narrow' },
+  )
 
   const cssCounts = {
     dark: Object.keys(cssImport.dark).length,
@@ -604,7 +627,7 @@ export function ThemeEditorPanel({ editor }: { editor: ReturnType<typeof useThem
       )}
 
       <div className="flex items-center gap-2 mt-3">
-        <Btn onClick={saveTheme} className="bg-accent text-accent-fg hover:bg-accent-hover" disabled={saving || (creatorMode === 'css' && !cssImport.recognized)}
+        <Btn primary onClick={saveTheme} disabled={saving || (creatorMode === 'css' && !cssImport.recognized)}
           aria-describedby={creatorMode === 'css' && !cssImport.recognized ? 'theme-editor-css-summary' : undefined}>
           {saving ? i18nT('components.themeEditor.saving') : isEditing ? i18nT('components.themeEditor.update_theme') : i18nT('components.themeEditor.save_theme')}
         </Btn>

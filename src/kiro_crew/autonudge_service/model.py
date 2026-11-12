@@ -35,6 +35,10 @@ if TYPE_CHECKING:
 #: a cap would bring back a watch with nothing to watch.
 MONITOR_TERMINAL_REASON = "monitor_terminal"
 
+#: How often a sleeping ungated loop, or a held loop, reads its pull request
+#: (``subject_reads``); the reconciler rescues a held loop at the same cadence.
+SUBJECT_READ_SECS = 300.0
+
 #: ``stopped_reason`` for a loop whose own kill switch fired: the stop file at
 #: ``stop_sentinel_path`` existed when the timer woke. The file is how the agent
 #: declares a ``{{STOP_FILE}}`` goal reached, so the record is KEPT and deactivated
@@ -128,6 +132,16 @@ STRUCTURAL_TERMINAL_REASON = "structural_terminal"
 # would spend every remaining cycle on refusal cards. Re-armable like the structural
 # stop; any genuine new turn in the session clears the slot's verdict.
 MODEL_REFUSED_REASON = "model_refused"
+
+
+# Persisted reason for a loop stopped because a refused turn's cycle claim could not be
+# released in the store. Resumable: the next fire after a revival takes a fresh claim.
+CLAIM_UNSAVED_REASON = "claim_unsaved"
+
+
+# Persisted reason for a loop ``_load`` held stopped because a restart caught it
+# mid-delivery with an unresolved cycle claim. Resumable like ``claim_unsaved``.
+INTERRUPTED_CYCLE_REASON = "interrupted_cycle"
 
 
 def new_goal_token() -> str:
@@ -233,13 +247,17 @@ _BUDGET_EXHAUSTED_REASONS = frozenset({CYCLE_CAP_REASON, RUNTIME_BUDGET_REASON})
 # in-flight cycle right after the user paused must NOT replace that pause and
 # make it directive-revivable; and (2) they are re-armable (folded into
 # ``_REPLACEABLE_LOOP_STOP_REASONS`` below). ``structural_terminal`` needs both,
-# for the same reason ``cycle_cap``/``runtime_budget`` do.
+# for the same reason ``cycle_cap``/``runtime_budget`` do. The two cycle-claim
+# stops need both too: the system records them, so a re-arm may displace them,
+# and a later reasonless pause must not relabel them ``manual``.
 _TERMINAL_BOUND_REASONS = _BUDGET_EXHAUSTED_REASONS | {
     APPROVAL_STALL_REASON,
     STRUCTURAL_TERMINAL_REASON,
     SESSION_START_FAILURE_REASON,
     CONSECUTIVE_FAILURE_REASON,
     MODEL_REFUSED_REASON,
+    CLAIM_UNSAVED_REASON,
+    INTERRUPTED_CYCLE_REASON,
 }
 
 
@@ -472,7 +490,8 @@ class NudgeLoop:
     # nobody answered within the window. Set by ``notify_approval_stalled`` and
     # read by ``_timer`` as a HOLD: the loop stays active but fires no cycle, spending
     # neither its cycle cap nor its runtime budget. Set only on proof, never on
-    # prediction. Cleared by ``release_approval_hold`` once a person is back, and on
+    # prediction. Cleared by ``release_approval_hold`` once a person is back or a
+    # new turn starts in the session, and on
     # every revival. Persisted, because the cause usually outlives a restart.
     approval_stalled: bool = False
     # When the current hold began (0 = not held, or a legacy row). On release the
@@ -765,8 +784,7 @@ def budget_elapsed(loop: "NudgeLoop", now: float | None = None) -> bool:
 
 
 #: Share of a loop's cycle or runtime cap at or under which the nudge header
-#: says ``10% or less left``. Mirrors ``RENEW_THRESHOLD`` in goal-conductor's
-#: ``patrol_budget.py``, which re-checks it before it renews.
+#: says ``10% or less left``.
 NUDGE_RENEW_DUE_SHARE = 0.10
 
 

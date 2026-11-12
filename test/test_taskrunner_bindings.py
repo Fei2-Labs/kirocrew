@@ -40,7 +40,10 @@ from kiro_crew.taskrunner import TaskRunner
 
 pytestmark = pytest.mark.xdist_group(name="tree_scan_taskrunner_bindings")
 
-SHARED_BINDINGS_CHECKS = ("the_field_scan_counts_every_read_and_write_shape",)
+SHARED_BINDINGS_CHECKS = (
+    "the_field_scan_counts_every_read_and_write_shape",
+    "the_class_only_scan_can_fail",
+)
 
 #: Member -> (kind, coroutine, signature digest, owning module). Frozen at the split: the
 #: kind, coroutine flag and signature are BASE's; the owner is where the member lives now
@@ -55,12 +58,12 @@ _MEMBERS: dict[str, tuple[str, bool, str, str]] = {
     "_bound_history_key": ("function", True, "ec09f2c0755e", "run_scope"),
     "_build_resume_context": ("function", False, "41bb689ce7c8", "run_registry"),
     "_build_task_prompt": ("function", True, "4c406dd14756", "run_steps"),
-    "_call_llm_for_lesson": ("function", True, "1a3c02a39576", "run_reporting"),
+    "_call_llm_for_lesson": ("function", True, "402a11554e2b", "run_reporting"),
     "_capture_execution": ("function", False, "d1b2657e6a4e", "run_scope"),
     "_clamp_parallel_steps": ("staticmethod", False, "2edea9f8215c", "run_inputs"),
     "_cleanup_run_sessions": ("function", True, "859f30be3e40", "run_scope"),
     "_commit_snapshot": ("function", False, "04bd86086d4a", "run_registry"),
-    "_decompose": ("function", True, "4b43246cbda4", "plan_mode"),
+    "_decompose": ("function", True, "16cd35538179", "plan_mode"),
     "_ensure_resumable_workspace": ("function", True, "c658adc36b67", "run_lifecycle"),
     "_execute_single_task": ("function", True, "b60a0d3a7a41", "run_steps"),
     "_execute_tasks": ("function", True, "2bd591d8085c", "run_steps"),
@@ -241,11 +244,6 @@ def _class_only_constructs(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[s
         if isinstance(spelled, str) and spelled.startswith("__") and not spelled.endswith("__"):
             found.append(spelled)
     return found
-
-
-def test_the_class_only_scan_can_fail() -> None:
-    tree = ast.parse("def f(self):\n    super().g()\n    return __class__, self.__hidden\n")
-    assert sorted(_class_only_constructs(tree.body[0])) == ["__class__", "__hidden", "super()"]
 
 
 @pytest.mark.parametrize("owner", taskrunner._OWNERS)

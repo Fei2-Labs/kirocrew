@@ -282,7 +282,7 @@ describe('an uncoded close failure', () => {
       store.dispatch(sseSlots([slotRow('doomed'), slotRow('peer')]))
 
       const close = store.dispatch(deleteSlot('doomed'))
-      expect(apiMock.deleteChatSlot).toHaveBeenCalledWith('doomed')
+      expect(apiMock.deleteChatSlot).toHaveBeenCalledWith('doomed', undefined)
       store.dispatch(sseSlotPatch({ removed: ['doomed'] }))
       expect(root(store).dashboard.durablyRemoved.doomed).toBe(true)
 
@@ -364,6 +364,24 @@ describe('an uncoded close failure', () => {
     expect(selectCloseNotice(root(store))).toBeNull()
   })
 
+  it('the session reopened elsewhere after a timed-out close is not reported, the same session put back is (#31537)', async () => {
+    for (const [listed, expected] of [
+      ['inc-reopened', null],
+      ['inc-closed', { key: 'doomed', title: null, reason: 'failed' }],
+    ] as const) {
+      apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('Gateway Timeout'), { status: 504 }))
+      apiMock.chatSlots.mockResolvedValue([slotRow('peer')])
+      const store = makeStore()
+      store.dispatch(sseSlots([slotRow('doomed', { incarnation: 'inc-closed' }), slotRow('peer')]))
+      await store.dispatch(deleteSlot('doomed'))
+      await vi.waitFor(() => expect(root(store).dashboard.closeWatch?.doomed).toBeDefined())
+
+      store.dispatch(sseSlots([slotRow('doomed', { incarnation: listed }), slotRow('peer')]))
+      expect(selectCloseNotice(root(store))).toEqual(expected)
+      expect(root(store).dashboard.closeWatch?.doomed).toBeUndefined()
+    }
+  })
+
   it('a listing after the watch window is not tied to the timed-out close (#31168)', async () => {
     apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('Gateway Timeout'), { status: 504 }))
     apiMock.chatSlots.mockResolvedValue([slotRow('peer')])
@@ -399,6 +417,36 @@ describe('an uncoded close failure', () => {
 
     expect(root(store).dashboard.slots.map(s => s.key)).toEqual(['peer'])
     expect(selectCloseNotice(root(store))).toBeNull()
+  })
+
+  it('a 404 close whose popping sibling is still saving past the in-flight cap raises no false notice (#31538)', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    try {
+      // This tab's DELETE answers 404: another close popped the key first and is
+      // still slowly saving the long-context session. The 404 completed THIS close.
+      apiMock.deleteChatSlot.mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }))
+      apiMock.chatSlots.mockResolvedValue([slotRow('peer')])
+      const store = makeStore()
+      store.dispatch(sseSlots([slotRow('doomed', { title: 'Doomed notes' }), slotRow('peer')]))
+
+      await store.dispatch(deleteSlot('doomed'))
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(selectCloseNotice(root(store))).toBeNull()
+
+      // Past the 30s in-flight cap the hold lifts and the next list re-shows the
+      // row because the sibling save has not landed yet. That re-show is the slow
+      // save, not the server undoing the close, so it must stay quiet.
+      clock.mockReturnValue(1_700_000_000_000 + 30_001)
+      store.dispatch(sseSlots([slotRow('doomed', { title: 'Doomed notes' }), slotRow('peer')]))
+      expect(selectCloseNotice(root(store))).toBeNull()
+
+      // When the slow save finally lands, the row is removed for good.
+      store.dispatch(sseSlotPatch({ removed: ['doomed'] }))
+      expect(selectCloseNotice(root(store))).toBeNull()
+      expect(root(store).dashboard.slots.map(s => s.key)).toEqual(['peer'])
+    } finally {
+      clock.mockRestore()
+    }
   })
 
   it('a removed frame after the notice clears it', async () => {

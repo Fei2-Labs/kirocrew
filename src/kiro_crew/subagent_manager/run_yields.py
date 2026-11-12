@@ -92,6 +92,7 @@ async def _yield_for_stop_recovery_impl(
         build_tool_stall_recovery_prompt,
     )
     from kiro_crew.taskq.waits import EVIDENCE_LIVENESS_ORACLE, WaitRecord
+    from kiro_crew.timed_out_call import is_silence_timeout
 
     stop = classify_stop_reason(getattr(event, "stop_reason", ""))
     info._stop_recovery_used += 1
@@ -184,6 +185,7 @@ async def _yield_for_stop_recovery_impl(
     )
     evidence = str(getattr(event, "text", "") or "")
     idle_m = re.search(r"idle_secs=(\d+)", evidence)
+    terminated_m = re.search(r"processes_terminated=(\d+)", evidence)
     body = build_tool_stall_recovery_prompt(
         str(getattr(event, "title", "") or ""),
         int(idle_m.group(1)) if idle_m else 0,
@@ -191,6 +193,8 @@ async def _yield_for_stop_recovery_impl(
         # Typed verdict first; the evidence-text marker is the fallback for
         # a provider that forwards no status object.
         stuck_input=typed_input_wait or "stuck_input" in evidence,
+        processes_terminated=int(terminated_m.group(1)) if terminated_m else 0,
+        timed_out=is_silence_timeout(evidence),
     )
     return f"{TOOL_STALL_RECOVERY_PREFIX}\n{body}"
 

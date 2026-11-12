@@ -8,7 +8,10 @@ this user can supervise a pod at all.
 
 from __future__ import annotations
 
+import html
+import re
 import subprocess
+from pathlib import Path
 
 import pytest
 from test_pod_windows_liveness import supervisor as supervisor
@@ -54,6 +57,10 @@ def cfg(tmp_path, monkeypatch) -> PodConfig:
     c = PodConfig.load()
     c.pods_dir.mkdir(parents=True, exist_ok=True)
     return c
+
+
+#: The real gate, kept before the autouse fixture below stubs it out.
+_REAL_REQUIRE_BACKEND = win.require_backend
 
 
 @pytest.fixture(autouse=True)
@@ -241,6 +248,41 @@ def test_unit_state_is_inactive_on_a_clean_exit(cfg):
     assert win.unit_state(cfg, "smoke") == ("inactive", 0)
 
 
+def test_unit_state_is_active_while_a_boot_producer_lives_before_its_gateway(cfg, monkeypatch):
+    """Worktree removal refuses only an active pod, and a boot is using its
+    checkout before any gateway pid exists. A dead producer is not a boot."""
+    record = {"state": "preparing", "publisher": [4242, "77"]}
+    monkeypatch.setattr(win.runs, "read", lambda c, n: record)
+    monkeypatch.setattr(win.jobs, "close_identity", lambda handle: None)
+    monkeypatch.setattr(win.jobs, "open_identity", lambda pid, token: 9)
+    assert win.unit_state(cfg, "smoke") == ("active", 0)
+    monkeypatch.setattr(win.jobs, "open_identity", lambda pid, token: None)
+    assert win.unit_state(cfg, "smoke") == ("inactive", 0)
+    record["state"] = "finished"
+    monkeypatch.setattr(win.jobs, "open_identity", lambda pid, token: pytest.fail("not a boot"))
+    assert win.unit_state(cfg, "smoke") == ("inactive", 0)
+    # The producer writes the pid before `ready`, so the run must be read FIRST:
+    # a read that then misses `preparing` still finds the pid.
+    order: list[str] = []
+    monkeypatch.setattr(win.runs, "read", lambda c, n: order.append("run") or record)
+    monkeypatch.setattr(win, "supervised_pid", lambda c, n: order.append("pid"))
+    win.unit_state(cfg, "smoke")
+    assert order == ["run", "pid"]
+
+
+def test_active_names_counts_a_boot_before_its_gateway_pid(cfg, monkeypatch):
+    """Removal with a working backend lists active names; a boot has only a run record."""
+    record = {"state": "preparing", "publisher": [4242, "77"]}
+    cfg.pods_dir.mkdir(parents=True, exist_ok=True)
+    win.runs.path(cfg, "smoke").write_text("{}")
+    monkeypatch.setattr(win.runs, "read", lambda c, n: record)
+    monkeypatch.setattr(win.jobs, "close_identity", lambda handle: None)
+    monkeypatch.setattr(win.jobs, "open_identity", lambda pid, token: 9)
+    assert win.active_names(cfg) == {"smoke"}
+    monkeypatch.setattr(win.jobs, "open_identity", lambda pid, token: None)
+    assert win.active_names(cfg) == set()
+
+
 def test_unit_state_is_inactive_when_nothing_was_ever_recorded(cfg):
     assert win.unit_state(cfg, "smoke") == ("inactive", 0)
 
@@ -390,39 +432,66 @@ def test_the_runtime_wrapper_does_not_translate_on_windows(cfg, monkeypatch):
 
 # schtasks argv — pinned, because the fakes are the only thing asserting it
 def test_start_creates_a_manual_run_only_task_then_runs_it(cfg, monkeypatch):
-    """`/SC ONCE /ST 00:00` is a trigger already in the past, so Task Scheduler
-    never fires it on its own — that keeps a pod transient, like `systemctl
-    start` (never `enable`) and launchd's refusal to install under LaunchAgents.
+    """The trigger is already in the past, so Task Scheduler never fires it on its
+    own — that keeps a pod transient, like `systemctl start` (never `enable`) and
+    launchd's refusal to install under LaunchAgents.
 
-    Neither `/RU` nor `/RP` is passed: that is the documented "current logged-on
-    user" form and the only one that never prompts for a password.
+    Neither `/RU` nor `/RP` is passed and the definition names no user: that is the
+    "current logged-on user" form and the only one that never prompts for a password.
     """
     calls: list[tuple[str, ...]] = []
+    definitions: list[bytes] = []
 
     def task(*args):
         if args[0] == "/Query":
             return _cp(returncode=1)
         calls.append(args)
+        if args[0] == "/Create":
+            definitions.append(Path(args[-1]).read_bytes())
         return _cp()
 
     monkeypatch.setattr(win, "schtasks", task)
     assert win.start(cfg, "smoke").returncode == 0
     script = win.task_script_path(cfg, "smoke")
+    definition = script.with_suffix(".xml")
     assert calls[0] == (
         "/Create",
         "/F",
-        "/SC",
-        "ONCE",
-        "/ST",
-        "00:00",
         "/TN",
         r"\KiroCrew\pods\kirocrew-pod\smoke",
-        "/TR",
-        f'"{script}"',
+        "/XML",
+        str(definition),
     )
     assert calls[1] == ("/Run", "/TN", r"\KiroCrew\pods\kirocrew-pod\smoke")
     assert "/RU" not in calls[0] and "/RP" not in calls[0]
     assert script.exists(), "the wrapper must exist before the task points at it"
+    assert not definition.exists(), "the definition file is spent once /Create returns"
+    xml = definitions[0].decode("utf-16")
+    assert _element(xml, "Command") == str(script)
+    assert "<UserId>" not in xml
+    assert _element(xml, "LogonType") == "InteractiveToken"
+    assert _element(xml, "StartBoundary") < "2001"
+
+
+def _element(xml: str, tag: str) -> str:
+    """Text of the one *tag* element in a rendered task definition."""
+    found = re.findall(rf"<{tag}>([^<]*)</{tag}>", xml)
+    assert len(found) == 1, f"expected one <{tag}> in {xml!r}"
+    return html.unescape(found[0])
+
+
+def test_a_pod_task_runs_at_normal_priority_not_the_task_default(cfg):
+    """Task Scheduler's default priority 7 is BELOW_NORMAL, and the whole pod tree
+    inherits it. Busy CPUs then starve the boot past the readiness budget."""
+    xml = win.render_task_xml(win.task_script_path(cfg, "smoke"))
+    assert _element(xml, "Priority") == "5"
+
+
+def test_the_task_definition_escapes_the_wrapper_path(tmp_path):
+    script = tmp_path / "a&b<c>" / "kirocrew-pod.smoke.cmd"
+    xml = win.render_task_xml(script)
+    assert "a&amp;b&lt;c&gt;" in xml
+    assert _element(xml, "Command") == str(script)
 
 
 def test_start_preserves_a_stale_result_until_its_run_is_retired(cfg, monkeypatch):
@@ -526,22 +595,73 @@ def test_deleting_a_task_that_is_already_gone_is_a_no_op_not_a_failure(
 ):
     """Judged by re-probing absence, never by /Delete's own localized error.
 
-    "Already gone" means ``/Query /TN`` is non-zero while a bare ``/Query`` is zero
-    (the service answered); see ``test_stop_keeps_the_task_when_query_cannot_confirm_absence``.
+    "Already gone" means ``/Query /TN <task>`` is non-zero while the plane-folder
+    query is zero (the service answered); see
+    ``test_stop_keeps_the_task_when_query_cannot_confirm_absence``.
     """
 
     def fake(*a):
         if a[0] == "/Delete":
             return _cp(returncode=1, stderr="ERROR: The system cannot find the file specified.")
-        if a[0] == "/Query" and len(a) > 1:
-            return _cp(returncode=1)  # no such task
+        if a == _FOLDER_QUERY:
+            return _cp(returncode=0)  # the service answered
         if a[0] == "/Query":
-            return _cp(returncode=0)  # bare /Query: the service answered
+            return _cp(returncode=1)  # no such task
         return _cp()
 
     monkeypatch.setattr(win, "schtasks", fake)
     win.write_task_script(cfg, "smoke")
     assert win.stop(cfg, "smoke").returncode == 0
+
+
+_FOLDER_QUERY = ("/Query", "/TN", win.TASK_FOLDER_ROOT + "\\")
+
+
+def test_absence_is_proven_without_listing_every_task(cfg, monkeypatch, drainable_stop_root):
+    """A bare ``/Query`` is never asked: under full CPU load it outlives the budget.
+
+    A bare ``/Query`` took 120 s on a busy host while one folder or task query
+    took about 3 s. The fake times the bare form out the way the 30 s
+    budget does, so asking it at all fails teardown.
+    """
+
+    def fake(*a):
+        if a == ("/Query",):
+            raise subprocess.TimeoutExpired(["schtasks", "/Query"], 30)
+        if a[0] == "/Delete":
+            return _cp(returncode=1, stderr="ERROR: The system cannot find the file specified.")
+        if a == _FOLDER_QUERY:
+            return _cp(returncode=0)
+        if a[0] == "/Query":
+            return _cp(returncode=1)  # no such task
+        return _cp()
+
+    monkeypatch.setattr(win, "schtasks", fake)
+    win.write_task_script(cfg, "smoke")
+    assert win.stop(cfg, "smoke").returncode == 0
+    assert not win.task_script_path(cfg, "smoke").exists()
+
+
+def test_a_scheduler_probe_that_times_out_is_not_read_as_absence(
+    cfg, monkeypatch, drainable_stop_root
+):
+    """An unanswered service still fails closed when the probe itself times out."""
+
+    def fake(*a):
+        if a[0] == "/Delete":
+            return _cp(returncode=1, stderr="ERROR: Access is denied.")
+        if a == _FOLDER_QUERY:
+            raise subprocess.TimeoutExpired(["schtasks", *a], 30)
+        if a[0] == "/Query":
+            return _cp(returncode=1)
+        return _cp()
+
+    monkeypatch.setattr(win, "schtasks", fake)
+    win.write_task_script(cfg, "smoke")
+    cp = win.stop(cfg, "smoke")
+    assert cp.returncode == 1
+    assert "NOT proven zero-residue" in cp.stderr
+    assert win.task_script_path(cfg, "smoke").exists()
 
 
 def test_stop_keeps_the_task_when_query_cannot_confirm_absence(
@@ -558,7 +678,7 @@ def test_stop_keeps_the_task_when_query_cannot_confirm_absence(
         if a[0] == "/Delete":
             return _cp(returncode=1, stderr="ERROR: Access is denied.")
         if a[0] == "/Query":
-            return _cp(returncode=1)  # both the per-task and bare query are unanswered
+            return _cp(returncode=1)  # both the per-task and folder query are unanswered
         return _cp()
 
     monkeypatch.setattr(win, "schtasks", fake)
@@ -653,6 +773,25 @@ def test_require_backend_translates_the_windows_error_to_a_pod_error(monkeypatch
     )
     with pytest.raises(rt.PodError, match="no schtasks"):
         rt.require_backend()
+
+
+def test_a_refused_task_create_means_the_pod_backend_is_absent(monkeypatch):
+    """Only the scheduler's own refusal is "absent"; a missing schtasks stays a PodError."""
+    monkeypatch.setattr(rt, "IS_MACOS", False)
+    monkeypatch.setattr(rt, "IS_WINDOWS", True)
+    monkeypatch.setattr(win, "require_backend", _REAL_REQUIRE_BACKEND)
+    monkeypatch.setattr(win, "IS_WINDOWS", True)
+    monkeypatch.setattr(win, "_PROBE_OK", False)
+    monkeypatch.setattr(win, "schtasks_bin", lambda: r"C:\Windows\System32\schtasks.exe")
+    monkeypatch.setattr(
+        win, "_schtasks_raw", lambda *a: _cp(returncode=1, stderr="Access is denied.")
+    )
+    with pytest.raises(rt.PodBackendAbsent, match="Access is denied"):
+        rt.require_backend()
+    monkeypatch.setattr(win, "schtasks_bin", lambda: None)
+    with pytest.raises(rt.PodError) as exc:
+        rt.require_backend()
+    assert not isinstance(exc.value, rt.PodBackendAbsent)
 
 
 def test_install_backend_writes_nothing_on_windows(cfg, monkeypatch):

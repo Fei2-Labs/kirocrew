@@ -1,11 +1,13 @@
 """Check for and apply fork updates from GitHub Releases.
 
 GET  /api/update/fork  — check whether a newer fork release exists.
-POST /api/update/fork  — download the latest wheel and install it, then restart.
+POST /api/update/fork  — download the latest wheel and install it.
 
 The check hits the GitHub Releases API for Fei2-Labs/kirocrew and compares the
 latest tag's embedded version against the running one.  The apply downloads the
-wheel asset, installs it with pip, and restarts the gateway.
+wheel asset and installs it with pip.  It never restarts the running gateway —
+an update replaces the tree this process serves, so the install goes live on
+the next start (docs/decisions/2026-11-10-updates-never-restart-a-running-gateway.md).
 """
 
 from __future__ import annotations
@@ -24,7 +26,6 @@ from aiohttp import web
 
 import kiro_crew
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
-from kiro_crew.dashboard.handlers.updates_apply import _restart_gateway
 from kiro_crew.dashboard.handlers.updates_verdict import _is_newer
 from kiro_crew.platform.update_capability import MANAGED_BY_KIROCREW, derive_capability
 
@@ -243,28 +244,11 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
         logger.error("fork update install failed: %s", error)
         return web.json_response({"ok": False, "error": error}, status=500)
 
-    logger.info("fork update: installed %s, scheduling restart", tag)
-
-    # Restart through _restart_gateway, the same path POST /api/restart takes:
-    # reexec_python_module() takes required args, so calling it bare raised
-    # TypeError in the task and the gateway stayed up on the old code.
-    state = request.app["state"]
-
-    async def _delayed_restart() -> None:
-        # Reply BEFORE restarting — the exec replaces the process image.
-        await asyncio.sleep(2)
-        logger.info("fork update: restarting gateway")
-        try:
-            await _restart_gateway(state)
-        except Exception:
-            logger.exception("fork update: gateway restart failed")
-
-    task = asyncio.create_task(_delayed_restart())
-    state._background_tasks.add(task)
-    task.add_done_callback(state._background_tasks.discard)
+    logger.info("fork update: installed %s; it goes live on the next start", tag)
 
     return web.json_response({
         "ok": True,
         "installed_tag": tag,
-        "message": "Installed. Gateway restarting in 2 seconds.",
+        "restart_required": True,
+        "message": "Installed. Restart the gateway to run it.",
     })

@@ -74,6 +74,27 @@ def test_pinned_skill_is_exempt(loader):
     assert [s["key"] for s in loader.list_auto_skills()] == ["auto/pinned-old"]
 
 
+@pytest.mark.parametrize("value", [b"yes", b"1", b"True"])
+def test_hand_written_pinned_value_is_exempt(loader, value):
+    """Every value the skill review carries forward as a pin keeps the skill live."""
+    name = _mk(loader, "hand-pinned", created_days_ago=200)
+    _edit_skill_bytes(
+        loader, name, lambda raw: raw.replace(b"---\n", b"---\npinned: " + value + b"\n", 1)
+    )
+
+    counts = _run(loader)
+
+    assert counts["archived"] == 0
+    assert [s["key"] for s in loader.list_auto_skills()] == ["auto/hand-pinned"]
+
+
+def test_unpinned_value_is_still_archived(loader):
+    name = _mk(loader, "not-pinned", created_days_ago=200)
+    _edit_skill_bytes(loader, name, lambda raw: raw.replace(b"---\n", b"---\npinned: no\n", 1))
+
+    assert _run(loader)["archived"] == 1
+
+
 def test_cron_referenced_skill_is_exempt(loader):
     _mk(loader, "cron-old", created_days_ago=200)
     counts = _run(loader, cron_referenced={"auto/cron-old"})
@@ -139,6 +160,23 @@ def test_pin_write_failure_preserves_skill(loader, monkeypatch):
     with pytest.raises(OSError):
         loader.set_pinned(name, True)
     assert skill_file.read_text(encoding="utf-8") == before  # untouched, not truncated
+
+
+def test_update_skill_routes_windows_dacl_preservation_through_atomic_write(loader, monkeypatch):
+    """A SKILL.md save keeps the file's own Windows DACL, like the other two overwrites."""
+    import kiro_crew.skills as S
+
+    loader.create_skill("hand/kept", "---\nname: hand/kept\n---\nbody")
+    captured: dict[str, object] = {}
+    original = S.atomic_write
+
+    def recording(target, content, **kwargs):
+        captured.update(kwargs)
+        original(target, content, **kwargs)
+
+    monkeypatch.setattr(S, "atomic_write", recording)
+    assert loader.update_skill("hand/kept", "---\nname: hand/kept\n---\nnew") is True
+    assert captured["preserve_windows_dacl"] is True
 
 
 def test_archive_refuses_non_auto(loader):

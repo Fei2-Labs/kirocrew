@@ -79,6 +79,13 @@ class TestTheScopeSurfaceIsResolvedOnce:
         assert "src/kiro_crew/security/" in surface
         assert "scripts/deny_diff.py" in surface
 
+    def test_no_workflow_file_is_on_the_surface(self) -> None:
+        # On `pull_request` the lane runs the head's copy of its workflow, so a
+        # listed workflow only has an edit judge itself, and an edit that tightens
+        # nothing reds at `validate`'s by-design refusal of an empty file (exit 2).
+        workflows = [path for path in self._surface() if path.startswith(".github/workflows/")]
+        assert not workflows, workflows
+
     def test_the_fork_lane_extracts_that_list_and_spells_none_of_it(self) -> None:
         fork = _workflow("fork-security-scope-review.yml")
         script = _step_script(fork, "Resolve review scope")
@@ -89,8 +96,6 @@ class TestTheScopeSurfaceIsResolvedOnce:
         # here. A copy is how the fork lane comes to disagree with the same-repo
         # lane about what the security surface is.
         for path in self._surface():
-            if path == ".github/workflows/security-scope-review.yml":
-                continue  # the file it READS the list out of, not a copied entry
             assert path not in script, f"fork lane re-spells {path}"
 
     def test_a_short_extraction_refuses_instead_of_skipping_the_review(self) -> None:
@@ -112,9 +117,6 @@ class TestTheScopeSurfaceIsResolvedOnce:
 
         `latest` is one check-run per name, which during the floor step is this run's
         own in-progress one, so no prior is seen and the floor holds nothing.
-
-        Only these two reads of history: a read of the current state (pr-readiness)
-        is correct on the default.
         """
         for lane, job, step in (
             ("security-scope-review.yml", "publish", "Enforce the per-head monotonic floor"),
@@ -538,7 +540,6 @@ class TestTheTwoSecurityGatesScopeOneSurface:
             "scripts/scope_candidates.py",  # only this lane runs it
             "scripts/scope_redact.py",  # its outbound scrub, which only this gate lists
             ".github/review-prompts/security-scope.md",  # only this lane has a model
-            ".github/workflows/security-scope-review.yml",  # its own workflow
         }
     )
     _DIFFERENTIAL_ONLY = frozenset({".github/workflows/denial-differential.yml"})
@@ -1068,18 +1069,43 @@ class TestPerHeadMonotonicFloor:
         checkruns: str | None = None,
         gh_fail: bool = False,
         floor_rc: int = 0,
+        rate_limit_reset: int | None = None,
         **overrides: str,
     ) -> subprocess.CompletedProcess[str]:
         bash = _bash()
         if bash is None or shutil.which("jq") is None:
             pytest.skip("the floor step is Bash and encodes the check name with jq")
         stub = self._stub_dir(tmp_path, checkruns, gh_fail=gh_fail, floor_rc=floor_rc)
+        stubs = ""
+        if rate_limit_reset is not None:
+            # The first listing read is refused by a spent limit; what
+            # `gh api rate_limit --jq ...` prints is the core bucket's reset.
+            # `date` is pinned and `sleep` records its argument, so the wait is
+            # exact and instant. Those two are shell functions, not PATH stubs:
+            # Git for Windows' bash puts its own /usr/bin ahead of PATH.
+            stubs = 'date() { echo 1000; }\nsleep() { printf \'%s\\n\' "$1" >> "$SLEEPS"; }\n'
+            gh = stub / "gh"
+            listing = gh.rename(stub / "gh-listing")
+            refused = tmp_path / "refused-once"
+            gh.write_text(
+                "#!/usr/bin/env bash\n"
+                f'if [ "$2" = "rate_limit" ]; then echo {rate_limit_reset}; exit 0; fi\n'
+                f'if [ ! -e "{refused}" ]; then\n'
+                f'  : > "{refused}"\n'
+                '  echo "gh: API rate limit exceeded for installation ID 1. (HTTP 403)" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                f'exec "{listing}" "$@"\n',
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
         harness = tmp_path / "harness"
         harness.mkdir(exist_ok=True)
         shutil.copy(ROOT / "scripts" / "scope_candidates.py", harness / "scope_candidates.py")
         script = tmp_path / "floor.sh"
         script.write_text(
-            _step_by_name(
+            stubs
+            + _step_by_name(
                 "security-scope-review.yml", "publish", "Enforce the per-head monotonic floor"
             )["run"]
         )
@@ -1094,6 +1120,9 @@ class TestPerHeadMonotonicFloor:
             "VERDICT": "PASS",
             "HUMAN_OVERRIDE": "false",
             "HARNESS": str(harness),
+            # The step's `mktemp` lands here, never in the host's /tmp.
+            "TMPDIR": str(tmp_path),
+            "SLEEPS": str(tmp_path / "sleeps"),
         }
         env.update(overrides)
         return subprocess.run(
@@ -1125,6 +1154,16 @@ class TestPerHeadMonotonicFloor:
     def test_same_repo_unreadable_prior_fails_closed(self, tmp_path: Path) -> None:
         got = self._run_same_repo(tmp_path, gh_fail=True)
         assert got.returncode == 1, _proc_log(got)
+
+    def test_same_repo_floor_read_waits_out_a_spent_rate_limit(self, tmp_path: Path) -> None:
+        # A run that cannot read its priors fails, and that failure floors the
+        # head; a read refused by a spent limit waits for the reset (5s past
+        # it) and the floor settles on what the listing says.
+        got = self._run_same_repo(
+            tmp_path, checkruns='{"total_count":0,"check_runs":[]}', rate_limit_reset=1100
+        )
+        assert got.returncode == 0, _proc_log(got)
+        assert (tmp_path / "sleeps").read_text(encoding="utf-8") == "105\n"
 
     def test_same_repo_human_override_is_not_refloored(self, tmp_path: Path) -> None:
         # The override's clearance for this head is a deliberate softening; the

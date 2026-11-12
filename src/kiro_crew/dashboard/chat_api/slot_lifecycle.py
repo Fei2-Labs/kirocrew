@@ -5,8 +5,9 @@ cleanup sweep.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from typing import TYPE_CHECKING
+import contextlib
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, TypeVar
 
 from aiohttp import web
 
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_handlers import (
         _FILE_CHANGES_DRAIN_SECS,
         _GUARDED_WRITE_WAIT_SECS,
+        _SLOW_CLOSE_STAGE_SECS,
         DashboardState,
         NudgeLoop,
         SlotCloseError,
@@ -29,8 +31,10 @@ if TYPE_CHECKING:
         _teardown_drain_basis,
         _unblock_pending_waits,
         body_int,
+        close_in_flight,
         deny_app_slot_access,
         effective_session_key,
+        load_window_off_loop,
         logger,
         loop_slot_keys,
         note_slot_closed,
@@ -44,6 +48,8 @@ if TYPE_CHECKING:
         slot_not_found,
         time,
     )
+
+_T = TypeVar("_T")
 
 
 def _slot_still_ours(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
@@ -416,15 +422,29 @@ async def close_slot(
     handed up the manager line here (a no-op unless ``agent.session_manager_chain``).
     The idle sweep passes ``hand_back=False``: an idle archive keeps them on it.
     """
-    try:
-        await _close_slot(state, slot, name, pre_pop_check=pre_pop_check)
-    finally:
-        if state.get_slot(name) is slot:
-            slot.cancel_close()
+    # Published across the whole frame, restore included: a concurrent vocabulary delete
+    # must be able to strip this object while it is out of ``_slots``.
+    with close_in_flight(state, name, slot):
+        try:
+            await _close_slot(state, slot, name, pre_pop_check=pre_pop_check)
+        finally:
+            if state.get_slot(name) is slot:
+                slot.cancel_close()
     if hand_back and state.get_slot(name) is not slot:
         from kiro_crew.dashboard.session_control import hand_back_on_close
 
-        await hand_back_on_close(state, slot)
+        await _timed_close_stage(name, "hand-back", hand_back_on_close(state, slot))
+
+
+async def _timed_close_stage(name: str, stage: str, step: Awaitable[_T]) -> _T:
+    """Await one stage of closing *name*; a warning names it when it is slow."""
+    started = time.monotonic()
+    try:
+        return await step
+    finally:
+        elapsed = time.monotonic() - started
+        if elapsed >= _SLOW_CLOSE_STAGE_SECS:
+            logger.warning("Closing slot %s: %s took %.1fs", name, stage, elapsed)
 
 
 async def _drain_file_changes_flush(slot: "_ChatSlot") -> None:
@@ -485,6 +505,32 @@ def _emit_archived_rows(slot: "_ChatSlot", appended: int) -> None:
             slot._on_message(slot.key, msg)  # type: ignore[operator]
 
 
+def _hand_off_cards_when_the_turn_ends(
+    state: DashboardState, closed: "_ChatSlot", task: asyncio.Task
+) -> None:
+    """Hand *closed*'s merge cards to an open twin again once its turn *task* ends.
+
+    The close waits for the cancelled turn only so long, and a turn that outlives
+    the wait can put a card it took back on the popped slot when it ends
+    (``_restore_consumed_merge_contexts``). Nothing visits a popped slot again, so
+    that card would wait for a hydration an open twin never gets. Nothing is done
+    when the turn already ended, or when a failed archive save put the slot back
+    in the table, where its own next turn takes the card.
+    """
+    if task.done():
+        return
+    from kiro_crew.dashboard.chat_runner import hand_merge_cards_to_open_twin
+
+    def after_the_turn(_finished: asyncio.Task) -> None:
+        if state._slots.get(closed.key) is closed:
+            return
+        follow_up = asyncio.create_task(hand_merge_cards_to_open_twin(state, closed))
+        state._background_tasks.add(follow_up)
+        follow_up.add_done_callback(state._background_tasks.discard)
+
+    task.add_done_callback(after_the_turn)
+
+
 async def _close_slot(
     state: DashboardState,
     slot: "_ChatSlot",
@@ -505,7 +551,9 @@ async def _close_slot(
     app watchdog from resurrecting the very tab being dismissed. The four
     failure paths raise :class:`SlotCloseError`, leaving the slot open with every
     partial step rolled back; the caller renders the refusal in its own idiom
-    (an HTTP response, or a ``SessionControlError``). The APP-OWNERSHIP check is
+    (an HTTP response, or a ``SessionControlError``). A slot that loses its name
+    during any of the close's waits raises 409 ``slot_replaced`` before the next
+    step that acts by key. The APP-OWNERSHIP check is
     deliberately NOT here — it is DELETE-endpoint policy (App Kit isolation for
     app tokens) and stays in that handler; session control scopes the caller
     through ``authorize_target`` instead.
@@ -546,6 +594,20 @@ async def _close_slot(
     # close observed the already-terminal record, leaving an active orphan.
     slot.begin_close()
     closed_at = note_slot_closed(state, name)
+
+    def refuse_if_replaced() -> None:
+        # Each wait below can outlast this slot's hold on the name: another close pops
+        # it and a send recreates the key. The steps after a wait act BY KEY (the
+        # nudge retirements, the pop), so they would act on the replacement. The
+        # original is gone, so neither its loop nor an app's dismissal is put back
+        # (see _restore_original_after_failed_close); only this close's own fence is
+        # released, which close_slot's finally skips for a slot out of the table.
+        if state.get_slot(name) is not slot:
+            slot.cancel_close()
+            raise SlotCloseError(
+                "the session was replaced during the close", code="slot_replaced", status=409
+            )
+
     # The fence above is what makes this wait sound: it refuses a NEW truncating
     # save for the duration of the teardown, so the writes this drains cannot be
     # re-armed behind it. Placed here, after the synchronous tombstone and before
@@ -567,6 +629,7 @@ async def _close_slot(
             "open, close it again in a moment",
             code="history_write_running",
         )
+    refuse_if_replaced()
     from kiro_crew.execution_context import read_live_session_execution
 
     closing_key = effective_session_key(slot)
@@ -575,7 +638,9 @@ async def _close_slot(
     # into the session being closed and resurrect it. See
     # _retire_slot_nudge_loop for why disarming alone does not hold.
     try:
-        retired_loop = await _retire_slot_nudge_loop(name)
+        retired_loop = await _timed_close_stage(
+            name, "nudge-loop retire", _retire_slot_nudge_loop(name)
+        )
     except _NudgeRetireFailed as exc:
         # The loop could not be retired, so the close CANNOT proceed: persisting
         # the slot as closed while the registry still lists the loop is what lets
@@ -624,7 +689,9 @@ async def _close_slot(
             notify_slot_closed,  # circular: apps.teardown -> apps.bridges -> dashboard
         )
 
-        if not await notify_slot_closed(slot._app, name):
+        if not await _timed_close_stage(
+            name, "app close hook", notify_slot_closed(slot._app, name)
+        ):
             # The app could not record the dismissal. Refuse the close rather
             # than leave a worker running behind a tab the user believes is gone.
             await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
@@ -632,13 +699,16 @@ async def _close_slot(
             _sync_dashboard_slots(state)
             state.push_slots_update()
             raise SlotCloseError("failed to notify the app", code="app_close_hook_failed")
+        refuse_if_replaced()
         # The app hook awaits external work while the slot is still visible.
         # Re-arbitrate the nudge registry after it returns: an arm that committed
         # during that await must be retired before the synchronous pop below.
         # There is no await between a successful second retirement and the pop,
         # so a later queued arm revalidates against the now-missing slot.
         try:
-            late_retired_loop = await _retire_slot_nudge_loop(name)
+            late_retired_loop = await _timed_close_stage(
+                name, "late nudge-loop retire", _retire_slot_nudge_loop(name)
+            )
         except _NudgeRetireFailed as exc:
             await _restore_slot_nudge_loop(exc.loop, lambda: state.get_slot(name) is slot)
             from kiro_crew.apps.teardown import (
@@ -658,6 +728,8 @@ async def _close_slot(
             raise SlotCloseError("failed to retire nudge loop", code="nudge_retire_failed")
         if late_retired_loop is not None:
             retired_loop = late_retired_loop
+    # The retirements await the AutoNudge lock, and the pop below is by key too.
+    refuse_if_replaced()
     if pre_pop_check is not None:
         # Point of no return: re-assert authorization that the awaits above could
         # have staled (nudge retirement takes the AutoNudge lock; the app hook
@@ -728,6 +800,16 @@ async def _close_slot(
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
         await _drain_file_changes_flush(slot)
+        # After the cancelled turn was awaited, so a card it put back is handed over
+        # too: a twin of this chat that stays open is never hydrated, and without this
+        # it would not see a merge card queued here.
+        from kiro_crew.dashboard.chat_runner import hand_merge_cards_to_open_twin
+
+        await _timed_close_stage(
+            name, "merge-card hand-off", hand_merge_cards_to_open_twin(state, slot)
+        )
+        for task in _teardown_tasks:
+            _hand_off_cards_when_the_turn_ends(state, slot, task)
         # Post-pop teardown race: across the awaits above (and the app-notify awaits
         # before the pop) a concurrent same-key recreate — a POST /api/chat or the
         # session_close MCP verb — can mint a REPLACEMENT slot under `name`. When that
@@ -816,18 +898,23 @@ async def _close_slot(
             # and this frame is the last one that can commit the hold before the pop.
             # The key may already name a replacement, so nothing is delivered live.
             slot.flush_deferred_notes(broadcast=False, retain=False)
-            archived_ok = await save_slot_off_loop(
-                state,
-                slot,
-                closed=True,
-                closed_at=closed_at,
-                best_effort=False,
-                # Discriminated, not raw: this archive writes the ORIGINAL's
-                # routed transcript, and a divergent same-name takeover (an
-                # unbound recreate over a linked tab) took the key without
-                # touching that file — its moved watch must not refuse the
-                # archive the divergent branch of this close deliberately runs.
-                takeover_basis=_teardown_drain_basis(state, name, slot, _teardown_basis),
+            archived_ok = await _timed_close_stage(
+                name,
+                "archive save",
+                save_slot_off_loop(
+                    state,
+                    slot,
+                    closed=True,
+                    closed_at=closed_at,
+                    best_effort=False,
+                    after_commit_under_lock=slot.note_close_recorded,
+                    # Discriminated, not raw: this archive writes the ORIGINAL's
+                    # routed transcript, and a divergent same-name takeover (an
+                    # unbound recreate over a linked tab) took the key without
+                    # touching that file — its moved watch must not refuse the
+                    # archive the divergent branch of this close deliberately runs.
+                    takeover_basis=_teardown_drain_basis(state, name, slot, _teardown_basis),
+                ),
             )
         except Exception:
             # Save failed — restore slot so data isn't lost
@@ -1057,6 +1144,13 @@ async def _close_slot(
             # that landed during the save gets the marker re-derived from ITSELF instead
             # of inheriting the original's.
             _resettle_restricted_key(state, name)
+            # The archival flush ran after the hand-off above, so a held merge card it
+            # queued here goes to an open twin now. After the committed archive: an
+            # await between that flush and the save would reopen the window the
+            # shared-transcript check above closed.
+            await _timed_close_stage(
+                name, "late merge-card hand-off", hand_merge_cards_to_open_twin(state, slot)
+            )
             # Record the DELIBERATE close as a ``session/closed`` crew-log edge with
             # ``END_REASON_REMOVED`` so a later ``session_status`` gone row for this
             # worker reads ``closed`` ("finished, nothing to re-dispatch") rather than
@@ -1110,13 +1204,22 @@ async def _close_slot(
     # replacement's session no matter which transcript that replacement writes. Skip
     # it unless the key is still ours.
     if _slot_still_ours(state, name, slot):
-        await state.sessions.remove(_history_key_for(name))
+        await _timed_close_stage(
+            name, "session teardown", state.sessions.remove(_history_key_for(name))
+        )
         # Stop the archived session's remote workspace and keep it for retention:
         # background, best effort, a no-op without one. Inside the identity check,
         # so a replacement's is never touched.
         from kiro_crew.coder.retention import feed_notifier, schedule_archived
 
         schedule_archived((_history_key_for(name), closing_key), feed_notifier(state))
+        # The browser tabs that session opened close with it; other chats keep theirs.
+        # A linked slot's session (slack:<ts>) outlives its tab and shares the hub key,
+        # so it keeps its tabs. Imported here, never at boot: it loads the handlers.
+        if not slot.linked_session_key:
+            from kiro_crew.dashboard.handlers.browser_ops import close_chat_tabs
+
+            close_chat_tabs(state, _history_key_for(name))
     _release_closed_execution(state, slot, closing_key, closing_execution)
     _sync_dashboard_slots(state)
     state.push_slot_removed(name)
@@ -1126,7 +1229,7 @@ async def _close_slot(
         # Imported here, never at boot, and a no-op for a slot bound to none.
         from kiro_crew.dashboard.handlers.remote_work_item import close_work_item_for_slot
 
-        await close_work_item_for_slot(name)
+        await _timed_close_stage(name, "work item close", close_work_item_for_slot(name))
 
 
 async def api_chat_slot_delete(request: web.Request) -> web.Response:
@@ -1145,6 +1248,9 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
     Any other session keeps the sessions it opened. A worker left behind a closed
     conductor can neither be steered nor report to anyone. A worker that fails
     to close stays open and is named in ``failed_workers``.
+
+    A ``?incarnation=`` that does not name the slot holding the key answers 409
+    ``target_replaced`` before any teardown step, so the slot is untouched.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
@@ -1163,15 +1269,23 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
     # Read while the slot is still live, with no await before the close: its stamps
     # need it in the slot table, and the tree membership must be the one it closes.
     line = None if request_app else _conductor_line(state, name)
+
+    expected = request.query.get("incarnation", "")
+    if expected and slot._dashboard_card_identity != expected:
+        return web.json_response(
+            {"error": "the target session was replaced", "code": "target_replaced"},
+            status=409,
+        )
     try:
         await close_slot(state, slot, name)
     except SlotCloseError as exc:
-        # Every failure `close_slot` raises is a server-side 500 (history write
-        # running / nudge retire / app hook / history save); a literal status keeps
+        # A slot replaced while the close waited is a 409 (`slot_replaced`); every
+        # other failure `close_slot` raises is a server-side 500 (history write
+        # running / nudge retire / app hook / history save). Literal statuses keep
         # the error-code contract gate able to verify the `code` statically (a
         # `status=<expr>` would read as an un-verifiable dynamic-status response).
-        # The pre-pop re-check that raises other statuses is session-control's
-        # path, not this handler's.
+        if exc.status == 409:
+            return web.json_response({"error": exc.message, "code": exc.code}, status=409)
         return web.json_response({"error": exc.message, "code": exc.code}, status=500)
     closed, failed = await _close_managed(state, name, line) if line else ([], [])
     if not closed and not failed:
@@ -1307,7 +1421,9 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
         # every save this iteration dispatches. Closed on every exit of the
         # iteration, ``continue`` included.
         _teardown_basis = SlotRegistry.open_takeover_basis(state, name)
+        _close_registration = contextlib.ExitStack()
         try:
+            _close_registration.enter_context(close_in_flight(state, name, removed))
             # Same tombstone as the single-tab close: the archive pass must not
             # race a concurrent channel reconcile into resurrecting the slot. Its
             # instant is persisted as closed_at for the same teardown-window
@@ -1333,6 +1449,13 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             # both writes below (the hand-over drain and the archive) must carry its
             # chips, or the late attach lands on this popped slot where no save admits it.
             await _drain_file_changes_flush(removed)
+            # Same hand-off as the single-tab close, for the same reason: an open twin
+            # of this chat is never hydrated again, so it would miss a card queued here.
+            from kiro_crew.dashboard.chat_runner import hand_merge_cards_to_open_twin
+
+            await hand_merge_cards_to_open_twin(state, removed)
+            if _turn_killed and removed.task is not None:
+                _hand_off_cards_when_the_turn_ends(state, removed, removed.task)
             # Post-pop teardown race (same as the single-tab close, same gate): across
             # the cancel await above a concurrent same-key recreate can mint a
             # REPLACEMENT slot under `name`. When that replacement writes the SAME
@@ -1372,6 +1495,7 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                     failed.append(name)
                 continue
             rows_before = removed.total_messages
+            handover_attempted = False
             try:
                 # Order is unchanged and load-bearing: the cancel above, then the
                 # flush, then the save. What the guard adds is failure handling, and
@@ -1386,13 +1510,54 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                 # restart and reported as success. Sharing the arm restores the
                 # slot with its notes still held and reports the key in ``failed``
                 # instead.
+                # Gated on the hold, because that is the condition the sync load it
+                # replaced sat behind: ``flush_deferred_notes`` returns 0 on an
+                # empty hold before it loads anything. An empty hold has nothing to
+                # flush, so loading would read a whole idle restored tab's
+                # transcript for no delivery, and a read that raises would land in
+                # the arm below and leave the tab unarchivable.
+                if removed._deferred_notes:
+                    await load_window_off_loop(removed)
+                # The preload is an await after the first transcript-sharing check.
+                # A same-key replacement can register while the window is read, so
+                # recheck before flushing and saving the original as closed.
+                if _replacement_shares_transcript(state, name, removed):
+                    handover_attempted = True
+                    drained = await _persist_handover_tail(
+                        state,
+                        name,
+                        removed,
+                        takeover_basis=_teardown_drain_basis(state, name, removed, _teardown_basis),
+                    )
+                    _resettle_restricted_key(state, name)
+                    if not drained.rows_committed:
+                        failed.append(name)
+                    continue
                 removed.flush_deferred_notes(broadcast=False, retain=False)
+                # The flush just queued the held notes' context halves here, merge
+                # cards among them.
+                await hand_merge_cards_to_open_twin(state, removed)
+                # That hand-off can await a transcript read, so recheck for the same
+                # reason as after the preload.
+                if _replacement_shares_transcript(state, name, removed):
+                    handover_attempted = True
+                    drained = await _persist_handover_tail(
+                        state,
+                        name,
+                        removed,
+                        takeover_basis=_teardown_drain_basis(state, name, removed, _teardown_basis),
+                    )
+                    _resettle_restricted_key(state, name)
+                    if not drained.rows_committed:
+                        failed.append(name)
+                    continue
                 archived_ok = await save_slot_off_loop(
                     state,
                     removed,
                     closed=True,
                     closed_at=closed_at,
                     best_effort=False,
+                    after_commit_under_lock=removed.note_close_recorded,
                     # Discriminated for the same reason as the single-tab close:
                     # a divergent takeover's moved watch must not refuse the
                     # archive of a transcript it never touches.
@@ -1429,12 +1594,15 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                     # The ``failed`` report is what carries the outcome instead — which
                     # is also why the drain's answer needs no branch here, unlike at the
                     # pre-save exit above: this key reaches ``failed`` regardless.
-                    await _persist_handover_tail(
-                        state,
-                        name,
-                        removed,
-                        takeover_basis=_teardown_drain_basis(state, name, removed, _teardown_basis),
-                    )
+                    if not handover_attempted:
+                        await _persist_handover_tail(
+                            state,
+                            name,
+                            removed,
+                            takeover_basis=_teardown_drain_basis(
+                                state, name, removed, _teardown_basis
+                            ),
+                        )
                 # Either way the key-scoped restricted marker must describe whoever holds
                 # `name` now — the restored original, or the replacement that kept it.
                 # This arm never reaches the discard below, so it settles it here.
@@ -1576,6 +1744,7 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                 _resettle_restricted_key(state, name)
         finally:
             SlotRegistry.close_takeover_basis(state, _teardown_basis)
+            _close_registration.close()
         # Re-check identity ONE more time, and KEY-scoped here rather than
         # transcript-scoped: `_history_key_for(name)` is the session an unbound
         # replacement runs on, so a recreate landing between the save above and here
@@ -1593,6 +1762,11 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             logger.warning("Cleanup: session remove failed for %s", name, exc_info=True)
         else:
             _release_closed_execution(state, removed, closing_key, closing_execution)
+            # Same browser tab close as a single archive (see _close_slot).
+            if not removed.linked_session_key:
+                from kiro_crew.dashboard.handlers.browser_ops import close_chat_tabs
+
+                close_chat_tabs(state, _history_key_for(name))
         # Same retention as a single archive (see _close_slot).
         from kiro_crew.coder.retention import feed_notifier, schedule_archived
 

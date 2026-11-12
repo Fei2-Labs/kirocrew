@@ -45,16 +45,12 @@ Cloud API does not; media rides the shared ingest and upload paths; reactions
 carry phase receipts. ``max_buttons=0``, and unlike the other zero-widget channels
 this renderer does not fall back to a numbered list: ``turn_renderer._strip_options``
 removes a COMPLETE ``[OPTIONS:]`` trailer from the reply, so a question whose
-choices live only there reaches the user without them. A tool approval is
-unaffected -- ``on_prompt_choice`` builds its own numbered prompt. Declaring no
-widget is a deliberately conservative choice, NOT a platform ceiling: the pinned
-wheel ships a complete interactive-message builder and a poll builder, and what is
-unverified is whether a recipient's client renders a native-flow message sent from
-a PERSONAL linked device rather than a Business account. Recording it as impossible
-would close the door on every future picker here, so it is recorded as unverified.
-Losing the list is a gap rather than a position; ``docs/channel-capabilities.md``
-records it for a reader. Unlike
-the Business Cloud API there is no 24-hour window, so
+choices live only there reaches the user without them (``docs/channel-capabilities.md``
+records the gap). A tool approval is unaffected -- ``on_prompt_choice`` builds its
+own numbered prompt. No widget is declared because support is unverified, not
+impossible: the pinned wheel ships interactive-message and poll builders, but
+whether a recipient renders a native-flow message from a PERSONAL linked device is
+unknown. There is no 24-hour window as on the Business Cloud API, so
 ``supports_proactive_send=True`` and reminders work.
 """
 
@@ -69,6 +65,7 @@ from typing import Any, Awaitable, Callable
 from kiro_crew.config.sections import _coerce_whatsapp_groups
 from kiro_crew.messaging.attachments import append_attachment_context, cleanup
 from kiro_crew.messaging.dispatch import inbound_permitted
+from kiro_crew.messaging.outbound_files import ExtractLimits, OutboundFile
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
     InboundMessage,
@@ -76,7 +73,7 @@ from kiro_crew.messaging.transport import (
     TransportCapabilities,
 )
 from kiro_crew.sel import sel
-from kiro_crew.whatsapp.attachments import ingest_media
+from kiro_crew.whatsapp.attachments import attachment_for, ingest_media
 from kiro_crew.whatsapp.client import WhatsAppClient
 from kiro_crew.whatsapp.commands import parse_command
 from kiro_crew.whatsapp.echo import EchoTracker
@@ -142,19 +139,16 @@ WHATSAPP_CAPABILITIES = TransportCapabilities(
     files_inbound=True,
     # The renderer runs the shared outbound extractor at the seal and uploads
     # each raster through client.send_image_bytes; a refusal is reported rather
-    # than dropped. Inbound stays False until the download half lands.
+    # than dropped.
     files_outbound=True,
     rich_blocks=False,
     threads=False,
     max_message_chars=WHATSAPP_CHUNK_LIMIT,
     max_buttons=0,
     supports_proactive_send=True,
-    # Declared explicitly rather than left to the default. Inbound builds a
-    # session key from the chat JID and never resolves a dashboard mirror
-    # binding, so a connect from the dashboard is outbound-only; claiming
-    # otherwise would promise a two-way link whose replies land in a different
-    # session. Spelling it out is also what puts this channel under
-    # test_capability_ledger's roster instead of silently outside it.
+    # Inbound builds a session key from the chat JID and never resolves a
+    # dashboard mirror binding, so a connect from the dashboard is outbound-only.
+    # Declared explicitly so test_capability_ledger's roster covers this channel.
     supports_session_resume=False,
 )
 
@@ -228,7 +222,6 @@ class WhatsAppTransport(MessagingTransport):
         """The low-level client (dashboard pairing handlers read state/QR)."""
         return self._client
 
-    # -- Live config ---------------------------------------------------------
     def __init__(
         self,
         client: WhatsAppClient,
@@ -272,13 +265,12 @@ class WhatsAppTransport(MessagingTransport):
         #: a channel-neutral shape and a WhatsApp stanza id means nothing to the
         #: others, so it rides here rather than widening the shared contract.
         self.pending_message_id: dict[int, str] = {}
-        #: ``(text as the user sent it, media count)`` captured BEFORE ingestion
-        #: rewrites ``msg.text`` with attachment context and temp paths. The
-        #: durable inbound spool quotes the spooled text back to the
-        #: user in a restart notice, and the ingested form would quote on-disk
-        #: paths to files that do not survive the restart. Same keying and lifetime as the
-        #: three tables above.
-        self.pending_original: dict[int, tuple[str, int]] = {}
+        #: ``(text as the user sent it, its media's names)`` captured BEFORE ingestion
+        #: rewrites ``msg.text`` with attachment context and temp paths: the
+        #: inbound spool quotes it back in a restart notice, and the ingested form
+        #: would name temp files that do not survive the restart. Same keying and
+        #: lifetime as the three tables above.
+        self.pending_original: dict[int, tuple[str, tuple[str, ...]]] = {}
         #: The inbound messages that were voice notes, so the dispatcher can answer
         #: one in kind. Same keying and lifetime as the tables above.
         self.pending_voice_note: set[int] = set()
@@ -406,6 +398,13 @@ class WhatsAppTransport(MessagingTransport):
             on_sent=lambda message_id: self.echo.remember(jid, message_id),
         )
 
+    async def edit_text(self, conversation_id: str, message_id: str, text: str) -> bool:
+        """Edit a message this channel sent, echo-tracking the edit's own id."""
+        jid = normalize_jid(conversation_id)
+        return await self._client.edit_text(
+            jid, message_id, text, on_sent=lambda edit_id: self.echo.remember(jid, edit_id)
+        )
+
     async def react(
         self, conversation_id: str, sender_id: str, message_id: str, emoji: str
     ) -> None:
@@ -419,6 +418,29 @@ class WhatsAppTransport(MessagingTransport):
         sent_id = await self._client.react(jid, sender_id, message_id, emoji)
         if sent_id:
             self.echo.remember(jid, sent_id)
+
+    async def outbound_image_limits(
+        self, conversation_id: str, thread_id: str | None = None
+    ) -> ExtractLimits | None:
+        """The renderer's own budgets (``files.whatsapp_limits``)."""
+        from kiro_crew.whatsapp.files import whatsapp_limits
+
+        return whatsapp_limits()
+
+    async def send_outbound_image(
+        self, conversation_id: str, file: OutboundFile, *, thread_id: str | None = None
+    ) -> bool:
+        """Send one extracted image after the renderer's own decode screen.
+
+        A picture the screen refuses (undecodable, past the pixel budget) answers
+        False rather than reaching :meth:`send_image`, whose image build would
+        fail on it.
+        """
+        from kiro_crew.whatsapp.files import _decode_refusal
+
+        if await asyncio.to_thread(_decode_refusal, file) is not None:
+            return False
+        return bool(await self.send_image(conversation_id, file.data))
 
     async def resolve_conversation(self, user_id: str) -> str:
         return normalize_jid(wa_id_to_user_jid(user_id))
@@ -739,8 +761,9 @@ class WhatsAppTransport(MessagingTransport):
         # the number trigger an authenticated download on the operator's host,
         # which is a remote-triggered fetch with no authorization behind it.
         temp_paths: list[str] = []
-        # The user's own text and media count, before either is rewritten below.
-        self.pending_original[id(msg)] = (msg.text, 1 if desc.has_media else 0)
+        # The user's own text and media name, before either is rewritten below.
+        media_names = (attachment_for(desc, message_id).name,) if desc.has_media else ()
+        self.pending_original[id(msg)] = (msg.text, media_names)
         if desc.has_media and not self._may_fetch_media(msg, is_group=is_group):
             # Refusing is said out loud: silence reads as the agent ignoring a
             # photo the sender believes it received.
@@ -754,8 +777,7 @@ class WhatsAppTransport(MessagingTransport):
             # is a guarantee that silently does not hold.
             msg.attachments = list(temp_paths)
         elif skipped_note:
-            # Seen and skipped, said out loud: silence reads as the agent
-            # ignoring a photo the user believes it received.
+            # Seen and skipped, said out loud for the same reason.
             msg.text = f"{msg.text}\n\n{skipped_note}".strip() if msg.text else skipped_note
 
         if verdict is not None:
@@ -791,10 +813,9 @@ class WhatsAppTransport(MessagingTransport):
         always 'addressed'.
 
         Takes the UNWRAPPED message, not the envelope: ``contextInfo`` carries the
-        mention list, and it is invisible when the message arrived inside an
-        ephemeral or view-once carrier. Reading the envelope made an @-mention in
-        a disappearing group message read as "not addressed", so the agent stayed
-        silent exactly when it was called on.
+        mention list, and it is invisible inside an ephemeral or view-once
+        carrier, so an @-mention in a disappearing group message would read as
+        "not addressed".
         """
         if sender_is_operator:
             return True

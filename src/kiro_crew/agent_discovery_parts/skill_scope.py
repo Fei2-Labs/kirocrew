@@ -114,9 +114,7 @@ def can_inherit_skills(spec: dict[str, Any]) -> bool:
 #: Whether a mapped crewmate conductor's skills ADD the user's ``~/.kiro/skills`` and
 #: workspace ``.kiro/skills``. A one-release deprecation: the intended scope is the
 #: mapping alone (``docs/decisions/``, "conductors stay simple"), and the next
-#: release sets this to ``False`` and removes it. While it is on, a new crewmate
-#: chat that inherits a skill shows one notice naming the change
-#: (``mate_conductor_inherited_skills``).
+#: release sets this to ``False`` and removes it.
 MATE_CONDUCTOR_INHERITS_USER_SKILLS = True
 
 
@@ -148,43 +146,23 @@ def mate_conductor_scope(
     return list(dict.fromkeys([*globs, *inherited_skill_globs(project_dir)]))
 
 
-def mate_conductor_inherited_skills(project_dir: str | Path | None) -> list[str]:
-    """The skill names the crewmate conductor takes from the user's trees, or ``[]``.
-
-    Read through :func:`agent_skill_globs`, so it is empty whenever the conductor
-    inherits nothing: the flag above is off, its spec maps no skill, or it may not
-    inherit. A name is the folder that holds a ``SKILL.md`` in an inherited tree.
-    """
-    import glob
-
-    from kiro_crew.mate_worker import MATE_CONDUCTOR_AGENT
-
-    if not MATE_CONDUCTOR_INHERITS_USER_SKILLS:
-        return []
-    scope = agent_skill_globs(MATE_CONDUCTOR_AGENT, project_dir=project_dir)
-    inherited = [g for g in inherited_skill_globs(project_dir) if g in scope]
-    return sorted({Path(m).parent.name for g in inherited for m in glob.glob(g)})
-
-
 def inherited_skill_globs(
     project_dir: str | Path | None, *, kiro_home_dir: Path | None = None
 ) -> list[str]:
     """The skills a custom agent inherits from kiro-cli's default resources.
 
-    Since kiro-cli 2.7 a custom agent inherits the default skill trees,
-    ``~/.kiro/skills`` and the workspace's ``.kiro/skills``, unless
-    ``chat.disableInheritingDefaultResources`` turns that off. Native launches
-    turn it off to bound the startup catalog (``acp/skill_projection_parts/preparation.py``),
-    so an agent with no ``skill://`` entry of its own would get no skills at all. Crew
-    supplies those trees instead, through the same bounded directory and
-    ``skill_search`` a mapped agent uses. Returns ``[]`` when the workspace opted
-    out of inheritance. *kiro_home_dir* is the kiro-cli home the caller already
-    resolved; it defaults to :func:`kiro_crew.config.paths.kiro_home`.
+    Since kiro-cli 2.7 a custom agent inherits ``~/.kiro/skills`` and the
+    workspace's ``.kiro/skills`` unless ``chat.disableInheritingDefaultResources``
+    is set. Native launches set it to bound the startup catalog
+    (``acp/skill_projection_parts/preparation.py``), so Crew supplies those trees
+    instead, through the bounded directory and ``skill_search`` a mapped agent
+    uses. Returns ``[]`` when the workspace opted out of inheritance.
+    *kiro_home_dir* defaults to :func:`kiro_crew.config.paths.kiro_home`.
 
-    A tree that does not exist is left out. The workspace tree is
-    workspace-controlled (a link to a network share, for one), so it is asked
-    through :func:`kiro_crew.skills.project_skill_tree_present`: trust first,
-    then the no-follow traversal, never a path-following probe.
+    A missing tree is left out. The workspace tree is workspace-controlled (a link
+    to a network share, for one), so it is asked through
+    :func:`kiro_crew.skills.project_skill_tree_present`: trust first, then the
+    no-follow traversal, never a path-following probe.
     """
     from kiro_crew.agent_sdk.drivers import acp as acp_driver
     from kiro_crew.config import paths

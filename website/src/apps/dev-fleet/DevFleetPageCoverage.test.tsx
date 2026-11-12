@@ -1116,7 +1116,11 @@ describe('DevFleetPage make live', () => {
     renderPage()
     const banner = await screen.findByTestId('make-live-undo-banner')
     expect(banner).toHaveTextContent('The dashboard is now using “wt-live”.')
-    fireEvent.click(within(banner).getByRole('button', { name: 'Switch back to main' }))
+    const undo = within(banner).getByRole('button', { name: 'Switch back to main' })
+    // At rest it must not be the stock transparent Btn, which disappears on the ok tint.
+    expect(undo).toHaveClass('bg-bg-elevated', 'border-border-strong')
+    expect(undo).not.toHaveClass('bg-transparent')
+    fireEvent.click(undo)
     const dialog = await screen.findByRole('dialog')
     expect(within(dialog).getByText(/The dashboard will keep using its current version/)).toBeInTheDocument()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Switch back to main' }))
@@ -1504,7 +1508,9 @@ describe('DevFleetPage post-action refresh', () => {
     renderPage()
     await waitForRow('wt-a')
     const before = urls.length
-    fireEvent.click(screen.getByLabelText('Refresh fleet'))
+    // Refresh is an item in the toolbar's More actions menu; Radix opens on pointerdown.
+    fireEvent.pointerDown(screen.getByTestId('fleet-toolbar-more'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Refresh' }))
     await waitFor(() => expect(urls.some((u) => u.includes('fresh=1'))).toBe(true))
     // The empty forced answer must not become the rendered state: a plain
     // refetch follows and the rows survive.
@@ -1526,7 +1532,9 @@ describe('DevFleetPage post-action refresh', () => {
     renderPage()
     await waitForRow('wt-a')
     const before = urls.length
-    fireEvent.click(screen.getByLabelText('Refresh fleet'))
+    // Refresh is an item in the toolbar's More actions menu; Radix opens on pointerdown.
+    fireEvent.pointerDown(screen.getByTestId('fleet-toolbar-more'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Refresh' }))
     await waitFor(() => expect(urls.some((u) => u.includes('fresh=1'))).toBe(true))
     await waitFor(() => expect(urls.length).toBeGreaterThan(before + 1))
     expect(screen.getByText('wt-a')).toBeInTheDocument()

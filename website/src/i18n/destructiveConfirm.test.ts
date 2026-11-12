@@ -155,6 +155,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'components.remoteUpdate.confirm', // crew-name operand of the Update remote confirmation, quoted per locale
   'components.remoteUpdate.confirm_hint', // same operand on the confirmation's explanation line
   'components.remoteUpdate.restart_now_confirm', // crew-name operand of the Restart now confirmation, quoted per locale
+  'components.tagManagerList.delete_tag_confirm', // tag-name operand, quoted per locale
   // The code-execution grant's title AND body. #5725 quoted only the title, which left
   // the scope sentence one line under it reading as prose about every app (#6016).
   'components.appstore.trustAppModal.failed', // bare {{app}} #6016
@@ -171,6 +172,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.artifactDeployPage.remove_profile_confirm',
   'pages.artifactsPage.remove_artifact_confirm',
   'pages.chatSidebar.delete_folder_confirm',
+  'components.themeEditor.delete_theme_confirm', // theme-name operand, quoted per locale
   'hooks.useSessionActions.close_confirm.reason_setting', // {{setting}} = the settings toggle's label, quoted per locale
   'pages.chatSidebar.unlink_source_link_confirm', // {{label}} = PR/Issue chip label, glyph-quoted per locale (UX #8072)
   'pages.devFleetPage.keeps_name_the_live_target_and_discards_the_stag', // cancel-branch body, bare {{name}}/{{staged}} #5725
@@ -180,10 +182,13 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.devFleetPage.remove_name', // ASCII quotes → locale pair #5725
   'pages.chat.quickAsk.confirm_then', // {{button}} is page-authored DOM text, quoted in all catalogs at introduction
   'pages.overview.agentTemplatesTab.delete_confirm', // quoted in all catalogs at introduction (#12481)
+  'pages.overview.agentTemplatesTab.unlisted_delete_confirm', // file-name operand, quoted in all catalogs at introduction
+  'pages.overview.agentTemplatesTab.unlisted_delete_confirm_body_duplicate', // file, agent and stem operands, quoted in all catalogs at introduction
   'pages.overview.promptsTab.delete_confirm', // quoted in all catalogs at introduction (#4634)
   'pages.overview.skillsTab.delete_confirm',
   'pages.overview.skillsTab.dismiss_confirm',
   'pages.overview.steeringTab.delete_confirm',
+  'pages.overview.workflowLibrary.remove_confirm_title', // quoted in all catalogs at introduction (#18998)
   'pages.schedulePage.cronFolders.confirm_delete_folder',
   'pages.schedulePage.delete_named_job', // ASCII quotes → locale pair #5725
   'pages.settings.remoteCrewPanel.confirm_delete_of', // was fully bare #4821
@@ -262,6 +267,9 @@ export const CONFIRM_OPERAND_KEY_EXEMPTIONS: Record<string, string> = {
     'not a confirmation prompt: a non-interactive outcome notice stating whether the named '
     + 'mate was created; it offers no destructive action and the name identifies the '
     + 'uncertain result that the user must check in the roster',
+  'pages.schedulePage.late_save_unconfirmed':
+    'not a confirmation prompt: a non-interactive notice that a save sent from the closed '
+    + 'job dialog was never confirmed; it offers no destructive action',
   'apps.awsControl.console.library_remove_confirm_slug':
     'the {{folder}} operand is an S3 key prefix rendered inside a <folder> tag as a '
     + 'monospace <code> chip, so the tag already delimits it and glyph quotes would '
@@ -276,6 +284,12 @@ export const CONFIRM_OPERAND_KEY_EXEMPTIONS: Record<string, string> = {
     + 'mints itself (uuid4, never user-supplied text), and it already sits inside '
     + 'parentheses after the words "another install" -- so the risk glyph quotes exist '
     + 'to close, a crafted operand blending into the sentence, cannot arise here (#9554)',
+  'pages.overview.workflowLibrary.remove_confirm_name':
+    'the {{slug}} operand is the ref /workflow reaches the workflow by, its slash-command '
+    + 'slug or else its id, both written by the workflow library itself (lowercase letters, '
+    + 'digits, hyphens and underscores, no space or quote), and it sits directly after the literal '
+    + '\"/workflow\" command word, so the command shape delimits it and glyph quotes would '
+    + 'double-decorate a command whose own slash is the delimiter a reader checks (#18998)',
   'pages.settings.connectionsPanel.remove_confirm':
     'the {{provider}} operand is a Connections registry display name (GitHub, Asana), '
     + 'a fixed vendor brand never typed by a user, and the kind words "OAuth app" sit '

@@ -106,7 +106,7 @@ BASE_MEMBERS = {
     ),
     "send_message": (
         "coroutine",
-        "(self, chat_id: 'int', text: 'str', *, parse_mode: 'str | None' = None, reply_markup: 'dict | None' = None, retry_plain: 'bool' = True, reply_to_message_id: 'int | None' = None, message_thread_id: 'int | None' = None, disable_notification: 'bool' = False) -> 'int | None'",
+        "(self, chat_id: 'int', text: 'str', *, parse_mode: 'str | None' = None, reply_markup: 'dict | None' = None, retry_plain: 'bool' = True, reply_to_message_id: 'int | None' = None, message_thread_id: 'int | None' = None, disable_notification: 'bool' = False, err_out: 'dict[str, Any] | None' = None) -> 'int | None'",
     ),
     "send_rich_message": (
         "coroutine",
@@ -164,7 +164,7 @@ BASE_MEMBERS = {
     "_notify_status": ("function", "(self, healthy: 'bool', reason: 'str') -> 'None'"),
     "_poll_backoff": ("function", "(self, attempt: 'int', reason: 'str') -> 'float'"),
     "_polling_loop": ("coroutine", "(self) -> 'None'"),
-    "_get_updates": ("coroutine", "(self) -> 'list[dict] | None'"),
+    "_get_updates": ("coroutine", "(self, err_out: 'dict | None' = None) -> 'list[dict] | None'"),
     "_buffer_album_member": (
         "function",
         "(self, group_id: 'str', inbound: 'TelegramInbound', *, update_id: 'int' = 0) -> 'None'",

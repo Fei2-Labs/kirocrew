@@ -28,6 +28,10 @@ from kiro_crew.acp.types import (
 from kiro_crew.image_refs import strip_image_refs
 from kiro_crew.llm_helpers import run_bg_oneliner
 
+#: These tests start background helper turns, which are skipped while the host's
+#: memory posture is critical (see ``ample_host_free_memory``).
+pytestmark = pytest.mark.usefixtures("ample_host_free_memory")
+
 
 class _FakeSession:
     def __init__(self, events, *, raise_on_prompt=False, turn_credits=0.0, prior_credits=0.0):
@@ -110,22 +114,20 @@ class _ResettingSessions(_FakeSessions):
 
 @pytest.mark.asyncio
 async def test_the_background_owner_is_pinned_before_the_call_not_after_it(monkeypatch):
-    """The spend must stay with the session that ordered the work.
+    """The spend stays charged to the session that ordered the work.
 
-    ``run_bg_oneliner`` writes its ledger entry in the teardown, and the resolver
-    answers which unit a slot's work is landing in NOW -- so resolving there would
-    file this call's cost against a successor session that never incurred it,
-    silently, in an append-only file. The registry double flips its answer between
-    the two moments, so only a pre-call resolution can pass.
+    The owner is resolved before the call. The registry double flips its answer
+    between the two moments, as a slot reset does, so the entry goes to the newest
+    unit: an older unit never grows.
     """
     from kiro_crew.crew_log import emit
 
     monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
-    recorded: list[str] = []
+    recorded: list[tuple[str, str]] = []
     monkeypatch.setattr(
         emit,
         "on_background_completed",
-        lambda session_id, **_kw: recorded.append(session_id),
+        lambda session_id, **kw: recorded.append((session_id, kw.get("newer_unit", False))),
     )
     session = _FakeSession(
         [
@@ -141,7 +143,9 @@ async def test_the_background_owner_is_pinned_before_the_call_not_after_it(monke
         crew_log_kind="title",
         crew_log_session_key="dashboard:chat-7",
     )
-    assert recorded == ["owner-sid"], "the entry must name the unit that ordered the work"
+    assert recorded == [
+        ("successor-sid", True)
+    ], "the entry goes to the newest unit, held until that unit's crew log exists"
 
 
 @pytest.mark.asyncio
@@ -272,6 +276,58 @@ async def test_propagates_error_and_destroys():
     with pytest.raises(RuntimeError, match="boom"):
         await run_bg_oneliner(_FakeSessions(sess), "p")
     assert sess.destroyed is True
+
+
+class _AcquireRecorder:
+    """Hands out an answering session from both helper entry points, recording each acquire."""
+
+    def __init__(self) -> None:
+        self.acquired: list[str] = []
+
+    def _session(self) -> _FakeSession:
+        return _FakeSession(
+            [
+                SimpleNamespace(kind=EVENT_TEXT_CHUNK, text="ok"),
+                SimpleNamespace(kind=EVENT_COMPLETE, text=""),
+            ]
+        )
+
+    async def get_bg_session(self, start_priority=None):
+        self.acquired.append("get_bg_session")
+        return self._session()
+
+    async def get_or_create(self, key, **_kw):
+        self.acquired.append(key)
+        return self._session(), False, False
+
+
+@pytest.mark.asyncio
+async def test_background_helpers_do_not_start_while_memory_is_critical(monkeypatch, caplog):
+    """A helper turn nobody waits on starts no session while host memory is critical.
+
+    Both entry points raise before acquiring and log the skip; a one-liner a person
+    waits on (FOREGROUND) still starts, and so does background work once memory frees.
+    """
+    import kiro_crew.resource_status as resource_status
+    from kiro_crew.llm_helpers import background_turn
+    from kiro_crew.start_priority import StartPriority
+
+    sessions = _AcquireRecorder()
+    monkeypatch.setattr(resource_status, "_read_available_gb", lambda: 0.5)
+    with caplog.at_level("INFO", logger="kiro_crew.llm_helpers"):
+        with pytest.raises(RuntimeError, match="'chat_title' not started"):
+            await run_bg_oneliner(sessions, "p", sel_source="chat_title")
+        with pytest.raises(RuntimeError, match="'consolidation' not started"):
+            async with background_turn(sessions, task="consolidation", session_key="_consolidate"):
+                pass
+    assert sessions.acquired == []
+    skips = [r.getMessage() for r in caplog.records if "not started" in r.getMessage()]
+    assert len(skips) == 2 and all("critical" in line for line in skips), skips
+
+    assert await run_bg_oneliner(sessions, "p", start_priority=StartPriority.FOREGROUND) == "ok"
+    monkeypatch.setattr(resource_status, "_read_available_gb", lambda: 8.0)
+    assert await run_bg_oneliner(sessions, "p") == "ok"
+    assert sessions.acquired == ["get_bg_session", "get_bg_session"]
 
 
 # ── Reactive retry-on-model-rejection (option A) ──
@@ -739,7 +795,7 @@ async def test_the_suggestions_prompt_carries_no_image(attachment, monkeypatch):
         suggestions.ContextBuilder, "get_memory_for", MagicMock(side_effect=RuntimeError)
     )
     log = SimpleNamespace(
-        list_sessions=lambda: [{"key": "k", "title": "Screenshots"}],
+        list_sessions_indexed=lambda: [{"key": "k", "title": "Screenshots"}],
         derive_recent=lambda key, max_messages: [{"role": "user", "content": attachment}],
     )
     state = SimpleNamespace(conversation_log=log, crons=SimpleNamespace(list_jobs=lambda: []))

@@ -76,7 +76,7 @@ describe('CrewmateSwitcher closed chip', () => {
     expect(label.className).toContain('motion-reduce:transition-none')
     expect((label.firstElementChild as HTMLElement).className).toContain('overflow-hidden')
     expect(chip()).toHaveAccessibleName('Bots')
-    expect(chip()).toHaveAttribute('title', 'Switch Bot')
+    expect(chip()).toHaveAttribute('title', 'Switch bot')
     expect(chip()).toHaveAttribute('aria-expanded', 'false')
   })
 
@@ -149,8 +149,8 @@ describe('CrewmateSwitcher open list', () => {
     const list = await open()
     const search = screen.getByTestId('crewmate-switcher-search')
     // Same words as the roster column's search over the same roster (#24448).
-    expect(search).toHaveAccessibleName('Search Bots…')
-    expect(search).toHaveAttribute('placeholder', 'Search Bots…')
+    expect(search).toHaveAccessibleName('Search bots…')
+    expect(search).toHaveAttribute('placeholder', 'Search bots…')
 
     fireEvent.change(search, { target: { value: 'radar' } })
     // Matches the display name AND the agent template ("radar-template").
@@ -161,7 +161,7 @@ describe('CrewmateSwitcher open list', () => {
 
     fireEvent.change(search, { target: { value: 'nobody' } })
     expect(within(list).queryAllByRole('option')).toHaveLength(0)
-    expect(screen.getByTestId('crewmate-switcher-empty')).toHaveTextContent('No Bot matches')
+    expect(screen.getByTestId('crewmate-switcher-empty')).toHaveTextContent('No bot matches')
     // The create door is still offered under an empty result.
     expect(screen.getByTestId('crewmate-switcher-create')).toBeInTheDocument()
   })
@@ -275,8 +275,9 @@ describe('CrewmateSwitcher star', () => {
   it('holds the star while its write is in flight', async () => {
     setup({ onToggleStar: vi.fn(), starPending: new Set(['fixer']) })
     const list = await open()
-    expect(within(list).getByTestId('crewmate-switcher-star-fixer')).toBeDisabled()
-    expect(within(list).getByTestId('crewmate-switcher-star-oncall')).not.toBeDisabled()
+    // Held with aria-disabled, so a focused star keeps its focus.
+    expect(within(list).getByTestId('crewmate-switcher-star-fixer')).toHaveAttribute('aria-disabled', 'true')
+    expect(within(list).getByTestId('crewmate-switcher-star-oncall')).not.toHaveAttribute('aria-disabled')
   })
 })
 
