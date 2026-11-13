@@ -132,6 +132,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_foreign_settings_owner": ("function", False, "0d96e8ab9b17", "client_seed_ownership"),
     "_forget_sent_images": ("function", False, "b60c5fea256e", "client_turn"),
     "_fork_session": ("function", True, "bca802976336", "client_start"),
+    "_gated_session_mcp_servers": ("function", True, "7eb96c2fda05", "client_mcp_array"),
     "_goose_session_mcp_servers": ("function", False, "f5423acdeebc", "client_mcp_array"),
     "_guard_unresolved_mcp_refs": ("function", False, "779b51571c73", "client_mcp_array"),
     "_hand_back_unrevoked_claim": ("function", False, "d12bff1e2bd1", "client_seed_ownership"),
@@ -160,6 +161,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_is_opencode": ("property", False, "a6632a57e602", "client_class"),
     "_is_pi": ("property", False, "a6632a57e602", "client_class"),
     "_is_process_alive": ("function", False, "a6632a57e602", "client_lifecycle"),
+    "_is_spec_adapter": ("property", False, "a6632a57e602", "client_class"),
     "_is_strands": ("property", False, "a6632a57e602", "client_class"),
     "_jsonl_tool_results": ("staticmethod", False, "db2ae4946f1c", "client_tool_events"),
     "_judge_activated_model": ("function", True, "b60c5fea256e", "client_model_selection"),
@@ -174,6 +176,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_maybe_fire_pre_tool_hooks": ("function", True, "7518800ca3bd", "client_tool_events"),
     "_maybe_start_idle_reader": ("function", False, "b60c5fea256e", "client_transport"),
     "_mcp_timeout_progress": ("function", False, "0295d0f4c71a", "client_mcp_array"),
+    "_merge_configured_models": ("function", True, "b60c5fea256e", "client_model_selection"),
     "_member_mount_withheld": ("function", False, "78c5bf8e0fe2", "client_mcp_array"),
     "_mirrorless_member_mounts": ("function", False, "286e411ff644", "client_mcp_array"),
     "_model_config_candidates": ("staticmethod", False, "f9fa998bdaf1", "client_model_selection"),
@@ -199,6 +202,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_note_subagent_update": ("function", False, "58208c681b15", "client_native_children"),
     "_opencode_session_mcp_servers": ("function", False, "f5423acdeebc", "client_mcp_array"),
     "_parked_on_permission": ("data", False, "", ""),
+    "_permission_frame_answerable": ("function", False, "50405edf7b6a", "client_permissions"),
     "_permission_surface_governed": ("property", False, "a6632a57e602", "client_class"),
     "_persist_advertised_models_if_changed": (
         "function",
@@ -237,6 +241,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_redact_native_child_events": ("function", False, "4ae22451457c", "client_turn"),
     "_refuse_identity_drift": ("function", True, "2dfacffa6279", "client_permissions"),
     "_registration_throttle_line": ("function", True, "f21e39ec5ffb", "client_lifecycle"),
+    "_reject_unanswerable_permission": ("function", True, "87459833bc5c", "client_permissions"),
     "_reject_unknown_server_request": ("function", True, "87459833bc5c", "client_permissions"),
     "_release_accepted_steers": ("function", False, "9a0e503e4e3e", "client_turn_control"),
     "_release_held_steers": ("function", False, "b60c5fea256e", "client_turn_control"),
@@ -286,6 +291,8 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_spawn": ("function", True, "b60c5fea256e", "client_start"),
     "_start_mount_check": ("function", False, "b60c5fea256e", "client_mcp_array"),
     "_speaks_steering_request": ("property", False, "a6632a57e602", "client_class"),
+    "_spec_session_mcp_delivery": ("function", False, "cead29621fc3", "client_mcp_array"),
+    "_spec_session_mcp_servers": ("function", False, "7eb96c2fda05", "client_mcp_array"),
     "_stdin_write_lock": ("function", False, "fd738ff11600", "client_transport"),
     "_stdout_claims": ("data", False, "", ""),
     "_steer_echo_event": ("function", False, "e64128661dfa", "client_turn_control"),
@@ -336,6 +343,12 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "_write_response_bounded": ("function", True, "1aa0c9bf750c", "client_transport"),
     "_write_steer_cancel": ("function", True, "b60c5fea256e", "client_turn_control"),
     "acp_config_options": ("property", False, "3b4687b0c546", "client_class"),
+    "add_configured_opencode_models": (
+        "function",
+        False,
+        "43991cf5edd7",
+        "client_model_selection",
+    ),
     "advertised_commands": ("function", False, "92d6193dbe19", "client_transport"),
     "agent_version": ("property", False, "bb418bb7ece8", "client_class"),
     "initialize_result": ("property", False, "44dc9acb7120", "client_class"),
@@ -514,7 +527,19 @@ def test_every_owner_lists_in_the_facade_and_holds_its_members() -> None:
 @pytest.mark.parametrize("owner", acp_client._CLIENT_OWNERS)
 def test_no_owner_keeps_an_unbound_self_function(owner: str) -> None:
     module = sys.modules[owner]
+    # An ``AcpClient`` subclass defined in the owner itself (the fork's
+    # ``SpecAdapterAcpClient``) is also a legal binding target.
+    subclasses = [
+        value
+        for value in vars(module).values()
+        if isinstance(value, type) and issubclass(value, AcpClient) and value is not AcpClient
+    ]
     for node in _self_functions(_tree(module), owner):
+        if any(
+            any(member is vars(module)[node.name] for member in vars(cls).values())
+            for cls in subclasses
+        ):
+            continue
         assert node.name in _MEMBERS, f"{owner}.{node.name} is bound on no class"
         assert _member_function(node.name) is vars(module)[node.name]
 

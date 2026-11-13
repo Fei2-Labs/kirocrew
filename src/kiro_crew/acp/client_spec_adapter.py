@@ -17,6 +17,8 @@ Upstream's own session-permission arming (``_apply_session_permission_routing``,
 gated on ``Routing.SESSION_CONFIG`` inside the shared handshake) still runs for
 these backends exactly as for every other one; this module adds to it, it does
 not replace it.
+
+Instance fields read: ``_agent``, ``_work_dir``.
 """
 
 from __future__ import annotations
