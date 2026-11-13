@@ -658,9 +658,6 @@ class AcpClient:
         # "allow"/"allow_always". Falling back to OPTION_ALLOW_ONCE causes
         # claude-agent-acp to reject the response.
         self._permission_options: dict[str | int, dict[str, str]] = {}
-        # toolCallId -> the original permission frame, held until its arguments
-        # arrive or the turn exits and the unchanged gate can deny it.
-        self._parked_permissions: dict[str, JsonRpcMessage] = {}
         # Request id -> the permission event built for it, so approve_tool can
         # put the request through the security floor (``permission_floor``)
         # whichever consumer answers it.
@@ -1507,9 +1504,6 @@ class AcpClient:
     stream_events = _client_turn.stream_events
     stream_unsolicited = _client_turn.stream_unsolicited
     _dispatch_events = _client_turn._dispatch_events
-    _park_unverified_permission = _client_turn._park_unverified_permission
-    _release_parked_permission = _client_turn._release_parked_permission
-    _flush_parked_permissions = _client_turn._flush_parked_permissions
     _forget_sent_images = _client_turn._forget_sent_images
     _send_prompt = _client_turn._send_prompt
     _read_prompt_response = _client_turn._read_prompt_response

@@ -228,7 +228,6 @@ from kiro_crew.acp.client_tool_events import _is_shell_kind  # noqa: F401
 from kiro_crew.acp.client_tool_events import _make_unified_diff  # noqa: F401
 from kiro_crew.acp.client_transport import _is_safe_oauth_url  # noqa: F401
 from kiro_crew.acp.client_transport import _jsonrpc_error_code  # noqa: F401
-from kiro_crew.acp.client_turn import _MAX_PARKED_PERMISSIONS  # noqa: F401
 from kiro_crew.acp.client_turn import _TOOL_INTERRUPTED_MARKER  # noqa: F401
 from kiro_crew.acp.client_turn import _is_tool_interrupted_marker  # noqa: F401
 from kiro_crew.acp.client_turn_control import _CLIENT_STEERING_REQUEST_METHODS  # noqa: F401

@@ -85,7 +85,6 @@ from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_MCP_OAUTH_REQUEST,
-    EVENT_PERMISSION_REQUEST,
     EVENT_MCP_SERVER_INIT_FAILURE,
     EVENT_MCP_SERVER_INITIALIZED,
     EVENT_STEER_CONSUMED,
@@ -1715,55 +1714,3 @@ async def _read_prompt_response(self: AcpClient, req_id: int, timeout: float) ->
     self._last_stop_reason = ""
     self._turn_done.set()
     raise AcpTimeoutError(partial_output="".join(output))
-
-
-#: Held shell permission requests per client — a bounded hold against a
-#: refinement stream that never lands (see ``_park_unverified_permission``).
-_MAX_PARKED_PERMISSIONS = 16
-
-
-def _park_unverified_permission(self: AcpClient, event: AcpEvent, msg: JsonRpcMessage) -> bool:
-    """Hold an identifiable shell request until its streamed arguments arrive."""
-    # The wait-for-refinement pairing is the OpenCode deferral's other half
-    # (``_defer_opencode_shell_permission``): only that backend asks before
-    # its command-bearing update lands. Every other backend's request is
-    # gated on arrival, exactly as before the mechanism existed.
-    if self.backend != ACP_BACKEND_OPENCODE:
-        return False
-    if event.kind != EVENT_PERMISSION_REQUEST or not event.is_shell or event.shell_command:
-        return False
-    tool_call_id = event.tool_call_id or ""
-    parked = getattr(self, "_parked_permissions", None)
-    if not tool_call_id or parked is None:
-        return False
-    if len(parked) >= _MAX_PARKED_PERMISSIONS:
-        logger.warning(
-            "parked-permission cap reached (%d); gating %s without its arguments",
-            _MAX_PARKED_PERMISSIONS,
-            tool_call_id,
-        )
-        return False
-    parked[tool_call_id] = msg
-    return True
-
-
-def _release_parked_permission(self: AcpClient, tool_call_id: str) -> AcpEvent | None:
-    """Rebuild a parked permission after its tool-call refinement was cached."""
-    parked = getattr(self, "_parked_permissions", None)
-    if not parked or not tool_call_id or tool_call_id not in parked:
-        return None
-    event = self._build_permission_event(parked[tool_call_id])
-    if event is None or not event.shell_command:
-        return None
-    del parked[tool_call_id]
-    return event
-
-
-def _flush_parked_permissions(self: AcpClient) -> list[AcpEvent]:
-    """Release unresolved permission requests so consumers can answer them."""
-    parked = getattr(self, "_parked_permissions", None)
-    if not parked:
-        return []
-    pending = list(parked.values())
-    parked.clear()
-    return [event for msg in pending if (event := self._build_permission_event(msg)) is not None]
