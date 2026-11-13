@@ -13,6 +13,7 @@ const {
   apply,
   readForkRevision,
   RELEASES_URL,
+  LATEST_RELEASE_URL,
   compareUrl,
   ASSET_ZIP,
   ASSET_SHA512,
@@ -130,6 +131,36 @@ test("pickTargetRelease: skips drafts, prereleases, bad tags and missing assets"
   assert.strictEqual(pickTargetRelease("not-a-list"), null);
 });
 
+test("pickTargetRelease: the real tag-name ordering picks the newest published_at", () => {
+  // GitHub returned our same-version tags in descending tag-name order; the
+  // first match was the installed build, not the newest release.
+  const releases = [
+    release({ tag_name: "v0.13.0+fork.ged8034aa8c", published_at: "2026-11-01T10:00:00Z" }),
+    release({ tag_name: "v0.13.0+fork.g85603fae24", published_at: "2026-11-02T10:00:00Z",
+      assets: [] }),                                    // no mac assets on this one
+    release({ tag_name: "v0.13.0+fork.g6130eb9a81", published_at: "2026-11-03T10:00:00Z" }),
+  ];
+  const picked = pickTargetRelease(releases);
+  assert.strictEqual(picked.tag, "v0.13.0+fork.g6130eb9a81");
+  assert.strictEqual(picked.sha, "6130eb9a81");
+});
+
+test("pickTargetRelease: newest published_at wins regardless of array position", () => {
+  const oldest = release({ tag_name: "v0.13.0+fork.gaaaaaaa1", published_at: "2026-11-01T00:00:00Z" });
+  const newest = release({ tag_name: "v0.13.0+fork.gbbbbbbb2", published_at: "2026-11-05T00:00:00Z" });
+  const middle = release({ tag_name: "v0.13.0+fork.gccccccc3", published_at: "2026-11-03T00:00:00Z" });
+  assert.strictEqual(pickTargetRelease([newest, oldest, middle]).tag, newest.tag_name);
+  assert.strictEqual(pickTargetRelease([oldest, middle, newest]).tag, newest.tag_name);
+  assert.strictEqual(pickTargetRelease([middle, newest, oldest]).tag, newest.tag_name);
+});
+
+test("pickTargetRelease: a release lacking published_at sorts last", () => {
+  const dated = release({ tag_name: "v0.13.0+fork.gaaaaaaa1", published_at: "2026-11-01T00:00:00Z" });
+  const undated = release({ tag_name: "v0.13.0+fork.gbbbbbbb2" });
+  assert.strictEqual(pickTargetRelease([undated, dated]).tag, dated.tag_name);
+  assert.strictEqual(pickTargetRelease([undated]).tag, undated.tag_name);
+});
+
 // ── verdict mapping ─────────────────────────────────────────────────────────
 
 test("isAhead: remote ahead -> update", async () => {
@@ -177,6 +208,27 @@ test("check: prints the release tag and exits 0 when ahead", async () => {
     process.stdout.write = orig;
   }
   assert.strictEqual(printed, target.tag_name + "\n");
+});
+
+test("check: a newest release only /releases/latest returns is still found", async () => {
+  const parent = tmpdir();
+  const bundle = makeBundle(parent, LOCAL);
+  const offPage = release({ published_at: "2026-11-09T00:00:00Z" });
+  const onPage = release({ tag_name: `v0.13.0+fork.g${LOCAL}`, published_at: "2026-11-01T00:00:00Z" });
+  const fetchImpl = fakeFetch({
+    [RELEASES_URL]: [onPage],
+    [LATEST_RELEASE_URL]: offPage,
+    [compareUrl(LOCAL, REMOTE)]: { status: "ahead" },
+  });
+  const orig = process.stdout.write;
+  let printed = "";
+  process.stdout.write = (s) => { printed += s; return true; };
+  try {
+    assert.strictEqual(await check(bundle, { fetch: fetchImpl }), 0);
+  } finally {
+    process.stdout.write = orig;
+  }
+  assert.strictEqual(printed, offPage.tag_name + "\n");
 });
 
 test("check: exits 1 when nothing is ahead, 2 on check failure", async () => {

@@ -31,7 +31,9 @@ const { spawn } = require("child_process");
 
 const GITHUB_REPO = "Fei2-Labs/kirocrew";
 const RELEASES_URL =
-  `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=15`;
+  `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=30`;
+const LATEST_RELEASE_URL =
+  `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
 const compareUrl = (local, remote) =>
   `https://api.github.com/repos/${GITHUB_REPO}/compare/${local}...${remote}`;
 
@@ -102,12 +104,15 @@ async function fetchJson(fetchImpl, url) {
 }
 
 /**
- * The newest release this lane may take: the first non-draft, non-prerelease
- * release whose tag is a fork tag AND that carries both arm64 assets.
- * Releases are returned newest-first, so the first match wins.
+ * The newest release this lane may take. Every fork tag shares the same
+ * version number, so GitHub's ordering is by tag name, not recency — the
+ * winner is the qualifying release with the greatest `published_at`. A
+ * release lacking `published_at` sorts last; ties keep the first seen.
  */
 function pickTargetRelease(releases) {
   if (!Array.isArray(releases)) return null;
+  let best = null;
+  let bestPublished = -1;
   for (const release of releases) {
     if (release.draft || release.prerelease) continue;
     const m = TAG_RE.exec(release.tag_name || "");
@@ -117,9 +122,14 @@ function pickTargetRelease(releases) {
     const zipUrl = byName.get(ASSET_ZIP);
     const shaUrl = byName.get(ASSET_SHA512);
     if (!zipUrl || !shaUrl) continue;
-    return { tag: release.tag_name, sha: m[1], zipUrl, shaUrl };
+    const published = Date.parse(release.published_at || "");
+    const publishedMs = Number.isNaN(published) ? -1 : published;
+    if (!best || publishedMs > bestPublished) {
+      best = { tag: release.tag_name, sha: m[1], zipUrl, shaUrl };
+      bestPublished = publishedMs;
+    }
   }
-  return null;
+  return best;
 }
 
 /**
@@ -148,7 +158,16 @@ async function isAhead(local, remote, { fetchImpl }) {
  */
 async function findUpdate(local, { fetchImpl }) {
   const { json: releases } = await fetchJson(fetchImpl, RELEASES_URL);
-  const target = pickTargetRelease(releases);
+  // The list is ordered by tag name, so once releases outgrow one page the
+  // newest can fall off it; /releases/latest is ordered by creation time.
+  let latest = null;
+  try {
+    latest = (await fetchJson(fetchImpl, LATEST_RELEASE_URL)).json || null;
+  } catch {
+    latest = null;
+  }
+  const candidates = Array.isArray(releases) ? releases : [];
+  const target = pickTargetRelease(latest ? [latest, ...candidates] : releases);
   if (!target) return null;
   if (!(await isAhead(local, target.sha, { fetchImpl }))) return null;
   return target;
@@ -325,5 +344,6 @@ module.exports = {
   ASSET_SHA512,
   APP_NAME,
   RELEASES_URL,
+  LATEST_RELEASE_URL,
   compareUrl,
 };
