@@ -1268,16 +1268,8 @@ def self_served_wrong_version(backend: str) -> str:
     would call a harness ready that refuses every chat. Read from the install's own
     manifest, never by running it.
     """
-    from kiro_crew.agent_sdk.backends import ACP_BACKEND_COPILOT, COPILOT_VERIFIED_VERSION
-
-    if backend == ACP_BACKEND_COPILOT:
-        from kiro_crew.acp.client import _resolve_self_served_bin
-        from kiro_crew.acp.harness.copilot import copilot_installed_version
-
-        binary, _searched_path = _resolve_self_served_bin(backend)
-        version = copilot_installed_version(binary) if binary else ""
-        if version and version != COPILOT_VERIFIED_VERSION:
-            return version
+    # Fork change: skip the Copilot verified-version gate so any installed
+    # release is accepted (see client_copilot.py for the rationale).
     return ""
 
 

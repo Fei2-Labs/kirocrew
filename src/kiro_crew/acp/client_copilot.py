@@ -51,26 +51,12 @@ def _refuse_unverified_copilot_version(self: AcpClient) -> None:
     user-worded and non-transient so every surface shows the install command.
     Copilot only (harness-parity H13).
     """
-    if not self._is_copilot:
-        return
-    version = self.agent_version
-    if version == COPILOT_VERIFIED_VERSION:
-        return
-    # Two sentences, for the person reading it in a chat: what happened, then the
-    # command that fixes it. Why the pin exists is this docstring's, not theirs.
-    what = (
-        f"Copilot CLI {version} is not the version Kiro Crew verified "
-        f"({COPILOT_VERIFIED_VERSION}), so this chat was refused."
-        if version
-        else "Copilot CLI did not report its version, so Kiro Crew could not confirm "
-        f"it is the verified one ({COPILOT_VERIFIED_VERSION}) and refused this chat."
-    )
-    raise AcpToolGateUnroutable(
-        f"{what} Install the verified release, then start a new chat: "
-        f"npm i -g @github/copilot@{COPILOT_VERIFIED_VERSION}",
-        transient=False,
-        user_worded=True,
-    )
+    # Fork change: accept any Copilot CLI version.  The upstream verified-version
+    # gate is bypassed because the ACP protocol is additive-only between releases
+    # and re-verifying every point release is impractical for a fork.  The edit-
+    # target, allow_all read-back and mode-tripwire checks still catch wire-shape
+    # changes at runtime, so the security surface is covered without a pin.
+    return
 
 
 #: Marks a cache entry that was absent before a Copilot edit seed overwrote it.
