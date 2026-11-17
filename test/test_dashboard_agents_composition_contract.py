@@ -1509,8 +1509,9 @@ def test_the_hardened_read_census_names_the_owners() -> None:
 
 
 def test_every_redacting_owner_is_classified_like_the_facade() -> None:
-    """The owners that call a redactor sit in the same posture bucket as the facade,
-    and none grows a gate-side baseline log site."""
+    """The owners that call a redactor are classified non-egress, the facade is
+    allowlisted only while it calls one itself, and none grows a gate-side baseline
+    log site."""
     from test_security_posture import _REDACTOR_CALL_RE, _gate_side_baseline_log_sites
 
     from kiro_crew import security_posture
@@ -1522,7 +1523,9 @@ def test_every_redacting_owner_is_classified_like_the_facade() -> None:
     }
     assert len(redacting) == 4
     allowlisted = security_posture.NON_EGRESS_REDACTION_MODULES
-    assert redacting | {"dashboard/handlers/agents.py"} <= allowlisted
+    assert redacting <= allowlisted
+    facade_redacts = bool(_REDACTOR_CALL_RE.search(_FACADE_PATH.read_text(encoding="utf-8")))
+    assert ("dashboard/handlers/agents.py" in allowlisted) == facade_redacts
     sinks = {module for _label, module, _detail in security_posture._REDACTION_SINKS}
     assert {m for m in sinks if "agent_admin" in m or m.endswith("handlers/agents.py")} == set()
     assert not _gate_side_baseline_log_sites(_FACADE_PATH.read_text(encoding="utf-8"))

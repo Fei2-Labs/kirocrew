@@ -946,4 +946,22 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "redactors, then the native approval card's own renderer. `redact_note` covers "
         "only a note's title and body, so the sink scrubs this field itself.",
     ),
+    (
+        "Issue Radar work log",
+        "apps/builtins/issue_radar/backend/pipeline_bridge.py",
+        "External event details written to the issue ledger and served by the "
+        "dashboard work log, redacted before truncation and persistence.",
+    ),
+    (
+        "Recovered subagent completion deliveries",
+        "run_coordinator/recovery.py",
+        "Task, agent and error text in the durable completion event sent to the "
+        "parent session after gateway recovery.",
+    ),
+    (
+        "Subagent command responses",
+        "subagent_command_authority.py",
+        "Command results persisted for exact replay to the caller, with provider "
+        "output redacted before storage and again when a response is reconstructed.",
+    ),
 )
