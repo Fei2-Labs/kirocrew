@@ -91,7 +91,7 @@ if TYPE_CHECKING:
 def _chat_turn_backend(state: object, slot: object) -> str:
     """Return the live or configured backend without config I/O on the event loop."""
 
-    from kiro_crew.acp.types import ACP_BACKEND_KIRO
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
 
     live_getter = getattr(state, "_live_slot_acp_client", None)
     live_client = live_getter(slot) if callable(live_getter) else None

@@ -1037,12 +1037,12 @@ async def _run_hook_inner(
         # initialising (dashboard/file_api/channel_upload.py imports is_tracked_channel
         # from it), so a module-scope import raises ImportError under the
         # suite's import order.
+        from kiro_crew.agent_sdk.drivers.acp import provider_label
         from kiro_crew.dashboard.handlers.usage import (
             persist_token_record_async,
             read_context_tokens,
             read_effective_agent,
         )
-        from kiro_crew.providers.acp import provider_label
 
         _used, _window = read_context_tokens(client)
         runtime_provider = provider_label(client)

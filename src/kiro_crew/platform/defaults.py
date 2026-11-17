@@ -65,7 +65,7 @@ class DefaultProviderRegistry:
     """Public provider registry for Kiro and operator-installed ACP adapters."""
 
     def create_factory(self, cfg: Any) -> Callable[..., Any]:
-        from kiro_crew.acp.types import ACP_BACKEND_KIRO
+        from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
 
         configured_backend = cfg.agent.acp_backend
         factory_backend = (
@@ -91,13 +91,17 @@ class DefaultProviderRegistry:
     ) -> Callable[..., Any]:
         """Build the registry dispatcher used only by an opted-in adapter."""
 
-        from kiro_crew.acp import backends as acp_backends
-        from kiro_crew.acp.types import ACP_BACKEND_KIRO
+        from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
+        from kiro_crew.agent_sdk.drivers.acp_registry import (
+            adapter_factory_capabilities,
+            adapter_provider_builder,
+            validate_backend,
+        )
 
         # Programmatic mutation can bypass persisted-value normalization.
         # Validate a configured adapter while the factory is built so a typo
         # fails before the first session tries to start.
-        acp_backends.descriptor_for(factory_backend)
+        validate_backend(factory_backend)
         factories: dict[str, Callable[..., Any]] = {}
         kiro_factory: Callable[..., Any] | None = None
 
@@ -110,34 +114,17 @@ class DefaultProviderRegistry:
                     kiro_factory = cfg.create_provider_factory()
                 return kiro_factory(*args, **kwargs)
 
-            from kiro_crew.acp import backends as acp_backends
-            from kiro_crew.providers.acp import AcpProvider, SpecAdapterAcpProvider
-
             # Programmatic mutation can bypass persisted-value normalization.
             # Refuse a foreign id before constructing any adapter provider.
-            acp_backends.descriptor_for(backend)
-            provider_types = {
-                acp_backends.Dialect.KIRO: AcpProvider,
-                acp_backends.Dialect.SPEC: SpecAdapterAcpProvider,
-            }
-            dialect = acp_backends.dialect_of(backend)
-            try:
-                provider_type = provider_types[dialect]
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"Unsupported ACP dialect {dialect!r} for backend {backend!r}"
-                ) from exc
+            validate_backend(backend)
             factory = factories.get(backend)
             if factory is None:
+                registry_model_ids, tool_search_supported = adapter_factory_capabilities(backend)
                 factory = cfg._create_adapter_provider_factory(
                     factory_backend=backend,
-                    provider_type=provider_type,
-                    registry_model_ids=acp_backends.supports(
-                        backend, acp_backends.CAP_REGISTRY_MODEL_IDS
-                    ),
-                    tool_search_supported=acp_backends.supports(
-                        backend, acp_backends.CAP_TOOL_SEARCH
-                    ),
+                    provider_builder=adapter_provider_builder(backend),
+                    registry_model_ids=registry_model_ids,
+                    tool_search_supported=tool_search_supported,
                 )
                 factories[backend] = factory
             return factory(*args, **kwargs)

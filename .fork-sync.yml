@@ -705,7 +705,7 @@ divergences:
       (divergences/fork-adapters-without-corpus), the `explicit` arm on
       `select_provider_backend` (divergences/member-backend-explicit-arm) and the
       registry-merged `/api/acp-backends` row
-      (divergences/acp-backends-registry-merged-route).
+      (divergences/acp-backends-registry-merged-route, retired 2026-11-17).
     pinned_by: "test/test_acp_client.py (upstream classes), test/test_harness_parity.py, test/test_agent_sdk_capabilities.py"
     decided: 2026-09-07
     revised: 2026-09-15
@@ -927,13 +927,23 @@ divergences:
     decided: 2026-09-15
 
   - id: acp-backends-registry-merged-route
+    status: retired
     what: |
-      `GET /api/acp-backends` is served by the fork's
+      RETIRED 2026-11-17. On main the route had already reverted to upstream's
+      handler: `dashboard/routes/agent_config.py` registers
+      `acp_backend_status.api_acp_backend_status` and nothing registered the
+      fork's `api_acp_backends`, while the only reader of the registry half, the
+      overview `AcpBackendCard`, is mounted on no page (only its unit test
+      renders it). The fork handler, its endpoint test and the
+      `install_snapshot()` wrapper it alone called are deleted; the route serves
+      upstream's rows unchanged. Do not restore the merged handler without a
+      mounted reader of the registry half.
+    superseded_what: |
+      `GET /api/acp-backends` served by the fork's
       `dashboard/handlers/acp_backends.py` (registry half: label, dialect,
       routing, capabilities, degraded_count, selectable) merged with the machine
       half from upstream's `acp_backend_status._snapshot()`, reached through the
-      fork's `install_snapshot()` wrapper appended to that upstream module. The
-      merged row carries upstream's `auth` object too.
+      fork's `install_snapshot()` wrapper appended to that upstream module.
     why: |
       Upstream registers `api_acp_backend_status` on the same path with only the
       machine half; the fork's overview `AcpBackendCard` reads the registry half.
@@ -941,8 +951,9 @@ divergences:
       one handler on one route (`test_dashboard_route_table.py` pins uniqueness).
       Take upstream's `_snapshot()` changes verbatim -- the wrapper is a keyed
       view of its rows, never a second probe.
-    pinned_by: "test/test_dashboard_route_table.py::test_acp_backends_resolves_once_and_serves_both_halves, test/test_acp_backends_endpoint.py, test/test_agent_sdk_backend_install.py::TestInstallSnapshot"
+    pinned_by: "test/test_dashboard_route_table.py::test_route_table_ordering_invariants (the replacement's route registration)"
     decided: 2026-09-15
+    retired: 2026-11-17
 
   - id: member-backend-explicit-arm
     what: |

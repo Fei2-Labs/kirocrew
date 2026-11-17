@@ -42,8 +42,9 @@ from kiro_crew.acp.liveness import (
     consult_offloaded,
 )
 from kiro_crew.acp.session_provider import AcpSessionProvider
-from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE, PROVIDER_LABEL_DEFAULT
 from kiro_crew.agent_sdk.drivers.acp_vocab import (  # noqa: F401 - STOP_* resolved by run_turn.py/run_yields.py via bind_component_globals
+    PROVIDER_LABEL_CLAUDE,
+    PROVIDER_LABEL_DEFAULT,
     STOP_CLASS_CANCELLED,
     STOP_CLASS_FAILED,
     STOP_CLASS_SUCCEEDED,
@@ -751,7 +752,7 @@ def dedicated_child_factory_kwargs(
     """Factory kwargs that keep a dedicated child on its parent's harness."""
     if parent_backend is None:
         return {}
-    from kiro_crew.acp.client import resolve_usable_model
+    from kiro_crew.agent_sdk.drivers.acp import resolve_usable_model
 
     kwargs: dict[str, Any] = {"acp_backend": parent_backend}
     resolved = resolve_usable_model(preferred_model, advertised)

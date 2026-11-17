@@ -47,20 +47,6 @@ from kiro_crew import agent_state  # noqa: F401
 from kiro_crew import crew_teams as teams_mod  # noqa: F401
 from kiro_crew import model_registry, model_scope
 from kiro_crew._facade_compose import compose as _facade_compose
-from kiro_crew.acp.backends import Dialect, UnknownAcpBackend, dialect_of
-from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
-from kiro_crew.acp.types import ACP_BACKENDS_AUTO_MODEL
-from kiro_crew.acp_backends import (  # noqa: F401 - selectable_backend_values is a facade name
-    ACP_BACKEND_CLAUDE,
-    ACP_BACKEND_KIRO,
-    ACP_BACKEND_PROMPT_HANDLER_COMMANDS,
-    ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
-    ACP_BACKENDS_MODEL_AT_LAUNCH,
-    model_registry_namespace,
-    selectable_backend_values,
-    selectable_stored_backend_values,
-    backend_from_stored,
-)
 from kiro_crew.agent import (  # noqa: F401
     AGENT_FILENAME,
     OWNED_KIRO_AGENT_FILES,
@@ -94,16 +80,32 @@ from kiro_crew.agent_files import (  # noqa: F401
     KAS_RESERVED_AGENT_IDS,
 )
 from kiro_crew.agent_sdk import host_auth
+from kiro_crew.agent_sdk.backends import (  # noqa: F401 - selectable_backend_values is a facade name
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_PROMPT_HANDLER_COMMANDS,
+    ACP_BACKENDS_KIRO_FAMILY,
+    ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
+    ACP_BACKENDS_MODEL_AT_LAUNCH,
+    backend_from_stored,
+    model_registry_namespace,
+    resolve_selected_backend,
+    selectable_backend_values,
+    selectable_stored_backend_values,
+)
 from kiro_crew.agent_sdk.capabilities import capabilities_for, capabilities_of
 from kiro_crew.agent_sdk.drivers.acp import (
     EntitlementRevalidating,
+    advertised_model_ids,
     catalog_row_would_drop,
     is_auth_failure_output,
+    model_is_unusable,
     resolve_kiro_bin_for_spawn,
     resolve_pin_spelling,
     resolve_ssh_auth_sock,
     settings_default_model,
 )
+from kiro_crew.agent_sdk.drivers.acp_vocab import backend_serves_auto_model
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agent_spec_format import (  # noqa: F401
     agent_spec_candidates,
@@ -892,9 +894,10 @@ def _configured_acp_backend() -> str:
         if not isinstance(backend, str):
             return ""
         # Stored ``"kiro"`` is the config-file spelling for the kiro runtime id
-        # (``ACP_BACKEND_KIRO``); callers judge the RUNTIME id (``dialect_of``
-        # and the capability sets know no ``"kiro"``).
-        return backend_from_stored(backend) or ""
+        # (``ACP_BACKEND_KIRO``); callers judge the RUNTIME id (the SDK
+        # capability sets know no ``"kiro"``).
+        resolved = backend_from_stored(backend)
+        return resolved if isinstance(resolved, str) else ""
     except Exception:
         return ""
 
@@ -970,7 +973,7 @@ def _effort_levels_for(request: web.Request) -> list[str]:
     """Reasoning-effort levels the relevant harness actually advertised.
 
     A live adapter session that reported none returns ``[]`` — do not substitute
-    kiro's process-global union. The kiro family (``Dialect.KIRO``, including
+    kiro's process-global union. The Kiro-family backends (including
     KAS) still falls through to that union so the first-class path is unchanged.
     """
     slot = ""
@@ -993,12 +996,12 @@ def _effort_levels_for(request: web.Request) -> list[str]:
         if levels:
             return list(levels)
         live_backend = _provider_backend(provider)
-        if live_backend is None or dialect_of(live_backend) is not Dialect.KIRO:
+        if live_backend is None or live_backend not in ACP_BACKENDS_KIRO_FAMILY:
             return []
         return get_reasoning_effort_ordered()
 
     backend = _configured_acp_backend()
-    if backend and dialect_of(backend) is not Dialect.KIRO:
+    if backend and backend not in ACP_BACKENDS_KIRO_FAMILY:
         return []
     return get_reasoning_effort_ordered()
 
@@ -1096,15 +1099,14 @@ from kiro_crew.dashboard.handlers.agents_kiro_catalog import (  # noqa: E402,F40
     _LIST_MODELS_FAILURE_BACKOFF_SECS,
     _LIST_MODELS_SUBPROCESS_TIMEOUT_SECS,
     _MODEL_LIST_STDERR_TAIL_CHARS,
-    _CatalogCache,
-    _CatalogUnavailable,
     _bounded_catalog,
     _catalog_cache,
+    _CatalogCache,
+    _CatalogUnavailable,
     _consume_refresh_exception,
     _fetch_kiro_catalog,
     _shared_catalog_fetch,
 )
-
 
 
 async def api_models(request: web.Request) -> web.Response:
@@ -1166,10 +1168,7 @@ async def api_models(request: web.Request) -> web.Response:
     # configured default now) read the same --list-models catalog below, so
     # only a foreign dialect takes the advertised path. An id with no
     # descriptor (a registry-prefixed adapter) is foreign by definition.
-    try:
-        _alt_is_kiro_family = bool(_alt_backend) and dialect_of(_alt_backend) is Dialect.KIRO
-    except UnknownAcpBackend:
-        _alt_is_kiro_family = False
+    _alt_is_kiro_family = bool(_alt_backend) and _alt_backend in ACP_BACKENDS_KIRO_FAMILY
     if _alt_backend and not _alt_is_kiro_family:
         advertised = (
             _models_from_provider(scope_provider)
@@ -1191,7 +1190,7 @@ async def api_models(request: web.Request) -> web.Response:
                     "error": "no live ACP session has advertised its models yet",
                     "code": "acp_backend_models_unavailable",
                     "backend": _alt_backend,
-                    "serves_auto": _alt_backend in ACP_BACKENDS_AUTO_MODEL,
+                    "serves_auto": backend_serves_auto_model(_alt_backend),
                 },
                 status=503,
             )
@@ -1210,7 +1209,7 @@ async def api_models(request: web.Request) -> web.Response:
             {
                 "models": advertised,
                 "backend": _alt_backend,
-                "serves_auto": _alt_backend in ACP_BACKENDS_AUTO_MODEL,
+                "serves_auto": backend_serves_auto_model(_alt_backend),
             }
         )
 
@@ -1549,8 +1548,6 @@ def _pin_entitlement_backend(
     # (``crewmate_harness.crewmate_inherited_source``): never the install's
     # ``agent.acp_backend``, which a Bot does not run on (a Kiro CLI install runs
     # its Bots on KAS).
-    from kiro_crew.acp_backends import resolve_selected_backend
-
     return resolve_selected_backend(getattr(cfg.agent, "member_acp_backend", ""))
 
 

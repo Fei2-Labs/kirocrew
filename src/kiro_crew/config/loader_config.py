@@ -12,6 +12,7 @@ import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 import kiro_crew.config.resolution as _resolution
 from kiro_crew import model_registry, model_scope, platform_compat
@@ -1664,7 +1665,7 @@ class KiroCrewConfig:
         self,
         *,
         factory_backend: str,
-        provider_type: type,
+        provider_builder: Callable[..., Any],
         registry_model_ids: bool,
         tool_search_supported: bool,
     ) -> Callable:
@@ -1675,7 +1676,7 @@ class KiroCrewConfig:
         return create_adapter_provider_factory(
             self,
             factory_backend=factory_backend,
-            provider_type=provider_type,
+            provider_builder=provider_builder,
             registry_model_ids=registry_model_ids,
             tool_search_supported=tool_search_supported,
             default_model=DEFAULT_MODEL,

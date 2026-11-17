@@ -159,8 +159,8 @@ def build_session_context(
     sets ``includeCrewContext: false``. Memory, lessons and hooks go to all.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
-    from kiro_crew.acp.types import is_spec_adapter_provider_label
     from kiro_crew.agent_files import is_kirocrew_default_agent
+    from kiro_crew.agent_sdk.drivers.acp_vocab import is_spec_adapter_provider_label
 
     execution_context, desk_member, member, memory_store, blocks_reads = _member.resolve_turn_owner(
         execution_context, session_key, member, memory_store, blocks_reads
@@ -421,9 +421,9 @@ def build_session_context(
     steering_ctx = _inclusion.steering_resources_part(
         agent=agent,
         is_cc=is_spec_adapter,
-    # Steering files from agent config resources: only on a harness that reads
-    # no agent ``resources`` (Claude Code, Codex), since kiro-cli loads them
-    # natively. The gate is shared with post-compaction re-injection.
+        # Steering files from agent config resources: only on a harness that reads
+        # no agent ``resources`` (Claude Code, Codex), since kiro-cli loads them
+        # natively. The gate is shared with post-compaction re-injection.
         provider_type=provider_type,
         essentials=essentials,
         context_groups=context_groups,

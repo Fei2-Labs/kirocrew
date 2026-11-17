@@ -546,7 +546,7 @@ class TestReadConfig:
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
             _real_client_without_io(),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", wraps=AcpClient) as mk,
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", wraps=AcpClient) as mk,
         ):
             worker = AcpWorker()
             await worker.start()
@@ -774,7 +774,7 @@ class TestLLMPoolStart:
                 "kiro_crew.knowledge.llm_pool._read_config",
                 side_effect=_changing_config,
             ),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=_client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", side_effect=_client),
         ):
             pool = LLMPool(pool_size=2)
             await pool.start()
@@ -854,7 +854,7 @@ class TestAcpWorker:
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
             patch(
-                "kiro_crew.knowledge.llm_pool.AcpClient",
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client",
                 return_value=admitted,
             ) as adapter_type,
         ):
@@ -873,7 +873,7 @@ class TestAcpWorker:
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
             patch(
-                "kiro_crew.knowledge.llm_pool.AcpClient",
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client",
                 return_value=admitted,
             ) as adapter_type,
         ):
@@ -891,7 +891,9 @@ class TestAcpWorker:
         provider.client = MagicMock(_pid=None)
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=provider) as client_type,
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=provider
+            ) as client_type,
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KAS)
             await worker.start()
@@ -947,7 +949,7 @@ class TestAcpWorker:
         fresh.is_ready = True
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=fresh),
         ):
             worker = AcpWorker()
             worker._client = stale
@@ -964,7 +966,7 @@ class TestAcpWorker:
         fresh.is_ready = True
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=fresh),
         ):
             worker = AcpWorker()
             worker._client = stale
@@ -984,7 +986,7 @@ class TestAcpWorker:
         unregistered: list[int] = []
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=fresh),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=fresh),
             patch(
                 "kiro_crew.knowledge.llm_pool.register_protected_pid",
                 side_effect=registered.append,
@@ -1014,7 +1016,9 @@ class TestAcpWorker:
         unregistered: list[int] = []
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]),
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", side_effect=[first, second]
+            ),
             patch(
                 "kiro_crew.knowledge.llm_pool.register_protected_pid",
                 side_effect=registered.append,
@@ -1053,7 +1057,9 @@ class TestAcpWorkerZeroToolConfirmation:
         second.spec_zero_tools = False
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]) as mk,
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", side_effect=[first, second]
+            ) as mk,
             caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_OPENCODE)
@@ -1079,7 +1085,9 @@ class TestAcpWorkerZeroToolConfirmation:
         second.spec_zero_tools = False
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]),
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", side_effect=[first, second]
+            ),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_OPENCODE)
             await worker.start()
@@ -1098,7 +1106,9 @@ class TestAcpWorkerZeroToolConfirmation:
         client.spec_zero_tools = True
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client) as mk,
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client
+            ) as mk,
             caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_OPENCODE)
@@ -1121,7 +1131,9 @@ class TestAcpWorkerZeroToolConfirmation:
         client.spec_zero_tools = False
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client) as mk,
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client
+            ) as mk,
             caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO)
@@ -1140,7 +1152,7 @@ class TestAcpWorkerZeroToolConfirmation:
         client.spec_zero_tools = False
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO)
             await worker.start()
@@ -1158,7 +1170,7 @@ class TestAcpWorkerZeroToolConfirmation:
         client.spec_zero_tools = True
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_OPENCODE)
             await worker.start()
@@ -1180,7 +1192,9 @@ class TestAcpWorkerZeroToolConfirmation:
         client.spec_zero_tools = False
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client) as mk,
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client
+            ) as mk,
             caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO)
@@ -1204,7 +1218,7 @@ class TestAcpWorkerZeroToolConfirmation:
         client.shutdown.side_effect = RuntimeError("boom")
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO)
             with pytest.raises(RuntimeError, match="zero-tool spec"):
@@ -1225,7 +1239,9 @@ class TestAcpWorkerZeroToolConfirmation:
         second.spec_zero_tools = False
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]) as mk,
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", side_effect=[first, second]
+            ) as mk,
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_OPENCODE)
             with pytest.raises(RuntimeError, match="zero-tool spec"):
@@ -1252,7 +1268,7 @@ class TestAcpWorkerZeroToolConfirmation:
         )
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO)
             await worker.start()
@@ -1275,7 +1291,7 @@ class TestAcpWorkerZeroToolConfirmation:
         )
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO)
             with pytest.raises(RuntimeError, match="could not be confirmed"):
@@ -1303,7 +1319,7 @@ class TestAcpWorkerZeroToolConfirmation:
         )
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             await AcpWorker(acp_backend=ACP_BACKEND_KIRO).start()
         assert calls == ["authored", "ready", "effective"]
@@ -1334,7 +1350,9 @@ class TestAcpWorkerZeroToolConfirmation:
         )
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]),
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", side_effect=[first, second]
+            ),
         ):
             await AcpWorker(acp_backend=ACP_BACKEND_OPENCODE).start()
         assert calls == ["first-ready", "second-authored", "second-ready", "second-effective"]
@@ -1363,7 +1381,7 @@ class TestAcpWorkerZeroToolConfirmation:
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
             patch(
-                "kiro_crew.knowledge.llm_pool.AcpClient",
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client",
                 side_effect=[first, second, third],
             ) as mk,
         ):

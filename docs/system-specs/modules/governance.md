@@ -4114,16 +4114,14 @@ facts are deliberately not conflated: a policy-denied harness and an uninstalled
 one need different operator remedies, and the dashboard must not offer an install
 instruction for a backend an administrator pinned off.
 
-Each row is the union of a REGISTRY half (`label`, `experimental`, `dialect`,
-`routing`, `capabilities`, `degraded_count`, `signin_command`) and a MACHINE half
-(`policy_id`, `installed`, `missing_components`, `install_command`,
-`restart_required`), served by ONE handler
-(`dashboard/handlers/acp_backends.py::api_acp_backends`) on ONE registration
-(the `agent_config` slice). Registering the path twice does not merge the two —
-aiohttp answers from the first match in registration order, so the second handler
-becomes unreachable and the fields it alone owned silently stop arriving, taking
-the top-level `routing_verdict` tool-gate indicator with them.
-`test_dashboard_route_table.py` pins both uniqueness and the served union.
+Each row (`id`, `policy_id`, `selectable`, `independent_setup`, `installed`,
+`missing_components`, `install_command`, `found_version`, `restart_required`,
+`auth`, plus the capability card from `agent_sdk.card_payload`) is built by ONE
+handler (`dashboard/handlers/acp_backend_status.py::api_acp_backend_status`) on
+ONE registration (the `agent_config` slice). Registering the path twice does not
+merge two handlers — aiohttp answers from the first match in registration order,
+so the second becomes unreachable and the fields it alone owned silently stop
+arriving.
 
 **Fails CLOSED to the floor, which is what keeps fail-closed from meaning
 bricked.** `governance_permits(..., fail_closed=True)` denies for an error raised
@@ -4557,11 +4555,6 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
   `GOVERNANCE_FLOOR_BACKEND`, `POLICY_ID_BY_BACKEND`, the baseline/effective
   split (`registered_backends` / `selectable_backends`) and
   `apply_selectable_denials`.
-- `dashboard/handlers/acp_backends.py` — `GET /api/acp-backends` (the single
-  handler: selectability ∩ install state ∩ capability table, plus the active
-  backend's tool-gate verdict; owner-only, and refused for an app-scoped token).
-- `dashboard/handlers/acp_backend_status.py` — `install_snapshot()`, the machine
-  half of those rows. No handler of its own.
 - `hooks.py` — Plane A gate threading + the computer-use read-only auto-approve
   (`_cu_read_only_auto_approve`, which reads the action-class table rather than a
   governance row).

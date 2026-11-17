@@ -1,10 +1,10 @@
 # LLM Provider Abstraction
 
 Kiro Crew drives every LLM through one seam: the `LLMProvider` ABC in
-`providers/base.py`. `AcpProvider` (`providers/acp.py`) is the only implementation
-the factory selects; `AcpSessionProvider` (`acp/session_provider.py`) is a second
-concrete subclass, the adapter a shared-runtime session is swapped onto once
-`AcpRuntime` is up.
+`providers/base.py`. The ACP provider family includes `AcpProvider`
+(`providers/acp.py`) for Kiro-dialect backends and `SpecAdapterAcpProvider` for
+spec-dialect backends; `AcpSessionProvider` (`acp/session_provider.py`) is the
+adapter a shared-runtime session is swapped onto once `AcpRuntime` is up.
 `agent.provider` is fixed to `"acp"` (enum `["acp"]`) — the provider is not the
 harness selector. **Which harness that one provider drives is a separate
 decision, taken from `agent_sdk/backends.py`**: `agent.acp_backend` names a backend id
@@ -46,8 +46,8 @@ isolation admission. See [the memory contract](memory-skills-hooks.md).
          └─────────┬─────────┘
                    │
             ┌──────┴──────┐
-            │ AcpProvider │
-            │ acp.py      │
+            │ ACP provider family  │
+            │ acp.py / spec adapter│
             └──────┬──────┘
                    │  backend id from agent_sdk/backends.py
                    └─ harness selected from the live backend registry
@@ -64,10 +64,11 @@ adapted backend meets, KAS included, as a worked example. The transport itself (
 config isolation) is [acp-client.md](acp-client.md); this file owns the
 *interface*.
 
-**One provider, by invariant:** `AcpProvider` is the only provider the factory
-builds, and `agent.provider` stays `enum=["acp"]`. There is no Bedrock or
-standalone provider and no multi-provider dispatch factory, because a second
-`agent.provider` value would route around every harness-parity invariant.
+**One provider seam, by invariant:** ACP implementations are selected inside
+`agent_sdk.drivers.acp_registry` according to the registered backend dialect,
+while `agent.provider` stays `enum=["acp"]`. There is no Bedrock or standalone
+provider and no `agent.provider` dispatch factory, because a second value would
+route around every harness-parity invariant.
 
 The Claude Code harness has its own page: [claude-code-provider.md](claude-code-provider.md).
 
@@ -1456,7 +1457,9 @@ in [agent-host-contract.md](agent-host-contract.md).
 
 - `agent.provider` is fixed to `"acp"` (enum `["acp"]`); the provider is not a choice.
 - `agent.acp_backend` is the harness choice, resolved through `agent_sdk.backends.resolve_selected_backend` (the top-level `acp_backends` module is a re-export shim kept for existing call sites). A stored Kiro CLI pick (`"kiro"`) resolves to KAS once the gateway confirmed the host's kiro-cli offers v3 and while KAS is selectable, so the factory builds a KAS provider for it with KAS's launch, projection, permissions and compaction; it builds the Kiro CLI provider without that confirmation ([harness-parity](harness-parity.md) H1). The Kiro CLI provider, its skill-view aliases and the `cli.json` overlay stay for that case.
-- `create_provider_factory()` returns a `Callable` that builds an `AcpProvider` for the resolved backend.
+- `create_provider_factory()` returns a `Callable` that builds the Kiro-dialect
+  `AcpProvider`; the platform registry uses the SDK's registry driver to select
+  the provider builder for other registered dialects.
 
 An agent spec's model is consumed by kiro-cli before Kiro Crew reaches
 `session/new`, so the live-session entitlement guard cannot diagnose a wrong
@@ -1483,7 +1486,7 @@ User-configured servers from the agent config are merged in.
 
 ## SessionManager (`session.py`)
 
-- Provider-agnostic via factory (one provider, `AcpProvider`, over the resolved backend)
+- Provider-agnostic via factory (one ACP provider seam over the resolved backend)
 - Calls `repair_agent_configs()` on gateway startup and periodically
 - Resume: calls `set_resume_session_id()` before `start()`
 

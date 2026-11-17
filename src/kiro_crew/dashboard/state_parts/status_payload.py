@@ -49,16 +49,13 @@ def _harness_status(backend: str | None) -> dict[str, object] | None:
     if backend is None:
         return None
     try:
-        from kiro_crew.acp import backends as acp_backends
+        from kiro_crew.agent_sdk.drivers.acp_registry import harness_status
 
-        try:
-            label = acp_backends.descriptor_for(backend).label
-        except Exception:
-            label = backend
+        label, kiro_credits = harness_status(backend)
         return {
             "backend": backend,
             "label": label,
-            "kiro_credits": acp_backends.bills_kiro_credits(backend),
+            "kiro_credits": kiro_credits,
         }
     except Exception:
         logger.debug("Harness status unavailable", exc_info=True)
