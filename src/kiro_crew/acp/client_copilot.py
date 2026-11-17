@@ -24,9 +24,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.acp.harness.copilot import note_copilot_identity_record
-from kiro_crew.acp.transport_errors import AcpToolGateUnroutable
 from kiro_crew.acp.types import JsonRpcMessage
-from kiro_crew.agent_sdk.backends import COPILOT_VERIFIED_VERSION
 from kiro_crew.platform.tool_paths import WRITE_PLANE_KINDS, target_paths
 
 if TYPE_CHECKING:

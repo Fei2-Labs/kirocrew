@@ -11,7 +11,6 @@ and ``_release_is_newer`` orders by effective version before the sha tiebreak.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from types import SimpleNamespace
 
@@ -38,7 +37,8 @@ class TestWheelLaneRefusal:
     @pytest.mark.asyncio
     async def test_git_checkout_is_refused(self, monkeypatch):
         monkeypatch.setattr(
-            updates_fork, "derive_capability",
+            updates_fork,
+            "derive_capability",
             lambda: _capability(update_capability.MANAGED_BY_GIT),
         )
         monkeypatch.setattr(update_provider, "resolve_provider", lambda: None)
@@ -49,7 +49,8 @@ class TestWheelLaneRefusal:
     @pytest.mark.asyncio
     async def test_managed_venv_is_allowed(self, monkeypatch):
         monkeypatch.setattr(
-            updates_fork, "derive_capability",
+            updates_fork,
+            "derive_capability",
             lambda: _capability(update_capability.MANAGED_BY_KIROCREW),
         )
         monkeypatch.setattr(update_provider, "resolve_provider", lambda: None)
@@ -58,7 +59,8 @@ class TestWheelLaneRefusal:
     @pytest.mark.asyncio
     async def test_policy_provider_owns_the_lane(self, monkeypatch):
         monkeypatch.setattr(
-            updates_fork, "derive_capability",
+            updates_fork,
+            "derive_capability",
             lambda: _capability(update_capability.MANAGED_BY_KIROCREW),
         )
         monkeypatch.setattr(update_provider, "resolve_provider", lambda: object())
@@ -88,9 +90,7 @@ class TestReleaseIsNewer:
     def test_an_older_release_is_not_an_upgrade(self):
         # The reported bug: latest release v0.13.0 vs running 0.13.0.1 used to
         # read available because the shas differ.
-        available, remote_version, _ = updates_fork._release_is_newer(
-            "v0.13.0+fork.g00000000"
-        )
+        available, remote_version, _ = updates_fork._release_is_newer("v0.13.0+fork.g00000000")
         assert available is False
         assert remote_version == "0.13.0"
 
@@ -121,16 +121,12 @@ class TestApplyNeverRestartsARunningGateway:
 
     @pytest.mark.asyncio
     async def test_successful_apply_schedules_no_restart(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            updates_fork.tempfile, "mkdtemp", lambda **k: str(tmp_path)
-        )
+        monkeypatch.setattr(updates_fork.tempfile, "mkdtemp", lambda **k: str(tmp_path))
 
         def _reexec_never(*args, **kwargs):  # pragma: no cover - must not run
             raise AssertionError("reexec_python_module must not be called directly")
 
-        monkeypatch.setattr(
-            "kiro_crew.platform_compat.reexec_python_module", _reexec_never
-        )
+        monkeypatch.setattr("kiro_crew.platform_compat.reexec_python_module", _reexec_never)
         monkeypatch.setattr(
             updates_fork, "require_owner_dashboard_request", lambda *a, **k: _none()
         )
@@ -143,18 +139,14 @@ class TestApplyNeverRestartsARunningGateway:
         monkeypatch.setattr(
             updates_fork, "_release_is_newer", lambda tag: (True, "0.14.0", "abc123")
         )
-        monkeypatch.setattr(
-            updates_fork, "_find_wheel_url", lambda rel: "https://example/x.whl"
-        )
+        monkeypatch.setattr(updates_fork, "_find_wheel_url", lambda rel: "https://example/x.whl")
         monkeypatch.setattr("urllib.request.urlretrieve", lambda *a, **k: None)
 
         class _Ok:
             returncode = 0
             stderr = ""
 
-        monkeypatch.setattr(
-            updates_fork.subprocess, "run", lambda *a, **k: _Ok()
-        )
+        monkeypatch.setattr(updates_fork.subprocess, "run", lambda *a, **k: _Ok())
 
         state = SimpleNamespace(_background_tasks=set())
         request = SimpleNamespace(app={"state": state})

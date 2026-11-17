@@ -18,9 +18,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from kiro_crew.dashboard.handlers.usage_history import _TOKEN_HISTORY_DAYS
-from kiro_crew.dashboard.handlers.usage_spend import daily_credits
 from kiro_crew import platform_compat
+from kiro_crew.dashboard.handlers.usage_history import _TOKEN_HISTORY_DAYS
 from kiro_crew.dashboard.handlers.usage_spend import daily_spend, spend_key_for_slot
 from kiro_crew.dashboard.handlers.usage_store import (
     _SESSIONS_HISTORY_DAYS,
@@ -167,6 +166,8 @@ def _sessions_from_own_records() -> dict:
             "tool_calls": 0,
         },
     }
+
+
 # Per-transcript counts from the last parse, keyed on the resolved path and
 # checked against ``(st_mtime_ns, st_size)``: a refresh reads again only the
 # transcripts that changed since. Each parse replaces the whole map with the

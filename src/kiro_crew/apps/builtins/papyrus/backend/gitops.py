@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import functools
 import logging
 import os
 import re

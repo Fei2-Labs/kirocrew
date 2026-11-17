@@ -595,7 +595,8 @@ _STRANDS = BackendDescriptor(
 )
 
 _BY_ID: dict[str, BackendDescriptor] = {
-    d.id: d for d in (_KIRO, _CLAUDE, _CODEX, _COPILOT, _KAS, _STRANDS, _GOOSE, _OPENCODE, _PI, _DEEPSEEK)
+    d.id: d
+    for d in (_KIRO, _CLAUDE, _CODEX, _COPILOT, _KAS, _STRANDS, _GOOSE, _OPENCODE, _PI, _DEEPSEEK)
 }
 
 

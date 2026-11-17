@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import pytest
 
-from kiro_crew.dashboard.handlers import updates
 from kiro_crew import fork_version
+from kiro_crew.dashboard.handlers import updates
 
 _INIT = '__version__ = "0.13.0"\n'
 
@@ -108,7 +108,10 @@ class TestForkUpstreamProbe:
             return None  # `git config --get remote.upstream.url` unset
 
         monkeypatch.setattr(updates, "_git_read", _read)
-        assert await updates._fork_upstream_probe("p", git="git", env={}, fork_tip="f" * 40) == self._DEFAULTS
+        assert (
+            await updates._fork_upstream_probe("p", git="git", env={}, fork_tip="f" * 40)
+            == self._DEFAULTS
+        )
 
     @pytest.mark.asyncio
     async def test_upstream_ahead_reports_counts_and_version(self, monkeypatch):
@@ -152,7 +155,10 @@ class TestForkUpstreamProbe:
 
         monkeypatch.setattr(updates, "_git_read", _read)
         monkeypatch.setattr(updates, "fetch_and_pin_upstream", _fetch)
-        assert await updates._fork_upstream_probe("p", git="git", env={}, fork_tip="f" * 40) == self._DEFAULTS
+        assert (
+            await updates._fork_upstream_probe("p", git="git", env={}, fork_tip="f" * 40)
+            == self._DEFAULTS
+        )
 
 
 class TestStatusFields:

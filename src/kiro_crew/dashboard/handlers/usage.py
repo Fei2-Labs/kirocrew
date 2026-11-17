@@ -804,9 +804,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _empty_session_summary,
         _kas_transcripts,
         _parse_sessions,
-        _sessions_from_own_records,
         _pin_listing_dir,
         _row_messages,
+        _sessions_from_own_records,
         _shard_sessions,
     )
     from kiro_crew.dashboard.handlers.usage_spend import (  # noqa: F401

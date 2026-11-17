@@ -1045,6 +1045,8 @@ def _live_slot_acp_client(self: DashboardState, slot: _ChatSlot) -> Any | None:
         if holder is not None:
             return holder
     return provider
+
+
 def _row_memo_context(state: "DashboardState") -> RowMemoContext | None:
     """The global halves of the per-slot row memo keys, or ``None`` to memo nothing.
 

@@ -853,7 +853,7 @@ async def _check_for_updates_legacy(self: GatewayOrchestrator) -> None:
                     str(info.get("channel") or ""), str(info.get("latest_version") or "")
                 )
             else:
-                commits_behind = int(info.get("commits_behind") or 0)
+                commits_behind = int(str(info.get("commits_behind") or 0))
                 if (
                     cfg.auto_update
                     and not deferred
@@ -863,13 +863,12 @@ async def _check_for_updates_legacy(self: GatewayOrchestrator) -> None:
                     and effect.reason == update_capability._IN_PLACE_REASON
                     and info.get("update_available")
                     and commits_behind > 0
-                    and int(info.get("commits_ahead") or 0) == 0
+                    and int(str(info.get("commits_ahead") or 0)) == 0
                 ):
                     version = str(info.get("latest_version") or "")
                     current = await asyncio.to_thread(update_next_start.read)
                     if not (
-                        current.armed_version == version
-                        and current.armed_behind == commits_behind
+                        current.armed_version == version and current.armed_behind == commits_behind
                     ):
                         await asyncio.to_thread(
                             update_next_start.arm, version, behind=commits_behind

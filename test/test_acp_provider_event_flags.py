@@ -9,11 +9,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_acp_provider import TestStartKiroRuntimeModelEntitlement as _ModelEntitlement
+from test_acp_provider import _build_provider
 
 from kiro_crew.acp.types import ACP_BACKEND_GOOSE
 from kiro_crew.testing.ids import UNALLOCATABLE_PID
-from test_acp_provider import TestStartKiroRuntimeModelEntitlement as _ModelEntitlement
-from test_acp_provider import _build_provider
 
 
 def test_child_fidelity_aware_survives_client_replacement():

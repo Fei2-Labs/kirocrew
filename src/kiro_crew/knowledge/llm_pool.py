@@ -812,7 +812,10 @@ class AcpWorker(Worker):
             )
 
     async def send_message(self, prompt: str, timeout: float = DEFAULT_TIMEOUT) -> str:
-        if self._provider is not None and not self._provider.is_process_alive():
+        if (
+            self._provider is not None
+            and not self._provider.is_process_alive()  # pid-owner-ok: the pool's own worker
+        ):
             await self.start()
         if self._provider is not None:
 
@@ -855,7 +858,7 @@ class AcpWorker(Worker):
 
     def is_alive(self) -> bool:
         if self._provider is not None:
-            return self._provider.is_process_alive()
+            return self._provider.is_process_alive()  # pid-owner-ok: the pool's own worker
         return self._client is not None and self._client.is_process_alive()
 
     def context_pct(self) -> float:

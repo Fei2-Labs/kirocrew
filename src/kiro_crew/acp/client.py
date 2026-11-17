@@ -186,7 +186,6 @@ from kiro_crew.acp.client_spawn_env import codex_acp_not_found_message  # noqa: 
 from kiro_crew.acp.client_spawn_env import finish_suspended_spawn  # noqa: F401
 from kiro_crew.acp.client_spawn_env import kiro_cli_not_found_message  # noqa: F401
 from kiro_crew.acp.client_start import _PROTOCOL_VERSION_BY_BACKEND  # noqa: F401
-from kiro_crew.acp.client_start import _wire_contract_for_backend  # noqa: F401
 from kiro_crew.acp.client_start import CLIENT_NAME  # noqa: F401
 from kiro_crew.acp.client_start import CLIENT_VERSION  # noqa: F401
 from kiro_crew.acp.client_start import PROTOCOL_VERSION  # noqa: F401
@@ -195,6 +194,7 @@ from kiro_crew.acp.client_start import PROTOCOL_VERSION_DEEPSEEK  # noqa: F401
 from kiro_crew.acp.client_start import PROTOCOL_VERSION_GOOSE  # noqa: F401
 from kiro_crew.acp.client_start import PROTOCOL_VERSION_OPENCODE  # noqa: F401
 from kiro_crew.acp.client_start import PROTOCOL_VERSION_PI  # noqa: F401
+from kiro_crew.acp.client_start import _wire_contract_for_backend  # noqa: F401
 from kiro_crew.acp.client_timeouts import _ACP_RESPAWN_BACKOFF_S  # noqa: F401
 from kiro_crew.acp.client_timeouts import _CANCEL_GRACE_SECS  # noqa: F401
 from kiro_crew.acp.client_timeouts import _COMPACTION_FAILED_TURN_BUDGET  # noqa: F401

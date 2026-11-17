@@ -523,8 +523,7 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
     # later as a protocol error on an unrelated session sharing this process.
     if self._acp_backend not in ACP_BACKENDS_ACP_RUNTIME:
         raise AcpRuntimeError(
-            f"Backend {self._acp_backend!r} is not served by AcpRuntime "
-            "and must use AcpClient."
+            f"Backend {self._acp_backend!r} is not served by AcpRuntime " "and must use AcpClient."
         )
 
     # A stored skill-view name is never the agent to spawn: map it to the

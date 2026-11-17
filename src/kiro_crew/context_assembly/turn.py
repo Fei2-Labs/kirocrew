@@ -44,7 +44,6 @@ def post_compaction_parts(
     template_dir: str | None = None,
     mode: str,
     is_cc: bool,
-    is_spec_adapter: bool,
     private_owner: bool,
     blocks_reads: bool,
     minimal_context: bool,
@@ -134,7 +133,7 @@ def post_compaction_parts(
         )
     _inject, _globs = ctx._skills_injection_plan(
         agent,
-        is_spec_adapter=is_spec_adapter,
+        is_cc=is_cc,
         project_dir=project,
         provider_type=provider_type,
         session_key=session_key,

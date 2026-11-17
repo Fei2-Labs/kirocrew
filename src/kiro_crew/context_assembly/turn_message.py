@@ -178,10 +178,6 @@ def build_message(
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.agent_sdk import context_provider_of
-    from kiro_crew.agent_sdk.drivers.acp_vocab import (
-        PROVIDER_LABEL_CLAUDE,
-        is_spec_adapter_provider_label,
-    )
     from kiro_crew.essential_delivery import EssentialDelivery
 
     # Before any blocking step: a build its cancelled turn left running on the
@@ -252,12 +248,7 @@ def build_message(
     # A harness that is not named is not assumed to be kiro-cli: the
     # essentials builder, the folder dedup and the ``is_cc`` gate all read
     # the value as given.
-    is_cc = provider_type == PROVIDER_LABEL_CLAUDE
-    # Separate flag for the DIALECT question (harness-parity H5/H6): skills and
-    # steering widen to every spec adapter, while the persona rewrite above
-    # stays claude-only. Collapsing them into one flag either leaks claude
-    # branding onto codex or silently drops codex's skills.
-    is_spec_adapter = is_spec_adapter_provider_label(provider_type or "")
+    is_cc = ctx.is_claude_code(provider_type)
 
     # Layer-3 rules gate + section delivery, per session-lifecycle branch.
     # The INVARIANT: every member turn passes the fail-closed rules gate,
@@ -599,7 +590,6 @@ def build_message(
                 template_dir=template_dir,
                 mode=mode,
                 is_cc=is_cc,
-                is_spec_adapter=is_spec_adapter,
                 private_owner=bool(_private_owner),
                 blocks_reads=blocks_reads,
                 minimal_context=minimal_context,

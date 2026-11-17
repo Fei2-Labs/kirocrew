@@ -473,12 +473,6 @@ ACP_BACKEND_ROUTING: dict = {
     ACP_BACKEND_OPENCODE: Routing.VERIFIED_SEEDED_SETTINGS,
     ACP_BACKEND_PI: Routing.VERIFIED_GATE_EXTENSION,
     ACP_BACKEND_GOOSE: Routing.VERIFIED_SEEDED_SETTINGS,
-    # copilot asks natively: ``copilot --acp`` emits ``session/request_permission``
-    # per privileged tool call on its own ACP path, observed on a live drive
-    # (``acp/backends.py``'s ``_COPILOT`` descriptor). Crew seeds nothing, applies
-    # no session config and loads no extension for it, so the member is the one
-    # that names the adapter's own asking rather than a Crew-established route.
-    ACP_BACKEND_COPILOT: Routing.PERMISSION_REQUEST,
     # deepseek reaches the same member as pi, and by the same reasoning: the harness
     # has no gate of its own that decides a TOOL CALL, so Crew loads one into it.
     # Its sandbox permits an in-policy

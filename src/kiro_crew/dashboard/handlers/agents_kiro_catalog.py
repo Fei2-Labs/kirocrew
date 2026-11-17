@@ -8,8 +8,8 @@ callers use; this plain module sits outside the owner composition, as
 from __future__ import annotations
 
 import asyncio
-import json
 import dataclasses
+import json
 import logging
 import os
 import subprocess
@@ -19,18 +19,17 @@ from aiohttp import web
 from kiro_crew import model_registry
 from kiro_crew.acp_backends import ACP_BACKEND_KIRO, model_registry_namespace
 from kiro_crew.agent_sdk import host_auth
-from kiro_crew.config.loader_credentials import inject_kiro_cli_api_key
 from kiro_crew.agent_sdk.drivers.acp import (
     is_auth_failure_output,
     resolve_kiro_bin_for_spawn,
     resolve_ssh_auth_sock,
 )
+from kiro_crew.config.loader_credentials import inject_kiro_cli_api_key
 from kiro_crew.dashboard.chat_utils import is_deprecated_model
 from kiro_crew.dashboard.kiro_readiness import KIRO_PREREQUISITE_REQUIRED_CODE
 from kiro_crew.executors import maintenance_executor, subprocess_executor
 from kiro_crew.platform_compat import kill_and_reap
-from kiro_crew.sandbox import configured_sandbox_mode, scrub_agent_subprocess_env
-
+from kiro_crew.sandbox import scrub_agent_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +72,6 @@ _LIST_MODELS_FAILURE_BACKOFF_SECS: float = 30.0
 # does not speak to those): each is clamped to the id-length bound and a row
 # keeps at most this many.
 _CATALOG_CACHE_MAX_FIELDS_PER_ROW = 64
-
 
 
 _CATALOG_UNAVAILABLE_CODE = "model_list_unavailable"
@@ -470,7 +468,10 @@ def _shared_catalog_fetch(gate_req: web.Request | None = None) -> "asyncio.Task[
 
     async def _run() -> list[dict]:
         try:
-            if gate_req is not None and await _agents.reject_if_kiro_unverified(gate_req) is not None:
+            if (
+                gate_req is not None
+                and await _agents.reject_if_kiro_unverified(gate_req) is not None
+            ):
                 raise _CatalogUnavailable(  # nothing spawned, so no backoff entry
                     "kiro sign-in not verified; catalog refresh skipped",
                     backoff=False,
@@ -523,4 +524,3 @@ def _consume_refresh_exception(task: "asyncio.Task[list[dict]]") -> None:
     exc = task.exception()
     if exc is not None:
         logger.debug("api_models: background catalog refresh failed (serving cached)", exc_info=exc)
-

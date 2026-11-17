@@ -81,7 +81,6 @@ dead-identifier	docs/system-specs/modules/computer-use.md	AppsFolder
 dead-identifier	docs/system-specs/modules/computer-use.md	ignoreDefaultValue
 dead-identifier	docs/system-specs/modules/governance.md	cu_action
 dead-identifier	docs/system-specs/modules/instances.md	instances_send_session
-dead-identifier	docs/system-specs/modules/kas-auth.md	client_type
 dead-identifier	docs/system-specs/modules/kas-auth.md	shape_idp
 dead-identifier	docs/system-specs/modules/knowledge.md	rank_of_first_relevant
 dead-identifier	docs/system-specs/modules/learn-cron-dashboard.md	fenced_code

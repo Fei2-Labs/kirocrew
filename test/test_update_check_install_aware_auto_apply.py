@@ -289,9 +289,7 @@ class TestAutoApplyGuard:
                     "commits_behind": 3,
                 },
                 auto_update=True,
-                effect=AutoUpdateEffect(
-                    "notify", "git", update_capability._IN_PLACE_REASON
-                ),
+                effect=AutoUpdateEffect("notify", "git", update_capability._IN_PLACE_REASON),
             )
         arm.assert_called_once_with("1.2.3", behind=3)
         orch._auto_apply_update.assert_not_awaited()
@@ -324,9 +322,7 @@ class TestAutoApplyGuard:
                     "commits_behind": 3,
                 },
                 auto_update=True,
-                effect=AutoUpdateEffect(
-                    "notify", "git", update_capability._IN_PLACE_REASON
-                ),
+                effect=AutoUpdateEffect("notify", "git", update_capability._IN_PLACE_REASON),
             )
         arm.assert_not_called()
         orch._auto_apply_update.assert_not_awaited()
@@ -350,9 +346,7 @@ class TestAutoApplyGuard:
                     "commits_behind": 3,
                 },
                 auto_update=True,
-                effect=AutoUpdateEffect(
-                    "notify", "git", update_capability._IN_PLACE_REASON
-                ),
+                effect=AutoUpdateEffect("notify", "git", update_capability._IN_PLACE_REASON),
             )
         arm.assert_not_called()
         orch._auto_apply_update.assert_not_awaited()
@@ -375,23 +369,22 @@ class TestAutoApplyGuard:
                     "commits_behind": 3,
                 },
                 auto_update=False,
-                effect=AutoUpdateEffect(
-                    "notify", "git", update_capability._IN_PLACE_REASON
-                ),
+                effect=AutoUpdateEffect("notify", "git", update_capability._IN_PLACE_REASON),
             )
         arm.assert_not_called()
 
     def test_a_deferred_fork_update_does_not_arm(self, monkeypatch):
-        """"Later" in a prompt is the user's answer for that version: never armed."""
+        """ "Later" in a prompt is the user's answer for that version: never armed."""
         from kiro_crew import update_next_start
         from kiro_crew.platform import update_capability
 
         arm = MagicMock()
         monkeypatch.setattr(update_next_start, "arm", arm)
         monkeypatch.setattr(update_next_start, "read", lambda: update_next_start.NextStartState())
-        with patch(
-            "kiro_crew.update_deferral.user_deferred_update", return_value=True
-        ), patch("kiro_crew.fork_version.is_fork_build", return_value=True):
+        with (
+            patch("kiro_crew.update_deferral.user_deferred_update", return_value=True),
+            patch("kiro_crew.fork_version.is_fork_build", return_value=True),
+        ):
             self._run(
                 {
                     "update_available": True,
@@ -402,9 +395,7 @@ class TestAutoApplyGuard:
                     "commits_behind": 3,
                 },
                 auto_update=True,
-                effect=AutoUpdateEffect(
-                    "notify", "git", update_capability._IN_PLACE_REASON
-                ),
+                effect=AutoUpdateEffect("notify", "git", update_capability._IN_PLACE_REASON),
             )
         arm.assert_not_called()
 
@@ -428,9 +419,7 @@ class TestAutoApplyGuard:
                     "commits_behind": 3,
                 },
                 auto_update=True,
-                effect=AutoUpdateEffect(
-                    "notify", "git", update_capability._UNATTENDED_OFF_REASON
-                ),
+                effect=AutoUpdateEffect("notify", "git", update_capability._UNATTENDED_OFF_REASON),
             )
         arm.assert_not_called()
 
@@ -453,9 +442,7 @@ class TestAutoApplyGuard:
                     "commits_behind": 3,
                 },
                 auto_update=True,
-                effect=AutoUpdateEffect(
-                    "notify", "git", update_capability._IN_PLACE_REASON
-                ),
+                effect=AutoUpdateEffect("notify", "git", update_capability._IN_PLACE_REASON),
             )
         arm.assert_not_called()
         orch._auto_apply_update.assert_not_awaited()

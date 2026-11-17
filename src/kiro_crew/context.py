@@ -1293,7 +1293,7 @@ def build_session_replay(
 def _skills_injection_plan(
     agent: str | None,
     *,
-    is_spec_adapter: bool,
+    is_cc: bool,
     project_dir: str | Path | None = None,
     provider_type: str | None = None,
     session_key: str | None = None,

@@ -203,15 +203,21 @@ _GROUP_LABEL_EXPR = (
     "${{ github.repository == 'kirodotdev/KiroCrew' && "
     "'kirocrew-linux-4-core' || 'ubuntu-latest' }}"
 )
+# The fork keeps the group object for upstream behind the same repository
+# check, so a fork's copy falls back to a hosted runner instead of waiting.
+_GROUP_FORK_EXPR = (
+    "${{ github.repository == 'kirodotdev/KiroCrew' && "
+    "fromJSON('{\"group\":\"kirocrew-runners\"}') || 'ubuntu-latest' }}"
+)
 _HOSTED_EXCEPTION_RUNNERS: dict[tuple[str, str], object] = {
-    ("first-principles-review.yml", "first-principles-review"): {"group": "kirocrew-runners"},
-    ("ux-review.yml", "ux-review"): {"group": "kirocrew-runners"},
-    ("design-review.yml", "design-review"): {"group": "kirocrew-runners"},
-    ("release.yml", "version"): {"group": "kirocrew-runners"},
-    ("release.yml", "resolve-promotion"): {"group": "kirocrew-runners"},
-    ("release.yml", "stable-gate"): {"group": "kirocrew-runners"},
-    ("release.yml", "github-release"): {"group": "kirocrew-runners"},
-    ("release.yml", "record-promotion"): {"group": "kirocrew-runners"},
+    ("first-principles-review.yml", "first-principles-review"): _GROUP_FORK_EXPR,
+    ("ux-review.yml", "ux-review"): _GROUP_FORK_EXPR,
+    ("design-review.yml", "design-review"): _GROUP_FORK_EXPR,
+    ("release.yml", "version"): _GROUP_LABEL_EXPR,
+    ("release.yml", "resolve-promotion"): _GROUP_LABEL_EXPR,
+    ("release.yml", "stable-gate"): _GROUP_LABEL_EXPR,
+    ("release.yml", "github-release"): _GROUP_LABEL_EXPR,
+    ("release.yml", "record-promotion"): _GROUP_LABEL_EXPR,
     ("fork-internal-content-scan.yml", "fork-internal-content-scan"): {"group": "kirocrew-runners"},
     ("fork-pr-description.yml", "describe"): {"group": "kirocrew-runners"},
     ("fork-workflow-guard.yml", "guard"): {"group": "kirocrew-runners"},
@@ -232,8 +238,8 @@ _HOSTED_EXCEPTION_RUNNERS: dict[tuple[str, str], object] = {
     ("publish-installer.yml", "publish-installer"): {"group": "kirocrew-runners"},
     ("publish-linux.yml", "publish-linux"): {"group": "kirocrew-runners"},
     ("publish-windows.yml", "publish-windows"): {"group": "kirocrew-runners"},
-    ("release.yml", "release-candidate-tests"): {"group": "kirocrew-runners"},
-    ("release.yml", "record-stable-promotion"): {"group": "kirocrew-runners"},
+    ("release.yml", "release-candidate-tests"): _GROUP_FORK_EXPR,
+    ("release.yml", "record-stable-promotion"): _GROUP_FORK_EXPR,
     # These dispatchable jobs use the group label upstream, but a personal
     # fork cannot reach the org group and must retain the hosted fallback.
     ("memory-benchmark.yml", "accept"): (

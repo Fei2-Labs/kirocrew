@@ -160,17 +160,15 @@ def build_session_context(
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.agent_files import is_kirocrew_default_agent
-    from kiro_crew.agent_sdk.drivers.acp_vocab import is_spec_adapter_provider_label
 
     execution_context, desk_member, member, memory_store, blocks_reads = _member.resolve_turn_owner(
         execution_context, session_key, member, memory_store, blocks_reads
     )
     is_custom = bool(agent) and not is_kirocrew_default_agent(agent)
-    # Dialect flag, distinct from the claude-only branding flag build_message
-    # keeps: steering resources and custom-agent skill globs are injected on
-    # EVERY spec adapter (none of them reads the agent spec natively), never
-    # keyed to claude alone.
-    is_spec_adapter = is_spec_adapter_provider_label(provider_type or "")
+    # A harness that is not named is not assumed to be kiro-cli: the
+    # essentials builder, the folder dedup and the ``is_cc`` gate all read
+    # the value as given.
+    is_cc = ctx.is_claude_code(provider_type)
     caps = ctx._resolve_caps(model_window)
     blocks = _budgets.ContextParts()
     parts = blocks.parts
@@ -231,7 +229,7 @@ def build_session_context(
     # below cannot disagree.
     inject_skills, skill_globs = ctx._skills_injection_plan(
         agent,
-        is_spec_adapter=is_spec_adapter,
+        is_cc=is_cc,
         project_dir=project,
         provider_type=provider_type,
         session_key=session_key,
@@ -413,17 +411,11 @@ def build_session_context(
     lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))
     max_context_chars = caps.max_context
 
-    # Steering files from agent config resources: the spec-adapter backends
-    # only, since kiro-cli loads an agent's ``resources`` natively. The gate
-    # is shared with post-compaction re-injection; ``is_spec_adapter`` is the
-    # fork's wider set (claude plus codex/goose/opencode/pi/copilot and
-    # registry ``acp:`` adapters), all of which read no agent ``resources``.
+    # Steering files from agent config resources: only on a harness that reads
+    # no agent ``resources`` (Claude Code, Codex), since kiro-cli loads them
+    # natively. The gate is shared with post-compaction re-injection.
     steering_ctx = _inclusion.steering_resources_part(
         agent=agent,
-        is_cc=is_spec_adapter,
-        # Steering files from agent config resources: only on a harness that reads
-        # no agent ``resources`` (Claude Code, Codex), since kiro-cli loads them
-        # natively. The gate is shared with post-compaction re-injection.
         provider_type=provider_type,
         essentials=essentials,
         context_groups=context_groups,
