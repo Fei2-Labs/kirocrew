@@ -36,8 +36,10 @@ from kiro_crew.acp.liveness import InFlightToolTracker
 from kiro_crew.acp.session_handle import NATIVE_CHILD_NOT_RESUMABLE, AcpRequestTimeout
 from kiro_crew.acp.timed_out_continuation import continue_timed_out_calls, timed_out_continuation
 from kiro_crew.acp.types import (
+    ACP_BACKENDS_AUTO_MODEL,
     EVENT_MODEL_FALLBACK,
     EVENT_STRUCTURED_STATUS,
+    PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
     PROVIDER_LABEL_KAS,
     STATUS_EXTENSION_VERSION,
@@ -56,6 +58,7 @@ from kiro_crew.acp.types import (
     WAIT_REASON_INPUT,
     StructuredStatus,
     classify_stop_reason,
+    is_spec_adapter_provider_label,
 )
 from kiro_crew.providers.base import EVENT_TOOL_CALL, EVENT_TOOL_RESULT
 
@@ -67,8 +70,11 @@ __all__ = [
     "EVENT_TOOL_CALL",
     "EVENT_TOOL_RESULT",
     "NATIVE_CHILD_NOT_RESUMABLE",
+    "ACP_BACKENDS_AUTO_MODEL",
+    "PROVIDER_LABEL_CLAUDE",
     "PROVIDER_LABEL_DEFAULT",
     "PROVIDER_LABEL_KAS",
+    "backend_serves_auto_model",
     "STATUS_EXTENSION_VERSION",
     "STATUS_PHASE_WAITING",
     "STOP_CLASS_CANCELLED",
@@ -88,6 +94,7 @@ __all__ = [
     "InFlightToolTracker",
     "StructuredStatus",
     "classify_stop_reason",
+    "is_spec_adapter_provider_label",
     # The engine's own in-prompt model fallback (``acp/engine_fallback.py``): the
     # per-turn walk a surface ends with one line, the verdict it reads, and the
     # readers a surface that shows the model uses to follow the engine.
@@ -105,6 +112,11 @@ __all__ = [
     "continue_timed_out_calls",
     "timed_out_continuation",
 ]
+
+
+def backend_serves_auto_model(backend: str) -> bool:
+    """Whether *backend* accepts the ACP ``auto`` model sentinel."""
+    return backend in ACP_BACKENDS_AUTO_MODEL
 
 
 def is_runtime_death(exc: BaseException) -> bool:

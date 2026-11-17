@@ -427,7 +427,7 @@ class TestWorkerConversationRecycle:
         # makes _collect_active_pids report a non-empty protected set to whatever
         # else shares this worker.
         with (
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=new_client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=new_client),
             patch("kiro_crew.knowledge.llm_pool.register_protected_pid"),
             patch("kiro_crew.knowledge.llm_pool.unregister_protected_pid"),
         ):

@@ -177,8 +177,11 @@ def build_message(
         (full_message, hook_result) — hook_result may be a reply/modify/inject.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
-    from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE, is_spec_adapter_provider_label
     from kiro_crew.agent_sdk import context_provider_of
+    from kiro_crew.agent_sdk.drivers.acp_vocab import (
+        PROVIDER_LABEL_CLAUDE,
+        is_spec_adapter_provider_label,
+    )
     from kiro_crew.essential_delivery import EssentialDelivery
 
     # Before any blocking step: a build its cancelled turn left running on the

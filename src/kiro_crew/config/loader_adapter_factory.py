@@ -11,7 +11,7 @@ def create_adapter_provider_factory(
     config: Any,
     *,
     factory_backend: str,
-    provider_type: type,
+    provider_builder: Callable[..., Any],
     registry_model_ids: bool,
     tool_search_supported: bool,
     default_model: str,
@@ -186,11 +186,11 @@ def create_adapter_provider_factory(
                 )
         # No second selection gate here: this factory is the ADAPTER half,
         # reached only after the caller resolved the backend and paired it
-        # with the matching ``provider_type``. Selecting again would let the
+        # with the matching provider builder. Selecting again would let the
         # two disagree — a SPEC id constructed through the Kiro provider
         # contract, which is the catch-all inheritance H5 forbids. The one
         # per-session selection runs in the direct Kiro factory above.
-        return provider_type(
+        return provider_builder(
             work_dir=wdir,
             model=m,
             agent=agent,

@@ -244,11 +244,6 @@ def _snapshot() -> List[Dict[str, Any]]:
     return [_row(state, selectable) for state in probe_backends()]
 
 
-def install_snapshot() -> Dict[str, Dict[str, Any]]:
-    """Rows from :func:`_snapshot`, keyed by backend id. Blocking."""
-    return {row["id"]: row for row in _snapshot()}
-
-
 def _recheck(backend: str) -> Dict[str, Any]:
     """Probe one backend and build its row. BLOCKING -- run under ``to_thread``.
 

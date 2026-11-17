@@ -46,11 +46,14 @@ Layering::
                             v
                      kiro_crew.agent_sdk.drivers.acp
                      kiro_crew.agent_sdk.drivers.acp_vocab
+                     kiro_crew.agent_sdk.drivers.acp_registry
+                     kiro_crew.agent_sdk.drivers.acp_worker
                                                   the only modules INSIDE this
                                                   package that import
                                                   kiro_crew.acp: the driver
-                                                  (call-time imports) and the
-                                                  by-value vocabulary it exposes
+                                                  adapters (call-time imports)
+                                                  and the by-value vocabulary
+                                                  they expose
                             v
                      kiro_crew.acp  (foundation)  wire, dialects, adapters,
                                                   session handles, worker pool
@@ -120,6 +123,10 @@ from kiro_crew.agent_sdk.drivers.acp import (
     kas_engine_unsupported_reason,
     kas_engine_verdict,
     kas_start_was_refused,
+)
+from kiro_crew.agent_sdk.drivers.acp_worker import (
+    AcpWorkerClient,
+    create_acp_worker_client,
 )
 from kiro_crew.agent_sdk.host_auth import (
     UNKNOWN_AGENT_AUTH,
@@ -240,6 +247,13 @@ def watch_agent_turns(provider: object, callback: Callable[[], None] | None) -> 
     return provider.watch_agent_turns(callback)
 
 
+def is_text_chunk_event(kind: str) -> bool:
+    """Whether *kind* is the backend's streamed text event."""
+    from kiro_crew.providers.base import EVENT_TEXT_CHUNK
+
+    return kind == EVENT_TEXT_CHUNK
+
+
 TURN_STOP_REASON_CANCELLED = "cancelled"
 TURN_STOP_REASON_END_TURN = "end_turn"
 
@@ -262,10 +276,13 @@ __all__ = [
     "batch_guard_refusal_outcome",
     "mcp_call_arguments",
     "watch_agent_turns",
+    "is_text_chunk_event",
     "tool_row_text",
     "agents_dir_competing_claim",
     "ContextPromptProvider",
     "ContextStreamEvent",
+    "AcpWorkerClient",
+    "create_acp_worker_client",
     "CONTEXT_EVENT_AGENT_CHANGED",
     "CONTEXT_EVENT_CLEAR",
     "CONTEXT_EVENT_COMPACTION",

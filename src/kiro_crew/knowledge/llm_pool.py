@@ -17,6 +17,11 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.agent_sdk import (
+    AcpWorkerClient,
+    create_acp_worker_client,
+    is_text_chunk_event,
+)
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_KIRO,
     POLICY_ID_BY_BACKEND,
@@ -47,19 +52,8 @@ from kiro_crew.sandbox import (
     wrap_argv_async,
 )
 
-try:
-    from kiro_crew.acp.client import (
-        AcpClient,
-        SpecAdapterAcpClient,
-        requires_spec_adapter_admission,
-    )
-except ImportError:
-    AcpClient = None  # type: ignore[assignment,misc]
-    SpecAdapterAcpClient = None  # type: ignore[assignment,misc]
-    requires_spec_adapter_admission = None  # type: ignore[assignment]
-
-# Sweep-protection shield for AcpClient-backed workers. These are direct,
-# long-lived AcpClient sessions (not SessionMap sessions / warm-pool providers),
+# Sweep-protection shield for client-backed workers. These are direct,
+# long-lived sessions (not SessionMap sessions / warm-pool providers),
 # so the gateway's periodic orphan sweep can't see them via _collect_active_pids
 # and would SIGKILL a *busy* worker mid-task as a false orphan ("ACP process
 # exited (code=1)"). Registering the live PID here prevents that. Applied inline
@@ -512,7 +506,7 @@ class AcpWorker(Worker):
         acp_backend: Optional[str] = None,
         config_snapshot: Optional[dict] = None,
     ) -> None:
-        self._client: Optional[AcpClient] = None
+        self._client: Optional[AcpWorkerClient] = None
         self._provider: Optional[LLMProvider] = None
         # Pre-resolved by the caller (off the event loop). ``None`` -> resolve
         # lazily in ``start`` (direct construction outside the pool / tests).
@@ -525,8 +519,6 @@ class AcpWorker(Worker):
         self._protected_pid: Optional[int] = None
 
     async def start(self) -> None:
-        if AcpClient is None:
-            raise RuntimeError("AcpClient not available (kiro_crew.acp.client not installed)")
         # Drop any prior client before respawning. send_message re-runs start()
         # when the client is not ready (e.g. a stalled handshake left _session_id
         # None); without this the previous subprocess would be orphaned.
@@ -683,7 +675,9 @@ class AcpWorker(Worker):
         assert self._client is not None
         return bool(self._client.authored_spec_declares_zero_tools())
 
-    async def _spawn_client(self, acp_backend: str, sandbox_mode: str) -> tuple[AcpClient, bool]:
+    async def _spawn_client(
+        self, acp_backend: str, sandbox_mode: str
+    ) -> tuple[AcpWorkerClient, bool]:
         """Build the client for *acp_backend*, bring it up, and return it with the pre-spawn read.
 
         The installed spec is repaired from its template first
@@ -712,14 +706,14 @@ class AcpWorker(Worker):
         # every other harness parses the file itself, so it still gets it rewritten.
         await asyncio.to_thread(_repair_agent_spec, routing_for(acp_backend) is Routing.AGENT_SPEC)
         if routing_for(acp_backend) is Routing.AGENT_SPEC:
-            client = AcpClient(
+            client = create_acp_worker_client(
                 agent=AGENT_NAME,
                 sandbox_mode=sandbox_mode,
                 acp_backend=acp_backend,
                 audit_source="subagent",
             )
         else:
-            client = AcpClient(
+            client = create_acp_worker_client(
                 agent=AGENT_NAME,
                 sandbox_mode=sandbox_mode,
                 acp_backend=acp_backend,
@@ -823,12 +817,10 @@ class AcpWorker(Worker):
         if self._provider is not None:
 
             async def _collect() -> str:
-                from kiro_crew.acp.types import EVENT_TEXT_CHUNK
-
                 output: list[str] = []
                 assert self._provider is not None
                 async for event in self._provider.stream(prompt):
-                    if event.kind == EVENT_TEXT_CHUNK and event.text:
+                    if is_text_chunk_event(event.kind) and event.text:
                         output.append(event.text)
                 return "".join(output)
 

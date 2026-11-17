@@ -72,7 +72,7 @@ class TestAcpWorkerEffort:
         client.send_command.side_effect = lambda *_args, **_kwargs: events.append("set")
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()
@@ -87,7 +87,7 @@ class TestAcpWorkerEffort:
         client = _mock_effort_client(["low", "medium", "high"], claude=True)
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()
@@ -107,7 +107,7 @@ class TestAcpWorkerEffort:
         client = _mock_effort_client(["low", "medium", "high"], backend=ACP_BACKEND_CODEX)
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()
@@ -131,7 +131,7 @@ class TestAcpWorkerEffort:
         )
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()
@@ -145,7 +145,9 @@ class TestAcpWorkerEffort:
         second = _mock_effort_client(["low", "medium", "high"])
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", side_effect=[first, second]),
+            patch(
+                "kiro_crew.knowledge.llm_pool.create_acp_worker_client", side_effect=[first, second]
+            ),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()
@@ -161,7 +163,7 @@ class TestAcpWorkerEffort:
         client = _mock_effort_client(["low", "medium"])
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()
@@ -175,7 +177,7 @@ class TestAcpWorkerEffort:
         client = _mock_effort_client([], supports=False, claude=True)
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()
@@ -197,7 +199,7 @@ class TestAcpWorkerEffort:
         client.spec_zero_tools = True
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
             caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"),
         ):
             worker = AcpWorker(effort="high", acp_backend=backend)
@@ -228,7 +230,7 @@ class TestAcpWorkerEffort:
         client.spec_zero_tools = True
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high", acp_backend=ACP_BACKEND_OPENCODE)
             await worker.start()
@@ -255,7 +257,7 @@ class TestAcpWorkerEffort:
         client.spec_zero_tools = True
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high", acp_backend=ACP_BACKEND_GOOSE)
             await worker.start()
@@ -273,7 +275,7 @@ class TestAcpWorkerEffort:
         client.send_command.side_effect = RuntimeError("effort command rejected")
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()
@@ -304,7 +306,10 @@ class TestLLMPoolEffort:
             result = await pool._create_worker()
 
         worker_type.assert_called_once_with(
-            sandbox_mode="auto", effort="high", acp_backend=ACP_BACKEND_KIRO
+            sandbox_mode="auto",
+            effort="high",
+            acp_backend=ACP_BACKEND_KIRO,
+            config_snapshot={},
         )
         assert result is fake_worker
 
@@ -492,7 +497,7 @@ class TestAcpWorkerEffortModelGate:
         client._model = "auto"
         with (
             patch("pathlib.Path.home", return_value=tmp_path),
-            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+            patch("kiro_crew.knowledge.llm_pool.create_acp_worker_client", return_value=client),
         ):
             worker = AcpWorker(effort="high")
             await worker.start()

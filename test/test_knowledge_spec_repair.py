@@ -257,7 +257,7 @@ async def _start(
     monkeypatch: pytest.MonkeyPatch, work_dir: Path
 ) -> tuple[AcpWorker, list[acp_client.AcpClient]]:
     made: list[acp_client.AcpClient] = []
-    monkeypatch.setattr(llm_pool, "AcpClient", _client_factory(work_dir, made))
+    monkeypatch.setattr(llm_pool, "create_acp_worker_client", _client_factory(work_dir, made))
     worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO, sandbox_mode="auto")
     await worker.start()
     return worker, made
@@ -308,7 +308,7 @@ class TestKnowledgeWorkerOnAnInjectedSpec:
 
         monkeypatch.setattr(auto_approve, "write_governed_spec", refuse)
         made: list[acp_client.AcpClient] = []
-        monkeypatch.setattr(llm_pool, "AcpClient", _client_factory(workspace, made))
+        monkeypatch.setattr(llm_pool, "create_acp_worker_client", _client_factory(workspace, made))
         worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO, sandbox_mode="auto")
 
         with pytest.raises(RuntimeError, match="could not be confirmed"):
@@ -344,7 +344,9 @@ class TestTheConfirmationReadsThePublishedAlias:
 
         made: list[acp_client.AcpClient] = []
         monkeypatch.setattr(
-            llm_pool, "AcpClient", _client_factory(workspace, made, after_publication=add_a_server)
+            llm_pool,
+            "create_acp_worker_client",
+            _client_factory(workspace, made, after_publication=add_a_server),
         )
         worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO, sandbox_mode="auto")
 
@@ -376,7 +378,9 @@ class TestTheConfirmationReadsThePublishedAlias:
 
         made: list[acp_client.AcpClient] = []
         monkeypatch.setattr(
-            llm_pool, "AcpClient", _client_factory(workspace, made, after_publication=reformat)
+            llm_pool,
+            "create_acp_worker_client",
+            _client_factory(workspace, made, after_publication=reformat),
         )
         worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO, sandbox_mode="auto")
 
@@ -406,7 +410,7 @@ class TestTheRepairRunsBeforeEverySpawn:
             "_repair_agent_spec",
             lambda tolerate=False: calls.append(f"repair tolerate={tolerate}") or False,
         )
-        monkeypatch.setattr(llm_pool, "AcpClient", MagicMock(return_value=client))
+        monkeypatch.setattr(llm_pool, "create_acp_worker_client", MagicMock(return_value=client))
 
         await AcpWorker(acp_backend=ACP_BACKEND_KIRO, sandbox_mode="auto").start()
 
@@ -426,7 +430,7 @@ class TestTheRepairRunsBeforeEverySpawn:
             "_repair_agent_spec",
             lambda tolerate=False: calls.append(f"repair tolerate={tolerate}") or False,
         )
-        monkeypatch.setattr(llm_pool, "AcpClient", MagicMock(return_value=client))
+        monkeypatch.setattr(llm_pool, "create_acp_worker_client", MagicMock(return_value=client))
 
         await AcpWorker(acp_backend=ACP_BACKEND_OPENCODE, sandbox_mode="auto").start()
 
@@ -682,7 +686,7 @@ class TestARegisteredInjection:
 
         monkeypatch.setattr(auto_approve, "write_governed_spec", refuse)
         made: list[acp_client.AcpClient] = []
-        monkeypatch.setattr(llm_pool, "AcpClient", _client_factory(workspace, made))
+        monkeypatch.setattr(llm_pool, "create_acp_worker_client", _client_factory(workspace, made))
         worker = AcpWorker(acp_backend=ACP_BACKEND_KIRO, sandbox_mode="auto")
 
         with pytest.raises(RuntimeError, match="could not be confirmed"):
