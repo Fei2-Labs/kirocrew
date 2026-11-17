@@ -1164,6 +1164,12 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # later agent-session injection is the registered output boundary.
         "monitoring/github_pull_request.py",
         "monitoring/pull_request.py",
+        # Catalog probing redacts child stderr for classification and logging,
+        # but returns only fixed error text; the stderr itself is not served.
+        "dashboard/handlers/agents_kiro_catalog.py",
+        # Legacy import normalizes persisted history before it enters the
+        # coordinator; the later parent-session delivery is the egress sink.
+        "run_coordinator/legacy.py",
         # Computer use: the redaction pass runs on third-party desktop content
         # (window titles, accessibility values) on its way INTO the model's
         # context, exactly like the MCP tool-result paths above. `policy.py` owns
@@ -1180,7 +1186,6 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         "mcp_shared_calls.py",
         "mcp_shared_dispatch.py",
         "mcp_shared_policy.py",
-        "dashboard/handlers/agents.py",
         # The agents handlers composed into dashboard/handlers/agents.py, in the
         # same class as that facade and the dashboard handlers around it: the
         # config and template-pane reads mask `oauth.clientSecret`, and the
