@@ -147,7 +147,7 @@ _EXPORTS.update(
 # Excluded from the mirror, so bind the control-plane (external-agent) handoff
 # schema at runtime: the dashboard's same-named move-a-session schema is a
 # different tool, imported from ``messaging_session_schemas`` by its registry.
-SESSION_HANDOFF_SCHEMA = _importlib.import_module(
+SESSION_HANDOFF_SCHEMA: ToolSchema = _importlib.import_module(
     "kiro_crew.validation_parts.core_turn_schemas"
 ).SESSION_HANDOFF_SCHEMA
 _EXPORTS["SESSION_HANDOFF_SCHEMA"] = "kiro_crew.validation_parts.core_turn_schemas"
@@ -299,7 +299,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         NOTHING_TO_DO_SCHEMA,
         REQUEST_SERVER_SCHEMA,
         RESET_CONVERSATION_SCHEMA,
-        SESSION_HANDOFF_SCHEMA,
         SET_PROJECT_SCHEMA,
         SKILL_DISCOVER_SCHEMA,
         SKILL_FETCH_SCHEMA,
@@ -426,7 +425,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _reject_unsupported_keywords,
         validate_mcp_tool_arguments,
     )
-    from kiro_crew.validation_parts.messaging_session_schemas import (  # noqa: F401
+    from kiro_crew.validation_parts.messaging_session_schemas import (
         _CHANNEL_TARGET_INCOMPATIBLE,
         _CREW_RE,
         _EMOJI_NAME_RE,
@@ -458,7 +457,11 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         SESSION_END_WAIT_SCHEMA,
         SESSION_FORK_SCHEMA,
         SESSION_GENERATE_TITLE_SCHEMA,
+    )
+    from kiro_crew.validation_parts.messaging_session_schemas import (  # noqa: F401
         SESSION_HANDOFF_SCHEMA as SESSION_HANDOFF_TARGET_SCHEMA,
+    )
+    from kiro_crew.validation_parts.messaging_session_schemas import (
         SESSION_HISTORY_LIST_SCHEMA,
         SESSION_PALETTE_SIZE,
         SESSION_READ_MESSAGE_SCHEMA,

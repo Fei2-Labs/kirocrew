@@ -14,7 +14,6 @@ import os
 import sys
 import threading
 import time
-
 from pathlib import Path
 
 from kiro_crew.config.paths import CONFIG_DIR_NAME, RUN_COORDINATOR_DIR_NAME, config_dir

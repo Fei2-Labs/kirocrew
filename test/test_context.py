@@ -1447,13 +1447,14 @@ class TestLoadAgentPrompt:
             encoding="utf-8",
         )
         monkeypatch.setattr(
-            "kiro_crew.context._agent_spec_candidates",
-            lambda _agent, _project=None: [spec],
+            "kiro_crew.member_essential_context.resolve_template_path",
+            lambda _agent, _project=None: spec,
         )
         # The stub forwards **kw because the reader takes keyword-only SEL
         # attribution labels this test does not care about.
-        # The reader lives in ``agent_discovery`` and is imported at call time.
-        monkeypatch.setattr("kiro_crew.agent_discovery._read_agent_spec", lambda _path, **kw: None)
+        monkeypatch.setattr(
+            "kiro_crew.member_essential_context._read_agent_spec", lambda _path, **kw: None
+        )
 
         assert ContextBuilder._load_agent_prompt("reviewer") == ""
 
@@ -1469,8 +1470,8 @@ class TestLoadAgentPrompt:
         )
         monkeypatch.setattr(hooks, "MAX_FILE_BYTES", 8)
         monkeypatch.setattr(
-            "kiro_crew.context._agent_spec_candidates",
-            lambda _agent, _project=None: [spec],
+            "kiro_crew.member_essential_context.resolve_template_path",
+            lambda _agent, _project=None: spec,
         )
 
         assert ContextBuilder._load_agent_prompt("reviewer") == ""

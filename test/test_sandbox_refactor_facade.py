@@ -363,7 +363,7 @@ _MOVED: dict[str, tuple[str, ...]] = {
         """.split()),
     "kiro_crew.sandbox_spawn": tuple("""
         corroborate_launcher_refusal credential_mask_applies spawn_delegates_masking
-        unconfined_live_agent_pid wrap_argv_async _SPAWN_SCRUB_ENV_PREFIXES scrub_env
+        unconfined_live_agent_pid wrap_argv_async scrub_env
         agent_env_scrub_prefixes scrub_agent_denied_env scrub_agent_subprocess_env
         sandboxed_spawn_argv shielded_prepare_off_loop sandboxed_spawn_argv_async
         _CGROUP_SCOPE_BUS_ENV_KEYS cgroup_scope_bus_env without_python_env

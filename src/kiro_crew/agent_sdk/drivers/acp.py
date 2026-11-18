@@ -1144,6 +1144,8 @@ def copilot_resolves() -> bool:
     from kiro_crew.acp.client import _resolve_copilot_bin
 
     return bool(_resolve_copilot_bin())
+
+
 def codex_adapter_disk_install() -> tuple[str, str]:
     """The codex-acp entry the spawn resolves, and its ``version`` from package.json.
 

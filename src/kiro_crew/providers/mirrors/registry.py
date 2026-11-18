@@ -309,24 +309,6 @@ PROJECTIONS: dict[str, McpProjection] = {
         # (providers/mirrors/opencode.py::opencode_projection).
         per_tool_deny=PerToolDeny.SETTINGS_FILE,
     ),
-    # Every selectable backend needs an explicit MCP projection declaration;
-    # projection_for() refuses one with neither a mirror nor a declaration.
-    ACP_BACKEND_COPILOT: McpProjection(
-        kind=ProjectionKind.NO_CHANNEL,
-        channel="the ``session/new`` ``mcpServers`` array (``acp/spec_servers.py``)",
-        tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
-        reason=(
-            "copilot is SELECTABLE here, so this is a decision and not a gap. Its "
-            "routing is Routing.PERMISSION_REQUEST: it asks Kiro Crew per tool call, so "
-            "the PreToolUse gate sees the operations themselves and needs nothing "
-            "pre-declared. Crew writes NO native copilot config file — the prompt, "
-            "tools and MCP servers all arrive on session/new through the generic "
-            "AcpClient._spec_session_mcp_servers array, gated on tool_gate's routed "
-            "verdict — so the session array IS the whole surface and there is no second "
-            "representation to keep in step. A native-config write would be the mirror; "
-            "adding one belongs here"
-        ),
-    ),
     ACP_BACKEND_PI: McpProjection(
         kind=ProjectionKind.BROKER_ONLY,
         reason=(

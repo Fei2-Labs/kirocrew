@@ -317,8 +317,6 @@ class TestConsolidateCmd:
         assert "no unconsolidated messages, skipping" in captured.out
 
 
-
-
 class TestGatewayExpireWiring:
     """Verify on_session_expire attribute is settable on a real SessionManager."""
 
@@ -403,9 +401,16 @@ class TestConsolidateCmdExceptionPath:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_all_reports_each_failed_key_and_exits_1(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         """One failed key in an --all run is named on stderr and fails the run.
 
@@ -452,9 +457,16 @@ class TestConsolidateCmdExceptionPath:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_finished_and_skipped_keys_exit_0(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         """A key that finishes and a key with nothing to do keep today's output."""
         sessions_dir = self._make_session_file(tmp_path, "good")
@@ -484,9 +496,16 @@ class TestConsolidateCmdExceptionPath:
     @patch("kiro_crew.cli.ConversationLog")
     @patch("kiro_crew.cli.KiroCrewConfig")
     def test_consolidate_sensitive_session_skip_exits_0(
-        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
-        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
-        tmp_path, capsys,
+        self,
+        mock_cfg_cls,
+        mock_log_cls,
+        mock_consolidator_cls,
+        mock_mem_cls,
+        mock_sess_cls,
+        mock_skills_cls,
+        mock_sel,
+        tmp_path,
+        capsys,
     ):
         """consolidate_now's deliberate sensitive-session skip is a skip, not a failure.
 
@@ -553,7 +572,6 @@ class TestExpireIdleSelFailure:
         # The real reset ran: the entry left the map.
         assert "expired-sel" not in sm._sessions
         callback.assert_not_called()
-
 
 
 @pytest.mark.usefixtures("fake_vector_store")

@@ -32,7 +32,6 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STEER_CONCURRENT_PROMPT,
     ACP_BACKENDS_STEERING_REQUEST,
-    METHOD_SESSION_STEER,
 )
 
 ALL_BACKENDS = sorted(ACP_BACKENDS_KNOWN)
@@ -96,8 +95,7 @@ def test_supports_steer_is_declared_not_inferred(backend: str, tmp_path: Any) ->
         backend in ACP_BACKENDS_STEER
         or backend in ACP_BACKENDS_STEER_CONCURRENT_PROMPT
         or (
-            backend in ACP_BACKENDS_STEERING_REQUEST
-            and backend in _CLIENT_STEERING_REQUEST_METHODS
+            backend in ACP_BACKENDS_STEERING_REQUEST and backend in _CLIENT_STEERING_REQUEST_METHODS
         )
     )
     assert client.supports_steer is expected
@@ -135,7 +133,7 @@ async def test_kas_steer_sends_the_measured_method(tmp_path: Any) -> None:
     client._send_request = AsyncMock(return_value=7)
     assert await client.steer("focus on the tests") is True
     client._send_request.assert_awaited_once_with(
-        METHOD_SESSION_STEER,
+        "_session/steer",
         {
             "sessionId": "kas-session",
             "message": "<user_message>\nfocus on the tests\n</user_message>",

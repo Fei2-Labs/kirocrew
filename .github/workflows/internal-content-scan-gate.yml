@@ -49,10 +49,13 @@ jobs:
   scan:
     # Same-repo events only. A fork PR has no OIDC token, so scanning it is
     # impossible rather than merely inconvenient; skipping is honest, and failing
-    # would be a permanent block on every fork contribution.
+    # would be a permanent block on every fork contribution. A copy of this file
+    # in another repository has no access to the ruleset bucket either, so it
+    # skips there the same way.
     if: >-
+      github.repository == 'kirodotdev/KiroCrew' && (
       github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository)
     uses: ./.github/workflows/internal-content-scan.yml
     # These have to be granted HERE. A reusable workflow's token permissions are
     # capped by the calling job and the callee cannot elevate them, so a caller

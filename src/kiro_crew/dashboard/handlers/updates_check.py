@@ -17,13 +17,13 @@ import logging
 import os
 import re
 import time
+from typing import cast
 
 import aiohttp
 from aiohttp import web
 
 from kiro_crew import __version__ as _local_version
-from kiro_crew import fork_version, platform_compat
-from kiro_crew import platform_compat, update_next_start, update_restart_ready
+from kiro_crew import fork_version, platform_compat, update_next_start, update_restart_ready
 from kiro_crew.changelog import release_of_build
 from kiro_crew.config.loader import (  # noqa: F401 - overlay_pins: the updates facade serves it
     KiroCrewConfig,
@@ -282,8 +282,8 @@ def status_update_fields(next_start: dict[str, object] | None = None) -> dict[st
         "fork_dirty": revision[1] if revision else False,
         "update_fork_suppressed": bool(_update_info.get("fork_suppressed")),
         "upstream_version": str(_update_info.get("upstream_version") or ""),
-        "fork_ahead_of_upstream": int(_update_info.get("fork_ahead_of_upstream") or 0),
-        "fork_behind_upstream": int(_update_info.get("fork_behind_upstream") or 0),
+        "fork_ahead_of_upstream": int(cast(int, _update_info.get("fork_ahead_of_upstream") or 0)),
+        "fork_behind_upstream": int(cast(int, _update_info.get("fork_behind_upstream") or 0)),
         "fork_sync_available": bool(_update_info.get("fork_sync_available")),
     }
 
@@ -742,9 +742,7 @@ async def _check_git_checkout(proj: str, capability: UpdateCapability) -> None:
         changes = "\n".join(lines).strip()
 
     try:
-        upstream_fields = await _fork_upstream_probe(
-            proj, git=git, env=env, fork_tip=remote_sha
-        )
+        upstream_fields = await _fork_upstream_probe(proj, git=git, env=env, fork_tip=remote_sha)
     except Exception:
         # Advisory only: a probe failure must never fail the check that feeds
         # the fleet's real update verdict.
@@ -827,8 +825,12 @@ async def _version_at_sha(proj: str, sha: str, *, git: str, env: dict[str, str])
     commit. ``""`` means the version could not be read at all.
     """
     init = await _git_read(
-        proj, "show", "--no-textconv", f"{sha}:src/kiro_crew/__init__.py",
-        git=git, env=env,
+        proj,
+        "show",
+        "--no-textconv",
+        f"{sha}:src/kiro_crew/__init__.py",
+        git=git,
+        env=env,
     )
     if init is None:
         return ""
@@ -837,15 +839,18 @@ async def _version_at_sha(proj: str, sha: str, *, git: str, env: dict[str, str])
         return ""
     literal = match.group(1)
     stamped = await _git_read(
-        proj, "show", "--no-textconv", f"{sha}:{_BUILD_VERSION_SPEC}",
-        git=git, env=env,
+        proj,
+        "show",
+        "--no-textconv",
+        f"{sha}:{_BUILD_VERSION_SPEC}",
+        git=git,
+        env=env,
     )
     if stamped is not None:
         candidate = stamped.strip()
         suffix = candidate[len(literal) :] if candidate.startswith(literal) else ""
         if candidate == literal or (
-            _BARE_RELEASE_RE.fullmatch(literal)
-            and _BUILD_SUFFIX_RE.fullmatch(suffix)
+            _BARE_RELEASE_RE.fullmatch(literal) and _BUILD_SUFFIX_RE.fullmatch(suffix)
         ):
             return candidate
     return literal
@@ -871,15 +876,19 @@ async def _fork_upstream_probe(
         "fork_behind_upstream": 0,
         "fork_sync_available": False,
     }
-    url = await _git_read(
-        proj, "config", "--get", "remote.upstream.url", git=git, env=env
-    )
+    url = await _git_read(proj, "config", "--get", "remote.upstream.url", git=git, env=env)
     if not url or not url.strip():
         return fields
     # ``ls-remote --symref`` answers "ref: refs/heads/<b>\tHEAD" plus the sha.
     head = await _git_read(
-        proj, "ls-remote", "--symref", "upstream", "HEAD",
-        git=git, env=env, timeout=30,
+        proj,
+        "ls-remote",
+        "--symref",
+        "upstream",
+        "HEAD",
+        git=git,
+        env=env,
+        timeout=30,
     )
     if not head:
         return fields
@@ -898,15 +907,15 @@ async def _fork_upstream_probe(
     # count_divergence() always measures HEAD; the probe's subject is the
     # fork tip (remote_sha), so compose the same rev-list args directly.
     revs = await _git_read(
-        proj, *divergence_count_args(upstream_sha, head=fork_tip),
-        git=git, env=env,
+        proj,
+        *divergence_count_args(upstream_sha, head=fork_tip),
+        git=git,
+        env=env,
     )
     counts = parse_divergence_counts(revs or "")
     if counts is None:
         return fields
-    fields["upstream_version"] = await _version_at_sha(
-        proj, upstream_sha, git=git, env=env
-    )
+    fields["upstream_version"] = await _version_at_sha(proj, upstream_sha, git=git, env=env)
     fields["fork_ahead_of_upstream"] = counts.ahead
     fields["fork_behind_upstream"] = counts.behind
     fields["fork_sync_available"] = counts.behind > 0

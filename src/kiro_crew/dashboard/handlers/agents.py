@@ -26,12 +26,11 @@ import copy  # noqa: F401
 import dataclasses
 import functools
 import hashlib  # noqa: F401
-import json
+import json  # noqa: F401  (agent_admin owners composed here read it)
 import logging
-import os
+import os  # noqa: F401  (agent_admin owners composed here read it)
 import re
 import stat  # noqa: F401
-import subprocess
 import time
 import uuid
 from collections.abc import Sequence  # noqa: F401
@@ -79,7 +78,6 @@ from kiro_crew.agent_files import (  # noqa: F401
     DASHBOARD_AUTHOR_AGENT_FILENAME,
     KAS_RESERVED_AGENT_IDS,
 )
-from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import (  # noqa: F401 - selectable_backend_values is a facade name
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
@@ -94,11 +92,10 @@ from kiro_crew.agent_sdk.backends import (  # noqa: F401 - selectable_backend_va
     selectable_stored_backend_values,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for, capabilities_of
-from kiro_crew.agent_sdk.drivers.acp import (
+from kiro_crew.agent_sdk.drivers.acp import (  # noqa: F401 - facade names
     EntitlementRevalidating,
     advertised_model_ids,
     catalog_row_would_drop,
-    is_auth_failure_output,
     model_is_unusable,
     resolve_kiro_bin_for_spawn,
     resolve_pin_spelling,
@@ -348,16 +345,22 @@ from kiro_crew.dashboard.handlers.source_providers import (  # noqa: F401
     owner_view_for_request,
 )
 from kiro_crew.dashboard.kas_local_commands import local_harness_menu
-from kiro_crew.dashboard.kiro_readiness import (
+from kiro_crew.dashboard.kiro_readiness import (  # noqa: F401 - the code is a facade name
     KIRO_PREREQUISITE_REQUIRED_CODE,
     kiro_latched_ready,
     reject_if_kiro_unverified,
 )
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES  # noqa: F401
-from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
+from kiro_crew.executors import (  # noqa: F401 - facade names
+    discovery_executor,
+    maintenance_executor,
+    subprocess_executor,
+)
 from kiro_crew.external_text import redact_external_text as _redact_external  # noqa: F401
-from kiro_crew.kiro_prerequisite import spawn_supervised_oneshot
+from kiro_crew.kiro_prerequisite import (  # noqa: F401 - agents_kiro_catalog reads it here
+    spawn_supervised_oneshot,
+)
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.member_workspace import (  # noqa: F401
     AUTO_WORKSPACE,
@@ -378,7 +381,7 @@ from kiro_crew.memory_stores import (  # noqa: F401
 )
 from kiro_crew.platform.governance import sanitize_agent_config_governance  # noqa: F401
 from kiro_crew.platform_compat import is_link_or_junction, kill_and_reap  # noqa: F401
-from kiro_crew.sandbox import (
+from kiro_crew.sandbox import (  # noqa: F401 - agents_kiro_catalog reads cgroup_scope_argv here
     SandboxUnavailableError,
     cgroup_scope_argv,
     configured_sandbox_mode,

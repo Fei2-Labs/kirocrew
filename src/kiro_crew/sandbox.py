@@ -640,7 +640,6 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         _CGROUP_SCOPE_BUS_ENV_KEYS,
         _NAMESPACE_LAUNCHERS,
         _NAMESPACE_LAUNCHERS_LOCK,
-        _SPAWN_SCRUB_ENV_PREFIXES,
         _namespace_launcher_child_is_confined,
         _sensitive_env_prefixes,
         _spawn_scrub_env_prefixes,
@@ -821,9 +820,9 @@ if TYPE_CHECKING:  # the forwarded names, visible to type checkers and IDEs
         voice_runtime_workspace_conflict,
     )
     from kiro_crew.sandbox_wrap import (  # noqa: F401
+        _INHERITED_USERNS_FAILURE_ENV,
         CONFIG_DIR_NAME,
         RUN_COORDINATOR_DIR_NAME,
-        _INHERITED_USERNS_FAILURE_ENV,
         _backend,
         _background_warm,
         _holds_inherited_unshare_failure,

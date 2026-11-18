@@ -19,7 +19,6 @@ import re
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
 from typing import Any
 
 from aiohttp import web
@@ -46,8 +45,8 @@ def _parse_tag(tag: str) -> tuple[str, str] | None:
 
 async def _fetch_latest_release() -> dict[str, Any]:
     """Fetch the latest GitHub Release metadata (off the event loop)."""
-    import urllib.request
     import json
+    import urllib.request
 
     def _get() -> dict[str, Any]:
         req = urllib.request.Request(RELEASES_API, headers={"Accept": "application/json"})
@@ -69,6 +68,7 @@ def _current_fork_sha() -> str:
     """The short sha of this build's fork revision, or empty string."""
     try:
         from kiro_crew._build_info import FORK_REVISION
+
         return FORK_REVISION or ""
     except ImportError:
         return ""
@@ -86,8 +86,10 @@ async def _wheel_lane_refusal() -> dict[str, Any] | None:
     clobbered checkout at worst. Both probes shell out or read pinned policy,
     so they run off the event loop together.
     """
+
     def _probe() -> tuple[Any, Any]:
         from kiro_crew.platform.update_provider import resolve_provider
+
         return derive_capability(), resolve_provider()
 
     try:
@@ -144,22 +146,27 @@ async def api_update_fork_check(request: web.Request) -> web.Response:
         release = await _fetch_latest_release()
     except Exception as exc:
         logger.warning("fork update check failed: %s", exc)
-        return web.json_response({"available": False, "error": str(exc)}, status=502)
+        return web.json_response(
+            {"available": False, "error": str(exc), "code": "fork_release_fetch_failed"},
+            status=502,
+        )
 
     tag = release.get("tag_name", "")
     if not _parse_tag(tag):
         return web.json_response({"available": False, "error": f"unrecognized tag: {tag}"})
 
     available, remote_version, remote_sha = _release_is_newer(tag)
-    return web.json_response({
-        "available": available,
-        "current_version": kiro_crew.__version__,
-        "current_sha": _current_fork_sha(),
-        "remote_version": remote_version,
-        "remote_sha": remote_sha,
-        "remote_tag": tag,
-        "release_url": release.get("html_url", ""),
-    })
+    return web.json_response(
+        {
+            "available": available,
+            "current_version": kiro_crew.__version__,
+            "current_sha": _current_fork_sha(),
+            "remote_version": remote_version,
+            "remote_sha": remote_sha,
+            "remote_tag": tag,
+            "release_url": release.get("html_url", ""),
+        }
+    )
 
 
 async def api_update_fork_apply(request: web.Request) -> web.Response:
@@ -172,7 +179,11 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
     refusal = await _wheel_lane_refusal()
     if refusal is not None:
         return web.json_response(
-            {"ok": False, "error": f"release-lane update refused: managed_by={refusal['managed_by']}"},
+            {
+                "ok": False,
+                "error": f"release-lane update refused: managed_by={refusal['managed_by']}",
+                "code": "fork_update_refused_managed",
+            },
             status=409,
         )
 
@@ -180,7 +191,9 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
         release = await _fetch_latest_release()
     except Exception as exc:
         logger.error("fork update: cannot fetch release: %s", exc)
-        return web.json_response({"ok": False, "error": str(exc)}, status=502)
+        return web.json_response(
+            {"ok": False, "error": str(exc), "code": "fork_release_fetch_failed"}, status=502
+        )
 
     tag = release.get("tag_name", "")
     available, _, _ = _release_is_newer(tag)
@@ -188,14 +201,23 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
         # Same ordering gate as the check: a direct POST must not install a
         # release the check would have refused as older-or-equal.
         return web.json_response(
-            {"ok": False, "error": f"latest release {tag or '?'} is not newer than this build"},
+            {
+                "ok": False,
+                "error": f"latest release {tag or '?'} is not newer than this build",
+                "code": "fork_release_not_newer",
+            },
             status=409,
         )
 
     wheel_url = _find_wheel_url(release)
     if not wheel_url:
         return web.json_response(
-            {"ok": False, "error": "no wheel asset in latest release"}, status=404
+            {
+                "ok": False,
+                "error": "no wheel asset in latest release",
+                "code": "fork_release_no_wheel",
+            },
+            status=404,
         )
 
     logger.info("fork update: applying %s from %s", tag, wheel_url)
@@ -216,9 +238,13 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
 
         # Install
         cmd = [
-            python, "-m", "pip", "install",
+            python,
+            "-m",
+            "pip",
+            "install",
             "--break-system-packages",
-            "--force-reinstall", "--no-deps",
+            "--force-reinstall",
+            "--no-deps",
             wheel_path,
         ]
         try:
@@ -242,13 +268,17 @@ async def api_update_fork_apply(request: web.Request) -> web.Response:
     error = await asyncio.to_thread(_download_and_install)
     if error:
         logger.error("fork update install failed: %s", error)
-        return web.json_response({"ok": False, "error": error}, status=500)
+        return web.json_response(
+            {"ok": False, "error": error, "code": "fork_update_install_failed"}, status=500
+        )
 
     logger.info("fork update: installed %s; it goes live on the next start", tag)
 
-    return web.json_response({
-        "ok": True,
-        "installed_tag": tag,
-        "restart_required": True,
-        "message": "Installed. Restart the gateway to run it.",
-    })
+    return web.json_response(
+        {
+            "ok": True,
+            "installed_tag": tag,
+            "restart_required": True,
+            "message": "Installed. Restart the gateway to run it.",
+        }
+    )

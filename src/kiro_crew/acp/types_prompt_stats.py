@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from kiro_crew.acp.types import RefusalInfo, TurnUsage
+    from kiro_crew.acp.types import AcpRateLimit, RefusalInfo, TurnUsage
 
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,14 @@ class AcpPromptStats:
     # its first reading includes everything billed before this process. The
     # next reading is adopted as the baseline and bills nothing.
     cost_baseline_unknown: bool = False
+    # Plan rate-limit state for the ACCOUNT, from a usage_update's
+    # _meta["_claude/rateLimit"]. None until an adapter reports one. Unlike the
+    # context counts this is not a property of the transcript, so neither
+    # compaction nor a model switch invalidates it — only a newer frame replaces
+    # it, and `carry_over` keeps it across turns because the adapter emits it
+    # ONLY on change: dropping it at a turn boundary would blank a live quota
+    # reading until the user happened to cross another threshold.
+    rate_limit: "AcpRateLimit | None" = None
     # True while ``context_pct`` reads 0.0 only because a compaction dropped the
     # counts and no fresh telemetry has re-derived them. Distinguishes "the
     # transcript is empty" from "the transcript's size is unknown" — the two are
@@ -105,7 +113,9 @@ class AcpPromptStats:
 
         Event/tool/credit counters are per-turn and start at zero; the context
         state describes the SESSION and must survive the re-init, or every turn
-        boundary would re-report an empty context.
+        boundary would re-report an empty context. ``rate_limit`` survives for a
+        stronger reason: it describes the account, and its adapter sends it only
+        when the state changes, so a dropped value is not re-reported next turn.
         """
         return AcpPromptStats(
             context_pct=self.context_pct,
@@ -116,6 +126,7 @@ class AcpPromptStats:
             cost_session_usd=self.cost_session_usd,
             cost_baseline_sid=self.cost_baseline_sid,
             cost_baseline_unknown=self.cost_baseline_unknown,
+            rate_limit=self.rate_limit,
         )
 
     def reset_context_state(self) -> None:
@@ -138,6 +149,12 @@ class AcpPromptStats:
         session in place" — which the background-session recycle decision reads
         as a recycle-now signal (``pct == 0.0 and unknown``); a just-claimed
         provider must not match that predicate.
+
+        ``rate_limit`` is deliberately NOT cleared — it is not context state.
+        The re-bind swaps which conversation the runtime serves, not which
+        account it bills, so the last known quota reading still describes the
+        new session; and since the adapter re-sends it only on change, clearing
+        it here would blank the reading for the rest of the process's life.
         """
         self.context_pct = 0.0
         self.context_used_tokens = 0
@@ -445,5 +462,3 @@ class AcpPromptStats:
         else:
             self.context_window_tokens = 0
             self.context_pct = 0.0
-
-

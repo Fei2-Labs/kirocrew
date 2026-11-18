@@ -37,57 +37,33 @@ class TestSpecAdapterLabelSet:
 
 
 class TestSkillsInjectionPlan:
-    def test_a_custom_agent_with_globs_injects_only_on_a_spec_adapter(self) -> None:
+    def test_a_custom_agent_injects_the_same_on_every_backend(self) -> None:
         """kiro-cli loads the agent's own skill globs; a spec adapter cannot.
 
-        So the injection is what keeps a custom agent's skills reachable there.
+        The plan therefore must not narrow on the vendor flag: a Claude-only
+        gate is how Codex and the other spec adapters would silently lose a
+        custom agent's skills.
         """
-        inject_spec, globs_spec = _skills_injection_plan("some-agent", is_spec_adapter=True)
-        inject_kiro, globs_kiro = _skills_injection_plan("some-agent", is_spec_adapter=False)
-        # Same globs resolved either way; only the injection decision differs.
-        assert globs_spec == globs_kiro
-        if globs_spec:
-            assert inject_spec is True
-            assert inject_kiro is False
+        claude = _skills_injection_plan("some-agent", is_cc=True)
+        other = _skills_injection_plan("some-agent", is_cc=False)
+        assert claude == other
 
     def test_the_default_agent_injects_regardless_of_backend(self) -> None:
         """Kiro Crew's own agent has no spec-provided globs to defer to."""
-        assert _skills_injection_plan(None, is_spec_adapter=False)[0] is True
-        assert _skills_injection_plan(None, is_spec_adapter=True)[0] is True
-
-    def test_the_parameter_is_named_for_the_dialect_not_the_vendor(self) -> None:
-        """Guards the rename from coming undone.
-
-        The old name (is_cc) invited the next reader to treat a dialect question
-        as claude-specific, which is how Codex would silently lose its skills.
-        """
-        import inspect
-
-        signature = inspect.signature(_skills_injection_plan)
-        assert "is_spec_adapter" in signature.parameters
-        assert "is_cc" not in signature.parameters
+        assert _skills_injection_plan(None, is_cc=False)[0] is True
+        assert _skills_injection_plan(None, is_cc=True)[0] is True
 
 
 class TestBrandingStaysClaudeOnly:
-    def test_build_message_keeps_a_separate_branding_flag(self) -> None:
+    def test_only_the_claude_label_is_claude_code(self) -> None:
         """The persona rewrite must not widen to every spec adapter.
 
         Rewriting kiro-cli branding to Claude's wording on a Codex session would
-        tell the user they are talking to the wrong product.
-
-        Pinned at the named constant rather than the bare ``"claude_code"``
-        literal: the gate is unchanged and still compares one exact session-map
-        label, and ``provider_identity.py``'s own note prefers the constant over
-        a literal for that label. The bite is the same either way -- a widening
-        of branding would have to replace this comparison with a set or a
-        dialect test, and this assertion is what fails when it does.
+        tell the user they are talking to the wrong product, so the gate that
+        selects it answers True for the one Claude label only.
         """
-        import inspect
+        from kiro_crew.agent_sdk.provider_identity import is_claude_code
 
-        from kiro_crew.acp.types import PROVIDER_LABEL_CLAUDE
-        from kiro_crew.context import ContextBuilder
-
-        assert PROVIDER_LABEL_CLAUDE == "claude_code"
-        source = inspect.getsource(ContextBuilder.build_message)
-        assert "provider_type == PROVIDER_LABEL_CLAUDE" in source, "branding must stay claude-only"
-        assert "is_spec_adapter_provider_label" in source, "skills must widen"
+        assert is_claude_code(PROVIDER_LABEL_CLAUDE)
+        for label in (PROVIDER_LABEL_CODEX, PROVIDER_LABEL_DEFAULT, PROVIDER_LABEL_KAS):
+            assert not is_claude_code(label)

@@ -38,7 +38,6 @@ import os
 import shlex
 import sys
 import urllib.parse
-from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 from kiro_crew import platform_compat

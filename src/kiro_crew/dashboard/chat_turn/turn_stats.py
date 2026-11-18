@@ -11,6 +11,7 @@ import math
 import time
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
+from kiro_crew.agent_sdk import context_provider_of
 from kiro_crew.dashboard.cache_rewrite import note_turn_cache
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.state import row_mid
@@ -179,6 +180,23 @@ def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
         payload["window_tokens"] = window
     else:
         payload["reset"] = True
+    # Plan rate limit (claude-agent-acp's `_meta["_claude/rateLimit"]`), attached
+    # to this frame rather than given its own event: it rides the same
+    # usage_update the context counts come from, refreshes on the same cadence,
+    # and lands in the same popover. Omitted entirely when the provider reports
+    # none, so the key's PRESENCE is the frontend's "this harness has a quota"
+    # signal — an empty dict would render a header over no rows. The `reset`
+    # branch above does not clear it: a compaction changes the transcript, not
+    # the account's quota.
+    #
+    # Read through the ABC-declared accessor once agent_sdk's positive provider
+    # admission accepts the client, not through a `hasattr` capability probe
+    # (H8). The dict check keeps an unspecced test double's Mock return (truthy,
+    # not JSON-serializable) out of a live WS frame.
+    if context_provider_of(client) is not None:
+        rate_limit = client.rate_limit_payload()
+        if isinstance(rate_limit, dict) and rate_limit:
+            payload["rate_limit"] = rate_limit
     return payload
 
 

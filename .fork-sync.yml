@@ -121,8 +121,12 @@ conflict_policy:
   - glob: ".github/workflows/**"
     policy: upstream_wins
     note: |
-      The only fork-side edits here are dependabot action-version bumps, which
-      dependabot re-opens if the merge drops them. Do NOT hand-carry them.
+      Fork-side edits here are dependabot action-version bumps, which
+      dependabot re-opens if the merge drops them -- do NOT hand-carry them --
+      and the `github.repository == 'kirodotdev/KiroCrew'` guards (#58) that
+      skip lanes needing upstream's runner group, OIDC roles or ruleset bucket.
+      Re-apply those guards after taking upstream; the hosted-exception pins in
+      test/test_ci_fleet_routing_expression_parity.py fail when one is lost.
       EXCEPT sync-upstream.yml, which is fork-only (see the next rule).
   - glob: ".github/workflows/sync-upstream.yml"
     policy: fork_wins
@@ -410,10 +414,10 @@ divergences:
 
   - id: spec-adapter-agent-resources
     what: |
-      `context._agent_spec_candidates`, `_load_agent_file_resources`, and the
-      spec-adapter context gate load a named agent's project-first `file://`
-      resources through the shared hardened spec reader. `_load_agent_prompt`
-      uses the same candidates so a project agent shadows its global namesake.
+      `_load_agent_prompt` and the spec-adapter context gate load a named
+      agent's project-first spec through the shared hardened spec reader
+      (`member_essential_context.read_template_spec` →
+      `resolve_template_path`), so a project agent shadows its global namesake.
     why: |
       Public-spec adapters do not read Kiro agent specs. Losing this seam leaves
       custom resources and project prompts silently absent while the Kiro path
@@ -805,7 +809,19 @@ divergences:
     decided: 2026-08-31
 
   - id: copilot-permission-request-row
+    status: retired
     what: |
+      RETIRED 2026-11-17. Upstream now ships its own copilot rows:
+      `ACP_BACKEND_COPILOT: Routing.SESSION_CONFIG` in
+      `agent_sdk/backends_routing.py` (Copilot CLI states its allow-all switch
+      as an ACP session config option) and a `ProjectionKind.MIRROR` entry in
+      `providers/mirrors/registry.py`. The sync kept both the fork's row and
+      upstream's in each dict literal; the later key (upstream's) was the one
+      in effect, and flake8 F602 failed Backend Lint on the duplicate. The
+      fork's `PERMISSION_REQUEST` row and its `NO_CHANNEL` projection are
+      deleted; the `Routing.PERMISSION_REQUEST` member and its
+      `tool_gate.routing_verdict` branch remain, with no row selecting them.
+    superseded_what: |
       Upstream's re-verified `agent_sdk/backends_routing.py` vocabulary has no
       "the adapter asks natively" member, so its table carries no copilot row.
       The fork restores the `PERMISSION_REQUEST` member (upstream's OWN old
@@ -823,6 +839,7 @@ divergences:
       honest routing claim after any sync that rewrites the routing table.
     pinned_by: "test/test_acp_deepseek_backend_enforcement.py (the `ACP_BACKEND_ROUTING >= ACP_BACKENDS_KNOWN` exhaustiveness pin fails without the row)"
     decided: 2026-10-29
+    retired: 2026-11-17
 
   - id: session-pid-files-under-run
     what: |

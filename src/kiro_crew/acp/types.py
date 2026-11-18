@@ -1647,6 +1647,7 @@ REGISTRY_PROVIDER_LABEL_PREFIX = "acp:"
 RATE_LIMIT_STATES: tuple[str, ...] = ("allowed", "allowed_warning", "rejected")
 
 
+@dataclass(frozen=True)
 class AcpRateLimit:
     """Plan rate-limit state for the account behind the current session.
 

@@ -240,8 +240,8 @@ from kiro_crew.dashboard.chat_turn.session_reset import (
 )
 from kiro_crew.dashboard.chat_turn.slash_commands import (  # noqa: F401
     _answer_slash_without_channel,
-    _chat_turn_backend,
     _begin_compact_command,
+    _chat_turn_backend,
     _forwards_harness_command,
     _slash_command_backend,
     _turn_compact_command,

@@ -93,9 +93,10 @@ def register(app: web.Application) -> None:
     # Separate from the upstream update path which is permanently disabled for
     # fork builds.
     from kiro_crew.dashboard.handlers.updates_fork import (
-        api_update_fork_check,
         api_update_fork_apply,
+        api_update_fork_check,
     )
+
     app.router.add_get("/api/update/fork", api_update_fork_check)
     app.router.add_post("/api/update/fork", api_update_fork_apply)
     # Restart with no update. Sibling of /api/update rather than a mode of it:

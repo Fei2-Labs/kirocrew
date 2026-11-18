@@ -776,6 +776,7 @@ class TestGitCheckoutStillWorks:
             # the fleet shape these tests stand in for. Serving them from the
             # queue would shift every later entry one slot.
             if "BUILD_VERSION" in " ".join(str(a) for a in args):
+
                 class _Absent:
                     returncode = 128
 
@@ -784,6 +785,7 @@ class TestGitCheckoutStillWorks:
 
                 return _Absent()
             if "remote.upstream.url" in " ".join(str(a) for a in args):
+
                 class _Unset:
                     returncode = 1
 
