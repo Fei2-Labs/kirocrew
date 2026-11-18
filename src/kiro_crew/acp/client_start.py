@@ -73,6 +73,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
+    ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKENDS_FORK_AT_MESSAGE,
@@ -415,15 +416,18 @@ async def _spawn(self: AcpClient) -> None:
         # ONE thread hop. Guarded: the sandbox temp file is live, so a
         # cancellation here must not orphan it. The launch tail scrubs after
         # it, and KIRO_API_KEY stays available only to the positively
-        # identified Kiro backend.
+        # identified Kiro backend. EXACT kiro, not the ``_is_kiro`` dialect:
+        # KAS shares the dialect but takes its env defaults from
+        # ``KasHarness.apply_spawn_env`` on the runtime path.
         return await self._to_thread_guarding_sandbox(
-            functools.partial(_resolve_spawn_env, kiro_api_key=self._is_kiro), env
+            functools.partial(_resolve_spawn_env, kiro_api_key=self.backend == ACP_BACKEND_KIRO),
+            env,
         )
 
     def _env_after_scrub(env: dict[str, str]) -> None:
         # The auxiliary kiro-cli children never reach a harness's apply_spawn_env,
-        # so they are named here.
-        if self._is_kiro:
+        # so they are named here. Exact kiro, for the same reason as above.
+        if self.backend == ACP_BACKEND_KIRO:
             from kiro_crew.acp.harness._common import apply_client_application_env
 
             apply_client_application_env(env)
