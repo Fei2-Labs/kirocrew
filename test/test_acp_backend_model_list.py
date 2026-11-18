@@ -202,13 +202,13 @@ class TestEndpointContract:
 
         Counted as the whole assignment rather than the bare word: that pins both
         halves at once -- the key ships twice, and each value is READ from the
-        membership set instead of restated as a literal -- and prose explaining
+        membership seam instead of restated as a literal -- and prose explaining
         either cannot make the count drift.
         """
         import inspect
 
         source = inspect.getsource(agents_handler.api_models)
-        assert source.count('"serves_auto": _alt_backend in ACP_BACKENDS_AUTO_MODEL') == 2
+        assert source.count('"serves_auto": backend_serves_auto_model(_alt_backend)') == 2
 
 
 class TestAutoModelMembership:
