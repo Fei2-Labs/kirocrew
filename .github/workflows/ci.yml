@@ -455,8 +455,10 @@ jobs:
             # cancelled it. The consumers' own `|| 'ubuntu-latest'` cannot
             # rescue that: it fires only on an EMPTY output, and this one is
             # non-empty and unusable, which is strictly worse than absent.
-            echo "linux_runner=ubuntu-latest" >> "$GITHUB_OUTPUT"
-            echo "linux_runner_large=ubuntu-latest" >> "$GITHUB_OUTPUT"
+            # Pinned to 24.04, not `ubuntu-latest`: on Ubuntu 26.04 Playwright
+            # cannot install Chromium, which reds the E2E and i18n render jobs.
+            echo "linux_runner=ubuntu-24.04" >> "$GITHUB_OUTPUT"
+            echo "linux_runner_large=ubuntu-24.04" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Pick the Windows runner label

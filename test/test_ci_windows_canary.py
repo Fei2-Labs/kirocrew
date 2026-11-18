@@ -135,7 +135,7 @@ def test_real_resolver_shell_emits_large_and_hosted_fallback(
     # fork running its own CI gets the hosted image, because a label no runner
     # there carries would queue every consumer until GitHub cancelled it.
     group_label, hosted = {
-        "linux": ("kirocrew-linux-4-core", "ubuntu-latest"),
+        "linux": ("kirocrew-linux-4-core", "ubuntu-24.04"),
         "windows": ("kirocrew-windows-4-core", "windows-latest"),
     }[platform]
     fallback = group_label if in_repo else hosted
