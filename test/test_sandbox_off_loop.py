@@ -1,7 +1,6 @@
 """Tests for the sandbox off-loop shields: ``sandboxed_spawn_argv_off_loop``
-(the fork's original wrapper, still the direct chokepoint for three call
-sites) and ``shielded_prepare_off_loop`` (the shared shield every other site
-was consolidated onto).
+(the fork's original wrapper, kept as a public compatibility entry point)
+and ``shielded_prepare_off_loop`` (the shared shield every call site uses).
 
 Cancel-injection tests: verify that cancelling the awaiting coroutine while the
 worker is still inside ``sandboxed_spawn_argv`` recovers the cleanup path and
@@ -131,7 +130,7 @@ class TestSandboxOffLoopCancellation:
     @pytest.mark.asyncio
     async def test_cancel_during_hop_drops_launcher_via_shared_shield(self, tmp_path):
         """Same guarantee, through ``shielded_prepare_off_loop`` — the wrapper
-        every OTHER call site was consolidated onto."""
+        every call site was consolidated onto."""
         fake, entered, release, created = self._blocking_sandbox(tmp_path)
         with patch("kiro_crew.sandbox.sandboxed_spawn_argv", side_effect=fake):
             task = asyncio.create_task(shielded_prepare_off_loop(_prepare(["/bin/true"])))
@@ -297,8 +296,8 @@ class TestShieldedPrepareOffLoop:
 
 
 class TestSandboxedSpawnArgvOffLoopPassthrough:
-    """The older wrapper (still the direct chokepoint for three call sites)
-    keeps the same pass-through contract as the shared shield."""
+    """The older wrapper (a public compatibility entry point) keeps the
+    same pass-through contract as the shared shield."""
 
     @pytest.mark.asyncio
     async def test_normal_return_passes_through(self, tmp_path):
@@ -338,8 +337,7 @@ class TestNoBareSandboxedSpawnArgvHops:
 
     One exemption remains: ``sandbox.py``'s own definition of
     ``sandboxed_spawn_argv_off_loop``. That wrapper predates ``shielded_prepare_off_loop``
-    and is deliberately kept alive (three call sites — ``dev_fleet``, papyrus's
-    ``gitops``/``latex`` — carry extensive test coverage keyed to its name), so its
+    and is deliberately kept alive as a public compatibility entry point, so its
     internal hop IS the shield, not a bypass of one.
     """
 

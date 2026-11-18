@@ -544,7 +544,7 @@ class TestGitSpawn:
         proc.communicate = mock.AsyncMock(return_value=(b"out", b""))
         proc.returncode = 0
         with mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
+            gitops, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
         ) as wrap, mock.patch(
             "asyncio.create_subprocess_exec", mock.AsyncMock(return_value=proc)
         ):
@@ -569,7 +569,7 @@ class TestGitSpawn:
         proc.returncode = 0
         spawn = mock.AsyncMock(return_value=proc)
         with mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
+            gitops, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
         ), mock.patch.object(gitops, "create_subprocess_limited", spawn):
             await gitops._git(["status"], cwd=repo)
         assert spawn.await_args is not None
@@ -587,7 +587,7 @@ class TestGitSpawn:
             return proc
 
         with mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
+            gitops, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
         ), mock.patch("asyncio.create_subprocess_exec", spawn):
             await gitops._git(["push"], cwd=repo)
         assert captured["GIT_TERMINAL_PROMPT"] == "0"
@@ -599,7 +599,7 @@ class TestGitSpawn:
         proc.returncode = None
         proc.pid = 9876
         with mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
+            gitops, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
         ), mock.patch(
             "asyncio.create_subprocess_exec", mock.AsyncMock(return_value=proc)
         ), mock.patch.object(
@@ -696,7 +696,7 @@ class TestGitSpawn:
 
     async def test_a_missing_git_binary_is_a_clear_error(self, repo: Path) -> None:
         with mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", return_value=(["/bin/true"], {}, None)
+            gitops, "sandboxed_spawn_argv", return_value=(["/bin/true"], {}, None)
         ), mock.patch(
             "asyncio.create_subprocess_exec", mock.AsyncMock(side_effect=FileNotFoundError)
         ):
@@ -800,7 +800,7 @@ class TestRepoConfigCannotExecuteCommands:
             raise OSError("stop here")
 
         with mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", side_effect=lambda argv, *a, **k: (argv, {}, None)
+            gitops, "sandboxed_spawn_argv", side_effect=lambda argv, *a, **k: (argv, {}, None)
         ), mock.patch.object(gitops, "create_subprocess_limited", _fake_exec):
             with pytest.raises(OSError):
                 await gitops._git(["status", "--porcelain"], cwd=Path("/tmp"))
@@ -935,7 +935,7 @@ class TestPackProgramsArePinnedForEveryRemote:
         with mock.patch.object(
             gitops, "_pin_attributes_sync", lambda cwd: None
         ), mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", side_effect=lambda argv, *a, **k: (argv, {}, None)
+            gitops, "sandboxed_spawn_argv", side_effect=lambda argv, *a, **k: (argv, {}, None)
         ), mock.patch.object(gitops, "create_subprocess_limited", _fake_exec):
             with pytest.raises(OSError):
                 await gitops._git(["push"], cwd=Path("/tmp"))
@@ -1062,7 +1062,7 @@ class TestGitProxyCannotExecuteACommand:
         with mock.patch.object(
             gitops, "_pin_attributes_sync", lambda cwd: None
         ), mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", side_effect=lambda argv, *a, **k: (argv, {}, None)
+            gitops, "sandboxed_spawn_argv", side_effect=lambda argv, *a, **k: (argv, {}, None)
         ), mock.patch.object(gitops, "create_subprocess_limited", _fake_exec):
             with pytest.raises(OSError):
                 await gitops._git(["status"], cwd=Path("/tmp"))
@@ -1081,7 +1081,7 @@ class TestGitProxyCannotExecuteACommand:
         with mock.patch.object(
             gitops, "_pin_attributes_sync", lambda cwd: None
         ), mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", side_effect=lambda argv, *a, **k: (argv, {}, None)
+            gitops, "sandboxed_spawn_argv", side_effect=lambda argv, *a, **k: (argv, {}, None)
         ), mock.patch.object(gitops, "create_subprocess_limited", _fake_exec):
             with pytest.raises(OSError):
                 await gitops._git(["status"], cwd=Path("/tmp"))
@@ -1240,7 +1240,7 @@ class TestGitattributesCannotNameAProgram:
         with mock.patch.object(
             gitops, "_pin_attributes_sync", side_effect=lambda cwd: order.append("pin")
         ), mock.patch.object(
-            gitops, "sandboxed_spawn_argv_off_loop", side_effect=lambda argv, *a, **k: (argv, {}, None)
+            gitops, "sandboxed_spawn_argv", side_effect=lambda argv, *a, **k: (argv, {}, None)
         ), mock.patch.object(gitops, "create_subprocess_limited", _fake_exec):
             with pytest.raises(OSError):
                 await gitops._git(["status"], cwd=Path("/tmp"))
@@ -1328,7 +1328,7 @@ class TestSandboxRefusalIsReportedNotSwallowed:
                 "no backend", "no_backend", "simulated"
             )
         )
-        with mock.patch.object(gitops, "sandboxed_spawn_argv_off_loop", boom):
+        with mock.patch.object(gitops, "sandboxed_spawn_argv", boom):
             with pytest.raises(gitops.GitSandboxUnavailable) as caught:
                 await gitops.commit(repo, "msg")
         # A `GitError` subclass, so existing handlers still catch it — but its own

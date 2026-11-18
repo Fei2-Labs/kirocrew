@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import logging
 import os
 import re
@@ -45,7 +46,7 @@ from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
     sandboxed_spawn_argv,
-    sandboxed_spawn_argv_off_loop,
+    shielded_prepare_off_loop,
 )
 from kiro_crew.sel import sel
 
@@ -449,7 +450,10 @@ async def _git(
     # heartbeat — for up to five seconds. Same form and reason as `latex._run` and
     # `apps/builtins/dev_fleet/server.py`.
     try:
-        wrapped, env, cleanup = await sandboxed_spawn_argv_off_loop(argv)
+        wrapped, env, cleanup = await shielded_prepare_off_loop(
+            functools.partial(sandboxed_spawn_argv, argv),
+            executor=subprocess_executor(),
+        )
     except SandboxUnavailableError as exc:
         # Translated, not bypassed. See `GitSandboxUnavailable` — the wrap is what
         # keeps an agent-written repo config from reaching a shell on the one path
