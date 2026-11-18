@@ -119,17 +119,7 @@ def test_every_known_backend_has_fixtures() -> None:
     and a skipped test is indistinguishable from a passing one on a dashboard.
     """
     present = {d.name for d in backend_dirs()}
-    # This build's own adapters (copilot, goose, pi) have no recorded frame corpus:
-    # none has been captured against a live host here, and a fabricated .jsonl
-    # would pin nothing real. Named out explicitly, so the gate still fails the
-    # moment a NEW id lands without a corpus; recorded in .fork-sync.yml as a gap.
-    # goose and pi left this set at the 2026-09-21 sync: upstream SHIPPED a
-    # recorded corpus for both, so the gap they named is closed. copilot is
-    # still fork-only with no live capture.
-    from kiro_crew.acp_backends import ACP_BACKEND_COPILOT
-
-    fork_adapters_without_corpus = {ACP_BACKEND_COPILOT}
-    required = {fixture_dir_name(b) for b in ACP_BACKENDS_KNOWN - fork_adapters_without_corpus}
+    required = {fixture_dir_name(backend) for backend in ACP_BACKENDS_KNOWN}
     missing = sorted(required - present)
     assert not missing, (
         f"no frame-replay fixtures for {missing}. Every backend in ACP_BACKENDS_KNOWN "
