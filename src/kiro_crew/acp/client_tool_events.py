@@ -16,7 +16,8 @@ Instance fields written: ``_jsonl_pos``, ``_stale_eligible``, ``_tool_call_diff_
 Instance fields read: ``_active_tool_calls``, ``_agent``, ``_audit_source``, ``_batch_window``,
 ``_copilot_ambiguous_mcp_calls``, ``_copilot_unmatched_titles``,
 ``_observed_tool_calls``, ``_permission_mode``, ``_sel_settled_tool_calls``,
-``_session_id``, ``_session_key``, ``_tool_call_harness_tool_name``,
+``_session_id``, ``_session_key``, ``_spec_mcp_server_names``,
+``_tool_call_harness_tool_name``, ``_tool_call_mcp_ambiguous``,
 ``_tool_call_unclassified``, ``last_prompt_stats``.
 """
 
@@ -494,7 +495,11 @@ def _extract_tool_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | None
         # One classification for the caches, the event and the metric:
         # kind + adapter-authored MCP markers, never the kind alone (see
         # _dispatch.classify_tool_call).
-        identity = classify_tool_call(update)
+        identity = classify_tool_call(
+            update,
+            allow_spec_title_identity=getattr(self, "_is_spec_adapter", False),
+            spec_mcp_server_names=getattr(self, "_spec_mcp_server_names", ()),
+        )
         # What the emitted event names. The classifier's verdict, unless Copilot's
         # title recovery (below) attributes the call to a server Crew placed.
         event_tool_name = identity.tool_name
@@ -612,6 +617,9 @@ def _extract_tool_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | None
             # Same lifecycle as is_shell: cache the trusted MCP server
             # identity so the later permission event can inherit it.
             self._tool_call_mcp_server[tool_call_id] = identity.mcp_server_name
+            _ambiguous = getattr(self, "_tool_call_mcp_ambiguous", None)
+            if _ambiguous is not None:
+                _ambiguous[tool_call_id] = identity.identity_ambiguous
             # Cache the trusted tool name too, so the permission event can
             # rebuild mcp__<server>__<tool> for per-tool governance.
             self._tool_call_tool_name[tool_call_id] = identity.tool_name
@@ -695,6 +703,7 @@ def _extract_tool_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | None
             mcp_server_name=event_mcp_server,
             tool_identity_trusted=event_tool_trusted,
             mcp_identity_trusted=event_mcp_trusted,
+            mcp_identity_ambiguous=identity.identity_ambiguous,
             diff_path=_diff_path,
             harness_tool_id=_event_tool_id,
         )
