@@ -4,41 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.dashboard.handlers.messaging import (
-    _validated_command_identity,
-    api_spawn,
-    api_spawn_delete,
-    api_spawn_steer,
-)
-from kiro_crew.subagent_command_authority import CommandIdentity
-
-
-class _Request(dict):
-    def __init__(self, subagents: object, body: dict[str, object], *, agent_id: str = "") -> None:
-        super().__init__(
-            app={"state": SimpleNamespace(subagents=subagents, conversation_log=None)},
-            internal_auth=True,
-        )
-        self._body = body
-        self.match_info = {"agent_id": agent_id}
-        self.headers = {}
-
-    @property
-    def app(self) -> dict[str, object]:
-        return self["app"]
-
-    async def json(self) -> dict[str, object]:
-        return self._body
-
-
-def _response_json(response: object) -> dict[str, object]:
-    raw = getattr(response, "body")
-    return json.loads(raw.decode("utf-8"))
+from kiro_crew.dashboard.handlers.messaging import _validated_command_identity
 
 
 def _identified(operation: str, body: dict[str, object]) -> dict[str, object]:
@@ -93,65 +62,3 @@ def test_changed_payload_is_rejected_even_with_claimed_hash() -> None:
 
     with pytest.raises(ValueError, match="payload_hash_mismatch"):
         _validated_command_identity(body, "steer", require_run_id=False)
-
-
-@pytest.mark.asyncio
-async def test_keyed_spawn_uses_authority_and_never_calls_legacy_spawn() -> None:
-    manager = MagicMock()
-    manager.command_authority.spawn = AsyncMock(
-        return_value=SimpleNamespace(id="c" * 8, done=False, error="")
-    )
-    body = _identified("spawn", {"task": "work", "agent": "", "run_id": "c" * 8})
-
-    response = await api_spawn(_Request(manager, body))  # type: ignore[arg-type]
-
-    assert response.status == 200
-    assert _response_json(response)["id"] == "c" * 8
-    manager.spawn.assert_not_called()
-    identity = manager.command_authority.spawn.await_args.args[0]
-    assert identity == CommandIdentity("c" * 8, "a" * 32, "b" * 32)
-
-
-@pytest.mark.asyncio
-async def test_keyed_spawn_fails_closed_when_authority_is_retired() -> None:
-    manager = SimpleNamespace(command_authority=None)
-    body = _identified("spawn", {"task": "work", "run_id": "c" * 8})
-
-    response = await api_spawn(_Request(manager, body))  # type: ignore[arg-type]
-
-    assert response.status == 503
-    assert _response_json(response)["code"] == "coordinator_unavailable"
-
-
-@pytest.mark.asyncio
-async def test_keyed_steer_uses_authority_and_returns_identifiers() -> None:
-    manager = MagicMock()
-    manager.steer_run = AsyncMock(return_value=(True, "ok"))
-    manager.command_authority.steer = AsyncMock(return_value=(True, "ok"))
-    body = _identified("steer", {"message": "correct it", "mode": "interrupt"})
-
-    response = await api_spawn_steer(
-        _Request(manager, body, agent_id="run123")  # type: ignore[arg-type]
-    )
-
-    assert response.status == 200
-    payload = _response_json(response)
-    assert payload["command_id"] == "a" * 32
-    manager.steer_run.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_keyed_cancel_uses_authority_for_unregistered_target() -> None:
-    manager = MagicMock()
-    manager._agents = {}
-    manager.cancel = AsyncMock(return_value=True)
-    manager.command_authority.cancel = AsyncMock(return_value=True)
-    body = _identified("cancel", {})
-
-    response = await api_spawn_delete(
-        _Request(manager, body, agent_id="queued-run")  # type: ignore[arg-type]
-    )
-
-    assert response.status == 200
-    assert _response_json(response)["cancelled"] is True
-    manager.cancel.assert_not_called()

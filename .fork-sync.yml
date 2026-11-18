@@ -1015,18 +1015,20 @@ divergences:
 
       WHAT STAYS, and is still tested directly: the modules themselves, plus
       `test_run_coordinator_{sqlite,contract,shadow,admission}.py`
-      (15/70/9/9 passing). Deleting those too would drop coverage of code that is
+      (15/70/9/5 passing). Deleting those too would drop coverage of code that is
       still importable.
 
-      THREE LIVE KEYED-COMMAND PATHS remain: spawn, steer and cancel, now owned by
-      `dashboard/messaging_api/{spawn,run_control}.py`. They resolve authority
-      through `_command_authority_or_none` and answer 503
-      `coordinator_unavailable` when it is absent. Keep that degradation: direct
-      access raises `AttributeError` and turns an unsupported request into a 500.
-      The old lookup route had zero callers and consumers and is removed; do not
-      restore it without a live caller. `test_run_coordinator_admission.py` uses a
-      MagicMock manager, so it cannot prove real authority exists; the no-authority
-      503 case is the pin that keeps absence safe.
+      NO KEYED-COMMAND PATH remains. The spawn MCP client is upstream's and sends
+      no command identity, and `dashboard/messaging_api/{spawn,run_control}.py`
+      never read one, so `_validated_command_identity`,
+      `_command_authority_or_none`, `_command_identity_response` and
+      `_authority_failure_response` in `dashboard/handlers/messaging.py` have no
+      caller and `subagent_command_authority.py` is reachable from no request.
+      Absence is safe by construction: nothing reads `command_authority`, so a
+      manager without one cannot turn a request into a 500. The tests that pinned
+      the client identity, the durable lookup-and-replay and the keyed handlers
+      went with those paths; restore them only together with a live caller. The
+      lookup route stays removed for the same reason.
 
     superseded_what: |
       `src/kiro_crew/run_coordinator/` (models, sqlite, shadow, delivery, recovery,

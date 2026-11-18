@@ -9,15 +9,18 @@ Supports `on_tool_approval` callback for interactive tool approval (routed throu
 ### Run coordinator seam
 
 The upstream `taskq` subsystem owns durable admission and queue recovery; the
-retired fork `RunCoordinator` is no longer wired into `SubagentManager`. The
-dashboard still accepts additive command identities on spawn, steer, and cancel
-for callers that carry them. Those requests use `SubagentCommandAuthority` only
-when a manager provides one; otherwise the dashboard returns 503
-`coordinator_unavailable` instead of failing with an attribute error. Requests
-without an identity retain the ordinary taskq-backed manager path. The removed
-command-lookup route is not part of the dashboard API.
+retired fork `RunCoordinator` is no longer wired into `SubagentManager`.
+Durable subagent commands are dormant. The spawn MCP tools post plain bodies
+with no command identity, and the spawn, steer, and cancel routes run the
+ordinary taskq-backed manager path without reading one, so an identity field a
+caller still sends is ignored. `SubagentCommandAuthority` and the identity
+helpers in `dashboard/handlers/messaging.py` stay importable with their own unit
+tests, but no request reaches them. The command-lookup route is not part of the
+dashboard API.
 
-`spawn_run`, `spawn_continue`, `spawn_steer`, and `spawn_release` generate a
+The rest of this section records the dormant authority's contract, not live
+behaviour. A keyed `spawn_run`, `spawn_continue`, `spawn_steer`, or
+`spawn_release` would generate a
 command ID and idempotency key before HTTP; spawn/continue also preassign the
 visible run ID. The gateway validates all-or-none identity fields, recomputes the
 canonical semantic SHA-256 hash, and fails closed on key/payload conflicts. An
