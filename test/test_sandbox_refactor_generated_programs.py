@@ -909,9 +909,11 @@ def test_namespace_argv_writes_exactly_what_the_builder_renders(
     monkeypatch.setattr(sandbox, "_resolve_agent_executable", lambda executable: executable)
     argv = sandbox.namespace_argv(["/bin/true", "--flag"], tier)
     assert len(rendered) == 1
-    assert argv[:3] == [sys.executable, "-I", "-S"]
-    assert argv[4:] == ["/bin/true", "--flag"]
-    launcher = Path(argv[3])
+    # ``-B`` stays on this launcher in the fork
+    # (.fork-sync.yml divergences/signed-bundle-bytecode-floor).
+    assert argv[:4] == [sys.executable, "-I", "-S", "-B"]
+    assert argv[5:] == ["/bin/true", "--flag"]
+    launcher = Path(argv[4])
     assert launcher.parent == host.crew / "run"
     assert launcher.name.startswith(f"kirocrew_sandbox_{os.getpid()}_")
     assert launcher.read_bytes() == rendered[0].encode("utf-8")

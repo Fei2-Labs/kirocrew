@@ -457,10 +457,13 @@ class TestNamespaceArgv:
         assert result[0] == sys.executable
         assert result[1] == "-I"
         assert result[2] == "-S"
-        assert result[3].endswith(".py")
-        assert result[4] == "/usr/local/bin/kiro-cli"
-        assert result[5] == "acp"
-        os.unlink(result[3])
+        # The fork keeps ``-B`` on this env-unreachable launcher
+        # (.fork-sync.yml divergences/signed-bundle-bytecode-floor).
+        assert result[3] == "-B"
+        assert result[4].endswith(".py")
+        assert result[5] == "/usr/local/bin/kiro-cli"
+        assert result[6] == "acp"
+        os.unlink(result[4])
 
     @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
     def test_established_target_that_cannot_be_restatted_refuses(self, mock_resolve, tmp_path):
@@ -498,7 +501,7 @@ class TestNamespaceArgv:
     @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
     def test_launcher_script_is_executable(self, mock_resolve):
         result = namespace_argv(["kiro-cli"], "strict")
-        launcher_path = result[3]
+        launcher_path = result[4]
         mode = os.stat(launcher_path).st_mode
         assert mode & 0o700 == 0o700
         os.unlink(launcher_path)
