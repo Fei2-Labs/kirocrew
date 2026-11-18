@@ -667,7 +667,14 @@ def sandboxed_spawn_argv(
     """
     from kiro_crew.sandbox_wrap import _run_coordinator_hidden_dir
 
-    extra_hidden_dirs = tuple(dict.fromkeys((*extra_hidden_dirs, _run_coordinator_hidden_dir())))
+    # Windows has no Kiro Crew layer that could apply the ledger mask. On an
+    # explicitly classified Kiro spawn there it would only disable the delegation
+    # to Kiro's own sandbox and refuse a child that the ACP launch, which never
+    # carries this mask, delegates.
+    if not (sys.platform == "win32" and is_kiro_cli is True):
+        extra_hidden_dirs = tuple(
+            dict.fromkeys((*extra_hidden_dirs, _run_coordinator_hidden_dir()))
+        )
     if extra_hidden_dirs or extra_visible_dirs or extra_private_dirs or extra_writable_dirs:
         wrapped, cleanup = wrap_argv(
             argv,
