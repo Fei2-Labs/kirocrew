@@ -368,18 +368,6 @@ conflict_policy:
       and is selectable. Take upstream's file whole; if a model is genuinely
       missing there, the fix is an upstream PR, not a fork edit.
 
-  # ── model-picker handlers: fork carries two UPSTREAM bugfixes, pending PRs ──
-  - glob: "src/kiro_crew/dashboard/@(chat_handlers.py|handlers/core.py|handlers/agents.py)"
-    policy: union
-    note: |
-      These carry the `model-picker-upstream-bugfixes` divergence: two fixes to
-      bugs that exist in upstream's own copy, held here only until upstream
-      merges them. Take upstream's structure and RE-APPLY the two hunks; do not
-      let a merge restore `is_claude_code(provider)` as the display-only test, or
-      `_advertised_cc_models`'s bare `return []`. Once upstream carries both,
-      DELETE this rule and the divergence entry rather than keeping a rule that
-      guards nothing.
-
 divergences:
   - id: acp-tool-gate-no-local-opt-out
     what: |
@@ -526,46 +514,6 @@ divergences:
       the namespace exists in all 13 locales after any sync.
     pinned_by: "website/src/test/AcpBackendCard.test.tsx, website/src/i18n/catalogParity.test.ts"
     decided: 2026-09-21
-
-  - id: model-picker-upstream-bugfixes
-    what: |
-      Two fixes in the model picker's save and list paths that upstream's own
-      copy still carries the bugs for. TEMPORARY: both are being submitted
-      upstream, and this entry plus its conflict rule are deleted once upstream
-      carries them.
-
-      (1) `chat_handlers._model_rejected_reason` keys the display-only-key
-      refusal on `capabilities_for(agent.acp_backend).model_id_namespace` --
-      the same field `_wire_model_id` translates through -- instead of on
-      `agent.provider`. `_validate_role_model` and `_model_pin_rejected` take
-      `backend=` beside `provider=` to carry it without a second config read.
-      The `is_canonical_key` test moves AHEAD of the config resolution, so only
-      a canonical key ever costs a load.
-
-      (2) `_advertised_cc_models` falls back to
-      `model_registry.advertised_models(namespace)` -- the cross-session sidecar
-      -- instead of answering `[]` when no session of that namespace is live.
-      BOTH exits change: the `request.app["state"]` early return and the loop's
-      fall-out.
-    why: |
-      (1) The config schema pins `agent.provider` to `enum=["acp"]` -- upstream's
-      too (`config/sections.py`) -- so `is_claude_code(provider)` is a branch
-      that can never be taken and every harness reads as the same provider. The
-      guard therefore rejected canonical registry keys on EVERY backend,
-      including claude-agent-acp, where they ARE the wire format and
-      `_wire_model_id` translates them. Measured: a picker offering
-      "Fable 5 (1M context)" whose save path refused it as "display-only",
-      naming a provider that was not the reason.
-
-      (2) "No live session" is not "nothing advertised". Answering `[]` sent
-      `_cc_models` down its entitlement-unknown branch, which shows the static
-      catalog UNFILTERED -- so a cold dashboard offered models the account
-      cannot run and HID the ones it can, because an id the catalog does not
-      list reaches the picker only through the advertised half. Measured on an
-      account served `claude-fable-5-1[1m]`: the cold picker showed Fable 5
-      (unentitled) and never showed Fable 5.1 (served).
-    pinned_by: "test/test_agent_model_pin_validation.py::TestNoRedundantConfigLoad, test/test_cc_models_endpoint.py::TestTheColdPickerFallsBackToThePersistedSnapshot"
-    decided: 2026-09-18
 
   - id: fork-version-identity
     what: |
