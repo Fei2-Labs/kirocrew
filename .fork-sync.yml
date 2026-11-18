@@ -799,6 +799,22 @@ divergences:
     decided: 2026-08-31
     revised: 2026-09-23
 
+  - id: copilot-any-release
+    what: "The fork serves every Copilot CLI release, not only COPILOT_VERIFIED_VERSION."
+    why: |
+      Upstream refuses a Copilot session at the handshake, and reports the install
+      as the wrong version, unless the CLI is exactly COPILOT_VERIFIED_VERSION.
+      The fork keeps the install hint pinned to that release but serves any
+      release: the ACP protocol between Copilot CLI releases is additive-only,
+      re-verifying every point release is impractical here, and the edit-target,
+      allow_all read-back and mode-tripwire checks still catch a wire-shape change
+      at runtime. `_refuse_unverified_copilot_version` (acp/client_copilot.py) and
+      `self_served_wrong_version` (agent_sdk/drivers/acp.py) keep their upstream
+      names and call sites so a sync merges cleanly; an upstream sync must not
+      restore their bodies.
+    pinned_by: "test/test_acp_copilot_backend.py::test_every_copilot_release_starts_at_the_handshake, ::test_the_self_served_probe_reports_no_wrong_copilot_version, ::test_an_unverified_release_is_served_on_the_first_spawn"
+    decided: 2026-11-16
+
   - id: copilot-backend-identity
     what: "is_copilot_backend predicate + 'copilot' in session_pid._MANAGED_AGENT_MARKERS."
     why: |

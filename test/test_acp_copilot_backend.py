@@ -35,6 +35,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_COPILOT,
     ACP_BACKEND_FORBIDDEN_MODES,
     ACP_BACKEND_PROMPT_COMMAND_ALLOWLIST,
+    COPILOT_VERIFIED_VERSION,
     prompt_command_issue,
     session_config_drift_issue,
 )
@@ -1410,38 +1411,24 @@ def test_an_oversized_git_file_is_not_a_pointer(tmp_path) -> None:
     assert copilot_mod._is_git_root(str(work)) is False
 
 
-@pytest.mark.parametrize("version", ["1.0.200", "1.0.99", ""])
-def test_an_unverified_copilot_release_is_refused_at_the_handshake(tmp_path, version) -> None:
-    """The list-based guards fail open on another release, so the session is refused."""
-    from kiro_crew.acp import client_copilot as cp
-
+@pytest.mark.parametrize("version", ["1.0.200", "1.0.99", "", COPILOT_VERIFIED_VERSION])
+def test_every_copilot_release_starts_at_the_handshake(tmp_path, version) -> None:
+    """This fork serves any Copilot CLI release (``.fork-sync.yml``: copilot-any-release)."""
     client = AcpClient(work_dir=tmp_path, acp_backend=COPILOT)
     client._agent_version = version
     client._agent_version_read = True
-    with pytest.raises(cp.AcpToolGateUnroutable) as raised:
-        client._refuse_unverified_copilot_version()
-    assert raised.value.transient is False and raised.value.user_worded is True
-    message = str(raised.value)
-    assert f"npm i -g @github/copilot@{cp.COPILOT_VERIFIED_VERSION}" in message
-    # UX: two sentences a chat reader can act on -- what happened, then the fix --
-    # and none of the guard internals (those belong to the refusal's docstring).
-    assert message.count(". ") == 1 and message.endswith(
-        f"start a new chat: npm i -g @github/copilot@{cp.COPILOT_VERIFIED_VERSION}"
-    )
-    assert "refused" in message.split(". ")[0]
-    for jargon in ("project-config", "allowlist", "environment variables"):
-        assert jargon not in message
-    if version:
-        assert f"Copilot CLI {version} " in message
-
-
-def test_the_verified_copilot_release_starts(tmp_path) -> None:
-    from kiro_crew.acp import client_copilot as cp
-
-    client = AcpClient(work_dir=tmp_path, acp_backend=COPILOT)
-    client._agent_version = cp.COPILOT_VERIFIED_VERSION
-    client._agent_version_read = True
     client._refuse_unverified_copilot_version()
+
+
+@pytest.mark.parametrize("version", ["1.0.200", "1.0.99"])
+def test_the_self_served_probe_reports_no_wrong_copilot_version(monkeypatch, version) -> None:
+    from kiro_crew.acp import client as client_mod
+    from kiro_crew.acp.harness import copilot as harness_copilot
+    from kiro_crew.agent_sdk.drivers.acp import self_served_wrong_version
+
+    monkeypatch.setattr(client_mod, "_resolve_self_served_bin", lambda _b: ("/bin/copilot", ""))
+    monkeypatch.setattr(harness_copilot, "copilot_installed_version", lambda _bin: version)
+    assert self_served_wrong_version(COPILOT) == ""
 
 
 def test_the_version_refusal_is_copilots_alone(tmp_path) -> None:
@@ -1554,12 +1541,10 @@ def test_the_sign_in_remedy_gives_only_actions() -> None:
 
 def test_the_install_hint_pins_the_verified_release() -> None:
     """A new install lands on the release the defences were measured on."""
-    from kiro_crew.acp import client_copilot as cp
-    from kiro_crew.agent_sdk.backends import ACP_BACKEND_LAUNCH, COPILOT_VERIFIED_VERSION
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_LAUNCH
 
     record = ACP_BACKEND_LAUNCH[COPILOT]
     assert record.install_command == f"npm i -g @github/copilot@{COPILOT_VERIFIED_VERSION}"
-    assert cp.COPILOT_VERIFIED_VERSION is COPILOT_VERIFIED_VERSION
 
 
 def test_an_edit_seed_is_not_retained_past_its_event(tmp_path) -> None:
@@ -1620,15 +1605,13 @@ def test_the_version_refusal_runs_at_the_handshake() -> None:
 
 
 def test_the_verified_version_is_the_recorded_handshake() -> None:
-    from kiro_crew.acp import client_copilot as cp
-
     reported = {
         f["result"]["agentInfo"]["version"]
         for name in ("mcp-stdio-mount-live.jsonl",)
         for f in _frames(name)
         if isinstance(f.get("result"), dict) and "agentInfo" in f["result"]
     }
-    assert reported == {cp.COPILOT_VERIFIED_VERSION}
+    assert reported == {COPILOT_VERIFIED_VERSION}
 
 
 @pytest.mark.asyncio
@@ -1680,10 +1663,8 @@ def test_the_seed_restore_keeps_whatever_was_cached(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_unverified_release_is_refused_once_without_a_respawn(tmp_path) -> None:
-    """A fresh process reports the same version, so the refusal must not be retried."""
-    from kiro_crew.acp import client_copilot as cp
-
+async def test_an_unverified_release_is_served_on_the_first_spawn(tmp_path) -> None:
+    """Another release comes up on its first process, with nothing killed or respawned."""
     client = AcpClient(work_dir=tmp_path, acp_backend=COPILOT)
     spawns = {"n": 0}
 
@@ -1708,10 +1689,9 @@ async def test_an_unverified_release_is_refused_once_without_a_respawn(tmp_path)
     client._snapshot_process_tree = AsyncMock()
     client._kill_process = AsyncMock()
     client._reset_state = _reset
-    with pytest.raises(cp.AcpToolGateUnroutable):
-        await client.ensure_ready()
+    await client.ensure_ready()
     assert spawns["n"] == 1
-    assert client._kill_process.await_count == 1
+    assert client._kill_process.await_count == 0
 
 
 @pytest.mark.asyncio
