@@ -368,6 +368,12 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     # crew and answers "no such crew" rather than acting on one.
     "microvm_crews.json",
     "computer_use.json",
+    # ``workflow_policy.load_state`` reads an absent file as ``{}`` and ``{}`` as
+    # the restrictive default, so an empty document is absent-equivalent for every
+    # reader -- which is what makes sealing it safe. Without the seal an absent
+    # file stays creatable inside the sandbox, and the next read adopts whatever
+    # the agent wrote there.
+    "workflow_policy.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
     # Absent until the operator first saves a deny setting, and while absent a sandbox
