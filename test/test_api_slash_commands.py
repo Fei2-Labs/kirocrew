@@ -96,13 +96,25 @@ class TestApiSlashCommands:
     @pytest.mark.asyncio
     async def test_slot_uses_its_live_provider_after_default_switch(self):
         from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+        from kiro_crew.agent_sdk.capabilities import capabilities_for
 
         live = SimpleNamespace(
-            backend=ACP_BACKEND_CLAUDE,
-            _slash_commands=["compact", "review"],
+            capabilities=capabilities_for(ACP_BACKEND_CLAUDE),
+            advertised_commands=lambda: [
+                {"name": "compact", "description": "Compact the conversation"},
+                {"name": "review", "description": "Review the current changes"},
+            ],
         )
-        sessions = SimpleNamespace(get_provider=lambda key: live)
-        state = SimpleNamespace(sessions=sessions)
+
+        async def provider_alive(_session_key):
+            return True
+
+        sessions = SimpleNamespace(
+            get_provider=lambda key: live,
+            is_provider_alive=provider_alive,
+        )
+        slot = SimpleNamespace(key="chat-1")
+        state = SimpleNamespace(sessions=sessions, _slots={"chat-1": slot})
         with patch(
             "kiro_crew.dashboard.handlers.agents.KiroCrewConfig.load",
             return_value=_fake_config(""),
