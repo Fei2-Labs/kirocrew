@@ -244,12 +244,12 @@ _FACADE_DEFS = (
     "_advertised_backend_models",
     "_wrap_list_models_argv",
     "_scoped_default",
-    "_CatalogUnavailable",
-    "_bounded_catalog",
-    "_CatalogCache",
-    "_fetch_kiro_catalog",
-    "_shared_catalog_fetch",
-    "_consume_refresh_exception",
+    "_provider_backend",
+    "_models_from_provider",
+    "_configured_acp_backend",
+    "_models_list_scope",
+    "_advertised_alt_backend_models",
+    "_effort_levels_for",
     "api_models",
     "api_slash_commands",
     "api_kirocrew_agents",
@@ -262,7 +262,20 @@ _FACADE_DEFS = (
 
 #: Base definitions in a plain sibling module outside the owner composition, which
 #: the facade imports and binds under the same name: name -> module stem.
-_SIBLING_DEFS = {"api_effort_levels": "agents_effort_levels"}
+_SIBLING_DEFS = {
+    "api_effort_levels": "agents_effort_levels",
+    **dict.fromkeys(
+        (
+            "_CatalogUnavailable",
+            "_bounded_catalog",
+            "_CatalogCache",
+            "_fetch_kiro_catalog",
+            "_shared_catalog_fetch",
+            "_consume_refresh_exception",
+        ),
+        "agents_kiro_catalog",
+    ),
+}
 
 _MOVED = frozenset(name for names in _BASE_OWNERS.values() for name in names)
 
@@ -522,10 +535,27 @@ def test_facade_state_stays_on_the_facade() -> None:
     so a test that rebinds one there is the binding every function sees -- which
     holds only while no owner keeps a copy."""
     state = _module_assignments(_FACADE_PATH.read_text(encoding="utf-8"))
-    assert {"logger", "_config_lock", "_catalog_cache", "_AVATAR_MAX_BYTES"} <= state
+    assert {"logger", "_config_lock", "_AVATAR_MAX_BYTES"} <= state
     assert {"_CAPABILITY_UNAVAILABLE", "_WINDOWS_RESERVED_NAMES", "_drained_to_thread"} <= state
     owned = {stem: sorted(_module_assignments(source)) for stem, source in _owner_sources().items()}
     assert {stem: names for stem, names in owned.items() if names} == {}
+
+
+def test_the_catalog_cache_is_read_through_the_facade() -> None:
+    """The catalog sibling creates the cache, the facade binds that object, and every
+    catalog function reaches it as ``agents._catalog_cache``: a test that rebinds the
+    facade's name is the cache the fetch and the route both see."""
+    catalog = importlib.import_module("kiro_crew.dashboard.handlers.agents_kiro_catalog")
+    assert vars(agents)["_catalog_cache"] is vars(catalog)["_catalog_cache"]
+    readers = sorted(
+        name
+        for name, value in vars(catalog).items()
+        for fn in [value, *(vars(value).values() if isinstance(value, type) else ())]
+        if isinstance(getattr(fn, "__func__", fn), types.FunctionType)
+        and getattr(fn, "__func__", fn).__module__ == catalog.__name__
+        and "_catalog_cache" in set(_global_names(getattr(fn, "__func__", fn).__code__))
+    )
+    assert readers == []
 
 
 @pytest.mark.parametrize("name", _FACADE_DEFS)
@@ -550,15 +580,17 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
     assert defined == set(_FACADE_DEFS)
     siblings = set(_SIBLING_DEFS)
     total = len(defined) + len(_MOVED) + len(siblings)
-    assert len(defined | _MOVED | siblings) == total == 120
+    assert len(defined | _MOVED | siblings) == total == 126
 
 
 @pytest.mark.parametrize("name", sorted(_SIBLING_DEFS))
 def test_a_sibling_definition_is_the_facade_binding(name: str) -> None:
-    """The facade binds the sibling's own object, so routes and patches see one function."""
+    """The facade binds the sibling's own object, so routes and patches see one function;
+    the handlers package re-exports the public ones."""
     sibling = importlib.import_module(f"kiro_crew.dashboard.handlers.{_SIBLING_DEFS[name]}")
     assert getattr(agents, name) is vars(sibling)[name]
-    assert getattr(handlers_pkg, name) is vars(sibling)[name]
+    if not name.startswith("_"):
+        assert getattr(handlers_pkg, name) is vars(sibling)[name]
 
 
 def test_the_owners_log_as_the_facade() -> None:
