@@ -291,6 +291,34 @@ class TestKiroInternalSandboxExclusion:
                 extra_hidden_dirs=(r"C:\secrets",),
             )
 
+    def test_windows_spawn_chokepoint_keeps_kiro_delegation(self, tmp_path, monkeypatch):
+        """The chokepoint's own ledger mask must not refuse a delegated Kiro child.
+
+        The pod child probe prepares through ``sandboxed_spawn_argv``; the ACP
+        launch delegates the same child without that mask, so the probe must too.
+        """
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: False)
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: str(tmp_path / "crew" / "run-coordinator"),
+        )
+        launch = r"C:\Program Files\Kiro\kiro-cli.exe"
+        with (
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+            patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect,
+            patch("kiro_crew.sandbox_spawn.cgroup_scope_argv", side_effect=lambda argv: argv),
+        ):
+            try:
+                argv, _env, cleanup = sandbox_mod.sandboxed_spawn_argv(
+                    [launch, "acp"], "auto", env={}, is_kiro_cli=True
+                )
+            except sandbox_mod.SandboxUnavailableError as exc:
+                pytest.fail(f"the chokepoint refused a delegated Kiro child: {exc}")
+        assert argv == [launch, "acp"]
+        assert cleanup is None
+        mock_detect.assert_not_called()
+
     def test_windows_sel_failure_refuses_delegation(self, monkeypatch):
         """An unaudited Windows delegation falls through to fail-closed policy."""
         monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
