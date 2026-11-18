@@ -2147,21 +2147,29 @@ cannot move ACP inside an in-flight run's immutable manager deadline. The
 ordinary `timeout=None` provider path continues to resolve live config, so
 dashboard turns and non-subagent callers retain their existing behavior.
 
-### Session Resume via `session/load`
+### Native Session Resume
 
 When `set_resume_session_id(sid)` is called before `ensure_ready()`, the client
-attempts `session/load` instead of `session/new`:
+resumes instead of creating a new session only when the backend's
+`CAP_NATIVE_RESUME` level is `SUPPORTED` and `initialize` advertises the
+corresponding RPC. The wire flag proves the method exists; it does not prove that
+the prior transcript is restored. `UNAVAILABLE`, `UNVERIFIED` and `DEGRADED`
+backends skip native resume so Crew does not suppress its own transcript replay.
+Members of `ACP_BACKENDS_RESUME_WITHOUT_LOAD` use `session/resume`; other
+backends use `session/load`.
 
-1. Check `agentCapabilities.loadSession` from `initialize` response
-2. Verify `~/.kiro/sessions/cli/{sid}.json` exists on disk
-3. Send `session/load` with `sessionId`, `cwd`, `mcpServers` (the pooled
+1. Check `agentCapabilities.loadSession` (or `sessionCapabilities.resume` for
+   the named `ACP_BACKENDS_RESUME_WITHOUT_LOAD` members) from `initialize`
+2. Verify `~/.kiro/sessions/cli/{sid}.json` exists on disk for backends outside
+   `ACP_BACKENDS_HARNESS_OWNED_SESSIONS`; those members resolve the id in their
+   own store and skip the local file check
+3. Send the supported resume RPC with `sessionId`, `cwd`, `mcpServers` (the pooled
    broker stubs, re-declared so the resumed session keeps talking to the
-   shared gateway — `session/load` re-initializes the session's MCP servers,
+   shared gateway — a resume re-initializes the session's MCP servers,
    so an empty list would un-pool the session), plus eligible unpooled managed
    elements carrying their session token, and
-   `_meta: {"_kiro.dev/session_file": "<path>"}` (required —
-   without it kiro-cli silently ignores the request). `AcpRuntime.load_session`
-   builds the same params for the multiplexed runtime.
+   `_meta: {"_kiro.dev/session_file": "<path>"}` when required by the Kiro
+   harness. `AcpRuntime.load_session` applies its own replay guard for KAS.
 4. On success (response contains `modes`): set `_session_id`, `_resumed = True`
 5. On failure (JSON-RPC error, timeout, file missing): fall through to `session/new`
 
