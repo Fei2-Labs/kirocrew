@@ -228,8 +228,15 @@ def test_shard_selection_and_checks_stay_intact(jobs):
     # task, and takes the Windows larger-runner group instead: an uncontainerized
     # VM, so the probe it exists for behaves as it does on the shared pool. The
     # group is pinned by name because a bare `group:` dispatches to any member,
-    # and a Linux or macOS member would silently take a Windows job.
-    assert jobs["pod-boot-windows"]["runs-on"] == {"group": "kirocrew-runners-windows"}
+    # and a Linux or macOS member would silently take a Windows job. A fork
+    # cannot reach that organization group, so anywhere else the canary takes
+    # the hosted Windows image, which is an uncontainerized VM too.
+    for repository, expected in (
+        (_REPO, {"group": "kirocrew-runners-windows"}),
+        ("fork/repo", "windows-latest"),
+    ):
+        context = {"github.repository": repository}
+        assert _expression(jobs["pod-boot-windows"]["runs-on"], context) == expected
 
 
 @pytest.mark.parametrize(
