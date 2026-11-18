@@ -855,7 +855,7 @@ divergences:
       `session_pid_tracking.py` silently flattens the layout again and the
       shield tests start failing with FileNotFoundError on the file they just
       registered into.
-    pinned_by: "test/test_acp_spawn_offload.py (TestRuntimeShieldSurvivesAFailedAppend et al. assert run/kiro_pids.txt and run/kiro_session_pids.txt)"
+    pinned_by: "test/test_acp_spawn_offload.py (TestRuntimeShieldSurvivesAFailedAppend et al. assert run/kiro_pids.txt and run/kiro_session_pids.txt); upstream-authored pid-file tests (test_process_tree*.py, test_runtime_reconcile*.py, test_runtime_cleanup_regression.py, test_inapp_restart_supervisor_*.py, test_windows_tree_reap.py, test_windows_cleanup_capacity.py) are adapted to run/ at each sync"
     decided: 2026-10-29
 
   - id: session-mcp-exclusion-path-is-proven

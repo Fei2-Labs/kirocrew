@@ -303,7 +303,8 @@ def test_metadata_write_refusal_keeps_the_pin_until_a_successful_retry(
 
     monkeypatch.setattr(session_pid, "config_dir", lambda: tmp_path)
     monkeypatch.setattr(session_pid, "_PROTECTED_PIDS", {100})
-    (tmp_path / "kiro_pids.txt").write_text("100\n", encoding="utf-8")
+    (tmp_path / "run").mkdir()
+    (tmp_path / "run" / "kiro_pids.txt").write_text("100\n", encoding="utf-8")
     original_rewrite = session_pid._rewrite_pid_file
     monkeypatch.setattr(session_pid, "_rewrite_pid_file", lambda *args: False)
     state = pc._PendingWindowsTreeCleanup(1000, kernel.identities[1000])
@@ -316,7 +317,7 @@ def test_metadata_write_refusal_keeps_the_pin_until_a_successful_retry(
 
     monkeypatch.setattr(session_pid, "_rewrite_pid_file", original_rewrite)
     assert session_pid.cleanup_orphaned_session_roots() == 1
-    assert (tmp_path / "kiro_pids.txt").read_text(encoding="utf-8") == ""
+    assert (tmp_path / "run" / "kiro_pids.txt").read_text(encoding="utf-8") == ""
     assert sorted(kernel.closed) == [1000, 2000]
     assert session_pid._PROTECTED_PIDS == set()
     assert pc._PENDING_WINDOWS_TREE_CLEANUPS == {}

@@ -588,7 +588,7 @@ class TestSnapshotProcessTree:
             400: (4000, b"proc400"),
         }
         # Verify child:parent:start-id lines written to kiro_pids.txt
-        content = (tmp_path / "kiro_pids.txt").read_text(encoding="utf-8")
+        content = (tmp_path / "run" / "kiro_pids.txt").read_text(encoding="utf-8")
         lines = {ln.strip() for ln in content.splitlines() if ln.strip()}
         assert lines == {"200:100:2000", "300:100:3000", "400:100:4000"}
 
@@ -630,7 +630,7 @@ def _book(root) -> set[str]:
     """The tracking file's non-empty lines."""
     return {
         ln.strip()
-        for ln in (root / "kiro_pids.txt").read_text(encoding="utf-8").splitlines()
+        for ln in (root / "run" / "kiro_pids.txt").read_text(encoding="utf-8").splitlines()
         if ln.strip()
     }
 
@@ -788,7 +788,7 @@ class TestRuntimeSnapshotDescendants:
 
         assert scan.call_count == 1, "the retry walked from a root it could not prove"
         assert r._child_pids == {}
-        assert not (tmp_path / "kiro_pids.txt").exists()
+        assert not (tmp_path / "run" / "kiro_pids.txt").exists()
 
     @pytest.mark.asyncio
     async def test_no_descendants_writes_nothing(self, tmp_path):
@@ -801,7 +801,7 @@ class TestRuntimeSnapshotDescendants:
             await r._snapshot_descendants()
 
         assert r._child_pids == {}
-        assert not (tmp_path / "kiro_pids.txt").exists()
+        assert not (tmp_path / "run" / "kiro_pids.txt").exists()
 
     @pytest.mark.asyncio
     async def test_a_failed_scan_never_raises(self, tmp_path):
@@ -931,7 +931,7 @@ class TestRuntimeSnapshotDurability:
             await r._snapshot_descendants()
 
         assert r._child_pids == {}, "a capture that does not read back was recorded"
-        assert not (tmp_path / "kiro_pids.txt").exists()
+        assert not (tmp_path / "run" / "kiro_pids.txt").exists()
 
     @pytest.mark.asyncio
     async def test_a_live_pid_outside_the_tree_keeps_its_record(self, tmp_path):

@@ -140,7 +140,7 @@ class TestATurnRecordsItsLateChildrenBeforeTheLeaderExits:
             assert (
                 _group_member_vouches(_leader_gone(handle)) is True
             ), "a leaderless group the run's own late child keeps alive was refused"
-            tracked = (_tracking_file / "kiro_pids.txt").read_text(encoding="utf-8")
+            tracked = (_tracking_file / "run" / "kiro_pids.txt").read_text(encoding="utf-8")
             assert f"{child}:{leader.pid}:" in tracked, "the record did not persist the child"
 
     @pytest.mark.asyncio

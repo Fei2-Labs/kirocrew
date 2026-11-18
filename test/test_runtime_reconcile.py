@@ -546,10 +546,10 @@ def test_the_wiring_reads_a_recycled_identity_out_of_the_real_registry_file(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
     gw = os.getpid()
-    (home / "kiro_session_pids.txt").write_text(
+    (home / "run" / "kiro_session_pids.txt").write_text(
         f"{gw}:5001:TOKEN-AS-RECORDED\n{gw}:5002:TOKEN-AS-RECORDED\n", encoding="utf-8"
     )
     monkeypatch.setattr(
