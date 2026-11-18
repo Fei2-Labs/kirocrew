@@ -1623,7 +1623,9 @@ than once per job.
 
 That step has THREE branches, not two, and the third is load-bearing. A run
 executing in another repository -- a fork running its own CI on its `main` --
-cannot reach an organization runner group, so it stays on `ubuntu-latest`. Give
+cannot reach an organization runner group, so it stays on a GitHub-hosted runner,
+pinned to `ubuntu-24.04` because Playwright cannot install Chromium on the
+Ubuntu 26.04 image `ubuntu-latest` now resolves to. Give
 it the group's label and every one of the eighteen consumers sits queued in that
 fork until GitHub's pending limit cancels it, and the consumers' own
 `|| 'ubuntu-latest'` cannot rescue it, because that fires only on an EMPTY
@@ -1637,7 +1639,7 @@ more. The measured occupancy behind that decision belongs in the pull request
 that makes it, not here, where it would go stale.
 
 Rollback for this site is that step's non-fleet branches back to
-`ubuntu-latest`, with no AWS or runner-group change. The hosted
+`ubuntu-24.04`, with no AWS or runner-group change. The hosted
 `|| 'ubuntu-latest'` on each consumer expression is left in place on purpose: an
 empty resolver output means the `changes` job failed, which is not the same
 condition as a run being found ineligible, and a paid runner is the wrong answer

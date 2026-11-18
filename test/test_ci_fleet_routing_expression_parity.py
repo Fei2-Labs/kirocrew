@@ -618,7 +618,7 @@ def test_ci_resolvers_share_actor_policy_and_emit_large_labels() -> None:
         # LABEL: a bare `group:` dispatches to any member, so a mixed group could put
         # a Linux consumer on Windows.
         group_label, hosted = {
-            "linux": ("kirocrew-linux-4-core", "ubuntu-latest"),
+            "linux": ("kirocrew-linux-4-core", "ubuntu-24.04"),
             "windows": ("kirocrew-windows-4-core", "windows-latest"),
         }[os_name]
         assert step["env"]["IN_REPO"] == "${{ github.repository == 'kirodotdev/KiroCrew' }}"
