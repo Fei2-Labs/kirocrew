@@ -757,9 +757,9 @@ def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
     constructions = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "AcpClient"
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "create_acp_worker_client"
     ]
-    assert constructions, "llm_pool no longer constructs an AcpClient; re-check this pin"
+    assert constructions, "llm_pool no longer constructs its ACP client; re-check this pin"
     for call in constructions:
         passed = {kw.arg for kw in call.keywords}
         assert (
