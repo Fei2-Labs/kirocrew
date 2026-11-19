@@ -1242,6 +1242,22 @@ divergences:
     decided: 2026-09-04
     revised: 2026-09-04
 
+  - id: acp-backends-preview-flag
+    what: |
+      `PREVIEW_ACP_BACKENDS` (`mc-preview-acp-backends`, fork-only, gates the
+      active ACP backend row on System > Services) is a gateway-held preview:
+      `acp_backends` is in `FEATURE_PREVIEW_FLAGS`
+      (`config/sections_dashboard.py`) and `PREVIEW_ACP_BACKENDS` is in
+      `PREVIEW_FLAGS` (`website/src/utils/previewFlags.ts`).
+    why: |
+      Upstream made preview flags gateway-held at the 2026-11-03 sync and pins
+      every declared flag constant into both lists. The fork's flag was declared
+      but listed in neither, so `previewFlagServerSync.test.tsx` failed and the
+      flag could not be set from config or cleared by the LTS lock. Listing it
+      adds no switch: the flag stays default-off, with no Settings toggle.
+    pinned_by: "website/src/test/previewFlagServerSync.test.tsx, test/test_feature_previews_config.py"
+    decided: 2026-11-19
+
   - id: fork-ux-removals
     what: "Channels app hidden from the App Store; Board app removed."
     why: "Deliberate fork UX divergence; an upstream sync must not restore them."
