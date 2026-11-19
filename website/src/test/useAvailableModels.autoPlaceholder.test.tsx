@@ -80,25 +80,30 @@ describe('useAvailableModels placeholder before the first fetch resolves', () =>
     expect(result.current).toEqual([])
   })
 
-  it('scopes the fetch to a live slot so an open chat keeps its own catalog', async () => {
+  it('fetches the own harness list of an open chat so it keeps its own catalog', async () => {
+    // A chat on another harness than the configured one passes the server's
+    // `models_backend`; that list is fetched for that backend, not the default.
     fetchAvailableModels.mockResolvedValue([{ name: 'gpt-5.6-sol', description: 'Kiro' }])
-    const { result } = renderHook(
-      () => useAvailableModels({ slot: 'chat-1', backend: '' }),
-      { wrapper },
-    )
+    const { result } = renderHook(() => useAvailableModels({ backend: 'kiro' }), { wrapper })
     await waitFor(() => expect(result.current.map((m) => m.name)).toEqual(['gpt-5.6-sol']))
-    expect(fetchAvailableModels).toHaveBeenCalledWith({ slot: 'chat-1', scope: 'slot:chat-1' })
+    expect(fetchAvailableModels).toHaveBeenCalledWith('kiro')
   })
 
-  it('withholds auto for the sidebar bulk switcher on an adapter live session', () => {
-    // ChatSidebar now passes the live slot + harness. The first paint must not
-    // offer Auto when that harness does not serve it.
+  it('withholds auto for an enabled picker on an adapter harness', () => {
+    // A picker that names an adapter harness must not offer Auto on its first
+    // paint when that harness does not serve it.
     fetchAvailableModels.mockReturnValue(new Promise(() => {}))
     const { result } = renderHook(
-      () => useAvailableModels({ enabled: true, slot: 'chat-9', backend: 'opencode' }),
+      () => useAvailableModels({ enabled: true, backend: 'opencode' }),
       { wrapper },
     )
     expect(result.current).toEqual([])
-    expect(fetchAvailableModels).toHaveBeenCalledWith({ slot: 'chat-9', scope: 'slot:chat-9' })
+    expect(fetchAvailableModels).toHaveBeenCalledWith('opencode')
+  })
+
+  it('offers auto for the kiro harness list when the configured list is kiro', () => {
+    fetchAvailableModels.mockReturnValue(new Promise(() => {}))
+    const { result } = renderHook(() => useAvailableModels({ backend: 'kiro' }), { wrapper })
+    expect(result.current.map((m) => m.name)).toEqual(['auto'])
   })
 })
