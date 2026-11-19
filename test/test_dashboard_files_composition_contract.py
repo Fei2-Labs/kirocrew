@@ -165,6 +165,7 @@ _OWNER_MODULES = (
     "browse",
     "project_dirs",
     "git_panel",
+    "git_repo_discovery",
     "project_tree",
     "dashboard_config",
     "path_probe",
@@ -227,6 +228,8 @@ _BASE_OWNERS: dict[str, tuple[str, ...]] = {
         _repo_filter_refusal_cause _run_git_bounded _worktree_probe_failure_is_empty_scope
         api_project_git_log api_project_git_status
         """.split()),
+    # Holds no name from the one-module file, so the base-shape digest pins none.
+    "git_repo_discovery": (),
     "project_tree": tuple("""
         _ProjectTreeFolderMoved _project_tree_allot _project_tree_body
         _project_tree_fence _project_tree_file_quotas _project_tree_git_layout

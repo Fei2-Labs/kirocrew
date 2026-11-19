@@ -450,7 +450,9 @@ divergences:
       NOT on upstream main). BOTH halves are losable and BOTH were lost at the
       2026-09-21 sync.
 
-      Backend, in `dashboard/handlers/files.py`: `_discover_repo_roots` (the
+      Backend, behind the `dashboard/handlers/files.py` facade (the constants
+      there, the scan in `file_api/git_repo_discovery.py`, the grouped answer in
+      `file_api/git_panel.py`): `_discover_repo_roots` (the
       up-then-down scan, bounded depth 3 / 12 repos / 4000 entries, cached 60s,
       bypassed by `?refresh=1`), `_verify_descendant_roots` (a realpath identity
       check at USE time -- `core.worktree` can point a contained repo at an
