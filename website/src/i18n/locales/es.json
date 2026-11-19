@@ -7120,7 +7120,13 @@
       "composer_action_footer_host": "{{productName}} revisó el borrador. {{app}} sigue sin poder verlo.",
       "composer_action_needs_empty": "{{app}} solo puede insertar en un mensaje vacío. Vacía primero el borrador.",
       "composer_action_would_resolve": "El texto de {{app}} empieza por /, ! o @, o contiene un $skill, un archivo o una imagen, así que se ejecutaría en vez de enviarse como texto. No se insertó.",
-      "composer_action_footer": "{{app}} no puede ver tu borrador. Su texto se inserta tal cual y tú decides si lo envías."
+      "composer_action_footer": "{{app}} no puede ver tu borrador. Su texto se inserta tal cual y tú decides si lo envías.",
+      "rate_limit_allowed": "Correcto",
+      "resets": "Se restablece",
+      "plan_limit": "Límite del plan",
+      "limit_type": "Tipo de límite",
+      "rate_limit_warning": "Cerca del límite",
+      "rate_limit_rejected": "Limitado"
     },
     "chatPane": {
       "agent_list": "Lista de agentes",

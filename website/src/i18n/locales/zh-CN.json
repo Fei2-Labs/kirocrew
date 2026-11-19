@@ -6752,7 +6752,13 @@
       "composer_action_needs_empty": "{{app}} 只能插入到空消息中。请先清空草稿。",
       "composer_action_would_resolve": "{{app}} 的文本以 /、! 或 @ 开头，或包含 $skill、文件或图片，因此会被执行而不是作为文本发送。没有插入。",
       "composer_action_footer": "{{app}} 看不到你的草稿。它的文字按原样插入，是否发送由你决定。",
-      "turn_interrupted_restored_queue_other": "上一轮被中断。“恢复”只会重新运行那一轮。{{count}} 条排队消息不会自动发送：请展开队列（{{count}} 条已排队 ^），再用“立即发送”(⚡)逐条发送。"
+      "turn_interrupted_restored_queue_other": "上一轮被中断。“恢复”只会重新运行那一轮。{{count}} 条排队消息不会自动发送：请展开队列（{{count}} 条已排队 ^），再用“立即发送”(⚡)逐条发送。",
+      "rate_limit_allowed": "正常",
+      "resets": "重置",
+      "plan_limit": "套餐限额",
+      "limit_type": "限额类型",
+      "rate_limit_warning": "接近限额",
+      "rate_limit_rejected": "已限流"
     },
     "chatPane": {
       "agent_list": "代理列表",

@@ -7120,7 +7120,13 @@
       "composer_action_footer_host": "{{productName}} a vérifié le brouillon. {{app}} ne le voit toujours pas.",
       "composer_action_needs_empty": "{{app}} ne peut insérer que dans un message vide. Vide d'abord le brouillon.",
       "composer_action_would_resolve": "Le texte de {{app}} commence par /, ! ou @, ou contient un $skill, un fichier ou une image : il s'exécuterait au lieu d'être envoyé comme texte. Il n'a pas été inséré.",
-      "composer_action_footer": "{{app}} ne voit pas ton brouillon. Son texte est inséré tel quel, et c'est toi qui choisis de l'envoyer."
+      "composer_action_footer": "{{app}} ne voit pas ton brouillon. Son texte est inséré tel quel, et c'est toi qui choisis de l'envoyer.",
+      "rate_limit_allowed": "OK",
+      "resets": "Réinitialisation",
+      "plan_limit": "Limite du forfait",
+      "limit_type": "Type de limite",
+      "rate_limit_warning": "Proche de la limite",
+      "rate_limit_rejected": "Limité"
     },
     "chatPane": {
       "agent_list": "Liste des agents",

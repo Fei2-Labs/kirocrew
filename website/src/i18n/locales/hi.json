@@ -6936,7 +6936,13 @@
       "composer_action_footer_host": "{{productName}} ने ड्राफ़्ट जाँचा। {{app}} अब भी उसे नहीं देख सकता।",
       "composer_action_needs_empty": "{{app}} केवल खाली संदेश में डाल सकता है। पहले ड्राफ़्ट खाली करो।",
       "composer_action_would_resolve": "{{app}} का टेक्स्ट /, ! या @ से शुरू होता है, या उसमें $skill, फ़ाइल या इमेज है, इसलिए वह टेक्स्ट की तरह भेजे जाने के बजाय चलता। उसे नहीं डाला गया।",
-      "composer_action_footer": "{{app}} तुम्हारा ड्राफ़्ट नहीं देख सकता। उसका टेक्स्ट जैसा है वैसा डाला जाता है, और भेजना तुम तय करते हो।"
+      "composer_action_footer": "{{app}} तुम्हारा ड्राफ़्ट नहीं देख सकता। उसका टेक्स्ट जैसा है वैसा डाला जाता है, और भेजना तुम तय करते हो।",
+      "rate_limit_allowed": "ठीक",
+      "resets": "रीसेट",
+      "plan_limit": "प्लान सीमा",
+      "limit_type": "सीमा प्रकार",
+      "rate_limit_warning": "सीमा के करीब",
+      "rate_limit_rejected": "सीमित"
     },
     "chatPane": {
       "agent_list": "एजेंट सूची",

@@ -117,7 +117,7 @@ const INITIAL_STATE = {
   _wsChunkedDuringFetch: false, liveFrameSeq: 0, refreshAppliedSeq: {}, _redeliveredFramesDropped: 0, history: [], historyHasMore: false,
   historyOffset: 0, unresumableResume: null, lastResumeRequestId: null, pendingResumes: {}, undeletableHistory: null,
   pendingInput: null, pendingInputSend: false, mainComposerAppend: null, agentSwitchNotice: null, creatingSlot: false, foregroundCreateId: null, pendingForkOpens: 0,
-  lastCreatedActivation: null, slotContextPct: {}, slotContextTokens: {}, voicePlaying: false,
+  lastCreatedActivation: null, slotContextPct: {}, slotContextTokens: {}, slotRateLimit: {}, voicePlaying: false,
   voicePreparing: false, voiceAudio: null, subagents: {}, subagentQueued: {}, subagentQueuedReason: {}, subagentReplayUnconfirmed: null, automations: {},
   selectedSubagentId: null, toolLog: [], workflowRuns: {}, activityOpen: false, sidePanelAlwaysOpen: false, sidePanelAlwaysOpenSetting: null, sidePanelReopenSlot: null,
   activityTab: 'changes', activityTabRequest: 0, revealRequest: null, revealNonce: 0,

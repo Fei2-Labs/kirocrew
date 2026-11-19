@@ -6936,7 +6936,13 @@
       "composer_action_footer_host": "{{productName}} hat den Entwurf geprüft. {{app}} sieht ihn weiterhin nicht.",
       "composer_action_needs_empty": "{{app}} kann nur in eine leere Nachricht einfügen. Leere zuerst den Entwurf.",
       "composer_action_would_resolve": "Der Text von {{app}} beginnt mit /, ! oder @ oder enthält einen $skill, eine Datei oder ein Bild und würde daher ausgeführt statt als Text gesendet. Er wurde nicht eingefügt.",
-      "composer_action_footer": "{{app}} kann deinen Entwurf nicht sehen. Sein Text wird wörtlich eingefügt, und du entscheidest, ob du ihn sendest."
+      "composer_action_footer": "{{app}} kann deinen Entwurf nicht sehen. Sein Text wird wörtlich eingefügt, und du entscheidest, ob du ihn sendest.",
+      "rate_limit_allowed": "OK",
+      "resets": "Zurücksetzung",
+      "plan_limit": "Plan-Limit",
+      "limit_type": "Limit-Typ",
+      "rate_limit_warning": "Nahe am Limit",
+      "rate_limit_rejected": "Limitiert"
     },
     "chatPane": {
       "agent_list": "Agenten-Liste",

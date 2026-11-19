@@ -343,10 +343,16 @@ export function seedContextUsage(
 }
 
 export const slotCacheReducers = {
-  sseContextUsage(state: ChatState, action: PayloadAction<{ slot: string; pct?: number; used_tokens?: number; window_tokens?: number; reset?: boolean }>) {
-    const { slot, pct, used_tokens, window_tokens, reset } = action.payload
+  sseContextUsage(state: ChatState, action: PayloadAction<{ slot: string; pct?: number; used_tokens?: number; window_tokens?: number; reset?: boolean; rate_limit?: { status?: string; limit_type?: string; utilization?: number; resets_at?: number } }>) {
+    const { slot, pct, used_tokens, window_tokens, reset, rate_limit } = action.payload
     if (isUnsafeKey(slot)) return
     const key = safeKey(slot)
+    // The quota reading is account state, so it follows the OPPOSITE rule to
+    // the token counts below: a frame without it leaves the stored value in
+    // place and `reset` does not clear it. The backend only omits the key when
+    // the harness reports no quota at all, and a compaction or model switch --
+    // which is what `reset` marks -- changes the transcript, not the account.
+    if (rate_limit) state.slotRateLimit[key] = rate_limit
     if (window_tokens && window_tokens > 0) {
       // Real counts: set both the percentage and the {used, window} pair.
       if (typeof pct === 'number') state.slotContextPct[key] = pct

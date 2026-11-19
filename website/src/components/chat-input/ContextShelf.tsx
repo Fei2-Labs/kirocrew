@@ -15,7 +15,7 @@ import { acpBackendName } from '../../api/acpBackend'
 // Only a session on another harness than the install's draws it, so its brand
 // assets stay out of the chat bundle.
 const HarnessLogo = lazy(() => import('../HarnessLogo').then(m => ({ default: m.HarnessLogo })))
-import { fmtPercent } from '../../i18n/format'
+import { fmtPercent, fmtRelative } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import type { ComposerControl } from '../composerControl'
 import { usePressActivation } from '../../hooks/usePressActivation'
@@ -263,7 +263,13 @@ function CacheHitRate({ slot }: { slot: string }) {
 
 /** The context-window readout and its popover (usage, model, the per-session
  *  auto-compact threshold). */
-export function ContextUsageControl({ contextPct, contextUnknown = false, contextUsedTokens, contextWindowTokens, derivePctFromUsed, showContextPct, showContextTokens, shelfCompact, modelName, cacheSlot, ctxPopoverOpen, setCtxPopoverOpen, autoCompactThreshold }: {
+const RATE_LIMIT_STATUS_VIEW: Record<string, { key: string; color?: string }> = {
+  allowed: { key: 'components.chatInput.rate_limit_allowed' },
+  allowed_warning: { key: 'components.chatInput.rate_limit_warning', color: 'var(--warn)' },
+  rejected: { key: 'components.chatInput.rate_limit_rejected', color: 'var(--danger)' },
+}
+
+export function ContextUsageControl({ contextPct, contextUnknown = false, contextUsedTokens, contextWindowTokens, derivePctFromUsed, showContextPct, showContextTokens, shelfCompact, modelName, rateLimit, cacheSlot, ctxPopoverOpen, setCtxPopoverOpen, autoCompactThreshold }: {
   contextPct: number
   /** No reading for this slot yet: rendered as unknown, never as a measured 0%. */
   contextUnknown?: boolean
@@ -274,6 +280,7 @@ export function ContextUsageControl({ contextPct, contextUnknown = false, contex
   showContextTokens?: boolean
   shelfCompact: boolean
   modelName?: string
+  rateLimit?: ChatInputProps['rateLimit']
   /** The slot whose crew log the cache hit rate is read from; none reads nothing. */
   cacheSlot?: string | null
   ctxPopoverOpen: boolean
@@ -360,6 +367,32 @@ export function ContextUsageControl({ contextPct, contextUnknown = false, contex
                   <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.remaining')}</span><span className="text-text">{contextUnknown ? unknownMark : `${approx ? '~' : ''}${fmtTokens(remaining)}`}</span></div>
                   <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.total')}</span><span className="text-text">{fmtTokens(win)}</span></div>
                 </div>
+                {rateLimit && (() => {
+                  const statusView = rateLimit.status ? RATE_LIMIT_STATUS_VIEW[rateLimit.status] : undefined
+                  const util = typeof rateLimit.utilization === 'number' && rateLimit.utilization >= 0
+                    ? Math.min(rateLimit.utilization, 100)
+                    : undefined
+                  if (!statusView && util == null && !rateLimit.resets_at && !rateLimit.limit_type) return null
+                  return (
+                    <div className="mt-2 pt-2 border-t border-border flex flex-col gap-1 text-[11px] font-mono">
+                      <div className="flex items-center justify-between">
+                        <span className="text-muted">{i18nT('components.chatInput.plan_limit')}</span>
+                        {statusView
+                          ? <span className="font-semibold truncate max-w-[110px]" style={statusView.color ? { color: statusView.color } : undefined} title={i18nT(statusView.key)}>{i18nT(statusView.key)}</span>
+                          : util != null && <span className="text-text">{fmtPercent(util / 100)}</span>}
+                      </div>
+                      {statusView && util != null && (
+                        <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.used')}</span><span className="text-text">{fmtPercent(util / 100)}</span></div>
+                      )}
+                      {!!rateLimit.resets_at && (
+                        <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.resets')}</span><span className="text-text">{fmtRelative(rateLimit.resets_at)}</span></div>
+                      )}
+                      {!!rateLimit.limit_type && (
+                        <div className="flex justify-between"><span className="text-muted">{i18nT('components.chatInput.limit_type')}</span><span className="text-text truncate max-w-[110px]" title={rateLimit.limit_type}>{rateLimit.limit_type}</span></div>
+                      )}
+                    </div>
+                  )
+                })()}
                 {cacheSlot && <CacheHitRate slot={cacheSlot} />}
                 {modelName && (
                   <div className="mt-2 pt-2 border-t border-border flex justify-between text-[11px] font-mono">
