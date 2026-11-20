@@ -82,10 +82,8 @@ from kiro_crew.agent_sdk.backends import (  # noqa: F401 - selectable_backend_va
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_PROMPT_HANDLER_COMMANDS,
-    ACP_BACKENDS_KIRO_FAMILY,
     ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
     ACP_BACKENDS_MODEL_AT_LAUNCH,
-    backend_from_stored,
     model_registry_namespace,
     resolve_selected_backend,
     selectable_backend_values,
@@ -102,6 +100,7 @@ from kiro_crew.agent_sdk.drivers.acp import (  # noqa: F401 - facade names
     resolve_ssh_auth_sock,
     settings_default_model,
 )
+from kiro_crew.agent_sdk.drivers.acp_registry import backend_speaks_kiro_dialect
 from kiro_crew.agent_sdk.drivers.acp_vocab import backend_serves_auto_model
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agent_spec_format import (  # noqa: F401
@@ -335,7 +334,12 @@ from kiro_crew.dashboard.handlers.agent_templates import (  # noqa: F401
     validate_definition_patch,
 )
 from kiro_crew.dashboard.handlers.agents_cc_model_rows import merge_advertised_rows
+from kiro_crew.dashboard.handlers.agents_effort_levels import _effort_levels_for  # noqa: F401
 from kiro_crew.dashboard.handlers.agents_effort_levels import api_effort_levels  # noqa: F401
+from kiro_crew.dashboard.handlers.agents_effort_levels import (
+    _configured_acp_backend,
+    _provider_backend,
+)
 from kiro_crew.dashboard.handlers.agents_session_commands import (
     menu_backend,
     menu_with_session_commands,
@@ -850,17 +854,6 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     return merged
 
 
-def _provider_backend(provider: LLMProvider | None) -> str | None:
-    """ACP backend a live provider reports through the H14 contract."""
-    if provider is None:
-        return None
-    try:
-        backend = provider.backend
-    except (AttributeError, TypeError):
-        return None
-    return backend if isinstance(backend, str) else None
-
-
 def _models_from_provider(provider: LLMProvider) -> list[dict[str, str]]:
     """Verbatim advertised rows from one live provider, or ``[]``."""
     try:
@@ -882,27 +875,6 @@ def _models_from_provider(provider: LLMProvider) -> list[dict[str, str]]:
             }
         )
     return models
-
-
-def _configured_acp_backend() -> str:
-    """The configured non-default ACP backend, or ``""`` for kiro-cli.
-
-    Fails closed to ``""``: an unreadable config keeps the kiro-cli path, which is
-    the behaviour that exists today.
-    """
-    try:
-        from kiro_crew.config.loader import KiroCrewConfig
-
-        backend = KiroCrewConfig.load().agent.acp_backend
-        if not isinstance(backend, str):
-            return ""
-        # Stored ``"kiro"`` is the config-file spelling for the kiro runtime id
-        # (``ACP_BACKEND_KIRO``); callers judge the RUNTIME id (the SDK
-        # capability sets know no ``"kiro"``).
-        resolved = backend_from_stored(backend)
-        return resolved if isinstance(resolved, str) else ""
-    except Exception:
-        return ""
 
 
 def _models_list_scope(request: web.Request) -> tuple[str | None, LLMProvider | None]:
@@ -970,43 +942,6 @@ def _advertised_alt_backend_models(
         if models:
             return models
     return []
-
-
-def _effort_levels_for(request: web.Request) -> list[str]:
-    """Reasoning-effort levels the relevant harness actually advertised.
-
-    A live adapter session that reported none returns ``[]`` — do not substitute
-    kiro's process-global union. The Kiro-family backends (including
-    KAS) still falls through to that union so the first-class path is unchanged.
-    """
-    slot = ""
-    try:
-        raw_slot = request.query.get("slot")
-        slot = raw_slot.strip() if isinstance(raw_slot, str) else ""
-    except Exception:
-        slot = ""
-    if slot:
-        try:
-            state = request.app.get("state")
-            sessions = getattr(state, "sessions", None)
-            getter = getattr(sessions, "get_provider", None)
-            provider = getter(_history_key_for(slot)) if callable(getter) else None
-        except Exception:
-            provider = None
-        if provider is None:
-            return []
-        levels = provider.get_valid_effort_levels()
-        if levels:
-            return list(levels)
-        live_backend = _provider_backend(provider)
-        if live_backend is None or live_backend not in ACP_BACKENDS_KIRO_FAMILY:
-            return []
-        return get_reasoning_effort_ordered()
-
-    backend = _configured_acp_backend()
-    if backend and backend not in ACP_BACKENDS_KIRO_FAMILY:
-        return []
-    return get_reasoning_effort_ordered()
 
 
 def _advertised_backend_models(
@@ -1171,8 +1106,8 @@ async def api_models(request: web.Request) -> web.Response:
     # configured default now) read the same --list-models catalog below, so
     # only a foreign dialect takes the advertised path. An id with no
     # descriptor (a registry-prefixed adapter) is foreign by definition.
-    _alt_is_kiro_family = bool(_alt_backend) and _alt_backend in ACP_BACKENDS_KIRO_FAMILY
-    if _alt_backend and not _alt_is_kiro_family:
+    _alt_speaks_kiro_dialect = bool(_alt_backend and backend_speaks_kiro_dialect(_alt_backend))
+    if _alt_backend and not _alt_speaks_kiro_dialect:
         advertised = (
             _models_from_provider(scope_provider)
             if scope_provider is not None

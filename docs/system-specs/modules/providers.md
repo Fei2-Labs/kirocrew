@@ -68,7 +68,9 @@ config isolation) is [acp-client.md](acp-client.md); this file owns the
 `agent_sdk.drivers.acp_registry` according to the registered backend dialect,
 while `agent.provider` stays `enum=["acp"]`. There is no Bedrock or standalone
 provider and no `agent.provider` dispatch factory, because a second value would
-route around every harness-parity invariant.
+route around every harness-parity invariant. Application code that needs the
+dialect itself (the dashboard's model and effort lists) asks
+`acp_registry.backend_speaks_kiro_dialect` rather than a membership set.
 
 The Claude Code harness has its own page: [claude-code-provider.md](claude-code-provider.md).
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -10,6 +11,7 @@ from aiohttp import web
 
 from kiro_crew.acp.types import ACP_BACKEND_CODEX, ACP_BACKEND_KAS
 from kiro_crew.dashboard.handlers import agents as agents_handler
+from kiro_crew.dashboard.handlers import agents_effort_levels
 
 KIRO_FALLBACK = ["low", "medium", "high", "xhigh", "max"]
 
@@ -41,7 +43,9 @@ class _Provider:
 
 @pytest.fixture
 def kiro_union(monkeypatch: Any) -> list[str]:
-    monkeypatch.setattr(agents_handler, "get_reasoning_effort_ordered", lambda: list(KIRO_FALLBACK))
+    monkeypatch.setattr(
+        agents_effort_levels, "get_reasoning_effort_ordered", lambda: list(KIRO_FALLBACK)
+    )
     return KIRO_FALLBACK
 
 
@@ -78,13 +82,15 @@ class TestEffortLevelsFor:
     def test_settings_on_an_adapter_do_not_inherit_the_kiro_union(
         self, kiro_union: list[str], monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(agents_handler, "_configured_acp_backend", lambda: ACP_BACKEND_CODEX)
+        monkeypatch.setattr(
+            agents_effort_levels, "_configured_acp_backend", lambda: ACP_BACKEND_CODEX
+        )
         assert agents_handler._effort_levels_for(_config_request()) == []
 
     def test_settings_on_kiro_keep_the_global_list(
         self, kiro_union: list[str], monkeypatch: Any
     ) -> None:
-        monkeypatch.setattr(agents_handler, "_configured_acp_backend", lambda: "")
+        monkeypatch.setattr(agents_effort_levels, "_configured_acp_backend", lambda: "")
         assert agents_handler._effort_levels_for(_config_request()) == kiro_union
 
 
@@ -95,3 +101,18 @@ async def test_handler_returns_the_resolved_list(kiro_union: list[str]) -> None:
     assert isinstance(resp, web.Response)
     assert resp.status == 200
     assert resp.body == b"[]"
+
+
+@pytest.mark.asyncio
+async def test_handler_keeps_kiro_fallback_for_empty_advertisement(kiro_union: list[str]) -> None:
+    provider = _Provider("", [])
+    resp = await agents_handler.api_effort_levels(_slot_request(provider))
+    assert resp.status == 200
+    assert json.loads(resp.body) == KIRO_FALLBACK
+
+
+@pytest.mark.asyncio
+async def test_handler_returns_empty_for_missing_slot_provider(kiro_union: list[str]) -> None:
+    resp = await agents_handler.api_effort_levels(_slot_request(None))
+    assert resp.status == 200
+    assert json.loads(resp.body) == []

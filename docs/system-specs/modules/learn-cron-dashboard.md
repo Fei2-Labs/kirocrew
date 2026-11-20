@@ -7679,3 +7679,8 @@ Only the non-interactive
 arrow and outline overlay a target. Missing controls stop the guide instead of
 falling back to another element. Existing form drafts and navigation guards remain
 in force.
+
+`GET /api/effort-levels` returns levels advertised by the selected live provider.
+An adapter that advertises none gets an empty list rather than Kiro's global
+fallback; Kiro-dialect sessions keep the fallback when their own levels are not
+available. A request without a live slot uses the configured backend.

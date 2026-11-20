@@ -23,6 +23,16 @@ def adapter_factory_capabilities(backend: str) -> tuple[bool, bool]:
     )
 
 
+def backend_speaks_kiro_dialect(backend: str) -> bool:
+    """Whether *backend* speaks kiro's ACP dialect; an id with no descriptor does not."""
+    from kiro_crew.acp import backends
+
+    try:
+        return backends.dialect_of(backend) is backends.Dialect.KIRO
+    except backends.UnknownAcpBackend:
+        return False
+
+
 def adapter_provider_builder(backend: str) -> Callable[..., Any]:
     """Build a closure that constructs the provider implementation for *backend*."""
     from kiro_crew.acp import backends
