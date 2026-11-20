@@ -93,6 +93,8 @@ REACHES_NETWORK: dict[str, str] = {
     "/api/cloud/preflight": "shells the aws CLI (sts, iam) against the operator's profile",
     "/api/deploy/profiles": "shells `aws configure list-profiles`; the CLI's start-up on a "
     "host that has it is not bounded by this sweep",
+    "/api/update/fork": "fetches the fork's latest release from the GitHub API "
+    "(api.github.com), which answers 403 once its anonymous rate limit is spent",
 }
 
 #: Routes that answer 503 on a fresh home, and what each names as unavailable.
