@@ -20,8 +20,8 @@ Instance fields read: ``_acp_config_options``, ``_agent``,
 ``_spec_write_allowlist``, ``_spec_write_cwd``, ``_tool_call_diff_path``,
 ``_tool_call_harness_tool_name``, ``_tool_call_identity_unreadable``,
 ``_tool_call_input_redacted``, ``_tool_call_inputs``, ``_tool_call_is_shell``,
-``_tool_call_mcp_server``, ``_tool_call_params``, ``_tool_call_tool_name``,
-``_tool_call_unclassified``.
+``_tool_call_mcp_ambiguous``, ``_tool_call_mcp_server``, ``_tool_call_params``,
+``_tool_call_tool_name``, ``_tool_call_unclassified``.
 """
 
 from __future__ import annotations
@@ -1432,6 +1432,7 @@ def _build_permission_event(self: AcpClient, msg: JsonRpcMessage) -> AcpEvent | 
             # Same compatibility shape as the redaction map above.
             diff_path_cache=getattr(self, "_tool_call_diff_path", None),
             mcp_server_name_cache=self._tool_call_mcp_server,
+            mcp_identity_ambiguous_cache=getattr(self, "_tool_call_mcp_ambiguous", None),
             tool_name_cache=self._tool_call_tool_name,
             harness_tool_name_cache=getattr(self, "_tool_call_harness_tool_name", None),
             # Handed only on the KAS harness, the same gate as the kind carry (H13).

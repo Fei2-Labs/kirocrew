@@ -23,7 +23,7 @@ Instance fields written: ``_active_run_id``, ``_active_tool_calls``, ``_between_
 
 Instance fields read: ``_agent_accepts_image``, ``_batch_window``, ``_buffer``, ``_copilot_ambiguous_mcp_calls``, ``_copilot_unmatched_titles``, ``_engine_fallback``, ``_last_activity``, ``_liveness_oracle``,
 ``_permission_gate_events``, ``_pid``, ``_process``, ``_sel_settled_tool_calls``, ``_sent_images``,
-``_session_id``, ``_session_key``, ``_steer_turn``, ``_turn_lock``.
+``_session_id``, ``_session_key``, ``_steer_turn``, ``_tool_call_mcp_ambiguous``, ``_turn_lock``.
 """
 
 from __future__ import annotations
@@ -965,6 +965,7 @@ async def _dispatch_events(
     self._tool_call_unclassified.clear()
     self._skill_reads.clear()
     self._tool_call_mcp_server.clear()
+    getattr(self, "_tool_call_mcp_ambiguous", {}).clear()
     self._tool_call_tool_name.clear()
     self._tool_call_harness_tool_name.clear()
     self._tool_call_identity_unreadable.clear()

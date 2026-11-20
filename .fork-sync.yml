@@ -1113,6 +1113,24 @@ divergences:
     decided: 2026-08-29
     revised: 2026-09-15
 
+  - id: spec-mcp-title-identity
+    what: |
+      `client_tool_events._extract_tool_event` hands `classify_tool_call` the
+      spec-adapter flag and the session's exact MCP roster
+      (`allow_spec_title_identity`, `spec_mcp_server_names`), caches the
+      verdict's `identity_ambiguous` in `_tool_call_mcp_ambiguous`, and
+      `client_permissions` passes that cache to the permission builder so an
+      ambiguous `mcp__<server>__<tool>` title is hard-denied by the hook gate.
+    why: |
+      A spec adapter names an MCP call only in its `mcp__` title; without the
+      roster the call carries no server, so per-tool `@server/tool` governance
+      and the directive matcher see nothing, and a title matching two rostered
+      servers would reach a human prompt instead of a deny. Upstream's
+      `_extract_tool_event` calls the classifier bare, so a sync that takes
+      upstream's file drops these arguments silently.
+    pinned_by: "test/test_acp_spec_mcp_tools.py::TestSpecAdapterToolIdentity"
+    decided: 2026-08-29
+
   - id: connections-disconnect-owner-gate
     what: "api_connections_disconnect requires require_owner_dashboard_request."
     why: |
