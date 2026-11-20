@@ -372,6 +372,11 @@ class TestModelLoaderPaths:
         monkeypatch.setattr("kiro_crew.sel.sel", lambda: MagicMock())
         monkeypatch.setattr(sandbox, "cgroup_scope_argv", lambda argv: argv)
         monkeypatch.setattr(sandbox, "cgroup_scope_bus_env", lambda env: (env, ()))
+        # The crew fixture puts the data home outside the default one, which on macOS
+        # refuses every delegated Kiro launch before a model path is read; that
+        # refusal is pinned in test_sandbox_argv.py, so these branches run with the
+        # default-home policy.
+        monkeypatch.setattr(sandbox, "_run_coordinator_uses_custom_home", lambda: False)
 
         def configure(branch):
             platform = "win32" if branch == "windows-delegated" else "darwin"
