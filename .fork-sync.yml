@@ -297,6 +297,13 @@ conflict_policy:
                      (upstream has a module-level `_SPAWN_SCRUB_ENV_PREFIXES`
                      constant -- the fork needs the FUNCTION, or the ssh opt-in
                      silently needs a restart on that one path).
+        sandbox_leaves.py / sandbox_precreate.py  the `workflow_policy.json`
+                     leaf in `_CREW_READONLY_LEAVES`, `_CREW_CHILD_WITHHELD_LEAVES`
+                     and `_CREW_PRECREATE_READONLY_FILE_LEAVES` (upstream has no
+                     such leaf, so a whole-file take drops all three and
+                     `test_sandbox_governance_mask.py` reports it unaccounted).
+                     These three are the exception to the next sentence: losing
+                     them leaves the keystone WRITABLE from inside the sandbox.
       Losing a seam fails in the SAFE direction (the floor re-applies, the socket
       is scrubbed), so it will not show up as a security incident -- it shows up
       as the operator's workflow breaking again. `test/test_workflow_policy.py`

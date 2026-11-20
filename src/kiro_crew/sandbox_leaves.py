@@ -506,6 +506,14 @@ _CREW_READONLY_LEAVES: tuple[str, ...] = (
     # controls cloned with the machine's git identity.
     "registry_trust.json",
     "computer_use.json",
+    # The fork's loosening opt-ins (``workflow_policy.py``). READ-ONLY, not hidden,
+    # and the direction is the reason: a sandboxed reader that finds it absent falls
+    # back to the restrictive position, so masking it would silently re-impose the
+    # git-publication floor and re-scrub the ssh-agent socket for exactly the
+    # workflow the operator turned this on to allow. Writable, meanwhile, lets an
+    # auto-approved agent retire its own publication floor and hand itself the
+    # operator's signing keys.
+    "workflow_policy.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
     # The runtime config and its overlay. They are ordinary settings files, but they
@@ -996,6 +1004,22 @@ _CREW_CHILD_WITHHELD_LEAVES: tuple[str, ...] = (
     "ssh_auth_sock_consent.json",
     "project_hooks_consent.json",
     "credential_redaction.json",
+    # The fork's loosening opt-ins, withheld on the same two counts as the family
+    # above. It is an INPUT TO AN AUTHORIZATION DECISION an in-sandbox process
+    # makes: ``security``'s ``_git_publication_floor_applies`` resolves the
+    # git-publication floor out of it, and ``workflow_policy`` decides from it
+    # whether the ssh-agent socket is scrubbed. Withholding costs it CLOSED: that
+    # predicate fails to ``True`` -- the floor APPLIES -- on any error, so a foreign
+    # harness's child that cannot read the file gets the restrictive answer.
+    #
+    # The direction is the opposite of the READONLY entry for the same leaf, and
+    # both are right because they answer different readers. For Crew's OWN
+    # in-sandbox reader, masking would re-impose a floor the operator deliberately
+    # lifted, so it stays readable there. For an ENFORCED harness's foreign child --
+    # which reaches the file through a channel that hits no gate and leaves no
+    # record -- the loosening opt-ins are exactly what must not be legible, and
+    # losing them only re-imposes a floor.
+    "workflow_policy.json",
     # The paid-AWS consent grant. Unlike its sibling consent records this one stores
     # IDENTIFIERS as well as a decision -- ``Grant.to_dict`` writes ``account`` and
     # ``arn`` -- so a read tells a foreign child which AWS account and caller identity
