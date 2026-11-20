@@ -9960,6 +9960,20 @@
       "defaultValue": {}
     },
     {
+      "path": "dashboard.feature_previews.acp_backends",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Feature preview: acp_backends",
+      "help": "Turn on the 'acp_backends' feature preview.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
       "path": "dashboard.feature_previews.artifact_deploy",
       "kind": "core",
       "type": "boolean",

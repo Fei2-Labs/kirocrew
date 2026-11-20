@@ -52,6 +52,7 @@ REMOTE_EDITOR_HOST_PATTERN = (
 # the browser's copy as a cache of this section, and
 # test_feature_previews_config.py pins the two lists equal.
 FEATURE_PREVIEW_FLAGS: tuple[str, ...] = (
+    "acp_backends",
     "artifact_deploy",
     "bridge_approvals",
     "chat_runtime_sharing",

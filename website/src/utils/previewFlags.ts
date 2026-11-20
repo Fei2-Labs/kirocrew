@@ -61,6 +61,11 @@ export const PREVIEW_SESSION_ENVIRONMENTS = `${PREVIEW_FLAG_PREFIX}session-envir
 
 /** Inbound webhooks (`/webhooks`): functional, not yet polished enough to ship. */
 export const PREVIEW_WEBHOOKS = `${PREVIEW_FLAG_PREFIX}webhooks`
+/**
+ * The active ACP backend row on System > Services, which probes the owner-only
+ * `/api/acp-backends`. Default OFF. It has no switch in Settings; the gateway
+ * keeps it as `dashboard.feature_previews.acp_backends`, like every other flag.
+ */
 export const PREVIEW_ACP_BACKENDS = `${PREVIEW_FLAG_PREFIX}acp-backends`
 
 /**
@@ -282,6 +287,7 @@ export const PREVIEW_FLAGS: readonly string[] = [
   PREVIEW_DASHBOARD_STALE_WAKE,
   PREVIEW_BRIDGE_APPROVALS,
   PREVIEW_CHAT_RUNTIME_SHARING,
+  PREVIEW_ACP_BACKENDS,
 ]
 
 /**
