@@ -1,4 +1,8 @@
-"""The Git panel: bounded git runs and ``GET /api/project/git/{status,log,branch-diff}``."""
+"""The Git panel: bounded git runs and ``GET /api/project/git/{status,log,branch-diff}``.
+
+The status route answers a project directory that is not itself a repository with
+the repositories below it, grouped per repository; ``git_repo_discovery`` finds them.
+"""
 
 from __future__ import annotations
 
@@ -20,13 +24,18 @@ if TYPE_CHECKING:
         _BRANCH_DIFF_MAX_FILES,
         _GIT_FILTER_KEY_RE,
         _GIT_PROBE_STDERR_CAP,
+        _REPO_ROW_BUDGET,
+        _REPO_STATUS_CONCURRENCY,
         ConfigHookScanError,
         DashboardState,
+        _discover_repo_roots,
         _git_repo_touches,
         _match_known_project_for,
         _redact_project_path,
+        _repo_scan_cache,
         _sel,
         _slot_git_repo_snapshot,
+        _verify_descendant_roots,
         config_hook_disable_args_sandboxed,
         deny_app_slot_session_access,
         effective_session_key,
@@ -382,34 +391,49 @@ async def api_project_git_status(request: web.Request) -> web.Response:
     if not await asyncio.to_thread(os.path.isdir, base):
         return web.json_response({"repo": False, "files": []})
 
-    def _run() -> dict:
-        _git_cmd = [
-            "git",
-            "-c",
-            "diff.textconv=",
-            "-c",
-            "core.attributesFile=/dev/null",
-            "-c",
-            f"core.hooksPath={os.devnull}",
-            "-c",
-            "core.fsmonitor=",
-            # Repo-local .gitattributes is still consulted despite the
-            # attributesFile override, so keep driver escape hatches shut and
-            # emit non-ASCII paths raw (UTF-8) instead of C-quoted so the
-            # panel can open them.
-            "-c",
-            "core.quotePath=false",
-        ]
-        _env = {
-            **os.environ,
-            "GIT_ATTR_NOSYSTEM": "1",
-            "LC_ALL": "C",
-            "LANGUAGE": "C",
-        }
+    _git_base_cmd = [
+        "git",
+        "-c",
+        "diff.textconv=",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "core.fsmonitor=",
+        # Repo-local .gitattributes is still consulted despite the
+        # attributesFile override, so keep driver escape hatches shut and
+        # emit non-ASCII paths raw (UTF-8) instead of C-quoted so the
+        # panel can open them.
+        "-c",
+        "core.quotePath=false",
+    ]
+    _env = {
+        **os.environ,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "LC_ALL": "C",
+        "LANGUAGE": "C",
+    }
+
+    def _run(
+        base: str = base, known_root: str | None = None, approved_real: str | None = None
+    ) -> dict:
+        """Working-tree status for ONE repo.
+
+        ``known_root`` is the root discovery resolved, reported back as ``repoRoot``.
+        ``approved_real`` is the realpath verification approved for it, and is what
+        git's own toplevel must match.
+        """
+        # A copy per run: the hook-disable step below extends it per repository.
+        _git_cmd = list(_git_base_cmd)
 
         # Git owns repository discovery inside the sandbox. Its English
         # not-a-repository verdict is confirmed absence. Every other probe
         # failure remains an operational outage unless the directory vanished.
+        #
+        # Runs on EVERY route, discovered root included: discovery's answer can be
+        # up to ``_REPO_SCAN_TTL_SECONDS`` old, so "this was a repository a minute
+        # ago" is not evidence that it is readable now.
         probe_rc, probe_err = _probe_git_dir(base, _env)
         if probe_rc != 0:
             if _is_not_a_repo_verdict(probe_err):
@@ -481,9 +505,29 @@ async def api_project_git_status(request: web.Request) -> web.Response:
             env=_env,
             timeout=5,
         )
-        repo_root = root_out.strip()
-        if root_rc != 0 or not repo_root:
-            return {"_status_unavailable": True}
+        if known_root is not None:
+            # Discovery proved `.git` is CONTAINED, which is a fact about the
+            # filesystem. `core.worktree` moves the tree git actually reads, so a
+            # contained repo can still report an outside tree's filenames under a
+            # contained `repoRoot`. Ask git where it operates -- that collapses
+            # core.worktree, GIT_WORK_TREE and worktree pointers alike.
+            if root_rc != 0:
+                return {"_status_unavailable": True}
+            effective = os.path.realpath(os.path.normpath(root_out.strip()))
+            # Compared against the realpath VERIFICATION approved, never against a
+            # fresh resolve of the same path: a root swapped after verification
+            # resolves to the attacker's target on both sides and would agree.
+            expected = approved_real if approved_real is not None else os.path.realpath(known_root)
+            if effective != expected:
+                return {"_status_filter_refused": "unreadable"}
+            repo_root = known_root
+        else:
+            repo_root = root_out.strip()
+            if root_rc != 0 or not repo_root:
+                return {"_status_unavailable": True}
+            # Same normalisation as discovery, so `repoRoot` has one shape on
+            # Windows regardless of which route resolved it.
+            repo_root = os.path.normpath(repo_root)
 
         # Branch + ahead/behind via status -b
         status_rc, status_out, _ = _run_git_bounded(
@@ -565,13 +609,18 @@ async def api_project_git_status(request: web.Request) -> web.Response:
                 if y not in (" ", "?", "!"):
                     files.append({"path": filepath, "status": y, "staged": False})
 
-        # Merge numstat for line counts (staged + unstaged vs HEAD)
+        # Merge numstat for line counts (staged + unstaged vs HEAD). Skipped
+        # for a clean repo: one fewer spawn per untouched repo.
         try:
-            numstat_rc, numstat_out, _ = _run_git_bounded(
-                [*_git_cmd, "diff", "--numstat", "--no-textconv", "--no-ext-diff", "HEAD"],
-                cwd=base,
-                env=_env,
-                timeout=10,
+            numstat_rc, numstat_out, _ = (
+                _run_git_bounded(
+                    [*_git_cmd, "diff", "--numstat", "--no-textconv", "--no-ext-diff", "HEAD"],
+                    cwd=base,
+                    env=_env,
+                    timeout=10,
+                )
+                if files
+                else (1, "", False)
             )
             if numstat_rc == 0:
                 stats: dict[str, tuple[int | None, int | None]] = {}
@@ -594,14 +643,16 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         except FileNotFoundError:
             pass
 
-        result: dict = {"repo": True, "repoRoot": repo_root, "files": files[:500]}
+        result: dict = {"repo": True, "repoRoot": repo_root, "files": files[:_REPO_ROW_BUDGET]}
+        for f in result["files"]:
+            f["repoRoot"] = repo_root
         # Status paths are repo-root-relative; when the project directory sits
         # below the repo root, every path starts with this prefix.
         rel = os.path.relpath(base, repo_root)
         result["_prefix"] = (
             "" if rel in (".", "") or rel.startswith("..") else rel.replace(os.sep, posixpath.sep)
         )
-        if len(files) > 500:
+        if len(files) > _REPO_ROW_BUDGET:
             result["truncated"] = True
         if branch:
             result["branch"] = branch
@@ -611,7 +662,115 @@ async def api_project_git_status(request: web.Request) -> web.Response:
             result["behind"] = behind
         return result
 
-    result = await asyncio.to_thread(_run)
+    fresh = request.query.get("refresh") == "1"
+    roots, bounded, probe_failed = await asyncio.to_thread(
+        _discover_repo_roots, base, _git_base_cmd, _env, fresh
+    )
+    if probe_failed:
+        # The probe could not reach a verdict. A directory that vanished under us
+        # is still plain absence, so that check runs first and keeps its 200.
+        if await asyncio.to_thread(_project_directory_absent, base):
+            return web.json_response({"repo": False, "files": []})
+        return web.json_response(
+            {
+                "error": "Couldn't read the repository status.",
+                "code": "git_status_unavailable",
+            },
+            status=503,
+        )
+    if not roots:
+        # No repo at or under the project dir. A directory that vanished between
+        # the isdir check and here reads the same way, and the classification
+        # below agrees: absence is a normal no-repository answer.
+        return web.json_response({"repo": False, "files": []})
+
+    if len(roots) == 1 and roots[0] == base:
+        # The project dir IS the repo root: the ordinary single-repo answer.
+        result = await asyncio.to_thread(_run, base, roots[0])
+    elif len(roots) == 1 and base.startswith(roots[0] + os.sep):
+        # The dir sits INSIDE a repo: status stays scoped to the dir.
+        result = await asyncio.to_thread(_run)
+    else:
+        # Every DESCENDANT set takes the grouped path, one repo included: a lone
+        # descendant reported as a bare single repo hides both its name and a
+        # per-repo refusal, and it would need its own render case in the panel.
+        verified, dropped = await asyncio.to_thread(_verify_descendant_roots, base, roots)
+        if dropped:
+            # The tree moved under a cached answer, so drop the stale entry and
+            # report the repo list as partial rather than silently short.
+            _repo_scan_cache.pop(base, None)
+            bounded = True
+        if not verified:
+            return web.json_response({"repo": False, "files": []})
+        roots = [root for root, _real in verified]
+        # Each collection spawns git through the OS sandbox: bound the burst.
+        gate = asyncio.Semaphore(_REPO_STATUS_CONCURRENCY)
+
+        async def _one(root: str, approved_real: str) -> dict:
+            async with gate:
+                return await asyncio.to_thread(_run, root, root, approved_real)
+
+        collected = await asyncio.gather(
+            *(_one(root, real) for root, real in verified), return_exceptions=True
+        )
+        repos: list[dict] = []
+        truncated = False
+        # One budget shared across groups keeps `files` and `repos[].files`
+        # holding the same row objects, so the redaction below covers both.
+        budget = _REPO_ROW_BUDGET
+        for root, one in zip(roots, collected):
+            if isinstance(one, BaseException) or not one.get("repo"):
+                # A per-repo outage or refusal is reported ON ITS GROUP, never as
+                # a 503 for the whole workspace: one unreadable sibling must not
+                # blank the panel for every other repo in the tree. The group
+                # carries `refused` so the reader is told which repo, and the
+                # response stays 200 because the rest of it is real status.
+                # A collection that RAISED is the same outage: dropping its group
+                # would draw the workspace as if that repository did not exist.
+                if isinstance(one, BaseException) or (
+                    one.get("_status_unavailable") or one.get("_status_filter_refused")
+                ):
+                    repos.append(
+                        {
+                            "root": root,
+                            "name": os.path.relpath(root, base),
+                            "files": [],
+                            "refused": True,
+                        }
+                    )
+                continue
+            full = one.get("files", [])
+            rows = full[:budget] if len(full) > budget else full
+            budget -= len(rows)
+            entry: dict = {
+                "root": root,
+                "name": os.path.relpath(root, base),
+                "files": rows,
+            }
+            if len(rows) < len(full) or one.get("truncated"):
+                # Rows this repo really has, dropped by the shared budget OR by the
+                # per-repo cap inside `_run` (which arrives already truncated, so
+                # the length comparison alone cannot see it). Without saying so the
+                # group renders a count for a repo we did not finish reading.
+                entry["truncated"] = True
+                truncated = True
+            # No per-group ahead/behind: nothing renders them, and a field with
+            # no reader is surface to maintain rather than information.
+            for field in ("branch", "refused"):
+                if one.get(field):
+                    entry[field] = one[field]
+            truncated = truncated or bool(one.get("truncated"))
+            repos.append(entry)
+        merged = [row for group in repos for row in group["files"]]
+        # No top-level branch/ahead/behind: siblings each have their own.
+        result = {"repo": bool(repos), "files": merged, "repos": repos}
+        if truncated:
+            result["truncated"] = True
+
+    if bounded:
+        # Discovery stopped early, so the repo list is not the whole workspace.
+        result["reposTruncated"] = True
+
     # A project directory can vanish after the initial directory check and
     # surface from process creation as ENOENT/ENOTDIR (FileNotFoundError or
     # NotADirectoryError), including Windows errors 2, 3, and 267. Re-check the
@@ -707,17 +866,29 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         return redact_path_segments(path, redact)
 
     deduped_files: list[dict] = []
-    seen_keys: set[tuple[str, str | None, bool | None]] = set()
+    seen_keys: set[tuple[str, str | None, str | None, bool | None]] = set()
     files = result.get("files", [])
     for f in files:
         f["path"] = _redact_status_path(f["path"])
-        key = (f["path"], f.get("status"), f.get("staged"))
+        if f.get("repoRoot"):
+            f["repoRoot"] = _redact_project_path(f["repoRoot"])
+        # ``repoRoot`` is part of the key because the row list is FLAT across a
+        # multi-repo workspace: the same relative path exists once per repo, and
+        # keying without the root would collapse those siblings into one row.
+        key = (f["path"], f.get("repoRoot"), f.get("status"), f.get("staged"))
         if key in seen_keys:
             continue
         seen_keys.add(key)
         deduped_files.append(f)
     if "files" in result:
         result["files"] = deduped_files
+    kept = {id(f) for f in deduped_files}
+    for group in result.get("repos", []):
+        group["root"] = _redact_project_path(group["root"])
+        group["name"] = redact(group["name"])
+        if group.get("branch"):
+            group["branch"] = redact(group["branch"])
+        group["files"] = [f for f in group["files"] if id(f) in kept]
     return web.json_response(result)
 
 

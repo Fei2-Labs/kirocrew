@@ -176,6 +176,36 @@ class TestMultiRepoDiscovery:
         assert data["files"] == []
 
     @pytest.mark.asyncio
+    async def test_a_collection_that_raises_is_a_refused_group(
+        self, workspace, mock_sel, monkeypatch
+    ):
+        """An error collecting one repo marks THAT group refused; the sibling
+        still reports, and the failing repo does not vanish from the list."""
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        broken = str(workspace / "src" / "PkgB")
+        real_run = files_mod._run_git_bounded
+
+        def _fail_in_pkg_b(args, cwd, *a, **kw):
+            if os.path.realpath(cwd) == os.path.realpath(broken):
+                raise OSError("injected git spawn failure")
+            return real_run(args, cwd, *a, **kw)
+
+        monkeypatch.setattr(files_mod, "_run_git_bounded", _fail_in_pkg_b)
+        files_mod._repo_scan_cache.clear()
+        (workspace / "src" / "PkgA" / "a.txt").write_text("changed in A\n")
+
+        async with TestClient(TestServer(_make_app(str(workspace)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={workspace}")
+            data = await resp.json()
+
+        assert resp.status == 200
+        groups = {g["name"]: g for g in data["repos"]}
+        assert groups[os.path.join("src", "PkgB")]["refused"] is True
+        assert groups[os.path.join("src", "PkgB")]["files"] == []
+        assert [f["path"] for f in groups[os.path.join("src", "PkgA")]["files"]] == ["a.txt"]
+
+    @pytest.mark.asyncio
     async def test_single_repo_refusal_is_reported_on_the_response(self, repo, mock_sel):
         """The project dir being the repo draws no group header, so the refusal
         has to reach the client on its own.

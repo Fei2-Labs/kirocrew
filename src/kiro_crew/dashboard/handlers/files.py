@@ -4,7 +4,8 @@ Routes, the handlers package and tests import and patch every file handler throu
 this module. The handler families live in the ``file_api`` owners -- ``uploads``,
 ``workspaces``, ``pinned_io``, ``transfer``, ``office_preview``, ``sheet``,
 ``search``, ``path_complete``, ``grep``, ``browse``, ``project_dirs``,
-``git_panel``, ``project_tree``, ``dashboard_config``, ``path_probe`` (the
+``git_panel``, ``git_repo_discovery`` (the status route's repository scan),
+``project_tree``, ``dashboard_config``, ``path_probe`` (the
 ``_run_path_probe`` chokepoint), ``outbox``, ``channel_upload`` (the Slack and channel
 uploads with their shared admission gate), ``desktop`` (reveal, the native picker and
 screenshot) and ``editor`` (file read, raw, write and diff) -- and ``_facade_compose.compose``
@@ -49,6 +50,7 @@ import urllib.parse  # noqa: F401
 import uuid  # noqa: F401
 import zipfile  # noqa: F401
 from dataclasses import asdict  # noqa: F401
+from itertools import islice  # noqa: F401 - owner: git_repo_discovery
 from pathlib import Path, PurePath  # noqa: F401
 from typing import BinaryIO, Callable, NamedTuple, TypeVar  # noqa: F401
 
@@ -102,6 +104,7 @@ from kiro_crew.dashboard.file_api import dashboard_config as _owner_dashboard_co
 from kiro_crew.dashboard.file_api import desktop as _owner_desktop
 from kiro_crew.dashboard.file_api import editor as _owner_editor
 from kiro_crew.dashboard.file_api import git_panel as _owner_git_panel
+from kiro_crew.dashboard.file_api import git_repo_discovery as _owner_git_repo_discovery
 from kiro_crew.dashboard.file_api import grep as _owner_grep
 from kiro_crew.dashboard.file_api import office_preview as _owner_office_preview
 from kiro_crew.dashboard.file_api import outbox as _owner_outbox
@@ -165,6 +168,12 @@ from kiro_crew.dashboard.file_api.git_panel import (  # noqa: F401
     api_project_git_log,
     api_project_git_repos,
     api_project_git_status,
+)
+from kiro_crew.dashboard.file_api.git_repo_discovery import (  # noqa: F401
+    _discover_repo_roots,
+    _git_dir_is_contained,
+    _git_pointer_gitdir,
+    _verify_descendant_roots,
 )
 from kiro_crew.dashboard.file_api.grep import (  # noqa: F401
     _grep_doc_segments,
@@ -1300,6 +1309,21 @@ _SHEET_MAX_CDIR_ENTRY_BYTES = 512
 
 _GIT_PROBE_STDERR_CAP = 4096
 
+# Downward repository discovery for a project directory that is not itself a
+# repository (``_discover_repo_roots``): how deep, how many repositories and how
+# many directory entries one scan may reach, and how long its answer is reused
+# between polls.
+_REPO_SCAN_MAX_DEPTH = 3
+_REPO_SCAN_MAX_REPOS = 12
+_REPO_SCAN_MAX_ENTRIES = 4000
+_REPO_SCAN_TTL_SECONDS = 60.0
+# Discovered repositories whose status is collected at once.
+_REPO_STATUS_CONCURRENCY = 6
+#: Changed-file rows one status answer may carry, shared across repo groups.
+_REPO_ROW_BUDGET = 500
+
+_repo_scan_cache: dict[str, tuple[float, list[str], bool]] = {}
+
 # The branch diff (``api_project_git_branch_diff``) compares HEAD with the first
 # of these that exists: the remote's default branch, then a local main, then the
 # older default branch name, which is a real ref name and cannot be renamed here.
@@ -1408,6 +1432,7 @@ _facade_compose(
         _owner_browse,
         _owner_project_dirs,
         _owner_git_panel,
+        _owner_git_repo_discovery,
         _owner_project_tree,
         _owner_dashboard_config,
         _owner_path_probe,
