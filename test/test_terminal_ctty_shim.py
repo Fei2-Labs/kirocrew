@@ -75,7 +75,8 @@ class TestCttyArgvContract:
         prefix = spawn_shim_argv(RLIMIT_PROFILE_NONE, ctty_fd=0)
         assert prefix, "a ctty request must not be dropped as 'nothing to do'"
         assert prefix[0] == sys.executable
-        assert prefix[1:4] == ("-I", "-S", "-c")
+        # -B: fork divergence signed-bundle-bytecode-floor (HALF 2) keeps it here.
+        assert prefix[1:5] == ("-I", "-S", "-B", "-c")
         assert "--ctty-fd=0" in prefix
         assert prefix[-1] == "--"
         # No limits and no bias for this profile, so the ctty flag is the only one.
