@@ -1383,16 +1383,9 @@ class TestReclaimOwnsEveryHarnessItTracked:
             patch("kiro_crew.session_pid.platform_compat.get_ppid", return_value=1),
             patch("kiro_crew.session_pid.platform_compat.pid_exists", return_value=True),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
-            # The entry carries a token and the live token MATCHES, so identity
-            # is settled and this build kills through the PINNED path
-            # (``kill_process_tree_pinned``), not the bare ``kill_pid`` upstream
-            # has. That is a fork divergence and a stronger one: the recorded
-            # start token stays pinned THROUGH the kill, so PID reuse cannot land
-            # inside the probe/signal gap. Patching only ``kill_pid`` would miss
-            # this call and leave the identity check unpinned.
             patch(
-                "kiro_crew.session_pid.platform_compat.kill_process_tree_pinned",
-                side_effect=lambda p, token, s: (kills.append((p, s)) or True),
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append((p, s)),
             ),
         ):
             cleanup_orphaned_session_roots()
@@ -1422,15 +1415,12 @@ class TestReclaimOwnsEveryHarnessItTracked:
             patch("kiro_crew.session_pid._pid_start_token", return_value="sometoken"),
             patch("kiro_crew.acp.client._get_child_pids", return_value=[]),
             patch("kiro_crew.session_pid.platform_compat.pid_exists", return_value=True),
-            # Settled token => the PINNED kill path, which is a fork
-            # divergence upstream does not have (no ``expected_start_token``),
-            # so ``kill_pid`` is never reached and patching it recorded nothing.
             patch(
-                "kiro_crew.session_pid.platform_compat.kill_process_tree_pinned",
-                side_effect=lambda p, token, s: (kills.append(p) or True),
+                "kiro_crew.session_pid.platform_compat.kill_pid",
+                side_effect=lambda p, s: kills.append(p),
             ),
         ):
-            killed = _kill_confirmed_and_writeback(my_gw, [(99998, "sometoken")], set())
+            killed = _kill_confirmed_and_writeback(my_gw, [99998], set())
 
         assert kills == [99998]
         assert killed == 1
@@ -1513,7 +1503,7 @@ class TestReclaimOwnsEveryHarnessItTracked:
                 side_effect=lambda p, s: kills.append(p),
             ),
         ):
-            killed = _kill_confirmed_and_writeback(my_gw, [(99998, None)], set())
+            killed = _kill_confirmed_and_writeback(my_gw, [99998], set())
 
         assert kills == [], "signalled a PID no entry in the file vouched for"
         assert killed == 0
@@ -1540,7 +1530,7 @@ class TestReclaimOwnsEveryHarnessItTracked:
                 side_effect=lambda p, s: kills.append(p),
             ),
         ):
-            killed = _kill_confirmed_and_writeback(my_gw, [(99998, "recorded")], set())
+            killed = _kill_confirmed_and_writeback(my_gw, [99998], set())
 
         assert kills == []
         assert killed == 0
