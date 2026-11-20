@@ -947,12 +947,6 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "only a note's title and body, so the sink scrubs this field itself.",
     ),
     (
-        "Issue Radar work log",
-        "apps/builtins/issue_radar/backend/pipeline_bridge.py",
-        "External event details written to the issue ledger and served by the "
-        "dashboard work log, redacted before truncation and persistence.",
-    ),
-    (
         "Recovered subagent completion deliveries",
         "run_coordinator/recovery.py",
         "Task, agent and error text in the durable completion event sent to the "
