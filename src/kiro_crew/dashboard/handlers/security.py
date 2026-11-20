@@ -572,8 +572,12 @@ async def api_workflow_policy_patch(request: web.Request) -> web.Response:
     change whichever setting the operator did not touch.
     """
     from kiro_crew import workflow_policy
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
     op = "security.workflow_policy.update"
+    denied = await require_owner_dashboard_request(request, op)
+    if denied is not None:
+        return denied
     try:
         body = await request.json()
     except Exception:

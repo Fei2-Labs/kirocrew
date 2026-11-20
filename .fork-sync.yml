@@ -622,8 +622,9 @@ divergences:
       `security._git_publication_floor_applies()`,
       `security.floor_enforced_builtin_command_ids()`,
       `sandbox._sensitive_env_prefixes()` / `_spawn_scrub_env_prefixes()`, the
-      `/api/security/workflow-policy` handlers, and `WorkflowPolicyCard` in
-      `SecurityPanel.tsx`.
+      `/api/security/workflow-policy` handlers (the PATCH behind upstream's
+      `require_owner_dashboard_request`, like every mutating route in
+      `handlers/security.py`), and `WorkflowPolicyCard` in `SecurityPanel.tsx`.
     why: |
       Upstream's floor denies a bare `git push` and any push to
       main/master/mainline, un-disableably, and scrubs `SSH_AUTH_SOCK` in every
@@ -639,7 +640,7 @@ divergences:
       keystone the agent cannot read or write rather than in `config.json`, why
       every read fails soft to the restrictive position, and why both predicates
       test strict equality instead of truthiness.
-    pinned_by: "test/test_workflow_policy.py, website/src/pages/settings/SecurityPanel.workflowPolicy.test.tsx"
+    pinned_by: "test/test_workflow_policy.py, test/test_r6_owner_gate_regression.py (the PATCH's owner gate), website/src/pages/settings/SecurityPanel.workflowPolicy.test.tsx"
     decided: 2026-09-05
 
   - id: permission-argument-race-park
