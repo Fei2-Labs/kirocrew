@@ -257,7 +257,7 @@ async def test_goose_skips_session_load_when_native_resume_is_unavailable(
     client._send_request = AsyncMock(side_effect=fake_send)
     client._wait_for_response = AsyncMock(side_effect=fake_wait)
     client._drain_notifications = AsyncMock()
-    client._session_mcp_servers = AsyncMock(return_value=[])
+    client._session_mcp_servers = MagicMock(return_value=[])
 
     await client._initialize_session()
 

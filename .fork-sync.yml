@@ -168,6 +168,15 @@ conflict_policy:
   - glob: "src/kiro_crew/apps/builtins/**"
     policy: upstream_wins
 
+  - glob: "src/kiro_crew/acp/client_start.py"
+    policy: upstream_wins
+    note: |
+      Re-apply the native-resume capability gate before sending a resume RPC:
+      `loadSession` proves the RPC exists, but only a SUPPORTED
+      `CAP_NATIVE_RESUME` proves it can restore the transcript Crew would
+      otherwise stop replaying. Pinned by
+      `test/test_acp_backend_goose.py::test_goose_skips_session_load_when_native_resume_is_unavailable`.
+
   # Remaining first-party modules with no recorded fork divergence: upstream's
   # version is authoritative. If a resolution here turns out to need judgment,
   # promote the path to its own rule above rather than deciding it twice.
@@ -379,6 +388,21 @@ conflict_policy:
       missing there, the fix is an upstream PR, not a fork edit.
 
 divergences:
+  - id: client-native-resume-capability-gate
+    what: |
+      `AcpClient._initialize_session` attempts native resume only when the
+      backend advertises its protocol RPC AND `acp.backends.supports(backend,
+      CAP_NATIVE_RESUME)` is true. `loadSession` alone is not proof that the
+      host restores the prior transcript. UNAVAILABLE and UNVERIFIED
+      capabilities skip the RPC, leaving `resumed` false so Crew retains its
+      transcript replay path.
+    why: |
+      Goose advertises `loadSession` and accepts `session/load`, but transcript
+      restoration is not verified for the harness. Treating a successful empty
+      response as a native resume would suppress Crew's prior transcript.
+    pinned_by: "test/test_acp_backend_goose.py::test_goose_skips_session_load_when_native_resume_is_unavailable"
+    decided: 2026-11-18
+
   - id: acp-tool-gate-no-local-opt-out
     what: |
       `acp/tool_gate.enforce_runtime_routing` refuses a backend whose route to

@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from kiro_crew import __version__, acp_tool_gate, agent_scratch
 from kiro_crew import kiro_cli as kiro_cli_mod
 from kiro_crew import platform_compat
+from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp import batch_guard
 from kiro_crew.acp import managed_agent_shadow as managed_shadow_mod
 from kiro_crew.acp import runtime_process_tree
@@ -922,7 +923,15 @@ async def _initialize_session(self: AcpClient) -> None:
         resume_sid = await self._fork_session(*fork_request, capabilities)
     sent_snapshot: DerivedSpecSnapshot | None = None
 
-    if resume_sid and self._can_load_session:
+    # The handshake advertises the RPC; the descriptor records whether it restores
+    # the native transcript Crew would otherwise stop replaying.
+    if resume_sid and not acp_backends.supports(self.backend, acp_backends.CAP_NATIVE_RESUME):
+        logger.info(
+            "Skipping native resume for %s: not supported on %s",
+            resume_sid,
+            acp_backends.descriptor_for(self.backend).label,
+        )
+    elif resume_sid and self._can_load_session:
         # Only attempt session/load when the prior session transcript
         # actually exists on disk. Without this guard a stale persisted SID
         # (e.g. a slot reopened for a brand-new conversation) triggers a
