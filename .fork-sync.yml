@@ -1153,7 +1153,7 @@ divergences:
       servers would reach a human prompt instead of a deny. Upstream's
       `_extract_tool_event` calls the classifier bare, so a sync that takes
       upstream's file drops these arguments silently.
-    pinned_by: "test/test_acp_spec_mcp_tools.py::TestSpecAdapterToolIdentity"
+    pinned_by: "test/test_acp_spec_mcp_tools.py::TestSpecAdapterToolIdentity, test/test_crew_oauth_bridge_harnesses.py::test_a_ceiling_denying_the_server_refuses_the_dsh_ask_before_any_mint (the unrostered title is refused before the ceiling)"
     decided: 2026-08-29
 
   - id: connections-disconnect-owner-gate
