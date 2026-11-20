@@ -274,9 +274,8 @@ def _npm_copilot(root, version: str, *, name: str = "@github/copilot") -> str:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="npm bin links are symlinks on POSIX")
-class TestCopilotWrongVersion:
-    """UX: a Copilot CLI on any release but the verified one refuses every chat at
-    the handshake, so the row must not call it Installed.
+class TestCopilotReleaseProbe:
+    """Any readable installed Copilot release is available to the probe.
 
     Read from the install's own manifest, so each case lays down a real npm layout
     and lets the spawn's resolver find it.
@@ -290,14 +289,11 @@ class TestCopilotWrongVersion:
         monkeypatch.setattr(client, "_self_served_bin_caches", {})
         return probe.probe_backend(ACP_BACKEND_COPILOT)
 
-    def test_another_release_is_missing_the_verified_one(self, monkeypatch, tmp_path):
-        from kiro_crew.agent_sdk.backends import COPILOT_VERIFIED_VERSION
-
+    def test_another_release_is_installed(self, monkeypatch, tmp_path):
         state = self._probe(monkeypatch, _npm_copilot(tmp_path, "1.0.103"))
-        assert state.installed == probe.MISSING
-        assert state.found_version == "1.0.103"
-        assert state.missing_components == (f"copilot {COPILOT_VERIFIED_VERSION}",)
-        assert state.install_command == f"npm i -g @github/copilot@{COPILOT_VERIFIED_VERSION}"
+        assert state.installed == probe.INSTALLED
+        assert state.found_version == ""
+        assert state.missing_components == ()
 
     def test_the_verified_release_is_installed(self, monkeypatch, tmp_path):
         from kiro_crew.agent_sdk.backends import COPILOT_VERIFIED_VERSION
