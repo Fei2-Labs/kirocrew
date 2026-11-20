@@ -294,6 +294,7 @@ _MEMBERS: dict[str, tuple[str, object, str, str]] = {
     "pause_turn_admission_for_update": ("function", True, "a6632a57e602", "claims"),
     "pending_identity_sweep_fingerprint": ("property", False, "bb418bb7ece8", "state_views"),
     "project_aws_profile": ("function", False, "cb2074e9df23", "claims"),
+    "provider_label_for": ("function", False, "f1d40e624ae4", "session"),
     "provider_switch_replay_delivered": ("function", False, "721800ecea8c", "turn_context"),
     "provider_switch_replay_pending": ("function", False, "1eda252b53bd", "turn_context"),
     "rearm_first_turn": ("function", False, "44a1bff78c26", "claims"),
