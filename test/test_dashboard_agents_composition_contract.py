@@ -244,12 +244,9 @@ _FACADE_DEFS = (
     "_advertised_backend_models",
     "_wrap_list_models_argv",
     "_scoped_default",
-    "_provider_backend",
     "_models_from_provider",
-    "_configured_acp_backend",
     "_models_list_scope",
     "_advertised_alt_backend_models",
-    "_effort_levels_for",
     "api_models",
     "api_slash_commands",
     "api_kirocrew_agents",
@@ -263,7 +260,15 @@ _FACADE_DEFS = (
 #: Base definitions in a plain sibling module outside the owner composition, which
 #: the facade imports and binds under the same name: name -> module stem.
 _SIBLING_DEFS = {
-    "api_effort_levels": "agents_effort_levels",
+    **dict.fromkeys(
+        (
+            "api_effort_levels",
+            "_provider_backend",
+            "_configured_acp_backend",
+            "_effort_levels_for",
+        ),
+        "agents_effort_levels",
+    ),
     **dict.fromkeys(
         (
             "_CatalogUnavailable",

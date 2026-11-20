@@ -57,19 +57,23 @@ def _effort_levels_for(request: web.Request) -> list[str]:
             provider = getter(_history_key_for(slot)) if callable(getter) else None
         except Exception:
             provider = None
-        if provider is None:
-            return []
-        try:
-            getter = getattr(provider, "get_valid_effort_levels", None)
-            levels = getter() if callable(getter) else []
-        except (AttributeError, KeyError):
-            levels = []
-        if levels:
-            return list(levels)
-        live_backend = _provider_backend(provider)
-        if live_backend is None or not backend_speaks_kiro_dialect(live_backend):
-            return []
-        return get_reasoning_effort_ordered()
+        live_backend = None
+        if provider is not None:
+            try:
+                getter = getattr(provider, "get_valid_effort_levels", None)
+                levels = getter() if callable(getter) else []
+            except (AttributeError, KeyError):
+                levels = []
+            if levels:
+                return list(levels)
+            live_backend = _provider_backend(provider)
+        # A live provider that names its backend decides. A cold slot (no live
+        # provider yet) or a provider that names none falls to the configured
+        # backend below, as the settings path does.
+        if live_backend is not None:
+            return (
+                get_reasoning_effort_ordered() if backend_speaks_kiro_dialect(live_backend) else []
+            )
 
     backend = _configured_acp_backend()
     if backend and not backend_speaks_kiro_dialect(backend):
