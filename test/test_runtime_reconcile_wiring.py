@@ -306,15 +306,15 @@ def test_the_wiring_claims_pids_tracked_by_any_gateway_on_this_data_home(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
     mine, other = os.getpid(), os.getpid() + 1
     # 5101 is ours; 5202 belongs to another gateway pid on the same home; 5303 is a
     # sandbox child, recorded only as a descendant in the other file.
-    (home / "kiro_session_pids.txt").write_text(
+    (home / "run" / "kiro_session_pids.txt").write_text(
         f"{mine}:5101:TOKEN-A\n{other}:5202:TOKEN-B\n", encoding="utf-8"
     )
-    (home / "kiro_pids.txt").write_text(f"5303:{mine}\n", encoding="utf-8")
+    (home / "run" / "kiro_pids.txt").write_text(f"5303:{mine}\n", encoding="utf-8")
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
     # Patched on THIS module: the enumerator is a hoisted module-scope import here,
     # so patching its source module would leave this reference untouched and the
@@ -377,10 +377,10 @@ def test_a_foreign_gateways_dead_record_is_counted_but_not_claimed_retracted(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
     mine, foreign = os.getpid(), os.getpid() + 1
-    (home / "kiro_session_pids.txt").write_text(
+    (home / "run" / "kiro_session_pids.txt").write_text(
         f"{mine}:5001:TOK-A\n{foreign}:5002:TOK-B\n", encoding="utf-8"
     )
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
@@ -419,9 +419,9 @@ def test_the_entry_reader_carries_every_gateways_rows(
     from kiro_crew import session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    (home / "kiro_session_pids.txt").write_text(
+    (home / "run" / "kiro_session_pids.txt").write_text(
         "111:5001:TOK-A\n222:5002\ngarbage\n333:5003:TOK-C\n", encoding="utf-8"
     )
     owners = rr._session_pid_entry_owners()
@@ -614,7 +614,7 @@ def test_a_record_in_neither_tracking_file_is_counted_dead_but_not_claimed_retra
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
     monkeypatch.setattr(rr, "instance_slice_pids", lambda: set())
@@ -645,9 +645,9 @@ def test_a_descendant_only_record_is_retracted_from_the_descendant_file(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    pid_file = home / "kiro_pids.txt"
+    pid_file = home / "run" / "kiro_pids.txt"
     pid_file.write_text(f"5501:{os.getpid()}:TOK-D\n5502:{os.getpid()}:TOK-E\n", encoding="utf-8")
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
     monkeypatch.setattr(rr, "instance_slice_pids", lambda: set())
@@ -687,9 +687,9 @@ def test_a_legacy_bare_descendant_row_is_retracted_by_the_bare_line_remover(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    pid_file = home / "kiro_pids.txt"
+    pid_file = home / "run" / "kiro_pids.txt"
     pid_file.write_text("5601\n", encoding="utf-8")
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
     monkeypatch.setattr(rr, "instance_slice_pids", lambda: set())
@@ -718,9 +718,11 @@ def test_a_session_row_the_remover_left_in_place_is_not_claimed_retracted(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    (home / "kiro_session_pids.txt").write_text(f"{os.getpid()}:5801:TOK-F\n", encoding="utf-8")
+    (home / "run" / "kiro_session_pids.txt").write_text(
+        f"{os.getpid()}:5801:TOK-F\n", encoding="utf-8"
+    )
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
     monkeypatch.setattr(rr, "instance_slice_pids", lambda: set())
     monkeypatch.setattr(
@@ -752,9 +754,9 @@ def test_the_descendant_row_reader_names_only_a_pids_own_row(
     from kiro_crew import session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    (home / "kiro_pids.txt").write_text(
+    (home / "run" / "kiro_pids.txt").write_text(
         "5901:7001:TOK-G\n5902:7002\n5903\ngarbage\n\n", encoding="utf-8"
     )
     rows = rr._descendant_pid_rows()
@@ -778,9 +780,11 @@ def test_a_pid_carrying_two_rows_keeps_both_so_neither_is_retracted_by_the_other
     from kiro_crew import session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    (home / "kiro_pids.txt").write_text("6101:7101:TOK-H\n6101:7102:TOK-I\n", encoding="utf-8")
+    (home / "run" / "kiro_pids.txt").write_text(
+        "6101:7101:TOK-H\n6101:7102:TOK-I\n", encoding="utf-8"
+    )
 
     rows = rr._descendant_pid_rows()
 
@@ -803,9 +807,9 @@ def test_a_replacement_row_under_a_reused_pid_survives_the_dead_rows_retraction(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    pid_file = home / "kiro_pids.txt"
+    pid_file = home / "run" / "kiro_pids.txt"
     dead_row = f"6201:{os.getpid()}:TOK-DEAD"
     pid_file.write_text(dead_row + "\n", encoding="utf-8")
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
@@ -856,10 +860,10 @@ def test_a_replacements_session_row_survives_the_dead_records_retraction(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
     gw = os.getpid()
-    session_file = home / "kiro_session_pids.txt"
+    session_file = home / "run" / "kiro_session_pids.txt"
     # What the pass reads: the dead record, under its own recorded identity.
     session_file.write_text(f"{gw}:7101:DEAD-TOKEN\n", encoding="utf-8")
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
@@ -904,9 +908,9 @@ def test_the_session_row_remover_matches_whole_lines_in_both_grammars(
     from kiro_crew import session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    session_file = home / "kiro_session_pids.txt"
+    session_file = home / "run" / "kiro_session_pids.txt"
     session_file.write_text("111:7201:TOK\n111:7201\n222:7202:TOK\n", encoding="utf-8")
 
     rr._retract_session_rows(["111:7201:TOK", "111:7201"])
@@ -929,9 +933,11 @@ def test_a_recycled_descendant_with_no_session_row_counts_as_dead(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-    (home / "kiro_pids.txt").write_text("7301:4242:DESCENDANT-AS-RECORDED\n", encoding="utf-8")
+    (home / "run" / "kiro_pids.txt").write_text(
+        "7301:4242:DESCENDANT-AS-RECORDED\n", encoding="utf-8"
+    )
     monkeypatch.setattr(session_pid, "_pid_start_token", lambda pid: "SOMEBODY-ELSE-ENTIRELY")
     monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
     monkeypatch.setattr(rr, "instance_slice_pids", lambda: set())
@@ -962,11 +968,11 @@ def test_a_descendant_row_whose_identity_still_matches_is_alive(
     from kiro_crew import platform_compat, session_pid
 
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     monkeypatch.setattr(session_pid, "config_dir", lambda: home)
     # Two rows for one pid -- the file's append dedupes on child:parent, so a pid
     # legitimately carries one per parent. One is stale, one is current.
-    (home / "kiro_pids.txt").write_text(
+    (home / "run" / "kiro_pids.txt").write_text(
         "7401:4242:AN-OLDER-START\n7401:4343:STILL-RUNNING\n", encoding="utf-8"
     )
     monkeypatch.setattr(session_pid, "_pid_start_token", lambda pid: "STILL-RUNNING")

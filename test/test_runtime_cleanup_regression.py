@@ -194,7 +194,7 @@ async def open_session(rt, resume):
 
 
 def child_lines(lifecycle):
-    path = lifecycle.home / "kiro_pids.txt"
+    path = lifecycle.home / "run" / "kiro_pids.txt"
     return set(path.read_text(encoding="utf-8").splitlines()) if path.exists() else set()
 
 
@@ -295,7 +295,7 @@ async def test_repeated_kill_retains_escapees_for_periodic_cleanup(lifecycle, mo
         await await_until(asyncio.ensure_future(rt.kill(expected=True)))
         assert rt._process is None and rt._dead and rt._child_pids == {}
         assert root not in session_pid._PROTECTED_PIDS
-        assert (lifecycle.home / "kiro_session_pids.txt").read_text(encoding="utf-8") == ""
+        assert (lifecycle.home / "run" / "kiro_session_pids.txt").read_text(encoding="utf-8") == ""
         assert child_lines(lifecycle) == {
             f"{child}:{root}:child-{child}" for child in (escapee, recycled, foreign)
         }, "teardown must retain every survivor's original recovery identity"

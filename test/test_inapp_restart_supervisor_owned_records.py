@@ -136,7 +136,7 @@ _OLD_GATEWAY = textwrap.dedent("""
 def _restart(layout: str, tmp_path: Path) -> tuple[int, int, int, dict[str, str]]:
     """Run the old/new gateway pair; return (old pid, new pid, new's parent, verdicts)."""
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     work = tmp_path / "work"
     work.mkdir()
     old = subprocess.Popen(
@@ -231,9 +231,9 @@ class TestEachReaderWithTheSupervisorPinned:
         from kiro_crew import session_pid
 
         home = tmp_path / "home"
-        home.mkdir()
+        (home / "run").mkdir(parents=True)
         monkeypatch.setattr(session_pid, "config_dir", lambda: home)
-        rows = home / "kiro_session_pids.txt"
+        rows = home / "run" / "kiro_session_pids.txt"
         rows.write_text(f"{self._SUPERVISOR}:{_DEAD_CHILD}:TOK-B\n", encoding="utf-8")
         monkeypatch.setattr(rr, "_mcp_backend_pids", lambda: set())
         monkeypatch.setattr(rr, "instance_slice_pids", lambda: set())

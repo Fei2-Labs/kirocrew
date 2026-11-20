@@ -97,7 +97,7 @@ _OLD_GATEWAY = textwrap.dedent("""
 def _restart(layout: str, tmp_path: Path) -> tuple[int, int, dict[str, str]]:
     """Run the old/new gateway pair; return (old pid, new's parent, verdicts)."""
     home = tmp_path / "home"
-    home.mkdir()
+    (home / "run").mkdir(parents=True)
     old = subprocess.Popen(
         [sys.executable, "-c", _OLD_GATEWAY, layout, _NEW_GATEWAY],
         env={**os.environ, "KIROCREW_HOME": str(home)},
@@ -171,10 +171,10 @@ class TestEachReaderWithTheSupervisorPinned:
         from kiro_crew import session_pid
 
         home = tmp_path / "home"
-        home.mkdir()
+        (home / "run").mkdir(parents=True)
         monkeypatch.setattr(session_pid, "config_dir", lambda: home)
         monkeypatch.setattr(session_pid, "_cleanup_orphaned_mcp_servers", lambda: 0)
-        rows = home / "kiro_session_pids.txt"
+        rows = home / "run" / "kiro_session_pids.txt"
         mine = f"{self._SUPERVISOR}:{_DEAD_CHILD}:TOK-B"
         theirs = f"{self._OTHER_GATEWAY}:{_DEAD_CHILD + 1}:TOK-C"
         rows.write_text(f"{mine}\n{theirs}\n", encoding="utf-8")
@@ -187,13 +187,13 @@ class TestEachReaderWithTheSupervisorPinned:
         from kiro_crew import session_pid
 
         home = tmp_path / "home"
-        home.mkdir()
+        (home / "run").mkdir(parents=True)
         monkeypatch.setattr(session_pid, "config_dir", lambda: home)
         monkeypatch.setattr(platform_compat, "retry_pending_windows_process_trees", lambda: [])
         monkeypatch.setattr(
             platform_compat, "windows_tree_cleanup_pending", lambda _pid, _token: False
         )
-        path = home / "kiro_session_pids.txt"
+        path = home / "run" / "kiro_session_pids.txt"
         path.write_text("".join(f"{row}\n" for row in rows), encoding="utf-8")
         return path
 

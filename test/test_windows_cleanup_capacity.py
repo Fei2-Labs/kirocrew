@@ -742,6 +742,7 @@ def test_pending_root_tracking_survives_sweep_and_delayed_writeback(kernel, monk
     ) == (0, set(), [])
     monkeypatch.setattr(session_pid, "config_dir", lambda: tmp_path)
     path = session_pid._session_pid_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("42:100:10\n42:900:90\n", encoding="utf-8")
     session_pid._write_back_pid_file({"42:100:10", "42:900:90"})
     assert path.read_text(encoding="utf-8") == "42:100:10\n"
@@ -770,6 +771,7 @@ def test_pending_root_tracking_survives_the_tracked_child_sweep(kernel, monkeypa
     )
     monkeypatch.setattr(pc, "kill_pid", lambda *a: pytest.fail("pending tree killed by bare pid"))
     path = session_pid._pid_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("42:100:10\n100\n43:900:90\n", encoding="utf-8")
     assert session_pid._cleanup_orphaned_mcp_servers() == 0
     assert path.read_text(encoding="utf-8") == "42:100:10\n100\n"
