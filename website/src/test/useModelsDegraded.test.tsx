@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import {
   markModelsDegraded,
+  modelHealthKey,
   modelsDegraded,
   useModelsDegraded,
 } from '../providers/modelListHealth'
@@ -11,8 +12,8 @@ describe('useModelsDegraded', () => {
     // The store is module-level; reset both providers used below.
     markModelsDegraded('acp', false)
     markModelsDegraded('other', false)
-    markModelsDegraded('acp', false, 'config:codex')
-    markModelsDegraded('acp', false, 'slot:chat-1')
+    markModelsDegraded(modelHealthKey('acp', 'codex'), false)
+    markModelsDegraded(modelHealthKey('acp', 'kiro'), false)
   })
 
   it('re-renders when the flag flips with no change to the model list', () => {
@@ -42,15 +43,16 @@ describe('useModelsDegraded', () => {
     expect(result.current).toBe(false)
   })
 
-  it('is scope-scoped so a config 503 cannot flap a live slot', () => {
-    const { result } = renderHook(() => useModelsDegraded('acp', 'slot:chat-1'))
+  it('is backend-scoped so a 503 on one harness cannot flap the list of another', () => {
+    const chatKey = modelHealthKey('acp', 'kiro')
+    const { result } = renderHook(() => useModelsDegraded(chatKey))
     act(() => {
-      markModelsDegraded('acp', true, 'config:codex')
+      markModelsDegraded(modelHealthKey('acp', 'codex'), true)
     })
     expect(result.current).toBe(false)
-    expect(modelsDegraded('acp', 'slot:chat-1')).toBe(false)
+    expect(modelsDegraded(chatKey)).toBe(false)
     act(() => {
-      markModelsDegraded('acp', true, 'slot:chat-1')
+      markModelsDegraded(chatKey, true)
     })
     expect(result.current).toBe(true)
   })

@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { useProvider } from '../providers'
+import { lastKnownBackend, servesAutoModel } from '../providers/adapters/acp'
 import { modelHealthKey, modelListRefetchInterval, useModelsDegraded } from '../providers/modelListHealth'
 import { withAutoFirst } from '../providers/modelList'
 import type { ModelInfo } from '../providers/types'
@@ -11,6 +12,29 @@ import type { ModelInfo } from '../providers/types'
  *  is a catalog key resolved where it renders, not an English literal living in
  *  a data module. */
 const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
+
+/** The placeholder on a backend that does not serve `auto`. A module constant so
+ *  every render returns the same identity: a fresh `[]` per call would loop any
+ *  effect or memo keyed on the list. */
+const EMPTY: ModelInfo[] = []
+
+/**
+ * The list a picker paints before the first fetch resolves.
+ *
+ * `auto` is a kiro-namespace sentinel, so this first paint offers it only where
+ * the backend serves it. Left unconditional it undoes everything the fetcher does
+ * to avoid fabricating `auto`: the operator sees one row, picks the only thing on
+ * offer, and the turn fails at the wire with -32603. Another backend's list
+ * (`backend` in the config spelling, `kiro` for kiro) offers it only when that
+ * backend is the one the gateway last reported for the configured list.
+ */
+function placeholderFor(backend: string | undefined): ModelInfo[] {
+  if (backend !== undefined) {
+    const named = backend === 'kiro' ? '' : backend
+    if (named !== (lastKnownBackend() ?? '')) return EMPTY
+  }
+  return servesAutoModel() ? PLACEHOLDER : EMPTY
+}
 
 /**
  * THE model list. Every picker reads it through here.
@@ -69,7 +93,7 @@ export function useAvailableModelsQuery({ enabled, backend }: AvailableModelsOpt
     // each fetch's `isFetching`/`fetchStatus`/`dataUpdatedAt` flips re-rendered
     // ChatPage and every split pane even when the model list was unchanged.
     // A getter reads its field only when the caller does.
-    get data() { return query.data ?? PLACEHOLDER },
+    get data() { return query.data ?? placeholderFor(backend) },
     get error() { return query.error },
     get isError() { return query.isError },
     get isFetching() { return query.isFetching },

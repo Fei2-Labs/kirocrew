@@ -62,19 +62,105 @@ const MODELS_CACHE_TTL_MS = 24 * 60 * 60 * 1000 // 24h — bound stale-model exp
 interface CachedModels {
   ts: number
   models: ModelInfo[]
+  /** Which ACP backend's namespace these rows belong to (`''` = kiro).
+   *
+   *  Load-bearing, not bookkeeping: model ids are per-backend namespaces, so a
+   *  list cached under one backend is WRONG under another — and wrong in the
+   *  most dangerous way, because a `gpt-5.6-sol` row reads as a real option and
+   *  is only rejected at the wire. An unstamped entry (written by an older
+   *  build) is treated as unusable rather than assumed to be kiro's. */
+  backend?: string
+}
+
+/** Last backend a /api/models response identified itself as (`''` = kiro).
+ *
+ *  Needed because a bodyless failure (network down, gateway restarting) carries
+ *  no backend, yet the failure path still wants to know whether a cached list is
+ *  safe to serve. */
+const LAST_BACKEND_KEY = 'kc.acp.backend.v1'
+
+function rememberBackend(backend: string): void {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.setItem(LAST_BACKEND_KEY, backend)
+  } catch {
+    /* storage disabled — the cache guard just gets stricter, never looser */
+  }
+}
+
+/** Whether the active backend serves the `auto` sentinel, as the gateway reported
+ *  it (`ACP_BACKENDS_AUTO_MODEL`).
+ *
+ *  Remembered rather than recomputed because the answer is needed in exactly the
+ *  state that carries no response: a cold start whose first fetch has not landed,
+ *  or a bodyless network failure. Never mirrored as a list of backend ids here —
+ *  the gateway owns the membership, so adding a backend to it needs no client
+ *  change. */
+const LAST_SERVES_AUTO_KEY = 'kc.acp.servesAuto.v1'
+
+function rememberServesAuto(servesAuto: boolean): void {
+  try {
+    if (typeof localStorage === 'undefined') return
+    localStorage.setItem(LAST_SERVES_AUTO_KEY, servesAuto ? '1' : '0')
+  } catch {
+    /* storage disabled — falls back to the fail-closed default below */
+  }
+}
+
+/**
+ * Whether the active backend serves `auto`, as last reported by the gateway.
+ *
+ * Absence resolves to TRUE, which is the kiro answer. That direction is required,
+ * not preferred: `agent.acp_backend` defaults to kiro and kiro is the floor
+ * (harness-parity H4), so a browser that has never seen a response must behave
+ * exactly as it did before any adapter existed. Defaulting to `false` would strip
+ * the Auto row from a fresh kiro browser during a cold start or a transient 503 —
+ * changing the Kiro path to accommodate an added harness, which H1 forbids.
+ *
+ * The exposure that buys is one response wide. Every shape that identifies a
+ * non-kiro backend carries `serves_auto`, including the degraded 503 — which the
+ * gateway returns BEFORE any subprocess spawn, so it arrives promptly rather than
+ * after a cold-start timeout. The answer is then sticky in localStorage, so only
+ * the very first paint of a never-before-seen browser can show an Auto row on an
+ * adapter that lacks it.
+ */
+export function servesAutoModel(): boolean {
+  try {
+    if (typeof localStorage === 'undefined') return true
+    return localStorage.getItem(LAST_SERVES_AUTO_KEY) !== '0'
+  } catch {
+    return true
+  }
+}
+
+/** The last identified backend, or null when we have never seen one.
+ *
+ *  null (not `''`) on absence: defaulting to kiro would let a fresh browser
+ *  serve a kiro-stamped cache while a spec adapter is active. */
+export function lastKnownBackend(): string | null {
+  try {
+    if (typeof localStorage === 'undefined') return null
+    return localStorage.getItem(LAST_BACKEND_KEY)
+  } catch {
+    return null
+  }
 }
 
 /** Read the last-good live model list from localStorage, or null if absent,
  *  expired (older than the TTL), or unusable. Fully guarded: SSR (no
  *  localStorage), disabled storage, quota, and corrupt JSON all degrade to null
  *  so the caller falls through to auto-only. */
-function readCachedModels(): ModelInfo[] | null {
+function readCachedModels(expected: string | null): ModelInfo[] | null {
   try {
     if (typeof localStorage === 'undefined') return null
+    // No identified backend yet, or an entry from a build that did not stamp
+    // one: refuse. "Cannot tell" must not resolve to "serve it".
+    if (expected === null) return null
     const raw = localStorage.getItem(MODELS_CACHE_KEY)
     if (!raw) return null
     const parsed = JSON.parse(raw) as CachedModels
     if (!parsed || typeof parsed.ts !== 'number' || !Array.isArray(parsed.models)) return null
+    if (typeof parsed.backend !== 'string' || parsed.backend !== expected) return null
     const age = Date.now() - parsed.ts
     // Reject a stale cache AND a future timestamp: a cache written while the
     // clock was ahead yields a negative age after the clock is corrected, which
@@ -97,7 +183,7 @@ function readCachedModels(): ModelInfo[] | null {
  *  when the backend gave one, else its own fallback, which is the value the
  *  lookup would have produced anyway. Either way the next live response corrects
  *  it. */
-for (const m of readCachedModels() ?? []) learnWindow(m.name, m.contextWindow ?? 0)
+for (const m of readCachedModels(lastKnownBackend()) ?? []) learnWindow(m.name, m.contextWindow ?? 0)
 
 /** Drop the last-good list. Called when `agent.acp_backend` changes: the cache
  *  is keyed by nothing but time, so after a switch it still holds the PREVIOUS
@@ -117,10 +203,10 @@ export function clearCachedModels(): void {
 
 /** Persist a live model list with a timestamp. Best-effort — storage errors
  *  (quota, disabled, SSR) are swallowed so caching never breaks the picker. */
-function writeCachedModels(models: ModelInfo[]): void {
+function writeCachedModels(models: ModelInfo[], backend: string): void {
   try {
     if (typeof localStorage === 'undefined') return
-    const payload: CachedModels = { ts: Date.now(), models }
+    const payload: CachedModels = { ts: Date.now(), models, backend }
     localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(payload))
   } catch {
     /* quota exceeded / storage disabled — non-fatal */
@@ -198,6 +284,26 @@ function rowWindow(m: RawModel): number {
  *  isPricedMultiplier). */
 function rowMultiplier(m: RawModel): number | undefined {
   return isPricedMultiplier(m.rate_multiplier) ? m.rate_multiplier : undefined
+}
+
+/** Did the gateway refuse because the active ACP backend's model namespace is
+ *  not knowable yet, rather than because the call transiently failed?
+ *
+ *  Reads the raw body STRUCTURALLY rather than testing `e instanceof ApiError`:
+ *  class identity is not reliable here. It does not survive a partial module
+ *  mock, and it breaks across bundle realms where two copies of the module each
+ *  define their own class object. The `body` field is the contract.
+ *
+ *  Matched on the machine-readable `code`, never the message: the human text is
+ *  translated into 12 locales and localized prose is not a protocol. */
+function isBackendNamespaceUnavailable(e: unknown): boolean {
+  const body = (e as { body?: unknown } | null)?.body
+  if (typeof body !== 'string') return false
+  try {
+    return JSON.parse(body)?.code === 'acp_backend_models_unavailable'
+  } catch {
+    return false
+  }
 }
 
 export class AcpAdapter implements ProviderAdapter {
@@ -421,15 +527,48 @@ export class AcpAdapter implements ProviderAdapter {
   async fetchAvailableModels(backend?: string): Promise<ModelInfo[]> {
     // The last-good cache holds the configured backend's list: another backend's
     // list neither reads it (wrong ids) nor writes it (every other picker reads it).
+    // The remembered backend and `serves_auto` answer belong to the configured
+    // list too, for the same reason.
     const configured = backend === undefined
     const health = modelHealthKey(this.id, backend)
+    // Whether the fallback may offer the kiro-namespace `auto` sentinel for THIS
+    // list. The configured list asks what the gateway last reported; another
+    // backend's list offers it only for kiro or when the gateway affirms it.
+    let explicitServesAuto = backend === '' || backend === 'kiro'
+    const fallback = (): ModelInfo[] => {
+      if (configured) {
+        return readCachedModels(lastKnownBackend()) ?? (servesAutoModel() ? this._defaultModels() : [])
+      }
+      return explicitServesAuto ? this._defaultModels() : []
+    }
     try {
-      const models = await api.models(backend)
+      const raw = await api.models(backend)
+      // TWO shapes, and the shape itself identifies the namespace. The kiro
+      // path answers with a BARE ARRAY; a non-kiro backend answers
+      // `{models, backend, serves_auto}`. Reading only the array form treated a
+      // perfectly good spec-adapter list as an empty success and fell through to
+      // the cache -- serving kiro ids while another backend was active.
+      const isBare = Array.isArray(raw)
+      const envelope = (raw ?? {}) as { models?: unknown; backend?: unknown; serves_auto?: unknown }
+      const models: unknown = isBare ? raw : envelope.models
+      const answered: string = isBare ? '' : String(envelope.backend ?? '')
+      // `serves_auto` is only meaningful once a response NAMES a non-kiro
+      // backend. An empty `backend` is kiro, which advertises `auto` as a real
+      // row -- that covers the bare array and equally a malformed object body (a
+      // `{error}` from the kiro path carries neither field, and reading its
+      // absent flag as a denial would strip kiro's own Auto fallback).
+      const servesAuto = answered === '' ? true : envelope.serves_auto === true
+      if (configured) {
+        rememberBackend(answered)
+        rememberServesAuto(servesAuto)
+      } else if (!isBare) {
+        explicitServesAuto = servesAuto
+      }
       if (!Array.isArray(models) || models.length === 0) {
-        // Empty/non-array success: NOT a live list — keep polling, serve the
-        // last-good live list if we have one, else auto-only.
+        // Empty/unusable success: NOT a live list -- keep polling, and serve the
+        // last-good list only if it belongs to THIS backend's namespace.
         markModelsDegraded(health, true)
-        return (configured ? readCachedModels() : null) ?? this._defaultModels()
+        return fallback()
       }
       const result = models.map((m: RawModel) => {
         // Prefer the backend's resolved window over the bundled snapshot: the
@@ -454,13 +593,15 @@ export class AcpAdapter implements ProviderAdapter {
           rateMultiplier: rowMultiplier(m),
         }
       })
-      if (configured) writeCachedModels(result) // remember this good live list for next hiccup
+      // Remember this good live list for the next hiccup, stamped with its namespace.
+      if (configured) writeCachedModels(result, answered)
       markModelsDegraded(health, false) // live success → self-heal can stop polling
       return result
     } catch (err) {
       // Transient backend failure (503 / network): NOT live — keep polling.
-      // Serve the last-good live list if we have one, else auto-only. Never
-      // surface canonical registry keys — the ACP CLI rejects them (-32603).
+      // Serve the last-good live list if we have one, else auto-only where the
+      // backend serves it. Never surface canonical registry keys — the ACP CLI
+      // rejects them (-32603).
       // Read the refusal code HERE, where the error is formed, so an expired /
       // signed-out kiro-cli login (503 `kiro_prerequisite_required`) can raise
       // the one actionable sign-in banner instead of the generic config-load
@@ -469,7 +610,33 @@ export class AcpAdapter implements ProviderAdapter {
       // backend's sign-in, so only the configured list sets the flag.
       markModelsDegraded(health, true, err instanceof Error ? err.message : '')
       if (configured) markModelsAuthRequired(this.id, apiErrorCode(err) === 'kiro_prerequisite_required')
-      return (configured ? readCachedModels() : null) ?? this._defaultModels()
+      if (isBackendNamespaceUnavailable(err)) {
+        // This refusal names a non-kiro namespace that no live session has listed
+        // yet. Missing capability metadata cannot make the kiro-only `auto`
+        // sentinel safe to offer, so an absent flag reads as "does not serve it".
+        let named: string | null = null
+        let servesAuto = false
+        try {
+          const envelope = JSON.parse((err as { body?: string }).body ?? '') as {
+            backend?: unknown
+            serves_auto?: unknown
+          }
+          if (typeof envelope.backend === 'string') {
+            named = envelope.backend
+            servesAuto = envelope.backend === '' || envelope.serves_auto === true
+          }
+        } catch {
+          // The code predicate already parsed the body; malformed extras name no
+          // namespace.
+        }
+        if (configured) {
+          if (named !== null) rememberBackend(named)
+          rememberServesAuto(servesAuto)
+        } else {
+          explicitServesAuto = servesAuto
+        }
+      }
+      return fallback()
     }
   }
 
@@ -479,8 +646,13 @@ export class AcpAdapter implements ProviderAdapter {
    *  fable-5-1m, …). Those keys are DISPLAY identifiers the ACP CLI rejects as
    *  model ids: selecting one during the cold-start window writes it verbatim
    *  into slot.model and kiro-cli fails the turn with -32603 "model not
-   *  available". "auto" always resolves server-side, so it is the only safe
-   *  offering until the real list loads. */
+   *  available". "auto" resolves server-side on the kiro-agent family, so it is
+   *  the only safe offering until the real list loads.
+   *
+   *  Every caller MUST gate on {@link servesAutoModel} (or the backend's own
+   *  `serves_auto` answer) first: "auto" is a kiro-namespace id, not a universal
+   *  one, and on a spec adapter this list is the same -32603 trap it exists to
+   *  prevent. */
   private _defaultModels(): ModelInfo[] {
     return [{
       name: 'auto',

@@ -206,6 +206,19 @@ conflict_policy:
       marker, the repo-count header, `?refresh=1` on the refresh button, and the
       row-own-repoRoot file open. Upstream rewrote the whole panel at the
       2026-09-21 sync (264 added lines) and the fork's 118 went with it.
+  - glob: "website/src/providers/adapters/acp.ts"
+    policy: manual
+    note: |
+      divergences/acp-auto-withholding: the namespace-stamped model cache, the
+      remembered backend and `serves_auto` answer, the envelope-shaped
+      `/api/models` read and the gated `auto` fallback. Upstream rewrote
+      `fetchAvailableModels` at the 2026-11-03 sync and the fork's reader went
+      with it.
+  - glob: "website/src/hooks/useAvailableModels.ts"
+    policy: manual
+    note: |
+      divergences/acp-auto-withholding: the first-paint placeholder offers
+      `auto` only where the backend serves it.
   - glob: "website/src/pages/settings/SecurityPanel.tsx"
     policy: manual
     note: |
@@ -574,6 +587,31 @@ divergences:
       the namespace exists in all 13 locales after any sync.
     pinned_by: "website/src/test/AcpBackendCard.test.tsx, website/src/i18n/catalogParity.test.ts"
     decided: 2026-09-21
+
+  - id: acp-auto-withholding
+    what: |
+      The model pickers never offer the kiro-only `auto` sentinel on a backend
+      that does not serve it. `website/src/providers/adapters/acp.ts` reads the
+      `/api/models` envelope (`{models, backend, serves_auto}`) and the
+      `acp_backend_models_unavailable` refusal, remembers the configured
+      backend and its `serves_auto` answer in localStorage
+      (`kc.acp.backend.v1`, `kc.acp.servesAuto.v1`), stamps the last-good
+      model cache with its backend, and gates the degraded `auto` fallback on
+      that answer. `website/src/hooks/useAvailableModels.ts` gates the
+      first-paint placeholder the same way. Another backend's list
+      (`fetchAvailableModels(backend)`) offers `auto` only for kiro or when the
+      gateway affirms it for that backend.
+    why: |
+      `auto` is a kiro-namespace id (`ACP_BACKENDS_AUTO_MODEL`: kiro and KAS).
+      Offered as the only row on a spec adapter, it gets picked and the turn
+      fails at the wire. The gateway half (`serves_auto` on both the success
+      and the refusal, from `backend_serves_auto_model`) has no upstream
+      counterpart and survived the 2026-11-03 sync, while upstream's rewrite of
+      both frontend files dropped its only reader. Upstream's own
+      `sessionBackendModelList.test.tsx` expects `auto` for a failed claude
+      list; the fork keeps that expectation at `[]`.
+    pinned_by: "website/src/test/AcpAdapter.backendNamespace.test.ts, website/src/test/useAvailableModels.autoPlaceholder.test.tsx, website/src/test/sessionBackendModelList.test.tsx"
+    decided: 2026-08-27
 
   - id: fork-version-identity
     what: |

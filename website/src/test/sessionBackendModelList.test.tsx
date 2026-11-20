@@ -62,7 +62,10 @@ describe('AcpAdapter.fetchAvailableModels(backend)', () => {
 
     const rows = await adapter.fetchAvailableModels('claude')
 
-    expect(rows.map(m => m.name)).toEqual(['auto'])
+    // Nor the kiro-only `auto` sentinel: claude has no such id, and a bodyless
+    // failure does not affirm that it serves one (.fork-sync.yml
+    // divergences/acp-auto-withholding).
+    expect(rows).toEqual([])
     expect(modelsDegraded('acp:claude')).toBe(true)
     expect(modelsDegraded('acp')).toBe(false)
     expect(modelListRefetchInterval({ queryKey: ['available-models', 'acp', 'claude'] })).toBe(8_000)
