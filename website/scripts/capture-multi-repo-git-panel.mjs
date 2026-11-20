@@ -184,17 +184,21 @@ const NO_LOG = { repo: false, commits: [] }
 async function frame(browser, base, name, status, log = LOG, scrollToEnd = false) {
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
   logPageProblems(page)
-  await stubDashboardApi(page, { slots: SLOTS, theme: 'dark', extra: gitRoutes(status, log) })
-  await page.addInitScript(([slot, ws]) => {
-    localStorage.setItem('mc-active-slot', slot)
-    localStorage.setItem('mc-activity-open:' + slot, 'true')
-    localStorage.setItem('mc-privacy-notice-v1', '1')
-    localStorage.setItem('mc-project-dir:' + slot, ws)
-    localStorage.setItem('mc-panel-tabs:' + slot, JSON.stringify({
-      tabs: [{ id: 'git', kind: 'git', title: 'Git' }],
-      activeId: 'git',
-    }))
-  }, [SLOT, WS])
+  await stubDashboardApi(page, {
+    slots: SLOTS,
+    theme: 'dark',
+    extra: gitRoutes(status, log),
+    localStorageEntries: {
+      'mc-active-slot': SLOT,
+      ['mc-activity-open:' + SLOT]: 'true',
+      'mc-privacy-notice-v1': '1',
+      ['mc-project-dir:' + SLOT]: WS,
+      ['mc-panel-tabs:' + SLOT]: JSON.stringify({
+        tabs: [{ id: 'git', kind: 'git', title: 'Git' }],
+        activeId: 'git',
+      }),
+    },
+  })
   await page.goto(base + '/chat', { waitUntil: 'domcontentloaded' })
   await page.waitForTimeout(2600)
   if (scrollToEnd) {
