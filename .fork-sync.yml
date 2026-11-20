@@ -688,8 +688,8 @@ divergences:
       `_wire_model_id` spec-adapter branch went, because `to_acp_id` passes an
       advertised id through unchanged; `select_provider_backend` lost its
       Kiro-dialect narrowing, because upstream serves codex/opencode through the
-      same `AcpProvider`. The fork keeps ONLY: `copilot`, `goose`, `pi`
-      (divergences/fork-adapters-without-corpus), the `explicit` arm on
+      same `AcpProvider`. The fork keeps ONLY: `copilot`, `goose`, `pi`, the
+      `explicit` arm on
       `select_provider_backend` (divergences/member-backend-explicit-arm) and the
       registry-merged `/api/acp-backends` row
       (divergences/acp-backends-registry-merged-route, retired 2026-11-17).
@@ -891,23 +891,6 @@ divergences:
     pinned_by: "test/test_acp_launch_goldens.py (the kas case), test/test_acp_adapter_spawn.py (dialect `_is_kiro` pin)"
     decided: 2026-10-29
 
-  - id: fork-adapters-without-corpus
-    what: |
-      copilot, goose and pi have no recorded frame corpus under
-      `test/fixtures/acp_frames/`, no rows in the host-contract bucket tables
-      (`docs/system-specs/modules/agent-host-contract.md` reads `—` for them),
-      and `test_acp_frame_replay.py::test_every_known_backend_has_fixtures` names
-      them out explicitly.
-    why: |
-      Upstream's replay ratchet requires a corpus per `ACP_BACKENDS_KNOWN` id.
-      None of the three has been captured against a live host here, and a
-      fabricated .jsonl would pin nothing real. The exemption is a named set, not
-      a filter, so the gate still fails the moment a NEW id lands without one.
-      Capture a corpus (`scripts/update_acp_frame_snapshots.py` after recording)
-      and delete the id from the set in the same change.
-    pinned_by: "test/test_acp_frame_replay.py::test_every_known_backend_has_fixtures"
-    decided: 2026-09-15
-
   - id: registry-mirror-projection
     what: |
       `providers/mirrors/registry.py` PROJECTIONS carries a `McpProjection` for
@@ -936,9 +919,8 @@ divergences:
     why: |
       Giving the provider-factory narrowing a named set (rather than an inline
       backend-id check) is what keeps it legible on its own, and matches the
-      shape `host_auth.py` uses to declare sign-in for the same three ids (no
-      credential leaf -- none has been verified on disk here, see
-      divergences/fork-adapters-without-corpus).
+      shape `host_auth.py` uses to declare sign-in for the same three ids;
+      credential leaves stay owned by the per-harness declarations.
     pinned_by: "test/test_agent_sdk_capabilities.py, test/test_provider_dispatch.py::TestAcpBackendOverride, test/test_agent_sdk_host_auth.py::test_every_known_harness_has_a_declaration"
     decided: 2026-09-15
 
