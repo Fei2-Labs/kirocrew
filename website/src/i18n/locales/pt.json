@@ -7120,7 +7120,13 @@
       "composer_action_footer_host": "O {{productName}} verificou o rascunho. {{app}} continua sem vê-lo.",
       "composer_action_needs_empty": "{{app}} só pode inserir em uma mensagem vazia. Esvazie o rascunho primeiro.",
       "composer_action_would_resolve": "O texto de {{app}} começa com /, ! ou @, ou contém um $skill, um arquivo ou uma imagem, então seria executado em vez de enviado como texto. Não foi inserido.",
-      "composer_action_footer": "{{app}} não vê seu rascunho. O texto dele entra como está, e você decide se envia."
+      "composer_action_footer": "{{app}} não vê seu rascunho. O texto dele entra como está, e você decide se envia.",
+      "rate_limit_allowed": "OK",
+      "resets": "Redefine",
+      "plan_limit": "Limite do plano",
+      "limit_type": "Tipo de limite",
+      "rate_limit_warning": "Perto do limite",
+      "rate_limit_rejected": "Limitado"
     },
     "chatPane": {
       "agent_list": "Lista de agentes",

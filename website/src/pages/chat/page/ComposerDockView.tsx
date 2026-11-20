@@ -107,6 +107,8 @@ interface ComposerDockViewProps {
   /** Undefined while the slot has no reading. */
   contextPct: number | undefined
   contextTokens: { used?: number; window?: number; }
+  /** The slot's plan quota reading; undefined when its harness reports none. */
+  rateLimit?: { status?: string; limit_type?: string; utilization?: number; resets_at?: number }
   knowledgeFetch: ReturnType<typeof useActiveSlotState>['knowledgeFetch']
   messages: ChatMessage[]
   pendingFollowup: { items: FollowupItem[]; ts: number; } | undefined
@@ -329,7 +331,7 @@ interface ComposerDockViewProps {
  * Its body is not re-indented: `ChatPage.statusStackLayering.test.tsx` finds the status stack's end by its closing tag's depth (14 spaces).
  */
 export default function ComposerDockView({
-  embedded, forkUnavailable = false, mode, activeSlot, connected, dispatch, isMobile, isTouch, navigate, provider, activityOpen, composerBusy, contextPct, contextTokens, knowledgeFetch, messages, pendingFollowup,
+  embedded, forkUnavailable = false, mode, activeSlot, connected, dispatch, isMobile, isTouch, navigate, provider, activityOpen, composerBusy, contextPct, contextTokens, rateLimit, knowledgeFetch, messages, pendingFollowup,
   pendingQuestion, projectLocked, restoredQuestionNotice, sentMessages, slotRunning, slotStopping, composerDraft, historySuggestions, showHistorySuggestions, chatConfig, agentDropdown,
   agentDropdownRef, agentFilter, agentInputRef, defaultAgent, defaultAgentFailed, effectiveAgents, filteredAgents, installedAgents, setAgentDropdown, setAgentFilter, toggleDefaultAgent,
   codexPairModels, filteredModels, hiddenModelsQ, ownModelsFailed, ownModelsFetching, retryOwnModels, modelsBackend, jevRouteOn, modelDropdown, modelDropdownRef, modelFilter, modelInputRef, modelPickerConfigured, modelPickerReturnsFocusRef, setModelDropdown,
@@ -750,6 +752,7 @@ export default function ComposerDockView({
               contextUnknown={contextPct === undefined && contextTokens?.used == null}
               contextUsedTokens={contextTokens?.used}
               contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
+              rateLimit={rateLimit}
               derivePctFromUsed={contextTokens?.used != null && contextTokens.window == null}
               showContextPct={chatConfig.showContextPct}
               showContextTokens={chatConfig.showContextTokens}

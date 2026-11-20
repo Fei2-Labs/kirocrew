@@ -208,6 +208,9 @@ export default function ChatPane({
   // still renders, as unknown rather than a measured 0%.
   const contextPct = useAppSelector((s) => s.chat.slotContextPct[slotKey])
   const contextTokens = useAppSelector((s) => s.chat.slotContextTokens?.[slotKey])
+  // Plan quota for whatever harness this slot runs on: undefined for the ones
+  // that report none, which is most of them.
+  const rateLimit = useAppSelector((s) => s.chat.slotRateLimit?.[slotKey])
   // Prefer the warm's value: this pane's own query is staleTime:Infinity, so its
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
@@ -1314,6 +1317,7 @@ export default function ChatPane({
           contextUnknown={contextPct === undefined && contextTokens?.used == null}
           contextUsedTokens={contextTokens?.used}
           contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
+          rateLimit={rateLimit}
           derivePctFromUsed={contextTokens?.used != null && contextTokens.window == null}
           // A Crew Mode root with a message offers no switch, preview on or off: the raw
           // `crew_mode_root` stamp is the gateway's own lock (`crew_mode_locked`).

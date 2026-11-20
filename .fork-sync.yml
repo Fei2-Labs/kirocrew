@@ -537,6 +537,30 @@ divergences:
     pinned_by: "website/src/pages/settings/SecurityPanel.workflowPolicy.test.tsx, website/src/components/commandPalette/providers/settingsRegistry.test.ts"
     decided: 2026-09-21
 
+  - id: plan-quota-popover
+    what: |
+      The plan-quota block in the composer's context popover, end to end: the
+      `slotRateLimit` map in `website/src/store/chat/state.ts` (also listed in
+      `slotResidue.ts`), the `rate_limit` read in `sseContextUsage`
+      (`store/chat/slotCache.ts`) and its frame type in `hooks/useWebSocket.ts`,
+      the `rateLimit` prop passed by `components/ChatPane.tsx` and by
+      `pages/chat/page/activeSlotState.ts` -> `ChatPage.tsx` ->
+      `ComposerDockView.tsx`, the `RATE_LIMIT_STATUS_VIEW` render in
+      `components/chat-input/ContextShelf.tsx`, and the six
+      `components.chatInput.{plan_limit,rate_limit_allowed,rate_limit_warning,
+      rate_limit_rejected,resets,limit_type}` keys in all 13 locales.
+    why: |
+      The backend half (`parse_rate_limit` and `turn_stats.py`'s `rate_limit`
+      on the `context_usage` frame) has no upstream counterpart and survives a
+      sync, while every frontend file above is one upstream rewrites. Lost in
+      two steps: the 2026-09-23 sync dropped the store and the pane wiring,
+      leaving a renderer nothing fed, and the 2026-11-03 sync dropped the
+      renderer and the keys. Each step left `chat-input/props.ts` declaring the
+      prop, so the feature looked present. Re-apply the delta onto upstream's
+      structure, and check the store and the callers as well as the renderer.
+    pinned_by: "website/src/test/ChatInput.rateLimit.test.tsx (the render), website/src/store/chatSlice.rateLimit.test.ts (the store), website/src/i18n/catalogParity.test.ts (the keys)"
+    decided: 2026-11-19
+
   - id: acp-backend-card-catalog
     what: |
       The `pages.overview.acpBackend.*` catalog namespace (26 generated + 9 manual

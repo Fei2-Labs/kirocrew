@@ -2354,7 +2354,13 @@
       "composer_action_footer_host": "{{productName}} checked the draft. {{app}} still can't see it.",
       "composer_action_needs_empty": "{{app}} can only insert into an empty message. Clear the draft first.",
       "composer_action_would_resolve": "{{app}}'s text starts with /, ! or @, or holds a $skill, a file or an image, so it would run instead of being sent as text. It was not inserted.",
-      "composer_action_footer": "{{app}} can't see your draft. Its text goes in as written, and you choose to send it."
+      "composer_action_footer": "{{app}} can't see your draft. Its text goes in as written, and you choose to send it.",
+      "rate_limit_allowed": "OK",
+      "resets": "Resets",
+      "plan_limit": "Plan limit",
+      "limit_type": "Limit type",
+      "rate_limit_warning": "Near limit",
+      "rate_limit_rejected": "Rate limited"
     },
     "chatPane": {
       "crewmate_quiet": "{{name}} hasn't said anything to you yet.",

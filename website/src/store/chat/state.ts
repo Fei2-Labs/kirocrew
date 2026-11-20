@@ -465,6 +465,12 @@ export interface ChatState {
    *  an absent `used` as an approximation (a `~` prefix, derived from pct)
    *  rather than asserting a precise figure. */
   slotContextTokens: Record<string, { used?: number; window?: number }>
+  /** Per-slot plan rate-limit reading, when the harness reports one (only
+   *  claude-agent-acp does today). Every field is optional because the backend
+   *  omits what the adapter did not send — an absent `utilization` means "not
+   *  reported", which must render as nothing rather than as 0%. `resets_at` is
+   *  unix SECONDS, normalized backend-side. */
+  slotRateLimit: Record<string, { status?: string; limit_type?: string; utilization?: number; resets_at?: number }>
   voicePlaying: boolean
   /** A speech request for the active slot is waiting for its first audio. */
   voicePreparing: boolean
@@ -817,6 +823,7 @@ export const initialState: ChatState = {
   lastCreatedActivation: null,
   slotContextPct: {},
   slotContextTokens: {},
+  slotRateLimit: {},
   voicePlaying: false,
   voicePreparing: false,
   voiceAudio: null,

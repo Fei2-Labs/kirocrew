@@ -6936,7 +6936,13 @@
       "composer_action_footer_host": "{{productName}} খসড়াটি দেখেছে। {{app}} এখনও এটি দেখতে পায় না।",
       "composer_action_needs_empty": "{{app}} শুধু খালি বার্তায় লেখা যোগ করতে পারে। আগে খসড়াটি মুছে ফেলো।",
       "composer_action_would_resolve": "{{app}}-এর লেখা /, ! বা @ দিয়ে শুরু, অথবা এতে $skill, ফাইল বা ছবি আছে, তাই এটি লেখা হিসেবে না গিয়ে চলত। এটি যোগ করা হয়নি।",
-      "composer_action_footer": "{{app}} তোমার খসড়া দেখতে পায় না। এর লেখা যেমন আছে তেমনই যোগ হয়, আর পাঠাবে কিনা তুমি ঠিক করো।"
+      "composer_action_footer": "{{app}} তোমার খসড়া দেখতে পায় না। এর লেখা যেমন আছে তেমনই যোগ হয়, আর পাঠাবে কিনা তুমি ঠিক করো।",
+      "rate_limit_allowed": "ঠিক আছে",
+      "resets": "রিসেট",
+      "plan_limit": "প্ল্যান সীমা",
+      "limit_type": "সীমার ধরন",
+      "rate_limit_warning": "সীমার কাছাকাছি",
+      "rate_limit_rejected": "সীমিত"
     },
     "chatPane": {
       "agent_list": "এজেন্ট তালিকা",

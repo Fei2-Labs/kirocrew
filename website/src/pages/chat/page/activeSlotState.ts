@@ -259,6 +259,9 @@ export function useActiveSlotState({
   // not as a measured 0%.
   const contextPct = useAppSelector(s => s.chat.slotContextPct[s.chat.activeSlot ?? ''])
   const contextTokens = useAppSelector(s => s.chat.slotContextTokens?.[s.chat.activeSlot ?? ''])
+  // Plan quota for whatever harness this slot runs on: undefined for the ones
+  // that report none, which is most of them.
+  const rateLimit = useAppSelector(s => s.chat.slotRateLimit?.[s.chat.activeSlot ?? ''])
   // Length only. The two arrays themselves are mutated per streamed sub-agent /
   // tool chunk, and their only consumer is the Activity panel (SidePanel), which
   // is closed by default and now subscribes to them itself. Subscribing to the
@@ -282,6 +285,6 @@ export function useActiveSlotState({
     messages, messagesRef, kiroCrewVersion, completedTurnCount, knowledgeFetch, knowledgeFetchRef, softStopAtMapRef, sentMessages, slotRunning, slotRunningRef, turnDisclosure, setTurnDisclosureFor,
     toolDisclosure, setToolDisclosureFor, turnRowMayBeLive, composerBusy, projectLocked, slotStopping, slotLoading, slotSwitchTarget, pendingQuestion, restoredQuestionNotice, pendingFollowup,
     folderSuggestion, followupTsBySlot, splitMode, setSplitMode, clearSplitOnSelect, crewWindow, openEmbeddedCrewWindow, navigateToEmbeddedSlot, splitAnchor, setSplitAnchor, activeTip, dismissTip,
-    slotState, contextPct, contextTokens, activityOpen, slotHasMore, slotOldestIndex, cursorIsForActiveSlot, loadingOlder, olderFailed, activeViewIsBoundedPage, history, historyHasMore, environmentStart,
+    slotState, contextPct, contextTokens, rateLimit, activityOpen, slotHasMore, slotOldestIndex, cursorIsForActiveSlot, loadingOlder, olderFailed, activeViewIsBoundedPage, history, historyHasMore, environmentStart,
   }
 }

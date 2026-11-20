@@ -6752,7 +6752,13 @@
       "composer_action_needs_empty": "{{app}} は空のメッセージにのみ挿入できます。先に下書きを空にしてください。",
       "composer_action_would_resolve": "{{app}} のテキストは /、! か @ で始まるか、$skill、ファイル、画像を含むため、テキストとして送られずに実行されます。挿入しませんでした。",
       "composer_action_footer": "{{app}} は下書きを見られません。テキストはそのまま挿入され、送信するかどうかはあなたが決めます。",
-      "turn_interrupted_restored_queue_other": "前のターンが中断されました。「再開」はそのターンだけを再実行します。キュー内の {{count}} 件のメッセージは自動では送信されません。キュー（{{count}} 件がキュー内 ^）を開き、「今すぐ送信」(⚡) で 1 件ずつ送信してください。"
+      "turn_interrupted_restored_queue_other": "前のターンが中断されました。「再開」はそのターンだけを再実行します。キュー内の {{count}} 件のメッセージは自動では送信されません。キュー（{{count}} 件がキュー内 ^）を開き、「今すぐ送信」(⚡) で 1 件ずつ送信してください。",
+      "rate_limit_allowed": "正常",
+      "resets": "リセット",
+      "plan_limit": "プラン上限",
+      "limit_type": "上限の種類",
+      "rate_limit_warning": "上限に近い",
+      "rate_limit_rejected": "制限中"
     },
     "chatPane": {
       "agent_list": "エージェントリスト",

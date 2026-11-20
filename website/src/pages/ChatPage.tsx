@@ -172,7 +172,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     messages, messagesRef, kiroCrewVersion, completedTurnCount, knowledgeFetch, knowledgeFetchRef, softStopAtMapRef, sentMessages, slotRunning, slotRunningRef, turnDisclosure, setTurnDisclosureFor,
     toolDisclosure, setToolDisclosureFor, turnRowMayBeLive, composerBusy, projectLocked, slotStopping, slotLoading, slotSwitchTarget, pendingQuestion, restoredQuestionNotice, pendingFollowup,
     folderSuggestion, followupTsBySlot, splitMode, setSplitMode, clearSplitOnSelect, crewWindow, openEmbeddedCrewWindow, navigateToEmbeddedSlot, splitAnchor, setSplitAnchor, activeTip, dismissTip,
-    slotState, contextPct, contextTokens, activityOpen, slotHasMore, slotOldestIndex, cursorIsForActiveSlot, loadingOlder, olderFailed, activeViewIsBoundedPage, history, historyHasMore, environmentStart,
+    slotState, contextPct, contextTokens, rateLimit, activityOpen, slotHasMore, slotOldestIndex, cursorIsForActiveSlot, loadingOlder, olderFailed, activeViewIsBoundedPage, history, historyHasMore, environmentStart,
   } = useActiveSlotState({
     embedded, embedMode, popout, navigate, searchParams, activeSlot,
   })
@@ -1193,7 +1193,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             <UltraModeEffect />
             <ComposerDockView
               embedded={embedded} forkUnavailable={forkUnavailable} mode={mode} activeSlot={activeSlot} connected={connected} dispatch={dispatch} isMobile={isMobile} isTouch={isTouch} navigate={navigate} provider={provider}
-              activityOpen={activityOpen} composerBusy={composerBusy} contextPct={contextPct} contextTokens={contextTokens} knowledgeFetch={knowledgeFetch} messages={messages}
+              activityOpen={activityOpen} composerBusy={composerBusy} contextPct={contextPct} contextTokens={contextTokens} rateLimit={rateLimit} knowledgeFetch={knowledgeFetch} messages={messages}
               pendingFollowup={pendingFollowup} pendingQuestion={pendingQuestion} projectLocked={projectLocked} restoredQuestionNotice={restoredQuestionNotice} sentMessages={sentMessages}
               slotRunning={slotRunning} slotStopping={slotStopping} composerDraft={composerDraft} historySuggestions={historySuggestions} showHistorySuggestions={showHistorySuggestions}
               chatConfig={chatConfig} agentDropdown={agentDropdown} agentDropdownRef={agentDropdownRef} agentFilter={agentFilter} agentInputRef={agentInputRef} defaultAgent={defaultAgent}

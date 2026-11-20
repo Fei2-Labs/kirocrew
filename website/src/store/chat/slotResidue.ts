@@ -33,7 +33,7 @@ import {
 const slotKeyedMaps = (state: ChatState) => [
   state.slotMessages, state.slotActivity, state.slotRun, state.slotHydrated,
   state.slotSide, state.slotSideClosed, state.slotSideRestored ?? {}, state.slotSideReading ?? {}, state.slotSideClosedElsewhere ?? {}, state.slotStatusDetail,
-  state.slotContextPct, state.slotContextTokens, state.stopPressedAt,
+  state.slotContextPct, state.slotContextTokens, state.slotRateLimit, state.stopPressedAt,
   state.endedTurn,
   state.followups, state.folderSuggestions, state.restoredQuestionNotices,
   state.pendingQuestions, state.subagentQueued, state.subagentQueuedReason,
