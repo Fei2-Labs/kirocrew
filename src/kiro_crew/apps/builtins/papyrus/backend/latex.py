@@ -27,6 +27,7 @@ Security notes that must not be relaxed:
 from __future__ import annotations
 
 import asyncio
+import functools
 import glob
 import logging
 import os
@@ -46,7 +47,8 @@ from kiro_crew.executors import subprocess_executor
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
-    sandboxed_spawn_argv_off_loop,
+    sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 from kiro_crew.sel import sel
 
@@ -397,11 +399,15 @@ async def _run(
     and same reason as ``apps/builtins/dev_fleet/server.py``.
     """
     try:
-        wrapped, scrubbed, cleanup = await sandboxed_spawn_argv_off_loop(
-            argv,
-            "strict",
-            env=env,
-            extra_hidden_dirs=_sensitive_hidden_dirs(),
+        wrapped, scrubbed, cleanup = await shielded_prepare_off_loop(
+            functools.partial(
+                sandboxed_spawn_argv,
+                argv,
+                "strict",
+                env=env,
+                extra_hidden_dirs=_sensitive_hidden_dirs(),
+            ),
+            executor=subprocess_executor(),
         )
     except SandboxUnavailableError as exc:
         # Fail-closed is CORRECT here and is deliberately not bypassed: this

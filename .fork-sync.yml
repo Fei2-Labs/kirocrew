@@ -71,8 +71,11 @@ conflict_policy:
     policy: fork_wins
     keystone: true
     note: |
-      sandbox.py: keep BOTH sandboxed_spawn_argv_off_loop (3 call sites depend on
-      it by name) and shielded_prepare_off_loop. name_grant.py: upstream's
+      sandbox.py: keep BOTH sandboxed_spawn_argv_off_loop (a public compatibility
+      entry point) and shielded_prepare_off_loop. Call sites in
+      apps/builtins/** take upstream's `shielded_prepare_off_loop(functools.
+      partial(sandboxed_spawn_argv, ...))` form: upstream's tests patch that
+      module-level seam, and the git hook scan shares it. name_grant.py: upstream's
       hardening here is usually a strict superset — prefer it, it over-refuses
       which is the safe direction.
 

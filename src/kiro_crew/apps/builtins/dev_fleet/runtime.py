@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import re
@@ -30,7 +31,7 @@ from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
     create_subprocess_limited,
     sandboxed_spawn_argv,
-    sandboxed_spawn_argv_off_loop,
+    shielded_prepare_off_loop,
 )
 
 logger = logging.getLogger("kiro_crew.apps.builtins.dev_fleet.server")
@@ -728,7 +729,10 @@ async def _run_cmd(
     try:
         # sandboxed_spawn_argv can cold-probe the sandbox backend with a
         # synchronous subprocess (blocking base rule) — run it on the executor.
-        cmd, env, cleanup = await sandboxed_spawn_argv_off_loop(cmd, mode, env=base_env)
+        cmd, env, cleanup = await shielded_prepare_off_loop(
+            functools.partial(sandboxed_spawn_argv, cmd, mode, env=base_env),
+            executor=subprocess_executor(),
+        )
     except RuntimeError as exc:
         # Fail closed: no sandbox backend and unsandboxed exec not opted in.
         return -1, "", f"sandbox unavailable: {exc}"

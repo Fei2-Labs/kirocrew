@@ -108,12 +108,12 @@ def _spawn_raises(monkeypatch, exc: BaseException) -> None:
 
 
 def _passthrough_sandbox(monkeypatch, cleanup: str | None = None) -> None:
-    """``sandboxed_spawn_argv_off_loop`` double: identity argv, no OS isolation."""
-
-    async def _fake(argv, tier, env=None):
-        return (list(argv), dict(env or {}), cleanup)
-
-    monkeypatch.setattr(runtime, "sandboxed_spawn_argv_off_loop", _fake)
+    """``sandboxed_spawn_argv`` double: identity argv, no OS isolation."""
+    monkeypatch.setattr(
+        runtime,
+        "sandboxed_spawn_argv",
+        lambda argv, tier, env=None: (list(argv), dict(env or {}), cleanup),
+    )
 
 
 def _run_cmd_queue(monkeypatch, results: list[tuple[int, str, str]]) -> list[list[str]]:
