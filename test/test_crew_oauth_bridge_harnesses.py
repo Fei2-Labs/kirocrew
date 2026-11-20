@@ -422,7 +422,11 @@ def test_a_ceiling_denying_the_server_refuses_the_dsh_ask_before_any_mint(tmp_pa
     finally:
         ctx_mod.reset_context()
     assert result.action == TOOL_DENY
-    assert "governance" in result.reason.lower()
+    # The fork resolves a spec adapter's ``mcp__`` title against the session's
+    # MCP roster and fails closed on a title it cannot place
+    # (divergences/spec-mcp-title-identity). This replay mounts no roster, so
+    # that deny answers before the ceiling's; either way nothing is minted.
+    assert "ambiguous mcp identity" in result.reason.lower()
 
 
 def test_opencode_stays_out_because_its_ask_carries_no_arguments(tmp_path):
