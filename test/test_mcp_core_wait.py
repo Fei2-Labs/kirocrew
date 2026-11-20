@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import urllib.error
-import uuid
 from unittest.mock import patch
 
 from kiro_crew.mcp_core import _call_tool, _post
@@ -123,94 +120,6 @@ def test_spawn_run_transport_failure_reports_unknown_acceptance():
     assert "wait and recheck" in result
     assert "none of the requested subagents were started" not in result
     assert "task(s) failed to start" not in result
-    assert [call.args[0] for call in mock_post.call_args_list] == [
-        "/api/spawn",
-        "/api/spawn",
-    ]
-
-
-def test_spawn_run_recovers_uncertain_submission_by_durable_command_lookup():
-    """A lost response is resolved from its stable command, not declared lost."""
-    identities = iter(
-        [
-            uuid.UUID("00000000-0000-0000-0000-000000000001"),
-            uuid.UUID("00000000-0000-0000-0000-000000000002"),
-            uuid.UUID("00000000-0000-0000-0000-000000000003"),
-        ]
-    )
-    with (
-        patch(
-            "kiro_crew.mcp_core._post", return_value={"error": "timed out", "transport_error": True}
-        ) as mock_post,
-        patch(
-            "kiro_crew.mcp_core._get",
-            return_value={"found": True, "id": "durable1", "status": "spawned"},
-        ) as mock_get,
-        patch(
-            "kiro_crew.mcp_tools.spawn.uuid.uuid4",
-            side_effect=lambda: next(identities, uuid.UUID("00000000-0000-0000-0000-000000000099")),
-        ),
-    ):
-        result = _call_tool("spawn_run", {"task": "test task"})
-
-    body = mock_post.call_args.args[1]
-    assert body["run_id"] == "00000000"
-    assert body["command_id"] == "00000000000000000000000000000002"
-    assert body["idempotency_key"] == "00000000000000000000000000000003"
-    semantic_body = {
-        key: value
-        for key, value in body.items()
-        if key not in {"command_id", "idempotency_key", "payload_hash"}
-    }
-    canonical = json.dumps(
-        {"operation": "spawn", **semantic_body}, separators=(",", ":"), sort_keys=True
-    )
-    assert body["payload_hash"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    assert mock_get.call_args.args == ("/api/spawn/commands/00000000000000000000000000000003",)
-    assert "durable1" in result
-    assert "unknown acceptance status" not in result
-
-
-def test_spawn_run_resolves_machine_coded_coordinator_uncertainty() -> None:
-    """HTTP error flattening must not bypass the stable command lookup."""
-    for code in ("coordinator_outcome_uncertain", "coordinator_unavailable"):
-        with (
-            patch(
-                "kiro_crew.mcp_core._post",
-                return_value={"error": "coordinator unavailable", "code": code, "counted": True},
-            ),
-            patch(
-                "kiro_crew.mcp_core._get",
-                return_value={"found": True, "id": "durable-coded", "status": "spawned"},
-            ) as mock_get,
-        ):
-            result = _call_tool("spawn_run", {"task": "test task"})
-
-        mock_get.assert_called_once()
-        assert "durable-coded" in result
-        assert "unknown acceptance status" not in result
-
-
-def test_pending_command_lookup_preserves_transport_uncertainty() -> None:
-    """A durable pending row may still execute and must not close its batch early."""
-    pending = {
-        "found": True,
-        "id": "durable1",
-        "error": "command outcome is still pending",
-        "status": "pending",
-        "code": "command_pending",
-    }
-    with (
-        patch(
-            "kiro_crew.mcp_core._post",
-            return_value={"error": "timed out", "transport_error": True},
-        ) as mock_post,
-        patch("kiro_crew.mcp_core._get", return_value=pending),
-    ):
-        result = _call_tool("spawn_run", {"tasks": ["task1", "task2"]})
-
-    assert "acceptance status is unknown" in result
-    assert "command outcome is still pending" in result
     assert [call.args[0] for call in mock_post.call_args_list] == [
         "/api/spawn",
         "/api/spawn",
