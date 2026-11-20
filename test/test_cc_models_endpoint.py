@@ -39,6 +39,13 @@ def _request_with_providers(providers: dict) -> MagicMock:
     return req
 
 
+def _snapshot_rows(*model_ids: str) -> list[dict[str, str]]:
+    return [
+        {"model_name": model_id, "display_name": model_id, "description": ""}
+        for model_id in model_ids
+    ]
+
+
 def _FakeProvider(models, *, backend=None):
     """A provider double carrying a REAL capability record, not an identity flag.
 
@@ -98,7 +105,7 @@ class TestTheColdPickerFallsBackToThePersistedSnapshot:
     """No live session is not the same fact as nothing advertised.
 
     Every session that advertises writes the ids to a cross-session sidecar
-    (``model_registry.advertised_models``). Answering ``[]`` while that snapshot
+    (``model_registry.advertised_model_rows``). Answering ``[]`` while that snapshot
     exists sent ``_cc_models`` down its "entitlement unknown" branch, which shows
     the STATIC registry unfiltered -- so a cold dashboard offered models the
     account cannot run and HID the ones it can, because a model newer than this
@@ -109,8 +116,10 @@ class TestTheColdPickerFallsBackToThePersistedSnapshot:
     def test_the_snapshot_answers_when_no_session_is_up(self, monkeypatch):
         monkeypatch.setattr(
             model_registry,
-            "advertised_models",
-            lambda ns: ["claude-fable-5-1[1m]", "opus"] if ns == "claude_code" else [],
+            "advertised_model_rows",
+            lambda ns: (
+                _snapshot_rows("claude-fable-5-1[1m]", "opus") if ns == "claude_code" else []
+            ),
         )
         out = _advertised_cc_models(_request_with_providers({}), "claude_code")
         assert [m["model_name"] for m in out] == ["claude-fable-5-1[1m]", "opus"]
@@ -123,7 +132,9 @@ class TestTheColdPickerFallsBackToThePersistedSnapshot:
         picker kept reaching the unfiltered registry after the fallback existed.
         """
         monkeypatch.setattr(
-            model_registry, "advertised_models", lambda ns: ["claude-fable-5-1[1m]"]
+            model_registry,
+            "advertised_model_rows",
+            lambda ns: _snapshot_rows("claude-fable-5-1[1m]"),
         )
         bare = SimpleNamespace(app={})
         out = _advertised_cc_models(bare, "claude_code")
@@ -131,7 +142,9 @@ class TestTheColdPickerFallsBackToThePersistedSnapshot:
 
     def test_a_live_session_still_wins_over_the_snapshot(self, monkeypatch):
         """Authority order is unchanged: stale-but-real loses to live-and-real."""
-        monkeypatch.setattr(model_registry, "advertised_models", lambda ns: ["stale-id"])
+        monkeypatch.setattr(
+            model_registry, "advertised_model_rows", lambda ns: _snapshot_rows("stale-id")
+        )
         prov = _FakeProvider([{"modelId": "live-id", "name": "Live"}])
         out = _advertised_cc_models(_request_with_providers({"s": prov}), "claude_code")
         assert [m["model_name"] for m in out] == ["live-id"]
@@ -145,8 +158,8 @@ class TestTheColdPickerFallsBackToThePersistedSnapshot:
         """
         monkeypatch.setattr(
             model_registry,
-            "advertised_models",
-            lambda ns: ["claude-fable-5-1[1m]"] if ns == "claude_code" else [],
+            "advertised_model_rows",
+            lambda ns: (_snapshot_rows("claude-fable-5-1[1m]") if ns == "claude_code" else []),
         )
         names = [m["model_name"] for m in _cc_models(_request_with_providers({}))]
         assert "claude-fable-5-1[1m]" in names, "the served model must be offered"
@@ -159,7 +172,7 @@ class TestTheColdPickerFallsBackToThePersistedSnapshot:
         Nothing live AND nothing ever recorded is a genuinely unknown
         entitlement, and an empty picker there is worse than a superset.
         """
-        monkeypatch.setattr(model_registry, "advertised_models", lambda ns: [])
+        monkeypatch.setattr(model_registry, "advertised_model_rows", lambda ns: [])
         names = [m["model_name"] for m in _cc_models(_request_with_providers({}))]
         assert set(_REGISTRY_NAMES) <= set(names)
 
