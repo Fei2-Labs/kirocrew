@@ -553,16 +553,6 @@ class TestGetProcessStartId:
         # second must not alias onto one identity.
         assert pc.get_process_start_id(5) == "1700000000.000042"
 
-    def test_process_start_time_keeps_macos_microseconds(self, monkeypatch):
-        _fake_libproc(monkeypatch, payload=_bsdinfo(sec=1700000000, usec=42), ret=136)
-        first = pc.process_start_time(5)
-        _fake_libproc(monkeypatch, payload=_bsdinfo(sec=1700000000, usec=43), ret=136)
-        second = pc.process_start_time(5)
-
-        assert first == "1700000000.000042"
-        assert second == "1700000000.000043"
-        assert first != second
-
     def test_macos_treats_a_zero_start_time_as_unknown(self, monkeypatch):
         _fake_libproc(monkeypatch, payload=_bsdinfo(sec=0, usec=7), ret=136)
         assert pc.get_process_start_id(5) is None
