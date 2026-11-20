@@ -68,6 +68,11 @@ globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} 
 
 import App from '../App'
 import { PREVIEW_ACP_BACKENDS } from '../utils/previewFlags'
+import { i18nT } from '../i18n/t'
+
+// The credit pill's accessible name, read from the catalog so the absence
+// assertions below cannot pass by asking for a label the pill never carries.
+const CREDIT_PILL = i18nT('app.kiro_account_credits')
 
 const BASE_STATUS = { uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 }
 
@@ -94,7 +99,7 @@ describe('App top bar — harness readout', () => {
     // Wait on the harness segment so the status query has certainly resolved —
     // asserting the pill's absence before that would pass for the wrong reason.
     await screen.findByLabelText(/New sessions use OpenAI Codex/)
-    expect(screen.queryByLabelText('Kiro credit usage')).toBeNull()
+    expect(screen.queryByLabelText(CREDIT_PILL)).toBeNull()
   })
 
   it('keeps the credit segment on the first-class Kiro harness', async () => {
@@ -102,7 +107,7 @@ describe('App top bar — harness readout', () => {
     // must not take the independently useful credit segment with it.
     setHarness({ backend: '', label: 'Kiro CLI', kiro_credits: true })
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByLabelText('Kiro credit usage')).toBeTruthy()
+    expect(await screen.findByLabelText(CREDIT_PILL)).toBeTruthy()
     expect(screen.queryByLabelText(/New sessions use Kiro CLI/)).toBeNull()
   })
 
@@ -111,7 +116,7 @@ describe('App top bar — harness readout', () => {
     // spending, and must not invent a harness label either.
     setHarness(undefined)
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByLabelText('Kiro credit usage')).toBeTruthy()
+    expect(await screen.findByLabelText(CREDIT_PILL)).toBeTruthy()
     expect(screen.queryByLabelText(/New sessions use /)).toBeNull()
   })
 
@@ -127,7 +132,7 @@ describe('App top bar — harness readout', () => {
   it('hides the constant default readout while the preview is disabled', async () => {
     setHarness({ backend: '', label: 'Kiro CLI', kiro_credits: true })
     renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByLabelText('Kiro credit usage')).toBeTruthy()
+    expect(await screen.findByLabelText(CREDIT_PILL)).toBeTruthy()
     expect(screen.queryByLabelText(/New sessions use Kiro CLI/)).toBeNull()
   })
 
