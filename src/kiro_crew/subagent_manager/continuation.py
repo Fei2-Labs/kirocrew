@@ -135,12 +135,6 @@ class ContinuationCoordinator(ManagerComponent):
         worker's own done-callback removes that worker, and the id goes with the
         run's LAST live worker, so the hold lasts exactly as long as the danger.
         """
-        # A release whose off-loop file cleanup is still running has already
-        # given up the registry entry, so nothing else would report it busy —
-        # and a continuation admitted in that window resumes onto session
-        # files that are about to be deleted underneath it.
-        if conv_key in self._manager._releasing_conversations:
-            return SubagentInfo(id="release", task="", queued=True)
         for a in self._manager._agents.values():
             if not a.done and (a.conversation_key or f"subagent:{a.id}") == conv_key:
                 return a
@@ -1294,8 +1288,8 @@ class ContinuationCoordinator(ManagerComponent):
                 return (
                     False,
                     f"conversation_busy: run {busy.id} is still settling a state write",
-                ), None
-            return (False, f"conversation_busy: run {busy.id} is in flight"), None
+                )
+            return (False, f"conversation_busy: run {busy.id} is in flight")
         provider_label = (
             self._manager._sessions.conversation_provider(conv_key) or PROVIDER_LABEL_DEFAULT
         )
