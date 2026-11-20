@@ -76,8 +76,30 @@ class TestEffortLevelsFor:
         provider = _Provider(ACP_BACKEND_KAS, [])
         assert agents_handler._effort_levels_for(_slot_request(provider)) == kiro_union
 
-    def test_a_missing_slot_provider_does_not_invent_levels(self, kiro_union: list[str]) -> None:
+    def test_a_cold_adapter_slot_does_not_inherit_the_kiro_union(
+        self, kiro_union: list[str], monkeypatch: Any
+    ) -> None:
+        """No live provider yet: the configured backend decides, as in settings."""
+        monkeypatch.setattr(
+            agents_effort_levels, "_configured_acp_backend", lambda: ACP_BACKEND_CODEX
+        )
         assert agents_handler._effort_levels_for(_slot_request(None)) == []
+
+    def test_a_cold_kiro_slot_keeps_the_global_fallback(
+        self, kiro_union: list[str], monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(agents_effort_levels, "_configured_acp_backend", lambda: "")
+        assert agents_handler._effort_levels_for(_slot_request(None)) == kiro_union
+
+    def test_a_provider_naming_no_backend_follows_the_configured_one(
+        self, kiro_union: list[str], monkeypatch: Any
+    ) -> None:
+        monkeypatch.setattr(
+            agents_effort_levels, "_configured_acp_backend", lambda: ACP_BACKEND_CODEX
+        )
+        provider = MagicMock(spec=["get_valid_effort_levels"])
+        provider.get_valid_effort_levels.return_value = []
+        assert agents_handler._effort_levels_for(_slot_request(provider)) == []
 
     def test_settings_on_an_adapter_do_not_inherit_the_kiro_union(
         self, kiro_union: list[str], monkeypatch: Any
@@ -112,7 +134,10 @@ async def test_handler_keeps_kiro_fallback_for_empty_advertisement(kiro_union: l
 
 
 @pytest.mark.asyncio
-async def test_handler_returns_empty_for_missing_slot_provider(kiro_union: list[str]) -> None:
+async def test_handler_returns_empty_for_a_cold_adapter_slot(
+    kiro_union: list[str], monkeypatch: Any
+) -> None:
+    monkeypatch.setattr(agents_effort_levels, "_configured_acp_backend", lambda: ACP_BACKEND_CODEX)
     resp = await agents_handler.api_effort_levels(_slot_request(None))
     assert resp.status == 200
     assert json.loads(resp.body) == []

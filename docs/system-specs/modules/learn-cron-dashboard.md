@@ -7695,4 +7695,5 @@ in force.
 `GET /api/effort-levels` returns levels advertised by the selected live provider.
 An adapter that advertises none gets an empty list rather than Kiro's global
 fallback; Kiro-dialect sessions keep the fallback when their own levels are not
-available. A request without a live slot uses the configured backend.
+available. A request without a slot, for a slot with no live provider yet, or
+for a provider that names no backend uses the configured backend instead.
