@@ -580,7 +580,7 @@ jobs:
         # ADVISORY: the finalize step below resolves an errored/incomplete run to
         # NEUTRAL (never a hard failure) and fails the check ONLY on a real BLOCK
         # verdict. Mirrors design-review.yml's advisory contract.
-        uses: anthropics/claude-code-action@d535f5172dec02b204866b393d6b20b9b2aaf98d # v1.0.266
+        uses: anthropics/claude-code-action@acfe7992852970efb4fee683d63d628e3e52df67 # v1.0.286
         with:
           # Inference via Amazon Bedrock (region from the AWS creds step above).
           use_bedrock: "true"
