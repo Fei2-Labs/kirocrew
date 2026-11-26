@@ -15,6 +15,7 @@
     "learn_update": "Change lesson tier",
     "session_ledger_read": "Read progress log",
     "session_ledger_record": "Log progress step",
+    "session_handoff": "Hand off work to Kiro Crew",
     "skill_search": "Search skills",
     "skill_discover": "Discover skills",
     "skill_fetch": "Fetch skill",

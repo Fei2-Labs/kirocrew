@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -281,6 +282,28 @@ def test_a_missing_project_directory_refuses(keystone, wired, tmp_path):
 def test_a_sensitive_project_directory_refuses(keystone, wired):
     """A handoff must not reach a directory the dashboard would refuse to open."""
     _permit(keystone)
+    with pytest.raises(handoff.HandoffRefused) as exc:
+        asyncio.run(
+            handoff.start_handoff(_State(_Slot()), origin="external", prompt="x", project="~/.ssh")
+        )
+    assert exc.value.code == "project_denied"
+    assert exc.value.status == 403
+
+
+def test_a_sensitive_project_directory_that_does_not_exist_still_refuses(
+    keystone, wired, tmp_path, monkeypatch
+):
+    """The denial does not depend on the path being on disk: a host without
+    ``~/.ssh`` must answer ``project_denied``, not ``project_not_a_directory`` —
+    otherwise the answer leaks existence and the refusal can be bypassed."""
+    _permit(keystone)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(
+        os.path,
+        "expanduser",
+        lambda p: p.replace("~", str(tmp_path), 1) if p.startswith("~") else p,
+    )
+    assert not (tmp_path / ".ssh").exists()
     with pytest.raises(handoff.HandoffRefused) as exc:
         asyncio.run(
             handoff.start_handoff(_State(_Slot()), origin="external", prompt="x", project="~/.ssh")

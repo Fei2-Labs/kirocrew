@@ -71,9 +71,14 @@ class DefaultProviderRegistry:
         factory_backend = (
             configured_backend if isinstance(configured_backend, str) else ACP_BACKEND_KIRO
         )
-        if factory_backend == ACP_BACKEND_KIRO:
+        from kiro_crew.agent_sdk.drivers.acp_registry import backend_speaks_kiro_dialect
+
+        if backend_speaks_kiro_dialect(factory_backend):
             # H13: the ordinary Kiro path is the direct factory object, not a
             # registry dispatcher that happens to choose Kiro at call time.
+            # KAS speaks the kiro dialect, not an adapter: it is the same
+            # dialect through the engine route the config factory already builds,
+            # so the fork's DEFAULT backend must take this arm exactly as "" does.
             kiro_factory = cfg.create_provider_factory()
             setattr(
                 kiro_factory,

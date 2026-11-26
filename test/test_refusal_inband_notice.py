@@ -53,9 +53,7 @@ class _SteerClient(LLMProvider):
     """
 
     def __init__(self, *, supports_steer: bool = True, steer_result: bool = True):
-        self.supports_steer = supports_steer
-        # The deny paths read the refusal answer; a steer-capable double has both.
-        self.supports_refusal_steer = supports_steer
+        self._supports_steer = supports_steer
         self._steer_result = steer_result
         self.calls: list[str] = []
         self.steered: list[str] = []
@@ -78,6 +76,11 @@ class _SteerClient(LLMProvider):
 
     @property
     def supports_steer(self) -> bool:
+        return self._supports_steer
+
+    @property
+    def supports_refusal_steer(self) -> bool:
+        # The deny paths read the refusal answer; a steer-capable double has both.
         return self._supports_steer
 
     @property

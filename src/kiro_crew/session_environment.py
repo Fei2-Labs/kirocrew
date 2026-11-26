@@ -270,6 +270,7 @@ def remote_workspace_for(session_key: str | None) -> tuple[str, str] | None:
 LOCAL_ONLY_CORE_TOOLS: frozenset[str] = frozenset(
     {
         "set_project",  # retargets the slot at a directory on this machine
+        "session_handoff",  # starts a new session in a project directory on this machine
         "file_send",  # reads a file off this machine's disk
         "browser",  # drives this machine's browser panel
         "pod_up",  # boots a gateway from a worktree on this machine

@@ -6,6 +6,7 @@ verdict, and the except arm that falls back when the model refuses the account
 from __future__ import annotations
 
 import asyncio
+import functools
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.agent_sdk.provider_identity import is_claude_code
@@ -148,17 +149,22 @@ async def _inherited_default_model(
     if not isinstance(cfg, KiroCrewConfig):
         return ""
     app_name = getattr(slot, "_app", "")
-    resolved = await asyncio.to_thread(
+    # The slot's created-on harness, as the allocation passes it: the default
+    # is resolved for that harness, not the configured one. Omitted when the
+    # slot pins nothing, exactly as the allocation omits it: a None would
+    # read as an explicit override of nothing.
+    resolve = functools.partial(
         _session_model,
         cfg,
         agent,
         crew_agent=crew_agent,
         app_name=app_name if isinstance(app_name, str) else "",
         session_key=session_key,
-        # The slot's created-on harness, as the allocation passes it: the
-        # default is resolved for that harness, not the configured one.
-        backend_override=_slot_backend_allocation_kwargs(slot).get("backend_override"),
     )
+    picked = _slot_backend_allocation_kwargs(slot).get("backend_override")
+    if picked is not None:
+        resolve = functools.partial(resolve, backend_override=picked)
+    resolved = await asyncio.to_thread(resolve)
     return resolved or ""
 
 

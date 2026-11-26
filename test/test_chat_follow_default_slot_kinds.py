@@ -81,6 +81,9 @@ SLOT_CREATORS: dict[tuple[str, str], str] = {
         _RESTORED
     ),
     ("dashboard/chat_persistence_parts/slot_builders.py", "_apply_recent_session"): _RESTORED,
+    ("dashboard/handoff.py", "start_handoff"): (
+        "excluded: app=app_tag(origin) and origin=SlotOrigin.APP at birth"
+    ),
     ("dashboard/cron_inject.py", "_bind_cron_slot"): "excluded: origin=SlotOrigin.CRON",
     ("dashboard/handlers/cron_runs.py", "api_cron_to_chat"): (
         "excluded: origin=SlotOrigin.CRON on both calls"
