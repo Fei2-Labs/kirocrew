@@ -175,6 +175,7 @@ STDLIB_CONNECT_SITES = {
         "the skill's ledger, in its own process"
     ),
     "onboarding_scan.py": "a private snapshot of another agent's database",
+    "run_coordinator/sqlite.py": "the retained run coordinator's own database",
     "taskq/store.py": "the task queue database, which only the stdlib driver opens",
 }
 

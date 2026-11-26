@@ -84,7 +84,7 @@ def test_coordinator_pool_is_isolated_bounded_and_reset() -> None:
     assert coordinator._max_workers == ex._MAX_COORDINATOR_WORKERS
     assert (
         coordinator.submit(threading.current_thread)
-        .result(timeout=5)
+        .result(timeout=default_timeout())
         .name.startswith("mc-coordinator")
     )
 

@@ -257,6 +257,9 @@ _FACADE_DEFS = (
     "_CompactionReplay",
     "_iter_cc_agent_names",
     "MessageContext",
+    "_busy_owner_key",
+    "dequeue_busy_followup",
+    "inject_busy_followup",
     "handle_message",
 )
 
@@ -520,7 +523,7 @@ def test_every_definition_is_in_exactly_one_place() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     assert defined == set(_FACADE_DEFS)
-    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 87
+    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 90
 
 
 def test_the_owners_log_as_the_facade() -> None:

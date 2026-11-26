@@ -177,7 +177,7 @@ _STANDALONE = "kiro_crew/subagent_standalone.py"
 _MIN_OWNER_FUNCTIONS = 300
 
 #: Agent-sdk boundary edges ``subagent.py`` carries (``.github/agent-sdk-boundary-baseline.txt``).
-_FACADE_EDGES = 6
+_FACADE_EDGES = 5
 
 #: Each moved name, the owner that holds it, and its kind and shape in the one-module file
 #: (a function's signature, a value's type), captured from it before the split.

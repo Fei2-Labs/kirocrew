@@ -704,6 +704,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _meta_identity_full,
         _MetaIdentityChannel,
         _permission_tool_id,
+        _spec_mcp_identity,
         _str_field,
         classify_tool_call,
         codex_tool_name,

@@ -91,7 +91,7 @@ def test_the_sdk_wrapper_and_the_manager_answer_the_providers_label(
 
 def test_the_cases_cover_every_label_the_helper_can_return() -> None:
     labels = {providers_acp.provider_label(_provider(k, b)) for k, b in _CASES}
-    assert labels == set(PROVIDER_LABEL_BY_BACKEND.values())
+    assert labels == set(PROVIDER_LABEL_BY_BACKEND.values()) | {"acp:not-a-backend"}
 
 
 def test_the_standalone_sentinel_still_wins(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -12,10 +12,8 @@ from typing import TYPE_CHECKING
 
 from aiohttp import web
 
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
-
 if TYPE_CHECKING:
-    from kiro_crew.dashboard.chat_handlers import DashboardState
+    from kiro_crew.dashboard.chat_handlers import DashboardState, read_bounded_json
 
 
 async def api_chat_handoff(request: web.Request) -> web.Response:

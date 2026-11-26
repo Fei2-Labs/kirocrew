@@ -1408,6 +1408,10 @@ _SEAM_IMPORTS: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {
             ("kiro_crew.acp.harness.pi", "_resolve_pi_bin"),
         )
     },
+    ("kiro_crew.acp.harness.copilot", "_resolve_copilot_bin"): (
+        "kiro_crew.acp.client",
+        ("augmented_path",),
+    ),
     # A routing read-back builds its child's environment with the session's own
     # credential repair and PATH augmentation, which stayed on the client.
     **{
@@ -1450,19 +1454,43 @@ _SPLIT_FROM: dict[tuple[str, str], str] = {
     ("kiro_crew.acp.runtime_process_tree", "walk_observes_descendants"): "_direct_children",
 }
 
+#: Seam helpers the fork added after the upstream split. They never lived on a facade,
+#: so ``_MOVED`` cannot cite their provenance; the value states why the helper still
+#: reads the facade binding ``_SEAM_IMPORTS`` lists for it. A seam outside both
+#: inventories fails the provenance check below.
+_FORK_ADDED_SEAM_PROVENANCE: dict[tuple[str, str], str] = {
+    ("kiro_crew.acp.harness.copilot", "_resolve_copilot_bin"): (
+        "the Copilot backend is fork-added, and its resolver reads the client's PATH "
+        "augmentation seam at call time so a test rebinding it there reaches the resolution"
+    ),
+}
+
+
+def test_the_fork_added_seam_inventory_names_only_listed_unmoved_seams() -> None:
+    """The additive inventory is closed: a row names a real seam, and a moved helper
+    proves its origin through ``_MOVED`` rather than claiming the fork-added row."""
+    assert set(_FORK_ADDED_SEAM_PROVENANCE) <= set(_SEAM_IMPORTS)
+    for owner, function in _FORK_ADDED_SEAM_PROVENANCE:
+        for facade, owners in _MOVED.items():
+            assert function not in owners.get(owner, ()), (facade, owner, function)
+
 
 @pytest.mark.parametrize(("site", "seam"), list(_SEAM_IMPORTS.items()), ids=repr)
 def test_each_seam_is_a_binding_of_the_facade_the_helper_came_from(
     site: tuple[str, str], seam: tuple[str, tuple[str, ...]]
 ) -> None:
     """The facade holds each name itself -- a forwarded one would be read back from the
-    owner, which binds none of them -- and the helper's code came from that facade."""
+    owner, which binds none of them -- and the helper's provenance is explicit: either
+    its code came from that facade, or the fork-added inventory names why it did not."""
     owner, function = site
     facade, names = seam
     came_from_the_facade = _MOVED[facade].get(owner, ()) + _MOVED_METHODS.get(facade, {}).get(
         owner, ()
     )
-    assert _SPLIT_FROM.get(site, function.split(".", 1)[0]) in came_from_the_facade
+    if site in _FORK_ADDED_SEAM_PROVENANCE:
+        assert _FORK_ADDED_SEAM_PROVENANCE[site]
+    else:
+        assert _SPLIT_FROM.get(site, function.split(".", 1)[0]) in came_from_the_facade
     module = _FACADES[facade]
     for name in names:
         assert name in vars(module) and name not in module._EXPORTS, name
@@ -1523,7 +1551,14 @@ def test_the_owners_depend_on_each_other_one_way() -> None:
         transport_framing.__name__,
         launch.__name__,
     )
-    hosts = {claude_harness, opencode_harness, goose_harness, pi_harness, deepseek_harness}
+    hosts = {
+        claude_harness,
+        opencode_harness,
+        goose_harness,
+        pi_harness,
+        deepseek_harness,
+        copilot_harness,
+    }
     expected = {
         (errors, runtime_models.__name__),
         (the_launch, errors),
@@ -1840,13 +1875,13 @@ _SHARED_BINDINGS_PATCHED: frozenset[tuple[str, str]] = frozenset(
         ("kiro_crew.acp.client", "AcpClient"),
         ("kiro_crew.acp.client", "logger"),
         ("kiro_crew.acp.client", "redact_exfiltration_urls"),
+        ("kiro_crew.acp.client", "is_sensitive_path"),
         ("kiro_crew.acp.client", "scrub_agent_subprocess_env"),
         ("kiro_crew.acp.client", "wrap_argv"),
         ("kiro_crew.acp.client", "wrap_argv_async"),
         ("kiro_crew.acp.runtime", "_RESPONSE_WRITE_BOUND_SECS"),
         ("kiro_crew.acp.runtime", "_get_child_pids"),
         ("kiro_crew.acp.runtime", "agent_scratch"),
-        ("kiro_crew.acp.runtime", "augmented_path"),
         ("kiro_crew.acp.runtime", "launch"),
         ("kiro_crew.acp.runtime", "scrub_agent_subprocess_env"),
         ("kiro_crew.acp.runtime", "wrap_argv"),
