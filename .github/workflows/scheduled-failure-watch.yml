@@ -95,6 +95,7 @@ on:
       - "PR Merge-Conflict Label"
       - "PR Readiness Self-Heal Sweep"
       - "Ship Report"
+      - "Upstream Sync"
     types: [completed]
     # MUST equal the repository default branch, and a rename that misses this
     # line silences the watcher rather than breaking it: every `schedule:` run

@@ -678,7 +678,7 @@ class TestFastGatePythonRuntime:
         index = setups[0]
         setup = steps[index]
         assert setup["uses"] == (
-            "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
+            "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
         ), "Python setup must use the pinned action"
         assert setup.get("with", {}).get("python-version") == "3.12", "expected Python 3.12"
         assert "if" not in setup, "Python setup must be unconditional"

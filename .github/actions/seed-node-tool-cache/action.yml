@@ -23,8 +23,8 @@ runs:
     # comes from nodejs.org's index, which is what the manifest mirrors, and
     # the tarball is checked against nodejs.org's SHASUMS256.txt.
     #
-    # Where that order lives, in the pinned actions/setup-node (v7.0.0,
-    # 8207627): src/distributions/official_builds/official_builds.ts
+    # Where that order lives, in the pinned actions/setup-node (v7.1.0,
+    # 949feb2): src/distributions/official_builds/official_builds.ts
     # `setupNodeJs` calls `findVersionInHostedToolCacheDirectory` (= tc.find
     # over RUNNER_TOOL_CACHE) and returns on a hit; `getManifest` /
     # `getInfoFromManifest` run only on a miss, or for an `lts/*` alias,
