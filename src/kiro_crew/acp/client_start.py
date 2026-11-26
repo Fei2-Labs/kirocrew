@@ -257,6 +257,26 @@ async def _spawn(self: AcpClient) -> None:
             )
         )
     else:
+        # The kiro arm is a POSITIVE arm, never a fall-through: a known id no
+        # ProcessAdapter claims must be refused here rather than silently
+        # exec'ing kiro-cli under another harness's label. Membership is read
+        # off the dialect table, so a kiro-dialect id added later (KAS was one)
+        # inherits the arm and a spec-dialect id never can.
+        from kiro_crew.acp.backends import Dialect, UnknownAcpBackend, dialect_of
+
+        try:
+            kiro_arm = dialect_of(self.backend) is Dialect.KIRO
+        except UnknownAcpBackend:
+            # A half-added id: in the known set but carrying no descriptor yet,
+            # so there is no dialect to judge -- exactly the absence this guard
+            # exists to refuse.
+            kiro_arm = False
+        if not kiro_arm:
+            raise AcpError(
+                f"no spawn implementation for backend {self.backend!r}: "
+                "a known ACP backend must resolve a ProcessAdapter or the "
+                "kiro-dialect spawn arm, never fall through to kiro-cli"
+            )
         # Pin ONE reading of the environment for both the search and the
         # message that reports it. The previous code resolved against the live
         # ``os.environ`` and then, on failure, recomputed the directory set
@@ -786,7 +806,11 @@ def _initialize_params(self: AcpClient) -> dict[str, Any]:
     handshake (:meth:`_entitlement_probe_answer`), so the probe process is
     introduced to kiro-cli exactly as the session it probes for was.
     """
-    protocol_version: int | str = _PROTOCOL_VERSION_BY_BACKEND.get(self.backend, PROTOCOL_VERSION)
+    # The dialect contract is the gate and the fallback together: an unmapped
+    # dialect raises here, before the first wire request, instead of silently
+    # inheriting Kiro's contract through the table's absence (H5).
+    dialect_version, _ = _wire_contract_for_backend(self.backend)
+    protocol_version: int | str = _PROTOCOL_VERSION_BY_BACKEND.get(self.backend, dialect_version)
     return {
         "protocolVersion": protocol_version,
         "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},

@@ -147,11 +147,14 @@ def _sessions_from_own_records() -> dict:
     today = [h for h in history if h["date"] == today_str]
     week_cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     week = [h for h in history if h["date"] >= week_cutoff]
+    month_start = datetime.now().strftime("%Y-%m-01")
+    month = [h for h in history if h["date"] >= month_start]
 
     total_sessions = len(first_day_for_slot)
+    total_msgs = sum(msgs_for_slot.values())
     return {
         "total_sessions": total_sessions,
-        "total_messages": sum(msgs_for_slot.values()),
+        "total_messages": total_msgs,
         "total_tool_calls": 0,
         "all_time_sessions": total_sessions,
         "daily_history": history,
@@ -165,6 +168,17 @@ def _sessions_from_own_records() -> dict:
             "messages": sum(h["messages"] for h in week),
             "tool_calls": 0,
         },
+        "this_month": {
+            "sessions": sum(h["sessions"] for h in month),
+            "messages": sum(h["messages"] for h in month),
+            "tool_calls": 0,
+        },
+        "avg_msgs_per_session": round(total_msgs / max(total_sessions, 1), 1),
+        "avg_tools_per_session": 0.0,
+        # The token shards are all read by construction, so there is no
+        # transcript or session-directory degradation to report.
+        "refused_transcripts": 0,
+        "unreadable_session_dirs": 0,
     }
 
 
@@ -389,7 +403,13 @@ def _parse_sessions() -> dict:
         # ordinary empty-stats parse below rather than erroring -- an absent
         # directory there is COMPLETE data (nothing recorded yet), not a fault.
         if _configured_acp_backend():
-            return _sessions_from_own_records()
+            # KAS is itself another-backend state, yet its harness still writes
+            # transcript records beside the cli directory -- those are real
+            # session data, so the own-records fallback applies only when the
+            # KAS scan finds nothing either.
+            kas_paths, _unread = _kas_transcripts(sessions_dir.parent, sessions_dir)
+            if not kas_paths:
+                return _sessions_from_own_records()
 
     cutoff = time.time() - (_SESSIONS_HISTORY_DAYS * 86400)
     daily: Counter = Counter()

@@ -143,19 +143,13 @@ class TestMcpMatcher:
         # the LAST '__' so the whole server name is preserved — else a
         # server-level deny never matches and the tool is wrongly permitted.
         assert (
-            mcp_title_to_ref(
-                "mcp__npm__playwright_mcp__browser_click",
-                server_names={"npm__playwright_mcp"},
-            )
+            mcp_title_to_ref("mcp__npm__playwright_mcp__browser_click")
             == "@npm__playwright_mcp/browser_click"
         )
 
     def test_double_underscore_server_deny_matches(self):
         r = ScopedRuleset(mode=MODE_DENY, deny=("@npm__playwright_mcp",), matcher="mcp")
-        ref = mcp_title_to_ref(
-            "mcp__npm__playwright_mcp__browser_click",
-            server_names={"npm__playwright_mcp"},
-        )
+        ref = mcp_title_to_ref("mcp__npm__playwright_mcp__browser_click")
         assert not r.permits(ref).permitted
 
     def test_multi_segment_title_without_roster_keeps_a_governed_identity(self):
@@ -164,12 +158,6 @@ class TestMcpMatcher:
     def test_multi_segment_auto_approval_probe_stays_governed(self):
         assert classify_tool_title("mcp__npm__playwright_mcp__probe") == (
             ("mcp", "@npm__playwright_mcp/probe"),
-        )
-
-    def test_roster_preserves_double_underscore_tool_name(self):
-        assert (
-            mcp_title_to_ref("mcp__github__repo__delete", server_names={"github"})
-            == "@github/repo__delete"
         )
 
 

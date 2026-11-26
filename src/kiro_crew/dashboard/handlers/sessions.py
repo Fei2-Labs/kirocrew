@@ -1724,6 +1724,21 @@ async def api_sessions_usage(request: web.Request) -> web.Response:
         blocked = await reject_if_kiro_unverified(request, max_age_secs=_POLL_GATE_MAX_AGE_SECS)
         if blocked is not None:
             return blocked
+    # A spec-adapter harness bills its own vendor account, so the Kiro credit
+    # figure is never available there -- and reaching for it would spend real
+    # money on the billed `kiro-cli chat --no-interactive ... /usage` scrape
+    # every 30 seconds. Answer unavailable without refreshing; the cache is
+    # left intact so switching back to Kiro still serves the last good value.
+    # An UNKNOWN backend (no readable property, a MagicMock store) keeps the
+    # existing behaviour: it must not hide a balance the operator is really
+    # spending.
+    from kiro_crew.agent_sdk.drivers.acp_registry import harness_status
+    from kiro_crew.dashboard.state import active_acp_backend
+
+    _usage_state: DashboardState = request.app["state"]
+    _usage_backend = active_acp_backend(getattr(_usage_state, "sessions", None))
+    if _usage_backend is not None and not harness_status(_usage_backend)[1]:
+        return web.json_response({"usage": {"available": False}})
     # Payload and the fingerprint it was published under, taken in one step (no
     # await between them, and _publish_usage writes both without yielding), so
     # the foreign check below judges exactly what this response serves.

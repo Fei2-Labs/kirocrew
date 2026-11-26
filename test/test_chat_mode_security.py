@@ -1292,8 +1292,11 @@ async def test_harness_auto_refusal_mutates_no_grant_or_slot(state) -> None:
     with patch("kiro_crew.dashboard.chat_handlers.safety_override", return_value=override):
         async with _client(state) as client:
             resp = await client.post("/api/chat/mode", json={"mode": "auto", "slot": "s1"})
-            assert resp.status == 409
-            assert (await resp.json())["code"] == "permission_auto_requires_safety_override"
+            # ``auto`` is a harness permission concept, not one of
+            # KNOWN_APPROVAL_MODES, so the governance gate refuses it as input
+            # before the override is consulted and before any mutation.
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "unknown_approval_mode"
     assert override.active is True
     assert override.deactivate_calls == []
     assert slot._trust is False

@@ -56,6 +56,7 @@ from kiro_crew import model_registry, resource_status  # noqa: F401
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent import _prompt_path, _shipped_prompt, is_managed_prompt  # noqa: F401
 from kiro_crew.agent_discovery import WHOLE_CATALOG_TEMPLATES, agent_skill_globs
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_CLAUDE
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, is_claude_code
 from kiro_crew.agent_spec_format import iter_agent_spec_files, parse_agent_spec_text  # noqa: F401
@@ -1588,10 +1589,14 @@ class ContextBuilder:
         else:
             cfg = KiroCrewConfig.load()
             provider = cfg.agent.provider
-            # The joined spelling is the {bot_name} value the prompt
-            # substitutes, not prose about the product: respelling it would
-            # change what the model is told to answer to.
-            self._bot_name = "KiroCrew" if is_claude_code(provider) else "Kiro"  # brand-ok
+            # Keyed on agent.acp_backend beside the provider enum: the enum is
+            # single-valued ("acp") in the public build, so the claude persona
+            # an operator selects with `acp_backend = "claude"` would otherwise
+            # never reach the prompt. The joined spelling is the {bot_name}
+            # value the prompt substitutes, not prose about the product:
+            # respelling it would change what the model is told to answer to.
+            claude = is_claude_code(provider) or cfg.agent.acp_backend == ACP_BACKEND_CLAUDE
+            self._bot_name = "KiroCrew" if claude else "Kiro"  # brand-ok
         _memory_stores[_DEFAULT_KEY] = self.memory
 
     # ── Per-session delivery records (context_assembly/delivery_records.py) ──

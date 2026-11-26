@@ -219,17 +219,31 @@ def unexpected_imports(source: str, owner_names: dict[str, set[str]]) -> list[st
     return found
 
 
+#: Two different tools share this name; the facade serves the first owner's (the
+#: external-agent handoff), and the dashboard registry imports the second directly.
+_TWO_OWNER_NAMES = {
+    "SESSION_HANDOFF_SCHEMA": (
+        "kiro_crew.validation_parts.core_turn_schemas",
+        "kiro_crew.validation_parts.messaging_session_schemas",
+    )
+}
+
+
 def test_every_base_name_resolves_as_the_object_its_one_owner_defines() -> None:
     owners = _owner_names()
     homes: dict[str, list[str]] = {}
     for owner, names in owners.items():
         for name in names:
             homes.setdefault(name, []).append(owner)
-    assert {name for name in _BASE_DEFINED if len(homes.get(name, [])) != 1} == set()
+    assert {
+        name for name in _BASE_DEFINED - set(_TWO_OWNER_NAMES) if len(homes.get(name, [])) != 1
+    } == set()
+    for name, expected in _TWO_OWNER_NAMES.items():
+        assert tuple(homes[name]) == expected, name
     assert set(homes) == _BASE_DEFINED, "an owner defines a name the one module did not"
     listed = set(dir(validation))
     for name in sorted(_BASE_DEFINED):
-        (owner,) = homes[name]
+        owner = homes[name][0]
         assert getattr(validation, name) is getattr(sys.modules[owner], name), name
         assert name in listed, name
 

@@ -232,7 +232,9 @@ class TestSpawnResolvesEachBackendsOwnArgv:
             )
         # And kiro is a POSITIVE arm too, not the fall-through -- serving it by
         # absence is what let a known id exec kiro-cli under another label.
-        assert "ACP_BACKENDS_KIRO_DIALECT" in source
+        # The arm reads membership off the dialect table.
+        assert "dialect_of" in source
+        assert "Dialect.KIRO" in source
 
         # Codex: its own harness, resolving through the ladder that carries the
         # Node floor. Not a bare ``"codex" in source``, which a comment satisfies.
@@ -271,23 +273,13 @@ class TestSpecAdaptersAreNotToldWeSupportElicitation:
     adapter converts to `action: "cancel"`. No prompt, no visible error, and the
     call never reaches the PreToolUse gate.
 
-    WIDENED at the 2026-09-21 sync. This fork removed the key for SPEC ADAPTERS
-    only, keeping it on the kiro set; upstream then removed it for EVERY backend
-    on the same reasoning -- a client that sees the capability routes its
-    human-in-the-loop prompts through `elicitation/create` INSTEAD of falling
-    back to `session/request_permission`, so the declaration is not inert
-    anywhere, it replaces a working path with one that errors. That is strictly
-    stronger, so the old assertion (`"elicitation" in ACP_CLIENT_CAPABILITIES`)
-    now demands the very vulnerability this class is named for. What is pinned
-    here is the PROPERTY -- no backend is told we serve it -- and
-    `test_acp_client_capabilities.py::test_elicitation_is_not_advertised_without_a_handler`
-    is upstream's own guard on the same fact. Re-add the key only in the change
-    that registers a handler for it.
+    Kiro Crew handles `elicitation/create` (`acp/client_elicitation.py`), so the
+    capability is advertised on every dialect and is served rather than
+    cancelled. `test_acp_client_capabilities.py::test_elicitation_is_advertised_only_with_a_handler_on_both_drivers`
+    pins the capability and its handler together. What this class pins is the
+    dialect-correct wire contract: the initialize handshake never inherits
+    Kiro's contract by silence.
     """
-
-    def test_the_spec_set_omits_elicitation(self) -> None:
-        assert "elicitation" not in ACP_CLIENT_CAPABILITIES
-        assert "elicitation" not in ACP_CLIENT_CAPABILITIES_SPEC_ADAPTER
 
     def test_initialize_selects_the_set_by_dialect(self) -> None:
         """Keyed on the dialect so an added spec adapter inherits it."""

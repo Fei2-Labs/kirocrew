@@ -11,7 +11,7 @@ on an instance reaches every caller.
 
 Instance fields written: ``_allocation``.
 
-Instance fields read: ``identity_check_before_acquire``, ``parent_turns``.
+Instance fields read: ``_cfg``, ``_provider_factory``, ``identity_check_before_acquire``, ``parent_turns``.
 """
 
 from __future__ import annotations
@@ -120,6 +120,65 @@ def has_session(self: SessionManager, key: str) -> bool:
 def get_provider(self: SessionManager, key: str) -> LLMProvider | None:
     """Return the live provider for a folded key."""
     return self._allocation_boundary().get_provider(key)
+
+
+def live_harness(self: SessionManager, session_key: str) -> tuple[str | None, list[str]]:
+    """The backend and advertised model ids of a LIVE session.
+
+    ``None`` backend means there is no parent to inherit from (no session,
+    or a mock whose ``backend`` is not a string). An empty-string backend
+    is kiro-cli and must be distinguished from that absence — dedicated
+    children pin ``acp_backend=""`` so a Settings switch cannot redirect
+    them onto an adapter.
+
+    Advertised ids come from the same ``available_models`` surface the
+    picker reads. Empty means entitlement unknown, which
+    ``resolve_usable_model`` already treats as inherit-for-auto / trust a
+    concrete pin.
+    """
+    from kiro_crew.agent_sdk.drivers.acp import advertised_model_ids
+
+    if not session_key:
+        return None, []
+    provider = self.get_provider(session_key)
+    if provider is None:
+        return None, []
+    try:
+        backend = provider.backend
+        if not isinstance(backend, str):
+            return None, []
+        return backend, advertised_model_ids(provider.available_models())
+    except Exception:
+        return None, []
+
+
+def _provider_factory_for_backend(self: SessionManager, backend: str) -> Callable:
+    """Return the current factory, or a rare live-parent crossover factory.
+
+    The configured Kiro path must remain the direct first-class factory
+    (H13), so it cannot also dispatch an adapter inherited from a live
+    parent after Settings changes. Build a backend-specific factory only
+    for that dedicated-child crossover; ordinary sessions keep the
+    already-built factory object unchanged.
+    """
+    configured = getattr(self._cfg.agent, "acp_backend", "")
+    if not isinstance(configured, str):
+        configured = ""
+    if backend == configured:
+        if self._provider_factory is None:
+            raise RuntimeError("No provider factory configured")
+        return self._provider_factory
+    from kiro_crew.platform.interfaces import PROVIDER_BACKEND_FACTORY_ATTR
+
+    builder = getattr(self._provider_factory, PROVIDER_BACKEND_FACTORY_ATTR, None)
+    if callable(builder):
+        return builder(backend)
+    # An explicitly supplied factory owns dispatch itself. This is also the
+    # test/evaluation seam: replacing it with a real registry factory would
+    # spawn an operator-installed binary behind the caller's back.
+    if self._provider_factory is None:
+        raise RuntimeError("No provider factory configured")
+    return self._provider_factory
 
 
 def session_generation(self: SessionManager, key: str) -> int:

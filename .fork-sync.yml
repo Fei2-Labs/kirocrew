@@ -969,24 +969,22 @@ divergences:
     decided: 2026-09-15
 
   - id: registry-adapter-vocabulary
+    status: retired
     what: |
-      `agent_sdk/backends.py` declares `ACP_BACKENDS_REGISTRY_ADAPTERS =
-      {copilot, goose, pi}` (driver-internal disposition): the ids
-      `members._direct_factory_backend` degrades to kiro when the direct Kiro
-      provider factory is the caller -- their dialect-correct route is the
-      registry dispatcher, not `AcpProvider`. Upstream's own harnesses (kiro,
-      kas, claude, codex, opencode) are never members and pass through
-      unnarrowed. Session MCP composition does NOT read this set (see
-      divergences/mcp-injection-composition): the gate there is `self._is_kiro`,
-      applying to every non-kiro backend upstream's and this build's alike, not
-      to this narrower registry-adapter membership.
+      RETIRED 2026-11-26. Upstream serves copilot, goose and pi through the
+      direct ``AcpProvider`` factory the same way it serves codex and opencode:
+      ``test_acp_pi_backend_session.py::TestAPersistedLevelSurvivesAColdStart``
+      pins pi's per-model effort on that factory, and
+      ``test_crewmate_harness.py`` resolves goose and pi member routes on their
+      own harness. A set that degrades those ids to kiro on that factory drops
+      pi's effort and contradicts both, so ``ACP_BACKENDS_REGISTRY_ADAPTERS`` is
+      gone and the three ids pass through unnarrowed.
     why: |
-      Giving the provider-factory narrowing a named set (rather than an inline
-      backend-id check) is what keeps it legible on its own, and matches the
-      shape `host_auth.py` uses to declare sign-in for the same three ids;
-      credential leaves stay owned by the per-harness declarations.
-    pinned_by: "test/test_agent_sdk_capabilities.py, test/test_provider_dispatch.py::TestAcpBackendOverride, test/test_agent_sdk_host_auth.py::test_every_known_harness_has_a_declaration"
+      The record's premise -- that the three ids are this build's adapters and
+      only the registry dispatcher constructs them correctly -- stopped holding
+      when upstream adopted them, the same way it stopped holding for codex.
     decided: 2026-09-15
+    retired: 2026-11-26
 
   - id: acp-backends-registry-merged-route
     status: retired
@@ -1018,26 +1016,17 @@ divergences:
     retired: 2026-11-17
 
   - id: member-backend-explicit-arm
+    status: retired
     what: |
-      `members.select_provider_backend(explicit, session_key, member_backend,
-      configured_default)` -- one arm ahead of upstream's three, because the
-      fork's `create_provider_factory` passes the caller's `acp_backend` pick.
-      Every arm crosses `_direct_factory_backend`, which degrades to kiro ONLY
-      an id in `ACP_BACKENDS_REGISTRY_ADAPTERS` (divergences/
-      registry-adapter-vocabulary) -- upstream's own harnesses (kas, claude,
-      codex, opencode) pass through unnarrowed, since upstream already serves
-      them through the direct `AcpProvider` factory.
+      RETIRED 2026-11-26. Upstream's ``select_provider_backend`` carries the
+      caller's pick as ``backend_override`` (``members_parts/member_sessions.py``),
+      so the fork's extra leading arm and ``_direct_factory_backend`` are gone
+      from main, and with divergences/registry-adapter-vocabulary retired there
+      is no narrowing left for the arm to cross.
     why: |
-      Upstream's factory takes no per-call backend. The fork's old
-      `_kiro_dialect_only` narrowing degraded EVERY spec-dialect id, which
-      silently broke the private-member refusal for codex once codex became
-      upstream's (a spec-dialect id `AcpProvider` now serves directly). Scoping
-      the narrowing to the fork's own registry-adapter set fixes that without
-      giving up the degrade this build's copilot/goose/pi still need. Upstream
-      tests call the three-arg form; adapt them by passing `None` first, not by
-      dropping the arm.
-    pinned_by: "test/test_member_dispatch_mount.py::TestSelectProviderBackend, test/test_member_memory_auth.py::test_private_execution_requires_direct_mcp_tools, test/test_provider_dispatch.py::TestAcpBackendOverride"
+      Taking upstream's signature leaves nothing fork-owned here.
     decided: 2026-09-15
+    retired: 2026-11-26
 
   - id: durable-run-coordinator
     status: retired
@@ -1335,6 +1324,62 @@ divergences:
       They read the packaged tree rather than going through `registry`, because what
       ships is what is on disk and the App Store grid reads `hidden` straight out of
       the manifest.
+
+  # ── Recorded 2026-11-20 while repairing a branch 2079 commits behind upstream ──
+  # Method: `git grep` upstream/main vs HEAD for each symbol. Rule the owner set
+  # for this fork: keep upstream's code, add only what upstream lacks, and the
+  # day upstream carries a feature, take upstream's.
+
+  - id: acp-rate-limit-quota
+    what: |
+      `acp.types.AcpRateLimit` (a frozen dataclass), `AcpPromptStats.rate_limit`
+      carried across turns by `carry_over()`, and the `rate_limit` key on the
+      `context_usage` WS payload (`dashboard/chat_turn/turn_stats.py`), which the
+      dashboard's plan-quota popover reads.
+    why: "Account quota arrives only on change, so it must survive a turn boundary."
+    pinned_by: "test/test_context_usage_payload.py (the rate_limit cases)"
+    decided: 2026-08-27
+    note: |
+      Upstream has no `AcpRateLimit` (verified: 0 files). Seen LOST at the
+      2026-11-12 merge in three places at once: the `@dataclass` decorator, the
+      `rate_limit` field, and the payload key. The class still existed, so nothing
+      failed to import; only 7 tests failed, with `AcpRateLimit() takes no arguments`.
+
+  - id: copilot-verified-version-gate-bypassed
+    what: |
+      Any Copilot CLI release is accepted. `_refuse_unverified_copilot_version`
+      returns immediately and `agent_sdk/drivers/acp.py` no longer reports a
+      wrong-release install as missing.
+    why: |
+      The ACP wire is additive-only between releases and re-verifying each point
+      release is impractical; the edit-target, allow_all read-back and mode-tripwire
+      checks still run at runtime.
+    pinned_by: "test/test_acp_copilot_backend.py::test_an_unverified_copilot_release_starts_because_the_version_gate_is_bypassed, test/test_agent_sdk_backend_install.py::TestCopilotWrongVersion::test_another_release_is_installed_because_the_version_gate_is_bypassed"
+    decided: 2026-11-17
+    note: |
+      Upstream still pins `COPILOT_VERIFIED_VERSION` (5 files). Source change was
+      dbf2708b6d; its five tests kept asserting the refusal until 2026-11-20.
+      Take upstream's gate again if upstream ever drops the pin.
+
+  - id: ssh-agent-forward-read-per-spawn
+    what: |
+      `sandbox_spawn._sensitive_env_prefixes()` / `_spawn_scrub_env_prefixes()`
+      read `workflow_policy.forward_ssh_agent()` on every spawn so the operator's
+      opt-in applies without a gateway restart (#33153).
+    why: "Changing the keystone opt-in must take effect without restarting."
+    pinned_by: "NONE FOUND -- verify before relying on this entry"
+    decided: 2026-11-08
+    note: |
+      OPEN, NOT RESOLVED. This file drifted from upstream in the WRONG direction as
+      well: upstream's `sandbox_spawn.py` folds env-var case on Windows
+      (`fold = os.name == "nt"`) in `scrub_env` and `scrub_agent_denied_env`, and
+      keeps the module constant `_SPAWN_SCRUB_ENV_PREFIXES`; this fork has neither.
+      A lower-case spelling of a credential name can therefore survive the scrub on
+      Windows. At the next sync take upstream's file and re-apply only the
+      per-spawn `forward_ssh_agent()` read on top of it; do not pick a side.
+      `test_sandbox_refactor_facade.py` fails 4 cases until then (the moved-name
+      inventory still lists `_SPAWN_SCRUB_ENV_PREFIXES`). Keystone file: read
+      docs/system-specs/modules/security.md first.
 
 toolchain:
   python: ".venv/bin/python3"

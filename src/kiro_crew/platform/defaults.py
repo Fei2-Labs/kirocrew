@@ -82,7 +82,17 @@ class DefaultProviderRegistry:
             )
             return kiro_factory
 
-        return self._create_adapter_dispatch_factory(cfg, factory_backend)
+        dispatcher = self._create_adapter_dispatch_factory(cfg, factory_backend)
+        # The crossover seam rides on the dispatcher too: a dedicated child
+        # inheriting its live parent's harness asks the session store for a
+        # per-backend factory, and a configured adapter must be able to cross
+        # to a different one exactly as the Kiro path can.
+        setattr(
+            dispatcher,
+            PROVIDER_BACKEND_FACTORY_ATTR,
+            lambda backend: self._create_adapter_dispatch_factory(cfg, backend),
+        )
+        return dispatcher
 
     def _create_adapter_dispatch_factory(
         self,
@@ -112,6 +122,11 @@ class DefaultProviderRegistry:
             if backend == ACP_BACKEND_KIRO:
                 if kiro_factory is None:
                     kiro_factory = cfg.create_provider_factory()
+                # Thread the pick: the caller asked for Kiro explicitly, and the
+                # direct factory re-resolves from config when no override reaches
+                # it -- under a non-Kiro configured default the explicit pick
+                # would silently serve the configured backend instead.
+                kwargs.setdefault("backend_override", backend)
                 return kiro_factory(*args, **kwargs)
 
             # Programmatic mutation can bypass persisted-value normalization.

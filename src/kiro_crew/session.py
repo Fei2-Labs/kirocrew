@@ -579,6 +579,8 @@ class SessionManager:
     mark_lifecycle_lease = _claims.mark_lifecycle_lease
     has_session = _claims.has_session
     get_provider = _claims.get_provider
+    live_harness = _claims.live_harness
+    _provider_factory_for_backend = _claims._provider_factory_for_backend
 
     def provider_label_for(self, key: str) -> str:
         """Return live backend identity, falling back to persisted identity."""
