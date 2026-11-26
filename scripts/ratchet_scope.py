@@ -202,8 +202,13 @@ def changed_paths() -> tuple[set[str] | None, str]:
         # resolved explicitly and the diff left with ONE endpoint -- it then
         # runs to the working tree, which is what every consuming gate scans.
         # `resolve_base` also survives a shallow clone with no shared history,
-        # where the three-dot form simply fails.
-        attempts.append((f"{base}...HEAD", ["diff", "--name-only", resolve_base(base)]))
+        # where the three-dot form simply fails. A repo carrying neither ref
+        # (a fixture, or a checkout outside any fork) must not announce the
+        # degraded fallback for a base it never had: `resolve_base` is only
+        # asked when the ref exists, and the diff then fails like any other
+        # attempt whose endpoint is missing.
+        if _git("rev-parse", "--verify", "--quiet", base)[0] == 0:
+            attempts.append((f"{base}...HEAD", ["diff", "--name-only", resolve_base(base)]))
     for label, args in attempts:
         code, out = _git(*args)
         if code == 0:

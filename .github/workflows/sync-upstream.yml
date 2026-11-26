@@ -28,11 +28,22 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # 10 min for the sync itself, plus the 20 min the gh wrapper may spend in
+    # total waiting out a spent API rate limit.
+    timeout-minutes: 30
     steps:
       # persist-credentials retained: sync / "Open sync PR" runs git fetch + git push -u origin
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0          # merge needs real history, not a shallow clone
+
+      # A weekly sync that fails on a spent API rate limit surfaces nothing for
+      # a week, so every `gh` call goes through the rate-limit-aware wrapper
+      # (.github/actions/gh-rate-limit). The checkout above already fetched it.
+      - name: Install rate-limit-aware gh
+        uses: ./.github/actions/gh-rate-limit
+        with:
+          max-wait: "1200"
 
       - name: Read manifest
         id: cfg
