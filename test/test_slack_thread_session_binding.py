@@ -422,6 +422,9 @@ def _links_for(session_key, thread_ts):
         def mirror_accepts_inbound(self, key):
             return False
 
+        def provider_label_for(self, key):
+            return ""
+
     class _Slot:
         key = session_key
         linked_session_key = session_key
@@ -487,6 +490,9 @@ def _serialized(session_key, thread_ts, channel=_CHANNEL):
 
         def mirror_accepts_inbound(self, key):
             return False
+
+        def provider_label_for(self, key):
+            return ""
 
     class _Slot:
         key = session_key

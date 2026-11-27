@@ -1000,7 +1000,7 @@ class TestSelectProviderBackend:
     def test_member_route(self):
         from kiro_crew.members import select_provider_backend
 
-        assert select_provider_backend(None, MEMBER_KEY, "kas", "") == "kas"
+        assert select_provider_backend(MEMBER_KEY, "kas", "") == "kas"
 
     def test_non_member_gets_the_configured_default_unresolved(self):
         """The default arm passes the configured value through UNCHANGED —

@@ -364,7 +364,9 @@ class TestLifecycle:
         # KAS runtime under its own pid; the parent process stands in for it here.
         rows = {"other": f"{os.getppid()}:424242:tok\n", "self": f"{os.getpid()}:424242:tok\n"}
         if owner in rows:
-            (home / "kiro_session_pids.txt").write_text(rows[owner], encoding="utf-8")
+            pids = home / "run" / "kiro_session_pids.txt"
+            pids.parent.mkdir(parents=True, exist_ok=True)
+            pids.write_text(rows[owner], encoding="utf-8")
         live = _snapshot(
             home, _project(_spec(mcpServers={"c": _server_spec(script)}))["mcpServers"]["c"]
         )

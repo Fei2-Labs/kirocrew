@@ -223,6 +223,7 @@ async def test_client_auto_approve_floor_refusal_steers_the_host_notice_first(tm
         id=16,
         method="session/request_permission",
         params={
+            "sessionId": "s-floor",
             "toolCall": {"toolCallId": "tc-16", "title": os.path.expanduser("~/.ssh/id_rsa")},
             "options": [],
         },
@@ -242,6 +243,10 @@ def _permission_frame(request_id, options):
             "id": request_id,
             "method": "session/request_permission",
             "params": {
+                # The fork's ownership floor rejects a frame naming no session
+                # before any id validation runs, exactly as it rejects one
+                # naming a session the handle does not own.
+                "sessionId": "s1",
                 "toolCall": {"toolCallId": "tc-invalid", "title": "notes.txt"},
                 "options": options,
             },

@@ -498,11 +498,13 @@ def test_the_assignment_line_is_still_the_first_version_match() -> None:
     assert len(quoted) == 1, quoted
 
 
-def test_the_file_is_not_shipped_by_this_repo() -> None:
-    """The stamp belongs to a distribution's packaging step; the repo and the
-    wheels it publishes carry none, and the gitignore keeps a dev experiment
-    from being committed."""
-    assert not (PKG_DIR / BUILD_VERSION_FILENAME).exists()
-    assert f"src/kiro_crew/{BUILD_VERSION_FILENAME}" in (REPO_ROOT / ".gitignore").read_text(
+def test_the_file_is_shipped_for_the_fork_update_lane() -> None:
+    """Upstream ships no stamp; the fork does. fe68bd64cd (fork build identity,
+    upstream-ahead probe, fork fast-forward lane) tracks it so the fleet's
+    auto-update can read a version_newer event off the repo itself, and the
+    gitignore carries the un-ignore that keeps it committable."""
+    stamp = (PKG_DIR / BUILD_VERSION_FILENAME).read_text(encoding="utf-8").strip()
+    assert re.fullmatch(r"\d+\.\d+\.\d+(\.\d+)?", stamp), stamp
+    assert f"!src/kiro_crew/{BUILD_VERSION_FILENAME}" in (REPO_ROOT / ".gitignore").read_text(
         encoding="utf-8"
     )

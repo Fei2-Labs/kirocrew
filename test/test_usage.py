@@ -17,6 +17,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import kiro_crew.dashboard.handlers.usage as usage_mod
+import kiro_crew.dashboard.handlers.usage_store as usage_store_mod
 from kiro_crew import platform_compat
 from kiro_crew.dashboard.handlers.usage import (
     _cached_parse_sessions,
@@ -54,7 +55,7 @@ class TestParseSessions:
         sessions_dir = tmp_path / "cli"
         if directory_exists:
             sessions_dir.mkdir()
-        with patch.object(usage_mod, "_SESSIONS_DIR", sessions_dir):
+        with patch.object(usage_store_mod, "_SESSIONS_DIR", sessions_dir):
             result = _parse_sessions()
         assert result == {
             "total_sessions": 0,
@@ -81,7 +82,7 @@ class TestParseSessions:
         d = tmp_path / "cli"
         d.mkdir()
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch("kiro_crew.platform_compat.PinnedDirectory.names", side_effect=OSError("boom")),
         ):
             result = _parse_sessions()
@@ -105,7 +106,7 @@ class TestParseSessions:
         """
         empty = tmp_path / "empty"
         empty.mkdir()
-        with patch.object(usage_mod, "_SESSIONS_DIR", empty):
+        with patch.object(usage_store_mod, "_SESSIONS_DIR", empty):
             baseline = _parse_sessions()
         # Guard the guard: a baseline that lost its period keys would make the
         # comparison below pass while proving nothing.
@@ -123,7 +124,7 @@ class TestParseSessions:
             return real_names(self)
 
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(platform_compat.PinnedDirectory, "names", names),
         ):
             result = _parse_sessions()
@@ -140,7 +141,7 @@ class TestParseSessions:
         d = tmp_path / "cli"
         d.mkdir()
         (d / "readme.txt").write_text("hi")
-        with patch.object(usage_mod, "_SESSIONS_DIR", d):
+        with patch.object(usage_store_mod, "_SESSIONS_DIR", d):
             r = _parse_sessions()
             assert r["total_sessions"] == 0
             assert r["all_time_sessions"] == 0
@@ -150,7 +151,7 @@ class TestParseSessions:
         d.mkdir()
         _write_session(d / "s1.jsonl", [{"kind": "Prompt"}])
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(None)),
         ):
             r = _parse_sessions()
@@ -170,7 +171,7 @@ class TestParseSessions:
         _write_session(d / "s1.jsonl", [{"kind": "Prompt"}])
         _write_session(d / "s2.jsonl", [{"kind": "Prompt"}])
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(None)),
             caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"),
         ):
@@ -191,7 +192,7 @@ class TestParseSessions:
         f = d / "s1.jsonl"
         _write_session(f, [{"kind": "Prompt"}])
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
             caplog.at_level(logging.WARNING, logger="kiro_crew.dashboard.handlers.usage"),
         ):
@@ -213,7 +214,7 @@ class TestParseSessions:
             return orig_stat(self_, *a, **kw)
 
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
             patch.object(Path, "stat", stat_side_effect),
         ):
@@ -260,7 +261,7 @@ class TestParseSessions:
             return orig_open(self_, *a, **kw)
 
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=validate),
             patch.object(Path, "stat", stat_side_effect),
             patch.object(Path, "open", open_side_effect),
@@ -283,7 +284,7 @@ class TestParseSessions:
         old_mtime = time.time() - (60 * 86400)
         _write_session(f, [{"kind": "Prompt"}], mtime=old_mtime)
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -297,7 +298,7 @@ class TestParseSessions:
         old_mtime = time.time() - (60 * 86400)  # 60 days ago
         _write_session(f, [{"kind": "Prompt"}], mtime=old_mtime)
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -317,7 +318,7 @@ class TestParseSessions:
         ]
         _write_session(f, lines)
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -335,7 +336,7 @@ class TestParseSessions:
         f = d / "s1.jsonl"
         f.write_text('{"kind":"Prompt"}\nNOT_JSON\n{"kind":"ToolResults"}\n')
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -348,7 +349,7 @@ class TestParseSessions:
         f = d / "s1.jsonl"
         f.write_text('"just a string"\n42\nnull\n[1,2]\n{"kind":"Prompt"}\n')
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -367,7 +368,7 @@ class TestParseSessions:
             return orig_open(self_, *a, **kw)
 
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
             patch.object(Path, "open", open_raises),
         ):
@@ -386,7 +387,7 @@ class TestParseSessions:
         f = d / "today.jsonl"
         _write_session(f, [{"kind": "Prompt"}, {"kind": "ToolResults"}], mtime=now)
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -407,7 +408,7 @@ class TestParseSessions:
         # mtime is today, but timestamp says April 20
         _write_session(f, lines)
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -426,7 +427,7 @@ class TestParseSessions:
         ]
         _write_session(f, lines)
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -445,7 +446,7 @@ class TestParseSessions:
         ]
         _write_session(f, lines)
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
         ):
             r = _parse_sessions()
@@ -545,7 +546,7 @@ class TestApiKiroUsage:
         f = d / "s.jsonl"
         _write_session(f, [{"kind": "Prompt"}])
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
             patch.object(
                 usage_mod,
@@ -641,7 +642,7 @@ class TestApiKiroUsage:
         session_file = sessions_dir / "first.jsonl"
         billing = {"credits_used": 10, "credits_plan": 100, "plan": "Pro"}
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", sessions_dir),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", sessions_dir),
             patch.object(usage_mod, "get_usage_cache", return_value=billing),
             patch.object(
                 usage_mod, "validate_file_path", side_effect=_files_validate_as(str(session_file))
@@ -679,7 +680,7 @@ class TestApiKiroUsage:
         invalid_directory = tmp_path / "cli"
         invalid_directory.write_text("not a directory", encoding="utf-8")
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", invalid_directory),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", invalid_directory),
             patch.object(usage_mod, "get_usage_cache", return_value={}),
         ):
             app = web.Application()
@@ -704,7 +705,7 @@ class TestApiKiroUsage:
         invalid_directory.write_text("not a directory", encoding="utf-8")
         billing = {"credits_used": 10, "credits_plan": 100, "plan": "Pro"}
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", invalid_directory),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", invalid_directory),
             patch.object(usage_mod, "get_usage_cache", return_value=billing),
         ):
             app = web.Application()
@@ -735,7 +736,7 @@ class TestApiKiroUsage:
         f = d / "s.jsonl"
         _write_session(f, [{"kind": "Prompt"}])
         with (
-            patch.object(usage_mod, "_SESSIONS_DIR", d),
+            patch.object(usage_store_mod, "_SESSIONS_DIR", d),
             patch.object(usage_mod, "validate_file_path", side_effect=_files_validate_as(str(f))),
             patch.object(usage_mod, "get_usage_cache", return_value={"available": False}),
         ):
@@ -1116,7 +1117,7 @@ class TestCachedParseSessions:
     @pytest.mark.asyncio
     async def test_returns_complete_zero_shape_without_dir(self, tmp_path, monkeypatch):
         _reset_sessions_cache()
-        monkeypatch.setattr(usage_mod, "_SESSIONS_DIR", tmp_path / "nope")
+        monkeypatch.setattr(usage_store_mod, "_SESSIONS_DIR", tmp_path / "nope")
         result = await _cached_parse_sessions()
         assert result["total_sessions"] == 0
         assert result["today"] == {"sessions": 0, "messages": 0, "tool_calls": 0}
@@ -1127,7 +1128,7 @@ class TestCachedParseSessions:
         import threading
 
         _reset_sessions_cache()
-        monkeypatch.setattr(usage_mod, "_SESSIONS_DIR", tmp_path / "nope")
+        monkeypatch.setattr(usage_store_mod, "_SESSIONS_DIR", tmp_path / "nope")
         event_loop_thread = threading.get_ident()
         checked_on: list[int] = []
 
@@ -1146,7 +1147,7 @@ class TestCachedParseSessions:
         _reset_sessions_cache()
         sessions_dir = tmp_path / "cli"
         sessions_dir.mkdir()
-        monkeypatch.setattr(usage_mod, "_SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(usage_store_mod, "_SESSIONS_DIR", sessions_dir)
 
         calls = {"n": 0}
 
@@ -1195,7 +1196,7 @@ class TestCachedParseSessions:
         _reset_sessions_cache()
         sessions_dir = tmp_path / "cli"
         sessions_dir.mkdir()
-        monkeypatch.setattr(usage_mod, "_SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(usage_store_mod, "_SESSIONS_DIR", sessions_dir)
         monkeypatch.setattr(usage_mod, "_parse_sessions", lambda: {"error": "boom"})
         result = await _cached_parse_sessions()
         assert result == {"error": "boom"}
@@ -1210,7 +1211,7 @@ class TestCachedParseSessions:
         _reset_sessions_cache()
         sessions_dir = tmp_path / "cli"
         sessions_dir.mkdir()
-        monkeypatch.setattr(usage_mod, "_SESSIONS_DIR", sessions_dir)
+        monkeypatch.setattr(usage_store_mod, "_SESSIONS_DIR", sessions_dir)
 
         calls = {"n": 0}
 

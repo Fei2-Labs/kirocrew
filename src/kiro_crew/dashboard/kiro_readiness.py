@@ -320,10 +320,15 @@ async def reject_if_kiro_unverified(
     from kiro_crew.agent_sdk.host_auth import backends_retired_by_host_logout
 
     live_backend = _request_live_acp_backend(request)
+    applied_backend = _request_applied_acp_backend(request)
     effective_backend = (
         live_backend
         if live_backend is not None
-        else await asyncio.to_thread(_configured_acp_backend)
+        else (
+            applied_backend
+            if applied_backend is not None
+            else await asyncio.to_thread(_configured_acp_backend)
+        )
     )
     if effective_backend not in backends_retired_by_host_logout():
         return None
@@ -336,6 +341,26 @@ async def reject_if_kiro_unverified(
     body = _KIRO_PROBE_TIMED_OUT_RESPONSE if timed_out else _KIRO_NOT_READY_RESPONSE
     _warn_refused_once(_log_safe_path(request), body["code"])
     return web.json_response(body, status=503)
+
+
+def _request_applied_acp_backend(request: web.Request) -> str | None:
+    """The backend the session manager would allocate on NOW, if readable.
+
+    ``config.json`` runs ahead of the session manager until the config watcher
+    applies a write, and a rerun's fresh session starts from the APPLIED
+    factory: reading the file here would open the kiro gate for a turn that
+    still starts on kiro-cli. ``None`` when no session manager or no applied
+    config is held, so the caller falls back to the file's answer.
+    """
+    try:
+        state = request.app.get("state")
+        sessions = getattr(state, "sessions", None)
+        cfg = getattr(sessions, "_cfg", None)
+        backend = getattr(getattr(cfg, "agent", None), "acp_backend", None)
+        return backend if isinstance(backend, str) else None
+    except Exception:
+        logger.debug("Could not read the applied acp backend", exc_info=True)
+        return None
 
 
 def _request_live_acp_backend(request: web.Request) -> str | None:

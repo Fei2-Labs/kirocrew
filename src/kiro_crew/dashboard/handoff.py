@@ -165,8 +165,8 @@ def _vet(origin: str, prompt: str) -> str:
 def _resolve_project(project: str) -> str:
     """Resolve and vet the working directory for the new session.
 
-    Same three checks the dashboard's own slot-create applies, in the same order
-    — realpath, is-a-directory, not sensitive — because a handoff must not reach
+    Same three checks the dashboard's own slot-create applies — realpath,
+    not sensitive, is-a-directory — because a handoff must not reach
     a directory the dashboard would refuse to open. ``""`` means "no project",
     which the slot resolves the ordinary way.
     """
@@ -175,10 +175,13 @@ def _resolve_project(project: str) -> str:
     if not isinstance(project, str):
         raise HandoffRefused("bad_project", "project must be a string", status=400)
     resolved = os.path.realpath(os.path.expanduser(project.strip()))
-    if not os.path.isdir(resolved):
-        raise HandoffRefused("project_not_a_directory", f"not a directory: {project}", status=400)
+    # Sensitive BEFORE the existence check: answering "not a directory" for a
+    # path under a sensitive root would leak that the path does not exist and
+    # bypass the refusal, so the denial cannot depend on what is on disk.
     if is_sensitive_path(resolved):
         raise HandoffRefused("project_denied", "access denied", status=403)
+    if not os.path.isdir(resolved):
+        raise HandoffRefused("project_not_a_directory", f"not a directory: {project}", status=400)
     return resolved
 
 
