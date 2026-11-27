@@ -61,7 +61,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.updates_channel import api_update_auto_pin  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_channel import api_update_channel  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_channel import api_update_revalidate  # noqa: F401
-    from kiro_crew.dashboard.handlers.updates_channel import logger  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_check import _BARE_RELEASE_RE  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_check import _BUILD_SUFFIX_RE  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_check import _BUILD_VERSION_SPEC  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _CLI_MANIFEST_SCHEMA  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _FEED_MAX_BYTES  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _FEED_TIMEOUT_SECS  # noqa: F401
@@ -69,6 +71,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.updates_check import _MIN_VERSION_RE  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _PUB_DATE_RE  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _UPDATE_CHECK_INTERVAL  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_check import _VERSION_LITERAL_RE  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _VERSION_RE  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _can_arm_this_install  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _cancel_update_check  # noqa: F401
@@ -80,15 +83,30 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.dashboard.handlers.updates_check import _check_via_provider  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _do_update_check  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _fetch_feed_bytes  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_check import _fork_upstream_probe  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_check import _git_read  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _invalidate_update_check  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _last_update_check  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _release_update_check_task  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _run_update_check  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _upcoming_for_feed  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import _update_policy_file  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_check import _version_at_sha  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import api_update_check  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import last_checked_at  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_check import status_update_fields  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import _TAG_RE  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import FORK_REPO  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import RELEASES_API  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import _current_fork_sha  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import _fetch_latest_release  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import _find_wheel_url  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import _parse_tag  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import _release_is_newer  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import _wheel_lane_refusal  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import api_update_fork_apply  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import api_update_fork_check  # noqa: F401
+    from kiro_crew.dashboard.handlers.updates_fork import logger  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_step_up import _OFFERED_MAX_CHARS  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_step_up import _arm_packaged_app  # noqa: F401
     from kiro_crew.dashboard.handlers.updates_step_up import _audit_update_event  # noqa: F401

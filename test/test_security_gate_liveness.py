@@ -778,7 +778,20 @@ def _url_payload_command(n: int) -> str:
 #: Raised by 5, from 35,534, for the ``update-staging`` entry in the home fence: the
 #: self-update engine's wheel staging directory moved out of ``trust/`` to its own
 #: top-level masked leaf, and the file-tool gate covers it as it covered ``trust/``.
-_PACKAGE_LINE_BUDGET = 35_539
+#: Raised by 43, from 35,539, for the repository-governed git-publication floor of
+#: the ``workflow_policy.json`` keystone: an operator who sets
+#: ``git_publication_mode: repository_governed`` stands down the verb-anchored
+#: branch-name floor alone, while credential-exfiltration, self-protection,
+#: sensitive-path and destructive-command tiers keep evaluating the push. 33 are
+#: ``deny_gate._git_publication_floor_applies``, the fail-closed mode read that
+#: treats a missing or unreadable keystone as ``protected``; 16 the
+#: ``floor_enforced_builtin_command_ids`` mode consultation in
+#: ``denied_rules_tables`` the Settings display shares with the gate so the two
+#: cannot disagree; 7 the ``_CREW_SECRET_LEAVES`` leaf that keeps the keystone
+#: itself out of the agent's reach; 3 the export rows. Deny-only in the default
+#: mode: no denial main applied is narrowed, and the governed stand-down is the
+#: operator's own written opt-in. Re-measured.
+_PACKAGE_LINE_BUDGET = 35_582
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

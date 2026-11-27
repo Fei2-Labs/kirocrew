@@ -661,13 +661,13 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], "str | DeferredTool"]] = {
 #
 #   ``control_parts.schemas`` -- every control descriptor and the two config reads that shape one.
 #   ``control_parts.directive`` -- the directive emitter and the tools whose effect is one directive.
-#   ``control_parts.monitor`` -- the monitoring-loop tools: arm, inspect, update and stop a loop.
 #   ``control_parts.handoff`` -- the external-agent handoff tool (``session_handoff``).
+#   ``control_parts.monitor`` -- the monitoring-loop tools: arm, inspect, update and stop a loop.
 _OWNERS = (
     "kiro_crew.mcp_tools.control_parts.schemas",
     "kiro_crew.mcp_tools.control_parts.directive",
-    "kiro_crew.mcp_tools.control_parts.monitor",
     "kiro_crew.mcp_tools.control_parts.handoff",
+    "kiro_crew.mcp_tools.control_parts.monitor",
 )
 for _owner in _OWNERS:
     _importlib.import_module(_owner)
@@ -740,6 +740,7 @@ if TYPE_CHECKING:  # names the owners import from elsewhere in kiro_crew, still 
         MONITOR_WATCH_SCHEMA,
         NOTHING_TO_DO_SCHEMA,
         RESET_CONVERSATION_SCHEMA,
+        SESSION_HANDOFF_SCHEMA,
         SET_PROJECT_SCHEMA,
         SUGGEST_FOLLOWUP_SCHEMA,
         validate_judge_spec,

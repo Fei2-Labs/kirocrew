@@ -81,8 +81,12 @@ def byok_path() -> Path:
     return data_home() / BYOK_FILENAME
 
 
-def load_byok_keys() -> dict[str, str]:
+def load_byok_keys(*, for_update: bool = False) -> dict[str, str]:
     """Return the stored ``name -> value`` mapping, or ``{}`` on any problem.
+
+    ``for_update=True`` is the strict read a rewrite starts from: only a missing
+    file reads as empty, while any other read or parse failure propagates so the
+    mutation is abandoned rather than publishing an empty document over the store.
 
     Never raises: a missing file, unreadable file, malformed JSON, or unexpected
     shape all yield an empty mapping so the spawn path degrades to "no BYOK keys"
@@ -95,11 +99,15 @@ def load_byok_keys() -> dict[str, str]:
     except FileNotFoundError:
         return {}
     except OSError:
+        if for_update:
+            raise
         logger.warning("BYOK store unreadable at %s", path, exc_info=True)
         return {}
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
+        if for_update:
+            raise
         logger.warning("BYOK store at %s is not valid JSON; ignoring", path)
         return {}
     keys = data.get("keys") if isinstance(data, dict) else None
@@ -169,14 +177,14 @@ def set_byok_key(name: str, value: str) -> None:
             f"invalid BYOK key name {name!r}: must be a valid environment "
             f"variable name ([A-Za-z_][A-Za-z0-9_]*)"
         )
-    keys = load_byok_keys()
+    keys = load_byok_keys(for_update=True)
     keys[name] = value
     save_byok_keys(keys)
 
 
 def remove_byok_key(name: str) -> bool:
     """Delete one key. Returns ``True`` if it existed, ``False`` otherwise."""
-    keys = load_byok_keys()
+    keys = load_byok_keys(for_update=True)
     if name not in keys:
         return False
     del keys[name]

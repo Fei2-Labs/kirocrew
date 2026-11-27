@@ -161,6 +161,9 @@ _CAP_REASONS = {
 #: opt-out, ``"<default>"`` for the shared 64 KB ceiling, or the literal
 #: expression passed for a per-route cap.
 _CAP_REGISTER: dict[str, tuple[str, str]] = {
+    # A handoff is fixed control fields plus a prompt the handler caps at 16,000
+    # characters, so the shared default ceiling is the right one.
+    "chat_api/handoff.py::api_chat_handoff": ("<default>", _BOUNDED_BY_DEFAULT),
     # Pre-existing capped sites -- the bounded read's live consumers.
     "chat_pins.py::api_chat_pins_create": ("<default>", _BOUNDED_BY_DEFAULT),
     # Every milestones POST body is an id, an action and a surface name.

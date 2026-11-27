@@ -165,6 +165,9 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 # reservation) catches a cold-starting turn no provider has
                 # registered yet.
                 ("chat_api/session_relaunch.py", "api_chat_slot_project"),
+                # A handoff starts immediately only on an unreserved slot; a
+                # reserved one queues behind the send that reserved it.
+                ("handoff.py", "start_handoff"),
                 ("chat_api/slot_effort.py", "api_chat_slot_reasoning_effort"),
                 ("chat_api/slot_effort.py", "api_chat_slot_ultracode"),
                 # Reload refuses a reserved slot or sibling alias through

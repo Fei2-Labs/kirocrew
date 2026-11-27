@@ -328,11 +328,13 @@ def _pin_fork_revision(monkeypatch):
     STRICT on the attribute so a rename cannot silently restore the leak.
     """
     try:
-        fork_version = importlib.import_module("kiro_crew.fork_version")
+        import importlib as floor_importlib
+
+        fork_version = floor_importlib.import_module("kiro_crew.fork_version")
     except Exception:  # pragma: no cover - a partial checkout must not break collection
         return
     try:
-        crew_package = importlib.import_module("kiro_crew")
+        crew_package = floor_importlib.import_module("kiro_crew")
     except Exception:  # pragma: no cover - generated build metadata may be absent
         crew_package = None
     if crew_package is not None:

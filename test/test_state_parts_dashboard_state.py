@@ -115,7 +115,20 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, ws: 'web.WebSocketResponse') -> 'None'",
     ),
+    "_handoff_origin": ("function", False, False, "(self, slot: '_ChatSlot') -> 'str'"),
     "_has_legacy_slots_audience": ("function", False, False, "(self) -> 'bool'"),
+    "_live_slot_acp_backend": (
+        "function",
+        False,
+        False,
+        "(self, slot: '_ChatSlot') -> 'str | None'",
+    ),
+    "_live_slot_acp_client": (
+        "function",
+        False,
+        False,
+        "(self, slot: '_ChatSlot') -> 'Any | None'",
+    ),
     "_has_slot_patch_clients": ("function", False, False, "(self) -> 'bool'"),
     "_lineage_rows": ("function", False, False, "(self) -> 'list[dict[str, Any]]'"),
     "_link_slack_persisted": (
@@ -144,6 +157,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, task: \"'asyncio.Task'\") -> 'None'",
     ),
     "_on_ws_send_done": ("function", False, False, "(self, task: 'asyncio.Task') -> 'None'"),
+    "_resolve_provider_label": (
+        "function",
+        False,
+        False,
+        "(self, slot: '_ChatSlot') -> 'str'",
+    ),
     "_partition_preserving": (
         "staticmethod",
         False,
@@ -766,7 +785,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "update_required: 'bool' = False, update_min_version: 'str' = '', "
         "update_can_arm: 'bool' = False, update_auto_effect: 'str' = 'unknown', "
         "update_auto_manual_only: 'bool' = False, "
-        "update_bundled_by_app: 'bool' = False, update_restart_ready: 'bool' = False, "
+        "update_bundled_by_app: 'bool' = False, upstream_base_version: 'str' = '', fork_revision: 'str' = '', fork_dirty: 'bool' = False, update_fork_suppressed: 'bool' = False, upstream_version: 'str' = '', fork_ahead_of_upstream: 'int' = 0, fork_behind_upstream: 'int' = 0, fork_sync_available: 'bool' = False, update_restart_ready: 'bool' = False, "
         "update_restart_ready_version: 'str' = '', update_restart_ready_reason: 'str' = '', "
         "update_armed_version: 'str | None' = None, "
         "pending_apply_error: 'str | None' = None, "
@@ -837,6 +856,10 @@ _STATE_HINTS_UNRESOLVED_AT_BASE = frozenset(
 _STATE_HINTS_UNRESOLVED_BY_THE_SPLIT = frozenset(
     {
         "_drop_orphaned_mcp_report",
+        "_handoff_origin",
+        "_live_slot_acp_backend",
+        "_live_slot_acp_client",
+        "_resolve_provider_label",
         "_slot_chip_urls",
         "_slot_links",
         "approval_timeout_for",

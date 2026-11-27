@@ -81,6 +81,9 @@ _DOES_NOT_FLUSH: dict[tuple[str, str], str] = {
     ("dashboard/handlers/taskrunner.py", "api_taskrunner_to_chat"): (
         "starts a turn only on the fresh slot it just created, which holds no note"
     ),
+    ("dashboard/handoff.py", "start_handoff"): (
+        "starts a turn only on the fresh slot it just created, which holds no note"
+    ),
     ("dashboard/chat_turn/slash_commands.py", "_turn_slash_gate"): (
         "re-enters the turn already running with the expanded prompt; that turn's "
         "start decided the hold"

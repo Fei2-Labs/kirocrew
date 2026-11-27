@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Callable
 
 from aiohttp import web
@@ -42,6 +43,43 @@ if TYPE_CHECKING:
     from kiro_crew.dashboard.state_parts.dashboard_state import DashboardState
 
 logger = logging.getLogger("kiro_crew.dashboard.state")
+
+#: The key helpers and per-slot answers of one ``serialize_slots`` pass.
+#: ``chat_utils`` is a mirrored facade, so resolving ``effective_session_key`` or
+#: ``_history_key_for`` inside each row costs a facade read per row; resolving them
+#: once here keeps the pass's rows on one consistent pair of derivations too.
+#: Outside the pass the helpers resolve through the same facade at the call site.
+_SlotKeyPass = tuple[
+    Callable[[Any], str],
+    Callable[[str], str],
+    dict[str, tuple[str, str]],
+]
+_SLOT_KEY_PASS: ContextVar[_SlotKeyPass | None] = ContextVar(
+    "dashboard_slot_key_pass", default=None
+)
+
+
+def _slot_key_pair(slot: "_ChatSlot") -> tuple[str, str]:
+    """``(effective session key, dashboard history key)`` for *slot*.
+
+    Inside a ``serialize_slots`` pass the two derivations are shared by every row
+    projection that needs them: the link rows and provider label read the session
+    key, and the live-backend probes read the history key. A direct one-slot
+    projection computes both through the same helpers without keeping a memo.
+    """
+    key_pass = _SLOT_KEY_PASS.get()
+    if key_pass is None:
+        # circular import: chat_utils imports this module at load time. Module
+        # import avoids the _handle_fromlist __path__ probe on the facade.
+        import kiro_crew.dashboard.chat_utils as _cu
+
+        return _cu.effective_session_key(slot), _cu._history_key_for(slot.key)
+    effective_session_key, history_key_for, by_slot = key_pass
+    pair = by_slot.get(slot.key)
+    if pair is None:
+        pair = (effective_session_key(slot), history_key_for(slot.key))
+        by_slot[slot.key] = pair
+    return pair
 
 
 _CHANNEL_LABELS = {
@@ -683,12 +721,7 @@ def _slot_link_projection(
     pass starts, before any row is built, so a mutation landing mid-pass
     costs one recompute on the next pass and is never hidden.
     """
-    # circular import: chat imports state at module scope.
-    # Module import (not from-import) avoids the _handle_fromlist __path__
-    # probe on the facade, which cost one __getattr__ per slot.
-    import kiro_crew.dashboard.chat_utils as _cu
-
-    session_key = _cu.effective_session_key(slot)
+    session_key = _slot_key_pair(slot)[0]
     ctx = ROW_MEMO.get()
     key: tuple[object, ...] | None = None
     if ctx is not None and ctx.links is not None:
@@ -995,9 +1028,7 @@ def _resolve_provider_label(self: DashboardState, slot: _ChatSlot) -> str:
     """
     if not getattr(self, "sessions", None):
         return ""
-    from kiro_crew.dashboard.chat_utils import effective_session_key
-
-    label = self.sessions.provider_label_for(effective_session_key(slot))
+    label = self.sessions.provider_label_for(_slot_key_pair(slot)[0])
     return label if isinstance(label, str) else ""
 
 
@@ -1008,13 +1039,11 @@ def _live_slot_acp_backend(self: DashboardState, slot: _ChatSlot) -> str | None:
     still-open kiro session as kiro after the default harness moved on.
     """
     try:
-        from kiro_crew.dashboard.chat_utils import _history_key_for
-
         sessions = getattr(self, "sessions", None)
         getter = getattr(sessions, "get_provider", None)
         if not callable(getter):
             return None
-        provider = getter(_history_key_for(slot.key))
+        provider = getter(_slot_key_pair(slot)[1])
     except Exception:
         return None
     if provider is None:
@@ -1029,13 +1058,11 @@ def _live_slot_acp_backend(self: DashboardState, slot: _ChatSlot) -> str | None:
 def _live_slot_acp_client(self: DashboardState, slot: _ChatSlot) -> Any | None:
     """The live ACP client bound to this slot, or ``None`` if unbound."""
     try:
-        from kiro_crew.dashboard.chat_utils import _history_key_for
-
         sessions = getattr(self, "sessions", None)
         getter = getattr(sessions, "get_provider", None)
         if not callable(getter):
             return None
-        provider = getter(_history_key_for(slot.key))
+        provider = getter(_slot_key_pair(slot)[1])
     except Exception:
         return None
     if provider is None:
@@ -1113,37 +1140,42 @@ def serialize_slots(
     # suspenders on ``__new__``-built states that never ran __init__:
     # treat a missing set as empty rather than AttributeError-ing this hot
     # path.
-    # circular import: chat_utils imports this module at load time.
-    from kiro_crew.dashboard.chat_utils import effective_session_key
+    # circular import: chat_utils imports this module at load time. Module
+    # import avoids the _handle_fromlist __path__ probe on the facade.
+    import kiro_crew.dashboard.chat_utils as _cu
 
     under_construction = getattr(self, "_slots_under_construction", None) or ()
     queued_by_slot = _published_queued_by_slot(subs)
     queued_reason_by_slot = _published_queued_reason_by_slot(subs)
     saved_creators: dict[str, str] = {}
-    # Per-slot row memos for this pass; their global key parts are read here,
-    # once, BEFORE any row is built (see ``slot_row_memo``).
+    # Per-slot row memos and key derivations for this pass; their global and
+    # helper parts are read here, once, BEFORE any row is built (see
+    # ``slot_row_memo`` and ``_slot_key_pair``).
     memo_ctx = _row_memo_context(self)
-    memo_token = ROW_MEMO.set(memo_ctx)
+    key_token = _SLOT_KEY_PASS.set((_cu.effective_session_key, _cu._history_key_for, {}))
     try:
-        for s in self._slots.values():
-            if s.key in under_construction:
-                continue
-            saved_creators[s.key] = getattr(s, "_saved_created_by", "") or ""
-            self._drop_orphaned_mcp_report(s)
-            d = self.serialize_slot(
-                s,
-                include_check_status=include_check_status,
-                dashboard_user=dashboard_user,
-            )
-            d["subagents_running"] = bool(
-                subs and subs.running_agents_for(effective_session_key(s))
-            )
-            d["subagents_queued"] = queued_by_slot.get(s.key, 0)
-            if d["subagents_queued"] and s.key in queued_reason_by_slot:
-                d["subagents_queued_reason"] = queued_reason_by_slot[s.key]
-            out.append(d)
+        memo_token = ROW_MEMO.set(memo_ctx)
+        try:
+            for s in self._slots.values():
+                if s.key in under_construction:
+                    continue
+                saved_creators[s.key] = getattr(s, "_saved_created_by", "") or ""
+                self._drop_orphaned_mcp_report(s)
+                session_key = _slot_key_pair(s)[0]
+                d = self.serialize_slot(
+                    s,
+                    include_check_status=include_check_status,
+                    dashboard_user=dashboard_user,
+                )
+                d["subagents_running"] = bool(subs and subs.running_agents_for(session_key))
+                d["subagents_queued"] = queued_by_slot.get(s.key, 0)
+                if d["subagents_queued"] and s.key in queued_reason_by_slot:
+                    d["subagents_queued_reason"] = queued_reason_by_slot[s.key]
+                out.append(d)
+        finally:
+            ROW_MEMO.reset(memo_token)
     finally:
-        ROW_MEMO.reset(memo_token)
+        _SLOT_KEY_PASS.reset(key_token)
     if memo_ctx is not None and logger.isEnabledFor(logging.DEBUG):
         logger.debug("slot row memo pass: %s", dict(sorted(memo_ctx.counts.items())))
     # The slot-key/session-key correspondence the lineage join needs, read the same

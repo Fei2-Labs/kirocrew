@@ -425,6 +425,12 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _reject_unsupported_keywords,
         validate_mcp_tool_arguments,
     )
+
+    # The dashboard's same-named move-a-session schema is NOT imported here, even
+    # aliased: the facade does not serve it (the mirror excludes the divergent name and
+    # the runtime binding above is the control-plane tool), so a TYPE_CHECKING row for
+    # it would declare a name type checkers could resolve but runtime readers cannot.
+    # Its registry imports it from ``messaging_session_schemas`` directly.
     from kiro_crew.validation_parts.messaging_session_schemas import (
         _CHANNEL_TARGET_INCOMPATIBLE,
         _CREW_RE,
@@ -457,11 +463,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         SESSION_END_WAIT_SCHEMA,
         SESSION_FORK_SCHEMA,
         SESSION_GENERATE_TITLE_SCHEMA,
-    )
-    from kiro_crew.validation_parts.messaging_session_schemas import (  # noqa: F401
-        SESSION_HANDOFF_SCHEMA as SESSION_HANDOFF_TARGET_SCHEMA,
-    )
-    from kiro_crew.validation_parts.messaging_session_schemas import (
         SESSION_HISTORY_LIST_SCHEMA,
         SESSION_PALETTE_SIZE,
         SESSION_READ_MESSAGE_SCHEMA,

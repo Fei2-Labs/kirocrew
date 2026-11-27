@@ -114,7 +114,7 @@ _BASE_IMPORTS = frozenset("""
     batch_duration_cap_secs build_stopping_blocks canonical_key
     channel_inbound_permitted channels_modal command_hint_block consume_stop_declined
     contextlib current_context dashboard_link_block decline_stop describe_grant_lifetime
-    dispatch_interactive entries_queued_by flat_dm_session_key format_schedule
+    dispatch_interactive entries_queued_by flat_dm_session_key format_schedule full_version
     get_update_info hand_queue_to_successor handle_message handle_message_transport
     inspect is_allowed_user is_markdown_spec is_owner is_voice_memo is_yolo_mode
     iter_agent_spec_files json kiro_agents_dir legacy_key list_servers load_stt_config

@@ -35,15 +35,16 @@ from kiro_crew.dashboard.state import DashboardState
 STEP = 200
 
 # Facade reads each extra slot costs, measured on the main this file was written
-# against. The flush reads 4 per row: one each of ``effective_session_key``,
-# ``chunk_generation``, ``mirror_is_paused`` and ``slack_mirror_is_paused``.
-# The two ``__path__`` probes that Python's _handle_fromlist fired per slot
-# (one per ``from chat_utils import ...`` statement) are gone: both sites use
-# ``import ... as _cu`` + attribute access, which skips the probe.
+# against. The flush reads 3 per row: one each of ``chunk_generation``,
+# ``mirror_is_paused`` and ``slack_mirror_is_paused``. ``effective_session_key``
+# and ``_history_key_for`` resolve once per serialization pass and their per-slot
+# answers are shared by the row projections that need them. The ``__path__``
+# probes that Python's _handle_fromlist fired per slot are gone: the hot sites
+# use ``import ... as _cu`` + attribute access, which skips the probe.
 # ``mirror_is_paused`` is fetched once via ``_cu.mirror_is_paused`` and then
 # called twice from the local binding -- the second call does not re-read the facade.
 CREWMATE_SCAN_READS_PER_SLOT = 0
-SLOTS_FLUSH_READS_PER_SLOT = 4
+SLOTS_FLUSH_READS_PER_SLOT = 3
 
 
 def seed_slots(state: DashboardState, n: int, *, start: int = 0) -> None:

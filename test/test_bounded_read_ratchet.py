@@ -61,6 +61,7 @@ _STANDALONE: dict[str, tuple[int, str]] = {
 #: Reads of an HTTP response body, with the sites each file holds.
 _RESPONSE_READS: dict[str, int] = {
     "acp/kas_bundle.py": 1,
+    "acp/registry.py": 1,
     "apps/official_catalog.py": 1,
     "cli_server_stop.py": 1,
     "cli_server_update.py": 1,

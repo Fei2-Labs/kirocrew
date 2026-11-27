@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 import kiro_crew
-from kiro_crew.dashboard.handlers import updates_fork
+from kiro_crew.dashboard.handlers import updates, updates_fork
 from kiro_crew.platform import update_capability, update_provider
 
 
@@ -37,7 +37,7 @@ class TestWheelLaneRefusal:
     @pytest.mark.asyncio
     async def test_git_checkout_is_refused(self, monkeypatch):
         monkeypatch.setattr(
-            updates_fork,
+            updates,
             "derive_capability",
             lambda: _capability(update_capability.MANAGED_BY_GIT),
         )
@@ -49,7 +49,7 @@ class TestWheelLaneRefusal:
     @pytest.mark.asyncio
     async def test_managed_venv_is_allowed(self, monkeypatch):
         monkeypatch.setattr(
-            updates_fork,
+            updates,
             "derive_capability",
             lambda: _capability(update_capability.MANAGED_BY_KIROCREW),
         )
@@ -59,7 +59,7 @@ class TestWheelLaneRefusal:
     @pytest.mark.asyncio
     async def test_policy_provider_owns_the_lane(self, monkeypatch):
         monkeypatch.setattr(
-            updates_fork,
+            updates,
             "derive_capability",
             lambda: _capability(update_capability.MANAGED_BY_KIROCREW),
         )
@@ -73,7 +73,7 @@ class TestWheelLaneRefusal:
         def _boom():
             raise RuntimeError("git missing")
 
-        monkeypatch.setattr(updates_fork, "derive_capability", _boom)
+        monkeypatch.setattr(updates, "derive_capability", _boom)
         verdict = await updates_fork._wheel_lane_refusal()
         assert verdict is not None
         assert verdict["managed_by"] == "unknown"
@@ -127,9 +127,7 @@ class TestApplyNeverRestartsARunningGateway:
             raise AssertionError("reexec_python_module must not be called directly")
 
         monkeypatch.setattr("kiro_crew.platform_compat.reexec_python_module", _reexec_never)
-        monkeypatch.setattr(
-            updates_fork, "require_owner_dashboard_request", lambda *a, **k: _none()
-        )
+        monkeypatch.setattr(updates, "require_owner_dashboard_request", lambda *a, **k: _none())
         monkeypatch.setattr(updates_fork, "_wheel_lane_refusal", lambda: _none())
         monkeypatch.setattr(
             updates_fork,

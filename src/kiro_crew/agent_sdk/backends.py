@@ -1245,6 +1245,7 @@ def kiro_cli_pick_backend() -> str:
 from kiro_crew.agent_sdk.backends_launch import (  # noqa: E402,F401 - re-exported vocabulary
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_NODE_ADAPTER_PACKAGES,
+    ACP_BACKEND_PROCESS_ALIASES,
     ACP_BACKEND_PROCESS_NAMES,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_POD_HOME_REMAP,

@@ -307,7 +307,7 @@ class TestKiroInternalSandboxExclusion:
         with (
             patch("kiro_crew.sel.sel", return_value=MagicMock()),
             patch("kiro_crew.sandbox.detect_backend", return_value="none") as mock_detect,
-            patch("kiro_crew.sandbox_spawn.cgroup_scope_argv", side_effect=lambda argv: argv),
+            patch("kiro_crew.sandbox.cgroup_scope_argv", side_effect=lambda argv: argv),
         ):
             try:
                 argv, _env, cleanup = sandbox_mod.sandboxed_spawn_argv(

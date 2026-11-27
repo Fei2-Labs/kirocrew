@@ -22,6 +22,7 @@ from kiro_crew.run_coordinator import (
     SQLiteRunCoordinator,
     SubmitRun,
 )
+from kiro_crew.testing.wait import FALLBACK_TIMEOUT_SECS, async_wait_until
 
 
 def _request(
@@ -501,15 +502,15 @@ async def test_locked_shadow_burst_uses_bounded_pool_without_starving_default_ex
         for index in range(burst_size)
     ]
     try:
-        for _ in range(300):
-            if entered.is_set() and peak_active == executors_module._MAX_COORDINATOR_WORKERS:
-                break
-            await asyncio.sleep(0.01)
+        await async_wait_until(
+            lambda: entered.is_set() and peak_active == executors_module._MAX_COORDINATOR_WORKERS
+        )
         assert entered.is_set()
         assert peak_active == executors_module._MAX_COORDINATOR_WORKERS
 
         probe_thread = await asyncio.wait_for(
-            asyncio.to_thread(lambda: threading.current_thread().name), timeout=0.5
+            asyncio.to_thread(lambda: threading.current_thread().name),
+            timeout=FALLBACK_TIMEOUT_SECS,
         )
         assert probe_thread.startswith("test-default")
         await asyncio.gather(*tasks)

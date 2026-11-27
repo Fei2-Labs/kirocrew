@@ -1207,7 +1207,6 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
         "apps/builtins/code_review_sage/sage_lib/review_pool.py": (
             "app-owned review workers; no chat session is their parent"
         ),
-        "knowledge/llm_pool.py": "knowledge-indexing helper process; no session parent",
     }
 
     @classmethod
@@ -1233,7 +1232,7 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
 
     def test_the_enumeration_sees_the_seams_this_fix_threads(self) -> None:
         rels = {rel for rel, _ in self._constructions()}
-        assert {"providers/acp.py", "session_background.py"} <= rels
+        assert {"agent_sdk/drivers/acp_worker.py", "session_background.py"} <= rels
 
     def test_every_construction_threads_the_tree_or_is_a_placed_standalone(self) -> None:
         unplaced = []
