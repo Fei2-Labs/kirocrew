@@ -694,7 +694,16 @@ def is_denied(
     # keeps the per-rule opt-out semantics exactly as written -- a rule an operator
     # disabled stays disabled at whatever depth it fires.
     publish_sources = [source for source in payload_sources if _argv._is_git_publish(source)]
-    if publish_sources:
+    if publish_sources and not _git_publication_floor_applies():
+        # REPOSITORY-GOVERNED mode: the operator has declared the remote host's
+        # controls (rulesets, branch protection, required reviews and checks)
+        # authoritative for publication, so Kiro Crew stops parsing branch names.
+        # The push still falls through to every other tier below -- credential
+        # exfiltration, self-protection, sensitive paths, the destructive-command
+        # rules -- and ``push_allow_pending`` keeps the ALLOW audit, so the event
+        # log records the push either way. Only the branch-name floor stands down.
+        push_allow_pending = True
+    elif publish_sources:
         floor_tags: frozenset[str] = frozenset()
         for publish_source in publish_sources:
             floor_tags |= _argv._git_publish_floor_tags(publish_source)

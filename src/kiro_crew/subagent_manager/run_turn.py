@@ -346,18 +346,41 @@ async def _run_inner_impl(
     # is ``""``; fall back to the literal ``"auto"`` sentinel so the frontend
     # can show a neutral chip instead of nothing at all.
     info.requested_model = eff_model or "auto"
-    if eff_model:
-        extra_kwargs["model"] = eff_model
+    # The per-spawn backend (spawn_run ``backend``). ``is not None``: ``""``
+    # is a Kiro request and must reach the factory under a non-Kiro default.
+    if info.backend is not None:
+        extra_kwargs["backend_override"] = info.backend
+        if eff_model:
+            extra_kwargs["model"] = eff_model
+    else:
+        # A dedicated child stays on its LIVE parent's harness: shared-runtime
+        # multiplexing is the kiro-family arm, so a spec-adapter parent's child
+        # would otherwise cold-start on the factory snapshot -- and a Settings
+        # switch mid-run would redirect it onto a harness its parent never ran,
+        # carrying a model pin that harness cannot serve. The kwargs are inert
+        # on the shared arm, where no provider is constructed.
+        # circular import: subagent sits below the manager in the layering.
+        from kiro_crew.subagent import dedicated_child_factory_kwargs, parent_live_harness
+
+        parent_backend, advertised = parent_live_harness(
+            self._manager._sessions, info.parent_session_key
+        )
+        if parent_backend is not None:
+            extra_kwargs.update(
+                dedicated_child_factory_kwargs(
+                    parent_backend=parent_backend,
+                    advertised=advertised,
+                    preferred_model=eff_model,
+                )
+            )
+        elif eff_model:
+            extra_kwargs["model"] = eff_model
     # Sub-agent reasoning effort (per-call override -> role_efforts['subagent']
     # -> chat default). Passed as an override so it wins over the factory's
     # agent-derived default; "" leaves it to that default.
     eff_effort = plan.eff_effort
     if eff_effort:
         extra_kwargs["reasoning_effort_override"] = eff_effort
-    # The per-spawn backend (spawn_run ``backend``). ``is not None``: ``""``
-    # is a Kiro request and must reach the factory under a non-Kiro default.
-    if info.backend is not None:
-        extra_kwargs["backend_override"] = info.backend
     if info.bare:
         extra_kwargs["bare"] = True
     if info.allowed_tools:

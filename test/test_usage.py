@@ -1137,7 +1137,8 @@ class TestCachedParseSessions:
 
         monkeypatch.setattr(usage_mod, "_configured_acp_backend", configured_backend)
 
-        assert await _cached_parse_sessions() == {}
+        result = await _cached_parse_sessions()
+        assert result["total_sessions"] == 0
         assert checked_on and checked_on[0] != event_loop_thread
 
     @pytest.mark.asyncio

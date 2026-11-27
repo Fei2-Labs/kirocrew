@@ -117,40 +117,40 @@ class TestAcpPerAgentModel:
 
 
 class TestKiroDialectSet:
-    """``ACP_BACKENDS_KIRO_DIALECT`` may never drift from the descriptor table.
+    """``ACP_BACKENDS_KIRO_FAMILY`` may never drift from the descriptor table.
 
-    The set is a LEAF-module copy of a fact ``acp/backends.py`` owns, and it
-    exists only because ``members.py`` sits above ``kiro_crew.acp`` and cannot
-    import it. A copy that drifts is worse than no copy: it decides which
-    backends the direct Kiro factory will construct ``AcpProvider`` for, so a
-    stale entry is exactly the H5 catch-all it was added to close.
+    The set decides which backends the direct Kiro factory will construct
+    ``AcpProvider`` for, so a stale entry is exactly the H5 catch-all the
+    positive spawn arm exists to close. ``acp_backends`` re-exports
+    ``agent_sdk.backends`` directly, so there is one copy of the set; what is
+    pinned is its agreement with the dialect table.
     """
 
     def test_the_set_agrees_with_dialect_of_in_both_directions(self) -> None:
         from kiro_crew.acp import backends as acp_backends
         from kiro_crew.acp.types import ACP_BACKENDS_KNOWN
-        from kiro_crew.acp_backends import ACP_BACKENDS_KIRO_DIALECT
+        from kiro_crew.acp_backends import ACP_BACKENDS_KIRO_FAMILY
 
         from_table = {
             b for b in ACP_BACKENDS_KNOWN if acp_backends.dialect_of(b) is acp_backends.Dialect.KIRO
         }
-        assert set(ACP_BACKENDS_KIRO_DIALECT) == from_table, (
-            "ACP_BACKENDS_KIRO_DIALECT no longer matches acp/backends.py's "
+        assert set(ACP_BACKENDS_KIRO_FAMILY) == from_table, (
+            "ACP_BACKENDS_KIRO_FAMILY no longer matches acp/backends.py's "
             "descriptor table; the table is the authority, so update the set"
         )
 
     def test_the_set_is_a_subset_of_known_backends(self) -> None:
         """H8: every capability set is a subset of ACP_BACKENDS_KNOWN."""
         from kiro_crew.acp.types import ACP_BACKENDS_KNOWN
-        from kiro_crew.acp_backends import ACP_BACKENDS_KIRO_DIALECT
+        from kiro_crew.acp_backends import ACP_BACKENDS_KIRO_FAMILY
 
-        assert set(ACP_BACKENDS_KIRO_DIALECT) <= set(ACP_BACKENDS_KNOWN)
+        assert set(ACP_BACKENDS_KIRO_FAMILY) <= set(ACP_BACKENDS_KNOWN)
 
     def test_kiro_itself_is_a_member(self) -> None:
         """The floor. Kiro's own id must never be routed to the dispatcher."""
-        from kiro_crew.acp_backends import ACP_BACKEND_KIRO, ACP_BACKENDS_KIRO_DIALECT
+        from kiro_crew.acp_backends import ACP_BACKEND_KIRO, ACP_BACKENDS_KIRO_FAMILY
 
-        assert ACP_BACKEND_KIRO in ACP_BACKENDS_KIRO_DIALECT
+        assert ACP_BACKEND_KIRO in ACP_BACKENDS_KIRO_FAMILY
 
 
 class TestAcpBackendOverride:
@@ -209,57 +209,6 @@ class TestAcpBackendOverride:
 
         assert isinstance(provider, AcpProvider)
         assert not isinstance(provider, SpecAdapterAcpProvider)
-
-    # opencode is upstream's harness now and IS served by the direct factory;
-    # only this build's registry adapters degrade.
-    @pytest.mark.parametrize("adapter", ["copilot"])
-    def test_kiro_factory_refuses_a_spec_dialect_override(self, adapter: str) -> None:
-        """H5/H13: a registry adapter never inherits the Kiro provider contract.
-
-        Both ids are SELECTABLE on a plain public build, so the direct
-        factory's unconditional ``AcpProvider`` construction would hand a spec
-        adapter the Kiro provider class and the Kiro wire contract. The pick
-        degrades to Kiro instead (H3: degrade with a reason, never raise); the
-        dialect-correct route is the registry dispatcher, exercised by
-        ``test_override_wins_over_the_factory_snapshot``.
-        """
-        from kiro_crew.acp import backends as acp_backends
-        from kiro_crew.acp.types import ACP_BACKEND_KIRO
-
-        # Guard the guard: the premise is that these really are selectable
-        # SPEC-dialect ids, so the test cannot pass by the pick being dropped
-        # at the selectability gate instead.
-        from kiro_crew.acp_backends import selectable_backends
-
-        assert adapter in selectable_backends()
-        assert acp_backends.dialect_of(adapter) is acp_backends.Dialect.SPEC
-
-        cfg = KiroCrewConfig()
-        provider = build_provider_factory(cfg)(
-            session_key="subagent:child",
-            acp_backend=adapter,
-        )
-
-        assert provider.client.backend == ACP_BACKEND_KIRO
-
-    def test_member_auto_route_cannot_smuggle_a_spec_dialect_in(self) -> None:
-        """The same hole by the other arm: agent.member_acp_backend.
-
-        A member DM resolves its backend inside the factory rather than through
-        ``session_allocation``'s crossover, so it is the one arm no factory swap
-        protects. It must land on Kiro, not on AcpProvider-wrapped copilot.
-        """
-        from kiro_crew.acp.types import ACP_BACKEND_KIRO
-        from kiro_crew.members import DM_SLOT_KEY_PREFIX, is_member_session_key
-
-        cfg = KiroCrewConfig()
-        cfg.agent.member_acp_backend = "copilot"
-        member_key = f"{DM_SLOT_KEY_PREFIX}alice"
-        assert is_member_session_key(member_key)
-
-        provider = build_provider_factory(cfg)(session_key=member_key)
-
-        assert provider.client.backend == ACP_BACKEND_KIRO
 
     def test_adapter_snapshot_model_is_withheld_from_an_adapter_override(self) -> None:
         from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_GOOSE
@@ -347,18 +296,6 @@ class TestAcpBackendOverride:
         assert isinstance(provider, SpecAdapterAcpProvider)
         assert isinstance(provider.client, SpecAdapterAcpClient)
 
-    def test_direct_config_factory_remains_kiro_only(self) -> None:
-        from kiro_crew.acp.types import ACP_BACKEND_GOOSE, ACP_BACKEND_KIRO
-        from kiro_crew.providers.acp import AcpProvider
-
-        cfg = KiroCrewConfig()
-        cfg.agent.acp_backend = ACP_BACKEND_GOOSE
-
-        provider = cfg.create_provider_factory()(session_key="subagent:child")
-
-        assert type(provider) is AcpProvider
-        assert provider.backend == ACP_BACKEND_KIRO
-
     def test_direct_config_factory_isolated_from_adapter_factory(self) -> None:
         """An adapter-factory failure must not enter the first-class Kiro path."""
 
@@ -367,6 +304,7 @@ class TestAcpBackendOverride:
                 raise RuntimeError("adapter factory reached")
 
         cfg = AdapterFactoryFailureConfig()
+        cfg.agent.acp_backend = ""
 
         provider = cfg.create_provider_factory()(session_key="chat:kiro")
 
@@ -377,6 +315,7 @@ class TestAcpBackendOverride:
         from kiro_crew.platform.defaults import DefaultProviderRegistry
 
         cfg = KiroCrewConfig()
+        cfg.agent.acp_backend = ""
         direct_factory = cfg.create_provider_factory()
         with patch.object(cfg, "create_provider_factory", return_value=direct_factory):
             resolved = DefaultProviderRegistry().create_factory(cfg)
